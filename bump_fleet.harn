@@ -1,0 +1,614 @@
+#!/usr/bin/env harn
+//
+// bump_fleet.harn — orchestrate Harn-version bump PRs across every repo in
+// ~/projects/{*harn*,*burin*} that ships a `.github/workflows/bump-harn.yml`.
+//
+// Determinism: every GitHub interaction is a `gh` shell-out with JSON output.
+// The single LLM call at the end is a read-only summary against a local
+// model — it never drives any side-effect.
+//
+// Usage:
+//   harn run bump_fleet.harn                      // bump to latest harn release
+//   harn run bump_fleet.harn -- v0.7.52           // pin to explicit tag
+//   harn run bump_fleet.harn -- --dry-run         // discover-only, no dispatch
+//   harn run bump_fleet.harn -- v0.7.52 --dry-run
+let BUMP_BRANCH = "automation/bump-harn-runtime"
+
+let HARN_REPO = "burin-labs/harn"
+
+let POLL_INTERVAL_MS = 15000
+
+let POST_DISPATCH_GRACE_MS = 8000
+
+let MAX_POLL_MS = 30 * 60 * 1000
+
+let PARALLEL_LIMIT = 4
+
+// Default summary model is a small non-reasoning Ollama model so the audit
+// MD stays clean. Override with HARN_BUMP_FLEET_MODEL — anything Harn's
+// `local:` / `ollama:` prefix can route accepts.
+let SUMMARY_MODEL = env_or("HARN_BUMP_FLEET_MODEL", "local:gemma4:26b")
+
+// -------------------------------------------------------------------------------------------------
+// Argument parsing — tiny, positional + --dry-run flag.
+// -------------------------------------------------------------------------------------------------
+
+fn parse_args(args) {
+  var target = nil
+  var dry = false
+  var only = nil
+  var i = 0
+  while i < len(args) {
+    let a = args[i]
+    if a == "--dry-run" {
+      dry = true
+    } else if a == "--only" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--only requires a slug like burin-labs/harn-cloud"
+      }
+      only = args[i]
+    } else if starts_with(a, "--") {
+      throw "unknown flag: ${a}"
+    } else {
+      if target != nil {
+        throw "extra positional arg: ${a}"
+      }
+      target = a
+    }
+    i = i + 1
+  }
+  return {target: target, dry_run: dry, only: only}
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// gh helpers. Every call is a shell-out so the script is deterministic and
+// portable — no embedded credentials, just the operator's existing `gh auth`.
+
+// -------------------------------------------------------------------------------------------------
+
+fn gh_run(args) {
+  return shell("gh ${args}")
+}
+
+fn gh_json(args) {
+  let r = gh_run(args)
+  if !r.success {
+    throw "gh ${args} failed (exit ${r.status}): ${trim(r.stderr)}"
+  }
+  let body = trim(r.stdout)
+  if body == "" {
+    return nil
+  }
+  return json_parse(body)
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// Repo discovery — scan ~/projects for every directory matching
+// {*harn*,*burin*} that owns a bump-harn workflow. Skip git worktrees of an
+// already-discovered repo so we never double-dispatch the same workflow.
+
+// -------------------------------------------------------------------------------------------------
+
+fn discover_repos() {
+  let home = env_or("HOME", "")
+  let projects = "${home}/projects"
+  let listing = shell("ls -d ${projects}/*harn* ${projects}/*burin* 2>/dev/null")
+  let dirs = listing.stdout
+    .split("\n")
+    .filter(
+    { d -> d != "" && file_exists("${d}/.github/workflows/bump-harn.yml") },
+  )
+  var seen_common_dir = {}
+  var out = []
+  for dir in dirs {
+    let slug_probe = shell_at(dir, "git remote get-url origin 2>/dev/null")
+    if !slug_probe.success {
+      continue
+    }
+    let slug = remote_url_to_slug(trim(slug_probe.stdout))
+    if slug == nil {
+      continue
+    }
+    let common_dir_probe = shell_at(dir, "git rev-parse --git-common-dir 2>/dev/null")
+    if !common_dir_probe.success {
+      continue
+    }
+    let raw_common = trim(common_dir_probe.stdout)
+    let common = if starts_with(raw_common, "/") {
+      raw_common
+    } else {
+      "${dir}/${raw_common}"
+    }
+    if seen_common_dir[common] ?? false {
+      continue
+    }
+    seen_common_dir[common] = true
+    out = out + [{dir: dir, slug: slug, common_dir: common}]
+  }
+  // worktree dedupe
+  return out
+}
+
+fn remote_url_to_slug(raw) {
+  // git@github.com:owner/repo.git or https://github.com/owner/repo(.git)
+  let ssh = regex_captures("^git@github\\.com:([^/]+)/([^/.]+)(?:\\.git)?$", raw)
+  if ssh != nil && len(ssh) > 0 {
+    let g = ssh[0].groups
+    return "${g[0]}/${g[1]}"
+  }
+  let https = regex_captures("^https?://github\\.com/([^/]+)/([^/.]+?)(?:\\.git)?/?$", raw)
+  if https != nil && len(https) > 0 {
+    let g = https[0].groups
+    return "${g[0]}/${g[1]}"
+  }
+  return nil
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pre-pin readback — best-effort current version per repo, for the audit.
+// -------------------------------------------------------------------------------------------------
+
+fn read_pre_pin(dir) {
+  let candidates = [".harn-version"]
+  for f in candidates {
+    let path = "${dir}/${f}"
+    if file_exists(path) {
+      return trim(read_file(path))
+    }
+  }
+  // Try parsing harn-vm cargo dep on harn-cloud-style repos.
+  let cargo = "${dir}/Cargo.toml"
+  if file_exists(cargo) {
+    let text = read_file(cargo)
+    let m = regex_captures("(?m)^harn-vm\\s*=\\s*\"=?([0-9]+\\.[0-9]+\\.[0-9]+)\"", text)
+    if m != nil && len(m) > 0 {
+      return m[0].groups[0]
+    }
+  }
+  return nil
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// Per-repo bump pipeline. Dispatch the workflow, poll for completion, locate
+// the resulting PR, ensure auto-merge is enabled.
+
+// -------------------------------------------------------------------------------------------------
+
+fn make_outcome(repo, pre_pin) {
+  return {
+    dir: repo.dir,
+    slug: repo.slug,
+    status: "pending",
+    detail: "",
+    run_id: nil,
+    run_url: nil,
+    pr_number: nil,
+    pr_url: nil,
+    pre_pin: pre_pin,
+    auto_merge: nil,
+    duration_ms: 0,
+  }
+}
+
+/**
+ * Whether an outcome status implies the script actually kicked a workflow
+ * run for that repo (vs. resolving via probes only). Used to drive the
+ * "dispatched: N" counter in the audit summary.
+ */
+fn dispatched_status(s) {
+  return starts_with(s, "run_") || s == "dispatch_failed" || s == "pr_open"
+    || s == "already_current_post_run"
+}
+
+/** Strip optional leading 'v' so v0.7.52 and 0.7.52 compare equal. */
+fn strip_v(version) {
+  if version != nil && starts_with(version, "v") {
+    return version[1:len(version)]
+  }
+  return version
+}
+
+/**
+ * Probe the version pinned on origin/main by reading the canonical surface
+ * over `gh api`. Tries .harn-version first (most repos), falls back to the
+ * `harn-vm = "..."` Cargo.toml dep (harn-cloud). Returns the bare "X.Y.Z"
+ * string with any leading "v" already stripped, or nil.
+ */
+fn read_remote_pin(slug) {
+  let hv = shell(
+    "gh api repos/${slug}/contents/.harn-version --jq .content 2>/dev/null | base64 -d 2>/dev/null",
+  )
+  if hv.success && trim(hv.stdout) != "" {
+    return strip_v(trim(hv.stdout))
+  }
+  let cargo = shell("gh api repos/${slug}/contents/Cargo.toml --jq .content 2>/dev/null | base64 -d 2>/dev/null")
+  if cargo.success && trim(cargo.stdout) != "" {
+    let m = regex_captures("(?m)^harn-vm\\s*=\\s*\"=?([0-9]+\\.[0-9]+\\.[0-9]+)\"", cargo.stdout)
+    if m != nil && len(m) > 0 {
+      return m[0].groups[0]
+    }
+  }
+  return nil
+}
+
+/**
+ * Idempotently nudge auto-merge on. `gh pr merge --auto` is itself
+ * idempotent: re-enabling on an already-auto-merging PR exits 0 with a
+ * noop message. Treat any non-zero exit as a soft failure carrying the
+ * gh stderr forward.
+ */
+fn ensure_auto_merge(slug, pr_number) {
+  let r = gh_run("pr merge ${pr_number} --repo ${slug} --auto --squash")
+  return if r.success {
+    "enabled"
+  } else {
+    "failed: ${trim(r.stderr)}"
+  }
+}
+
+fn bump_one(repo, target, dry_run) {
+  let started_ms = now_ms()
+  let pre_pin = read_pre_pin(repo.dir)
+  let base = make_outcome(repo, pre_pin)
+  if dry_run {
+    return {
+      ...base,
+      status: "dry_run",
+      detail: "would dispatch bump-harn.yml with version=${target}",
+      duration_ms: now_ms() - started_ms,
+    }
+  }
+  let target_no_v = strip_v(target)
+  // ---- Idempotency pre-check (no side effects on the workflow) ----
+  let remote_pin = read_remote_pin(repo.slug)
+  let existing_pr = find_existing_pr(repo.slug)
+  // (a) Remote main is already pinned to the target. Nothing to do; the
+  //     workflow itself would self-skip but we save an Actions minute.
+  if remote_pin != nil && remote_pin == target_no_v {
+    let pr_n = if existing_pr == nil {
+      nil
+    } else {
+      existing_pr.number
+    }
+    let pr_u = if existing_pr == nil {
+      nil
+    } else {
+      existing_pr.url
+    }
+    return {
+      ...base,
+      status: "already_current",
+      detail: "remote main pin is ${remote_pin}; matches target",
+      pr_number: pr_n,
+      pr_url: pr_u,
+      duration_ms: now_ms() - started_ms,
+    }
+  }
+  // (b) An open bump PR already targets this version. Make sure auto-merge
+  //     is on, then exit — re-dispatching would force-push the same diff.
+  if existing_pr != nil && pr_targets_version(existing_pr, target) {
+    let am = if existing_pr.autoMergeRequest ?? nil != nil {
+      "already_enabled"
+    } else {
+      ensure_auto_merge(repo.slug, existing_pr.number)
+    }
+    let final_status = if starts_with(am, "failed") {
+      "pr_already_set_auto_merge_failed"
+    } else {
+      "pr_already_set"
+    }
+    return {
+      ...base,
+      status: final_status,
+      detail: "PR #${existing_pr.number} already targets ${target}; auto-merge: ${am}",
+      pr_number: existing_pr.number,
+      pr_url: existing_pr.url,
+      auto_merge: am,
+      duration_ms: now_ms() - started_ms,
+    }
+  }
+  // ---- Dispatch ----
+  let dispatch_ts = date_now_iso()
+  let dispatch = gh_run("workflow run bump-harn.yml --repo ${repo.slug} -F version=${target}")
+  if !dispatch.success {
+    return {
+      ...base,
+      status: "dispatch_failed",
+      detail: trim(dispatch.stderr),
+      duration_ms: now_ms() - started_ms,
+    }
+  }
+  sleep_ms(POST_DISPATCH_GRACE_MS)
+  let polled = poll_for_completion(repo.slug, dispatch_ts)
+  let run_outcome = if polled == nil {
+    {...base, status: "run_not_found", detail: "no workflow_dispatch run after ${MAX_POLL_MS / 1000}s"}
+  } else {
+    {
+      ...base,
+      run_id: polled.id,
+      run_url: polled.url,
+      status: "run_${polled.conclusion}",
+      detail: "workflow concluded ${polled.conclusion}",
+    }
+  }
+  // ---- Post-dispatch classification ----
+  let pr = find_existing_pr(repo.slug)
+  let post_remote = read_remote_pin(repo.slug)
+  let with_pr = if pr == nil {
+    let same = post_remote != nil && post_remote == target_no_v
+    {
+      ...run_outcome,
+      status: if run_outcome.status == "run_success" && same {
+        "already_current_post_run"
+      } else {
+        if run_outcome.status == "run_success" {
+          "run_skipped_no_diff"
+        } else {
+          run_outcome.status
+        }
+      },
+      detail: "${run_outcome.detail}; no open PR"
+        + if same {
+        " (remote pin now ${post_remote}, matches target)"
+      } else {
+        ""
+      },
+    }
+  } else {
+    {
+      ...run_outcome,
+      pr_number: pr.number,
+      pr_url: pr.url,
+      status: if run_outcome.status == "run_success" {
+        "pr_open"
+      } else {
+        run_outcome.status
+      },
+      detail: "${run_outcome.detail}; PR #${pr.number} on ${pr.headRefName}",
+    }
+  }
+  let final = if pr == nil {
+    with_pr
+  } else {
+    let am = if pr.autoMergeRequest ?? nil != nil {
+      "already_enabled"
+    } else {
+      ensure_auto_merge(repo.slug, pr.number)
+    }
+    let detail = if starts_with(am, "failed") {
+      "${with_pr.detail}; auto-merge: ${am}"
+    } else {
+      with_pr.detail
+    }
+    {...with_pr, auto_merge: am, detail: detail}
+  }
+  return {...final, duration_ms: now_ms() - started_ms}
+}
+
+fn pr_targets_version(pr, target) {
+  let title = pr.title ?? ""
+  let target_no_v = strip_v(target)
+  // Match either "v0.7.52" or "0.7.52" anywhere in the title.
+  return contains(title, target) || contains(title, target_no_v)
+}
+
+fn poll_for_completion(slug, after_iso) {
+  let stop_at_ms = now_ms() + MAX_POLL_MS
+  while now_ms() < stop_at_ms {
+    let runs = try {
+      gh_json(
+        "run list --repo ${slug} --workflow=bump-harn.yml --event=workflow_dispatch --limit=10 --json databaseId,createdAt,status,conclusion,url",
+      )
+    } catch (e) {
+      nil
+    }
+    if runs != nil {
+      // Pick the newest run created at-or-after our dispatch timestamp.
+      var best = nil
+      for r in runs {
+        if r.createdAt >= after_iso {
+          if best == nil || r.createdAt > best.createdAt {
+            best = r
+          }
+        }
+      }
+      if best != nil && best.status == "completed" {
+        return {id: best.databaseId, url: best.url, conclusion: best.conclusion ?? "unknown", status: best.status}
+      }
+    }
+    sleep_ms(POLL_INTERVAL_MS)
+  }
+  return nil
+}
+
+fn find_existing_pr(slug) {
+  let prs = try {
+    gh_json(
+      "pr list --repo ${slug} --head ${BUMP_BRANCH} --state open --json number,url,title,headRefName,autoMergeRequest --limit 1",
+    )
+  } catch (e) {
+    nil
+  }
+  if prs == nil {
+    return nil
+  }
+  if len(prs) == 0 {
+    return nil
+  }
+  return prs[0]
+}
+
+// -------------------------------------------------------------------------------------------------
+// Audit & summary.
+// -------------------------------------------------------------------------------------------------
+
+fn write_audit(run_id, payload) {
+  let runs_root = "${cwd()}/.harn-runs/bump-fleet/${run_id}"
+  mkdir(runs_root, true)
+  let body = json_stringify(payload, 2)
+  let json_path = "${runs_root}/audit.json"
+  write_file(json_path, body + "\n")
+  let md_payload = {...payload, audit_sha: sha3_256(body)[0:16]}
+  let md = render("@prompts/audit_report.harn.prompt", md_payload)
+  let md_path = "${runs_root}/audit.md"
+  write_file(md_path, md)
+  return {json_path: json_path, md_path: md_path}
+}
+
+fn summarize_with_local_llm(payload) {
+  let system = """
+You are a release-engineering audit assistant. You will receive a JSON record
+of a fleet-wide Harn version bump. Output 3-6 markdown bullets, nothing else.
+Each bullet is one short line. Call out: failed runs, repos that look
+already-current, repos where auto-merge could not be enabled, conspicuous
+duration outliers. Never invent facts. If nothing is anomalous, the only
+output is a single bullet "- nothing anomalous". Start with "- ".
+"""
+  let prompt = "Audit JSON:\n```json\n" + json_stringify(payload, 2) + "\n```\nBullets:\n"
+  let r = try {
+    llm_call(
+      prompt,
+      system,
+      {provider: "auto", model: SUMMARY_MODEL, max_tokens: 400, temperature: 0.0, llm_retries: 1},
+    )
+  } catch (e) {
+    return "(local LLM summary unavailable: ${e})"
+  }
+  let raw = trim(r.prose ?? r.text ?? "")
+  // Defensive: strip any chain-of-thought block, keep from the first bullet on.
+  let no_think = regex_replace("(?s)<think>.*?</think>", "", raw)
+  let lines = no_think.split("\n")
+  var first_bullet = -1
+  for {index, line} in lines.enumerate() {
+    if first_bullet == -1 && starts_with(trim(line), "- ") {
+      first_bullet = index
+    }
+  }
+  let cleaned = if first_bullet == -1 {
+    trim(no_think)
+  } else {
+    trim(lines[first_bullet:len(lines)].join("\n"))
+  }
+  return if cleaned == "" {
+    raw
+  } else {
+    cleaned
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Entry point.
+// -------------------------------------------------------------------------------------------------
+
+fn resolve_latest_release() {
+  let r = gh_run("api repos/${HARN_REPO}/releases/latest --jq .tag_name")
+  if !r.success {
+    throw "could not resolve latest harn release: ${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
+}
+
+pipeline main() {
+  let parsed = parse_args(argv)
+  let target = parsed.target ?? resolve_latest_release()
+  if regex_match("^v[0-9]+\\.[0-9]+\\.[0-9]+$", target) == nil {
+    eprintln("error: target must look like vX.Y.Z, got '${target}'")
+    return 2
+  }
+  let run_id = uuid_v7()
+  let started_ms = now_ms()
+  let started_iso = date_now_iso()
+  let mode_label = if parsed.dry_run {
+    "dry-run"
+  } else {
+    "live"
+  }
+  println("== harn-bump-fleet run ${run_id}")
+  println("   target version : ${target}")
+  println("   mode           : ${mode_label}")
+  let all_repos = discover_repos()
+  let repos = if parsed.only != nil {
+    all_repos.filter({ r -> r.slug == parsed.only })
+  } else {
+    all_repos
+  }
+  println("   repos discovered: ${len(all_repos)} (running on ${len(repos)})")
+  for r in repos {
+    println("     - ${r.slug}  (${r.dir})")
+  }
+  if len(repos) == 0 {
+    eprintln("no candidate repos matched (only=${parsed.only ?? \"\"})")
+    return 1
+  }
+  println("\n== dispatching (max_concurrent=${PARALLEL_LIMIT}) ...")
+  let settled = parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
+    bump_one(repo, target, parsed.dry_run)
+  }
+  // Flatten Result.Ok / Result.Err into uniform RepoOutcome rows.
+  var outcomes = []
+  for {index, value} in settled.results.enumerate() {
+    let repo = repos[index]
+    let row = if is_ok(value) {
+      unwrap(value)
+    } else {
+      let msg = unwrap_err(value)
+      {
+        dir: repo.dir,
+        slug: repo.slug,
+        status: "error",
+        detail: msg,
+        run_id: nil,
+        run_url: nil,
+        pr_number: nil,
+        pr_url: nil,
+        pre_pin: read_pre_pin(repo.dir),
+        auto_merge: nil,
+        duration_ms: 0,
+      }
+    }
+    outcomes = outcomes + [row]
+    println("   ${row.slug}: ${row.status}")
+  }
+  let finished_iso = date_now_iso()
+  let core_payload = {
+    run_id: run_id,
+    started_iso: started_iso,
+    finished_iso: finished_iso,
+    duration_ms: now_ms() - started_ms,
+    operator: username(),
+    host: hostname(),
+    target_version: target,
+    mode: mode_label,
+    repos_total: len(repos),
+    repos_dispatched: len(outcomes.filter({ o -> dispatched_status(o.status) })),
+    summary_model: SUMMARY_MODEL,
+    summary_text: "",
+    outcomes: outcomes,
+  }
+  println("\n== summarizing with ${SUMMARY_MODEL} ...")
+  let summary_text = if parsed.dry_run {
+    "(skipped on dry-run)"
+  } else {
+    summarize_with_local_llm({...core_payload, summary_text: ""})
+  }
+  let payload = {...core_payload, summary_text: summary_text}
+  let written = write_audit(run_id, payload)
+  println("\n== audit written")
+  println("   json: ${written.json_path}")
+  println("   md  : ${written.md_path}")
+  println("\n${summary_text}")
+  let any_error = outcomes
+    .any(
+    { o -> o.status == "error" || o.status == "dispatch_failed" || starts_with(o.status, "run_failure")
+      || o.auto_merge == "failed" },
+  )
+  return if any_error {
+    1
+  } else {
+    0
+  }
+}
