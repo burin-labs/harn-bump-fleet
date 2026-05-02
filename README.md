@@ -189,6 +189,9 @@ Reports are written to:
 
 ```text
 .harn-runs/release-harn/<run-id>/
+├── run-events.jsonl
+├── live-logs/
+│   └── prepare.log
 ├── release-audit.json
 ├── release-audit.md
 └── crystallization-input/
@@ -206,6 +209,11 @@ https://github.com/burin-labs/harn/issues/1146. It keeps deterministic release
 facts separate from model-authored audit/recovery text, and preserves command
 observations with stdout/stderr so failed pushes or hooks can be replayed
 offline without reading sibling run artifacts.
+
+For live runs, `run-events.jsonl` is append-only and safe to tail while the
+harness is still running. Long `scripts/release_ship.sh --prepare` output is
+also redirected to `live-logs/prepare.log`, which can be tailed separately
+while `shell_at()` is still waiting for the child process to exit.
 
 The script intentionally keeps the agent advisory. Deterministic checks and
 the repo's own `scripts/release_ship.sh` / `scripts/release_gate.sh` own the

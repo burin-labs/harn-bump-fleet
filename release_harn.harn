@@ -1295,6 +1295,42 @@ fn step_recovery_hint(command, r) {
   return ""
 }
 
+fn run_events_path(run_id) {
+  return path_join(cwd(), RUN_ROOT, run_id, "run-events.jsonl")
+}
+
+fn live_logs_dir(run_id) {
+  return path_join(cwd(), RUN_ROOT, run_id, "live-logs")
+}
+
+fn release_log_event(run_id, event_type, data) {
+  let path = run_events_path(run_id)
+  mkdir(dirname(path), true)
+  append_file(
+    path,
+    json_stringify(
+      {
+        schema_version: "release_harn.run_event.v1",
+        timestamp: date_now_iso(),
+        event_type: event_type,
+        data: data,
+      },
+    )
+      + "\n",
+  )
+  return path
+}
+
+fn command_live_log_path(run_id, name) {
+  let safe_name = regex_replace_all("[^A-Za-z0-9_.-]+", "-", name)
+  return path_join(live_logs_dir(run_id), safe_name + ".log")
+}
+
+fn live_logged_command(command, log_path) {
+  let log_arg = require_shell_arg(log_path, "live log path")
+  return command + " > " + log_arg + " 2>&1; status=$?; cat " + log_arg + "; exit $status"
+}
+
 fn append_command_step(cfg, steps, name, command) {
   let r = run_cmd(cfg, command)
   return {
@@ -1439,7 +1475,12 @@ if not changelog.exists():
 
 text = changelog.read_text()
 first = re.search(r"^## v([0-9]+\.[0-9]+\.[0-9]+)\s*$", text, re.M)
-if first and first.group(1) == next_version:
+unreleased = re.search(r"^## Unreleased\s*$", text, re.M)
+if (
+    first
+    and first.group(1) == next_version
+    and not (unreleased and unreleased.start() < first.start())
+):
     print(f"ok: CHANGELOG.md already starts with v{next_version}")
     raise SystemExit(0)
 
@@ -1526,11 +1567,17 @@ else:
         draft.extend([f"### {heading}", "", *entries, ""])
     draft_text = "\n".join(draft).rstrip() + "\n\n"
 
-insert_at = first.start() if first else len(text)
-new_text = text[:insert_at] + draft_text + text[insert_at:]
+if unreleased and (not first or unreleased.start() < first.start()):
+    replace_start = unreleased.start()
+    replace_end = first.start() if first else len(text)
+    new_text = text[:replace_start] + draft_text + text[replace_end:]
+else:
+    insert_at = first.start() if first else len(text)
+    new_text = text[:insert_at] + draft_text + text[insert_at:]
 changelog.write_text(new_text)
 source = "agent" if agent_notes else "deterministic"
-print(f"ok: inserted {source} CHANGELOG.md section for v{next_version} from {len(commits)} post-tag commits")
+verb = "promoted" if unreleased and (not first or unreleased.start() < first.start()) else "inserted"
+print(f"ok: {verb} {source} CHANGELOG.md section for v{next_version} from {len(commits)} post-tag commits")
 PY_RELEASE_NOTES
 """
 }
@@ -2092,20 +2139,46 @@ fn write_crystallization_fixture(run_id, payload, report_paths) {
 
 fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
   require_live_confirmation(cfg)
+  release_log_event(
+    run_id,
+    "phase_started",
+    {phase: "prepare", message: "starting release branch setup and prepare"},
+  )
   var steps = setup_release_branch(cfg, analysis)
   if execution_failed(steps) {
+    release_log_event(run_id, "phase_failed", {phase: "prepare", failed_step: last_failed_step(steps)})
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
   }
+  release_log_event(run_id, "step_started", {step: "ensure-release-notes"})
   steps = steps + ensure_release_notes(cfg, analysis, agent_review_result)
   if execution_failed(steps) {
+    release_log_event(run_id, "phase_failed", {phase: "prepare", failed_step: last_failed_step(steps)})
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
   }
   let cmd = prepare_command(cfg)
-  let r = run_cmd(cfg, cmd)
-  steps = steps + [recorded_step("prepare", cmd, r)]
+  let live_log = command_live_log_path(run_id, "prepare")
+  mkdir(dirname(live_log), true)
+  release_log_event(
+    run_id,
+    "step_started",
+    {step: "prepare", command: cmd, live_log: live_log, tail_hint: "tail -f " + live_log},
+  )
+  let r = if cfg.mock {
+    run_cmd(cfg, cmd)
+  } else {
+    run_cmd(cfg, live_logged_command(cmd, live_log))
+  }
+  steps = steps + [{...recorded_step("prepare", cmd, r), live_log: live_log}]
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "prepare", success: r.success, status: r.status, live_log: live_log},
+  )
   if execution_failed(steps) {
+    release_log_event(run_id, "phase_failed", {phase: "prepare", failed_step: last_failed_step(steps)})
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
   }
+  release_log_event(run_id, "phase_finished", {phase: "prepare", success: true})
   return steps
 }
 
@@ -2127,8 +2200,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     {name: "push", command: "git push -u origin ${branch}"},
   ]
   for step in commands {
+    release_log_event(run_id, "step_started", {step: step.name, command: step.command})
     let result = append_command_step(cfg, steps, step.name, step.command)
     steps = result.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: step.name, success: result.success, status: result.status},
+    )
     if !result.success {
       let failed_step = steps[len(steps) - 1]
       if step.name == "push" {
@@ -2150,8 +2229,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   let body_path = write_pr_body(run_id, post_prepare_analysis, agent_review_result, steps)
   let existing_pr_command = "gh pr list --base " + base_arg
     + " --head ${branch} --state open --json url --jq '.[0].url // \"\"'"
+  release_log_event(run_id, "step_started", {step: "find-existing-pr", command: existing_pr_command})
   let existing_pr = append_command_step(cfg, steps, "find-existing-pr", existing_pr_command)
   steps = existing_pr.steps
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "find-existing-pr", success: existing_pr.success, status: existing_pr.status},
+  )
   if !existing_pr.success {
     return steps
   }
@@ -2172,8 +2257,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     let create_command = "gh pr create --base " + base_arg
       + " --head ${branch} --title \"Release v${version}\" --body-file "
       + body_arg
+    release_log_event(run_id, "step_started", {step: "create-pr", command: create_command})
     let created = append_command_step(cfg, steps, "create-pr", create_command)
     steps = created.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: "create-pr", success: created.success, status: created.status},
+    )
     if !created.success {
       return steps
     }
@@ -2194,8 +2285,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     let pr_edit_arg = require_shell_arg(pr_url, "PR URL")
     let edit_command = "gh pr edit " + pr_edit_arg + " --title \"Release v${version}\" --body-file "
       + body_arg
+    release_log_event(run_id, "step_started", {step: "refresh-existing-pr-body", command: edit_command})
     let edited = append_command_step(cfg, steps, "refresh-existing-pr-body", edit_command)
     steps = edited.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: "refresh-existing-pr-body", success: edited.success, status: edited.status},
+    )
     if !edited.success {
       return steps
     }
@@ -2212,8 +2309,15 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     ]
     return steps
   }
-  let auto_merge = append_command_step(cfg, steps, "auto-merge", "gh pr merge " + pr_arg + " --auto --squash")
+  let auto_merge_command = "gh pr merge " + pr_arg + " --auto --squash"
+  release_log_event(run_id, "step_started", {step: "auto-merge", command: auto_merge_command})
+  let auto_merge = append_command_step(cfg, steps, "auto-merge", auto_merge_command)
   steps = auto_merge.steps
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "auto-merge", success: auto_merge.success, status: auto_merge.status},
+  )
   return steps
 }
 
@@ -2286,11 +2390,31 @@ pipeline main() {
   } else {
     cfg.repo
   }
+  let run_events = release_log_event(
+    run_id,
+    "run_started",
+    {repo: repo_label, mode: cfg.mode, bump: cfg.bump, agent: cfg.agent, mock: cfg.mock},
+  )
   println("== harn release harness ${run_id}")
   println("   repo : ${repo_label}")
   println("   mode : ${cfg.mode}")
   println("   bump : ${cfg.bump}")
+  println("   events: ${run_events}")
+  println("   tail : tail -f ${run_events}")
+  release_log_event(run_id, "analysis_started", {})
   let analysis = analyze_release(cfg)
+  release_log_event(
+    run_id,
+    "analysis_finished",
+    {
+      current_version: analysis.current_version,
+      next_version: analysis.next_version,
+      branch: analysis.branch,
+      changelog_top: analysis.changelog_top,
+      dirty_files: analysis.dirty_files,
+      deterministic_findings: analysis.deterministic_findings,
+    },
+  )
   println("   current -> next : ${analysis.current_version} -> ${analysis.next_version}")
   println("   changelog top   : v${analysis.changelog_top}")
   println("   dirty files     : ${analysis.dirty_files}")
@@ -2308,15 +2432,31 @@ pipeline main() {
       cfg.model
     }
     println("== agent review with ${model_label} ...")
+    release_log_event(
+      run_id,
+      "agent_started",
+      {model: model_label, llm_transcript_dir: agent_artifact_paths(run_id).llm_transcript_dir},
+    )
     agent_review_result = agent_review(cfg, analysis, run_id)
+    release_log_event(
+      run_id,
+      "agent_finished",
+      {
+        draft_changelog: agent_review_result.draft_changelog,
+        artifacts: agent_review_result.artifacts,
+        validation_findings: agent_review_result.validation_findings,
+      },
+    )
   }
   let agent_text = agent_review_result.text
   var execution = nil
   if cfg.mode == "prepare" {
     println("== running prepare ...")
+    release_log_event(run_id, "mode_execution_started", {mode: "prepare"})
     execution = execute_prepare(cfg, analysis, agent_review_result, run_id)
   } else if cfg.mode == "ship-pr" {
     println("== running prepare + PR handoff ...")
+    release_log_event(run_id, "mode_execution_started", {mode: "ship-pr"})
     execution = execute_ship_pr(cfg, analysis, agent_review_result, run_id)
   }
   let payload = {
@@ -2334,6 +2474,16 @@ pipeline main() {
   }
   let written = write_report(run_id, payload)
   let fixture = write_crystallization_fixture(run_id, payload, written)
+  release_log_event(
+    run_id,
+    "run_finished",
+    {
+      success: !execution_failed(execution),
+      report_json: written.json_path,
+      report_md: written.md_path,
+      fixture_dir: fixture.out_dir,
+    },
+  )
   println("== report written")
   println("   json: ${written.json_path}")
   println("   md  : ${written.md_path}")
