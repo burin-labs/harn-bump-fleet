@@ -190,8 +190,22 @@ Reports are written to:
 ```text
 .harn-runs/release-harn/<run-id>/
 ├── release-audit.json
-└── release-audit.md
+├── release-audit.md
+└── crystallization-input/
+    ├── manifest.json
+    ├── release-run.json
+    ├── deterministic-events.jsonl
+    ├── agent-events.jsonl
+    ├── tool-observations.jsonl
+    └── README.md
 ```
+
+The `crystallization-input/` directory is a self-contained fixture for the
+Harn crystallization importer tracked in
+https://github.com/burin-labs/harn/issues/1146. It keeps deterministic release
+facts separate from model-authored audit/recovery text, and preserves command
+observations with stdout/stderr so failed pushes or hooks can be replayed
+offline without reading sibling run artifacts.
 
 The script intentionally keeps the agent advisory. Deterministic checks and
 the repo's own `scripts/release_ship.sh` / `scripts/release_gate.sh` own the
