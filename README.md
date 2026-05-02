@@ -65,6 +65,9 @@ all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
    - If origin/main's `.harn-version` (or `harn-vm = "..."` in `Cargo.toml`)
      already matches the target, status is `already_current` and no workflow
      is dispatched.
+   - Repos that pin `harn-vm` to `github.com/burin-labs/harn` by Git commit
+     `rev` are compared against the target release tag's resolved commit SHA,
+     so git-pinned repos can also no-op without dispatching Actions.
    - If an open PR on `automation/bump-harn-runtime` already targets the
      target version, ensure auto-merge is on and status is `pr_already_set`.
 4. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
@@ -74,9 +77,10 @@ all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
    record.
-6. **Summarize**: a single read-only `llm_call` against the local model
-   produces a short bullet list of anomalies for the operator. The LLM is
-   **never** allowed to drive a side-effect — the audit is finalized first.
+6. **Summarize**: the harness first computes deterministic anomaly facts from
+   the outcome rows, then gives only those compact facts to a single read-only
+   local `llm_call` for formatting. The LLM is **never** allowed to classify
+   runs, infer state from raw audit JSON, or drive a side-effect.
 
 ## Idempotency guarantees
 
