@@ -1,5 +1,7 @@
 # harn-bump-fleet
 
+[![Harn static checks](https://github.com/burin-labs/harn-bump-fleet/actions/workflows/harn-static.yml/badge.svg)](https://github.com/burin-labs/harn-bump-fleet/actions/workflows/harn-static.yml)
+
 Local Harn-version bump orchestrator. Auto-discovers every repo under
 `~/projects/{*harn*,*burin*}` that ships a `.github/workflows/bump-harn.yml`
 and drives them all to the latest published Harn release with auto-merge
