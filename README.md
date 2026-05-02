@@ -140,13 +140,22 @@ harn run release_harn.harn -- --mock --agent
 harn run release_harn.harn -- --mock --agent --mode ship-pr
 ```
 
-Live modes require the explicit guard flag:
+Live modes require the explicit guard flag. The harness now normalizes the
+release branch before running the target repo's release script: if it starts
+from `main` or another branch, it stashes dirty tracked/untracked files when
+needed, fetches/syncs the base branch, switches or creates `release/vX.Y.Z`,
+restores the stashed release content there, and inserts a draft `## vX.Y.Z`
+CHANGELOG section from the post-tag delta before handing off to
+`scripts/release_ship.sh`. With `--agent`, the model must produce a
+ready-to-paste changelog block, so the draft notes can be rewritten from local
+evidence instead of copied from commit titles.
 
 ```sh
-# From a release/vX.Y.Z branch with CHANGELOG.md already topped by vX.Y.Z.
+# Starts from main, an existing release branch, or another branch.
+# If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
 harn run release_harn.harn -- --mode prepare --yes-live-release
 
-# Same, then commit/rebase/push/open PR/enable auto-merge.
+# Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
 harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
@@ -154,11 +163,15 @@ Options:
 
 - `--repo PATH` points at a different Harn checkout; default is
   `~/projects/harn`.
+- `--base BRANCH` changes the release PR base; default is `main`.
 - `--bump patch|minor|major` controls the expected next version; default is
   `patch`.
 - `--agent` gives a local model a bounded read/search/run tool surface for
   release readiness review. It defaults to `HARN_RELEASE_MODEL` or
-  `local:gemma4:26b`.
+  `local:gemma4:26b`. Agent runs persist the raw result, trace, and Harn
+  `llm_transcript.jsonl` sidecar under the run directory.
+- `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
+  `HARN_RELEASE_PROVIDER` or `auto`.
 - `--skip-audit` and `--skip-dry-run` pass through to
   `scripts/release_ship.sh --prepare`.
 
