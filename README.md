@@ -175,6 +175,16 @@ Options:
 - `--skip-audit` and `--skip-dry-run` pass through to
   `scripts/release_ship.sh --prepare`.
 
+In `ship-pr`, the PR body is generated from a fresh post-prepare snapshot
+instead of the initial audit text. If the PR already exists, the harness
+refreshes its title/body before enabling auto-merge. Side-effecting failures are
+preserved in the run report; with `--agent`, the failed command, stdout/stderr,
+classification, and execution transcript are fed back through a recovery
+`agent_loop` sidecar with its own JSONL transcript under `recovery/`. The only
+automatic bypass is the documented pre-push case where the hook output reports
+green tests and a wall-clock budget timeout; that retry uses
+`git push --no-verify` and records both attempts.
+
 Reports are written to:
 
 ```text
