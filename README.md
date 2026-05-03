@@ -36,7 +36,8 @@ harn run bump_fleet.harn -- --dry-run
 harn run bump_fleet.harn -- --only burin-labs/harn-cloud
 
 # Use a different local LLM for the summary.
-HARN_BUMP_FLEET_MODEL=local:qwen3.6:35b-a3b-coding-nvfp4 \
+HARN_BUMP_FLEET_MODEL=qwen3.6:35b-a3b-coding-nvfp4 \
+HARN_BUMP_FLEET_PROVIDER=ollama \
   harn run bump_fleet.harn
 ```
 
@@ -44,8 +45,31 @@ HARN_BUMP_FLEET_MODEL=local:qwen3.6:35b-a3b-coding-nvfp4 \
 
 - `harn` v0.7.x.
 - `gh` CLI, authenticated — the script never embeds tokens, just shells out.
-- A local Ollama or llama.cpp model for the end-of-run summary; defaults to
-  `local:gemma4:26b`. Override via `HARN_BUMP_FLEET_MODEL`.
+- A local Ollama or llama.cpp model for the end-of-run summary; defaults to the
+  repo-local `llamacpp` provider in `harn.toml`, serving Qwen3.6 on
+  `http://127.0.0.1:8001`. Override via `HARN_BUMP_FLEET_MODEL` /
+  `HARN_BUMP_FLEET_PROVIDER`.
+
+Recommended local llama.cpp server for Qwen3.6:
+
+```sh
+llama-server \
+  --model ~/models/qwen3.6/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
+  --alias qwen3.6-35b-a3b-ud-q4-k-xl \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --ctx-size 100000 \
+  --n-gpu-layers auto \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --jinja \
+  --reasoning-format deepseek \
+  --metrics \
+  --flash-attn auto
+```
+
+That host/port/model alias is what `harn.toml` uses, so normal invocations do
+not need LLM environment variables.
 
 ## CI
 
@@ -69,7 +93,7 @@ all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
      target version, ensure auto-merge is on and status is `pr_already_set`.
 4. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
    the resulting workflow run to completion, locate the PR the workflow
-   pushed, and idempotently call `gh pr merge --auto --squash` on it.
+   pushed, and idempotently call `gh pr merge --auto` on it.
 5. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
@@ -93,7 +117,8 @@ A second invocation against an unchanged fleet is essentially a no-op:
 - `render(...)` against a `.harn.prompt` template + `[asset_roots]` alias
   for the audit markdown.
 - `llm_call` with `model: "local:..."` routing through Ollama for an
-  on-machine, deterministic summary.
+  on-machine summary; the default route is the repo-local llama.cpp provider
+  defined in `harn.toml`.
 - `sha3_256` + `uuid_v7` for cryptographically tagged audit identity.
 - `regex_captures`, `json_parse`/`json_stringify`, `mkdir`, `file_exists`,
   `read_file`/`write_file` from the stdlib.
@@ -155,7 +180,7 @@ evidence instead of copied from commit titles.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
 harn run release_harn.harn -- --mode prepare --yes-live-release
 
-# Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
+# Same, then commit/rebase/push/open-or-reuse the PR and enable auto-merge.
 harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
@@ -168,17 +193,23 @@ Options:
   `patch`.
 - `--agent` gives a local model a bounded read/search/run tool surface for
   release readiness review. It defaults to `HARN_RELEASE_MODEL` or
-  `local:gemma4:26b`. Agent runs persist the raw result, trace, and Harn
-  `llm_transcript.jsonl` sidecar under the run directory.
+  `qwen3.6-35b-a3b-ud-q4-k-xl` via the repo-local `llamacpp` provider in
+  `harn.toml`, which points at `http://127.0.0.1:8001`. Agent runs persist the
+  raw result, trace, and Harn `llm_transcript.jsonl` sidecar under the run
+  directory.
 - `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
-  `HARN_RELEASE_PROVIDER` or `auto`.
+  `HARN_RELEASE_PROVIDER` or `llamacpp`.
 - `--skip-audit` and `--skip-dry-run` pass through to
   `scripts/release_ship.sh --prepare`.
 
-In `ship-pr`, the PR body is generated from a fresh post-prepare snapshot
-instead of the initial audit text. If the PR already exists, the harness
-refreshes its title/body before enabling auto-merge. Side-effecting failures are
-preserved in the run report; with `--agent`, the failed command, stdout/stderr,
+In `ship-pr`, the harness first scans only open PRs for an existing matching
+release/version-bump PR with auto-merge already enabled. If it finds one, it
+checks/shepherds that PR instead of repeating the release work; closed PRs are
+ignored so empirical test PRs can be closed safely. Otherwise, the PR body is
+generated from a fresh post-prepare snapshot instead of the initial audit text.
+If the PR already exists on the release branch, the harness refreshes its
+title/body before enabling auto-merge. Side-effecting failures are preserved in
+the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
 `agent_loop` sidecar with its own JSONL transcript under `recovery/`. The only
 automatic bypass is the documented pre-push case where the hook output reports
