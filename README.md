@@ -93,7 +93,7 @@ all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
      target version, ensure auto-merge is on and status is `pr_already_set`.
 4. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
    the resulting workflow run to completion, locate the PR the workflow
-   pushed, and idempotently call `gh pr merge --auto` on it.
+   pushed, and idempotently call `gh pr merge --auto --squash` on it.
 5. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
@@ -180,7 +180,7 @@ evidence instead of copied from commit titles.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
 harn run release_harn.harn -- --mode prepare --yes-live-release
 
-# Same, then commit/rebase/push/open-or-reuse the PR and enable auto-merge.
+# Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
 harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
