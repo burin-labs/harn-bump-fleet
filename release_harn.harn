@@ -5,45 +5,73 @@
 //
 // Defaults to audit-only. Live mutation requires --yes-live-release.
 // Use --mock to exercise the end-to-end flow without touching the real repo.
+import { agent_host_tools } from "std/agent/host_tools"
+import {
+  changelog_latest_version_section_from_text,
+  changelog_named_section_from_text,
+  changelog_release_section_update,
+  changelog_top_from_text,
+} from "lib/changelog"
+import { gh_cli_transient_failure, gh_retry_delay_seconds } from "lib/github_cli"
+import {
+  agent_changelog_section,
+  agent_result_text,
+  validate_release_agent_audit,
+} from "lib/release_audit"
+import {
+  execution_failed,
+  last_failed_step,
+  push_hook_budget_exceeded,
+  recorded_step,
+  recovery_step_ref,
+  recovery_step_refs,
+} from "lib/release_execution"
+import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
+import { command_output, fail, ok, require_shell_arg, safe_shell_arg } from "lib/shell_util"
+import { markdown_multiline, single_line_or, truncate_text } from "lib/text_util"
+
 let DEFAULT_REPO = path_join(env_or("HOME", ""), "projects/harn")
 
 let DEFAULT_BASE = env_or("HARN_RELEASE_BASE", "main")
 
-let DEFAULT_MODEL = env_or("HARN_RELEASE_MODEL", "qwen3.6-35b-a3b-ud-q4-k-xl")
+let DEFAULT_MODEL = env_or("HARN_RELEASE_MODEL", "qwen3.6:35b-a3b-coding-nvfp4")
 
-let DEFAULT_PROVIDER = env_or("HARN_RELEASE_PROVIDER", "llamacpp")
+let DEFAULT_PROVIDER = env_or("HARN_RELEASE_PROVIDER", "ollama")
 
 let MOCK_AGENT_MODEL = "claude-sonnet-4-7"
 
 let RUN_ROOT = ".harn-runs/release-harn"
 
-let ALLOWED_RELEASE_RUN_COMMANDS = [
-  "git status",
-  "git diff",
-  "git log",
-  "git show",
-  "git branch",
-  "git rev-parse",
-  "git diff-tree",
-  "git ls-files",
-  "git describe",
-  "git tag",
-  "gh pr list",
-  "gh pr view",
-  "gh pr checks",
-  "gh run list",
-  "gh run view",
-  "gh workflow list",
-  "gh workflow view",
-  "gh release list",
-  "gh release view",
-  "rg",
-  "grep",
-  "sed -n",
-  "head",
-  "cat",
-  "ls",
-  "test",
+let RELEASE_RUN_ARGV_PREFIXES = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "branch"],
+  ["git", "rev-parse"],
+  ["git", "diff-tree"],
+  ["git", "ls-files"],
+  ["git", "describe"],
+  ["git", "tag"],
+  ["gh", "pr", "list"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "list"],
+  ["gh", "run", "view"],
+  ["gh", "workflow", "list"],
+  ["gh", "workflow", "view"],
+  ["gh", "release", "list"],
+  ["gh", "release", "view"],
+  ["make", "lint-md"],
+  ["make", "-s", "lint-md"],
+  ["npx", "markdownlint-cli2"],
+  ["rg"],
+  ["grep"],
+  ["sed", "-n"],
+  ["head"],
+  ["cat"],
+  ["ls"],
+  ["test"],
 ]
 
 fn usage() {
@@ -65,12 +93,13 @@ Flags:
   --bump patch|minor|major  Version bump type. Defaults to patch.
   --mode audit|prepare|ship-pr
   --agent                 Ask a local model to review the release evidence with read/search/run tools.
-  --model MODEL           Local model id for --agent. Defaults to HARN_RELEASE_MODEL or qwen3.6-35b-a3b-ud-q4-k-xl.
-  --provider PROVIDER     LLM provider for --agent. Defaults to HARN_RELEASE_PROVIDER or llamacpp.
+  --model MODEL           Local model id for --agent. Defaults to HARN_RELEASE_MODEL or qwen3.6:35b-a3b-coding-nvfp4.
+  --provider PROVIDER     LLM provider for --agent. Defaults to HARN_RELEASE_PROVIDER or ollama.
   --mock                  Use fake command/file tools for a v0.7.52 -> v0.7.53 release rehearsal.
   --skip-audit            Pass through to release_ship.sh --prepare.
   --skip-dry-run          Pass through to release_ship.sh --prepare.
   --bootstrap-new-crates  First release that adds a workspace crate depended on by published crates.
+  --focus TEXT            Operator context the model must consider while compiling release notes.
   --yes-live-release      Required for live prepare/ship-pr modes.
 """
 }
@@ -90,6 +119,7 @@ fn parse_args(args) {
     skip_audit: false,
     skip_dry_run: false,
     bootstrap_new_crates: env_or("HARN_RELEASE_BOOTSTRAP_NEW_CRATES", "") == "1",
+    release_focus: env_or("HARN_RELEASE_FOCUS", ""),
     yes_live_release: false,
   }
   var i = 0
@@ -141,6 +171,12 @@ fn parse_args(args) {
       cfg = {...cfg, skip_dry_run: true}
     } else if a == "--bootstrap-new-crates" {
       cfg = {...cfg, bootstrap_new_crates: true}
+    } else if a == "--focus" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--focus requires context text"
+      }
+      cfg = {...cfg, release_focus: args[i]}
     } else if a == "--yes-live-release" {
       cfg = {...cfg, yes_live_release: true}
     } else if a == "-h" || a == "--help" {
@@ -168,14 +204,6 @@ fn expand_home(path) {
     return env_or("HOME", "") + path[1:len(path)]
   }
   return path
-}
-
-fn ok(stdout) {
-  return {success: true, status: 0, stdout: stdout, stderr: ""}
-}
-
-fn fail(status, stderr) {
-  return {success: false, status: status, stdout: "", stderr: stderr}
 }
 
 fn run_cmd(cfg, command) {
@@ -230,7 +258,7 @@ fn fake_command(command, cfg) {
     return ok("release/v0.7.53\n")
   }
   if contains(command, "git status --porcelain") {
-    return ok(" M CHANGELOG.md\n M README.md\n M scripts/release_ship.sh\n")
+    return ok("")
   }
   if contains(command, "git diff") && contains(command, "--stat") {
     return ok(
@@ -248,24 +276,15 @@ fn fake_command(command, cfg) {
       "commit abc1234 release: consolidate harn release PR flow\nM\tCHANGELOG.md\nM\tscripts/release_ship.sh\n\ncommit bcd2345 ci: publish release from tag drift\nM\t.github/workflows/publish-release.yml\n\ncommit cde3456 docs: clarify local developer loop\nM\tREADME.md\n",
     )
   }
+  if contains(command, "git log --stat") {
+    return ok(
+      "abc1234 release: consolidate harn release PR flow\n CHANGELOG.md            | 12 ++++++++++++\n scripts/release_ship.sh |  8 ++++++++\n\nbcd2345 ci: publish release from tag drift\n .github/workflows/publish-release.yml | 5 +++++\n\ncde3456 docs: clarify local developer loop\n README.md | 4 ++++\n",
+    )
+  }
   if contains(command, "git log --oneline") {
     return ok(
       "abc1234 release: consolidate harn release PR flow\nbcd2345 ci: publish release from tag drift\ncde3456 docs: clarify local developer loop\n",
     )
-  }
-  if contains(command, "python3 - <<'PY_VERSION'") {
-    return ok("0.7.52\n")
-  }
-  if contains(command, "python3 - <<'PY_CHANGELOG_TOP'") {
-    return ok("0.7.53\n")
-  }
-  if contains(command, "python3 - <<'PY_CHANGELOG_SECTION'") {
-    return ok(
-      "- Added merge-queue-safe release orchestration that ships from one release PR.\n- Tightened release metadata verification and changelog drift checks.\n- Documented the harn-release-bot workflow cascade.\n",
-    )
-  }
-  if contains(command, "python3 - <<'PY_CHANGELOG_GAPS'") {
-    return ok("- docs: clarify local developer loop\n")
   }
   if contains(command, "test -x scripts/release_ship.sh") {
     return ok("release_ship=ok\n")
@@ -287,8 +306,18 @@ fn fake_command(command, cfg) {
   if contains(command, "git commit -m") {
     return ok("[release/v0.7.53 9999999] Release v0.7.53\n")
   }
+  if contains(command, "git add -u") {
+    return ok("")
+  }
   if contains(command, "git fetch origin") || contains(command, "git rebase") {
     return ok("Current branch release/v0.7.53 is up to date.\n")
+  }
+  if contains(command, "git reset --hard") {
+    return ok("HEAD is now at abc1234 main\n")
+  }
+  if contains(command, "make -s lint-md") || contains(command, "make lint-md")
+    || contains(command, "npx markdownlint-cli2") {
+    return ok("markdownlint-cli2 v0.22.1\nSummary: 0 error(s)\n")
   }
   if contains(command, "git push --no-verify -u origin") {
     return ok("branch 'release/v0.7.53' set up to track 'origin/release/v0.7.53'.\n")
@@ -313,6 +342,9 @@ fn fake_command(command, cfg) {
     }
     return ok("[]\n")
   }
+  if contains(command, "gh pr view") && contains(command, "autoMergeRequest") {
+    return ok("false\n")
+  }
   if contains(command, "gh pr merge") {
     return ok("✓ Auto-merge enabled for pull request burin-labs/harn#999\n")
   }
@@ -331,97 +363,24 @@ fn checked(cfg, command) {
 }
 
 fn current_version(cfg) {
-  return checked(
-    cfg,
-    """
-python3 - <<'PY_VERSION'
-from pathlib import Path
-import re
-text = Path("Cargo.toml").read_text()
-m = re.search(r'^version = "([^"]+)"', text, re.M)
-if not m:
-    m = re.search(r'^version\\s*=\\s*"([^"]+)"', text, re.M)
-print(m.group(1) if m else "")
-PY_VERSION
-""",
-  )
-}
-
-fn next_version(current, bump) {
-  let p = current.split(".")
-  if len(p) != 3 {
-    throw "current version is not semver: ${current}"
+  let text = read_repo_file(cfg, "Cargo.toml")
+  let matches = regex_captures("(?m)^version\\s*=\\s*\"([^\"]+)\"", text)
+  if len(matches) == 0 {
+    return ""
   }
-  var major = to_int(p[0])
-  var minor = to_int(p[1])
-  var patch = to_int(p[2])
-  if bump == "major" {
-    major = major + 1
-    minor = 0
-    patch = 0
-  } else if bump == "minor" {
-    minor = minor + 1
-    patch = 0
-  } else {
-    patch = patch + 1
-  }
-  return "${major}.${minor}.${patch}"
-}
-
-fn version_from_release_branch(branch) {
-  if starts_with(branch, "release/v") {
-    return branch[9:len(branch)]
-  }
-  return ""
-}
-
-fn version_from_tag(tag) {
-  if starts_with(tag, "v") {
-    return tag[1:len(tag)]
-  }
-  return tag
+  return matches[0].groups[0]
 }
 
 fn changelog_top(cfg) {
-  return checked(
-    cfg,
-    """
-python3 - <<'PY_CHANGELOG_TOP'
-from pathlib import Path
-import re
-text = Path("CHANGELOG.md").read_text() if Path("CHANGELOG.md").exists() else ""
-for line in text.splitlines():
-    m = re.match(r"^## v([0-9]+[.][0-9]+[.][0-9]+)$", line.strip())
-    if m:
-        print(m.group(1))
-        break
-PY_CHANGELOG_TOP
-""",
-  )
+  return changelog_top_from_text(read_repo_file(cfg, "CHANGELOG.md"))
 }
 
 fn changelog_section(cfg) {
-  return checked(
-    cfg,
-    """
-python3 - <<'PY_CHANGELOG_SECTION'
-from pathlib import Path
-import re
-text = Path("CHANGELOG.md").read_text() if Path("CHANGELOG.md").exists() else ""
-capture = False
-out = []
-for line in text.splitlines():
-    if re.match(r"^## v[0-9]+[.][0-9]+[.][0-9]+$", line.strip()):
-        if capture:
-            break
-        capture = True
-        continue
-    if capture:
-        out.append(line)
-print("\n".join(out).strip())
-PY_CHANGELOG_SECTION
-""",
-  )
+  return changelog_latest_version_section_from_text(read_repo_file(cfg, "CHANGELOG.md"))
+}
+
+fn changelog_unreleased_section(cfg) {
+  return changelog_named_section_from_text(read_repo_file(cfg, "CHANGELOG.md"), "## Unreleased")
 }
 
 fn diff_names(cfg) {
@@ -442,66 +401,8 @@ fn release_file_changes(cfg, latest_tag) {
   )
 }
 
-fn changelog_gap_candidates(cfg, latest_tag) {
-  let latest = safe_shell_arg(latest_tag)
-  if latest == nil {
-    return "skipped: latest tag contains unsupported shell quoting characters"
-  }
-  return checked(
-    cfg,
-    "LATEST_TAG=" + latest
-      + """ python3 - <<'PY_CHANGELOG_GAPS'
-from pathlib import Path
-import os
-import re
-import subprocess
-
-latest = os.environ.get("LATEST_TAG", "")
-args = ["git", "log", "--pretty=%s", "--no-merges"]
-if latest:
-    args.append(f"{latest}..HEAD")
-else:
-    args.append("--max-count=50")
-subjects = subprocess.check_output(args, text=True).splitlines()
-
-text = Path("CHANGELOG.md").read_text() if Path("CHANGELOG.md").exists() else ""
-capture = False
-section = []
-for line in text.splitlines():
-    if re.match(r"^## v[0-9]+[.][0-9]+[.][0-9]+$", line.strip()):
-        if capture:
-            break
-        capture = True
-        continue
-    if capture:
-        section.append(line)
-section_text = "\n".join(section).lower()
-
-stop = {
-    "added", "adds", "allow", "allows", "change", "changes", "fix",
-    "fixes", "harn", "release", "version", "update", "updates",
-    "with", "from", "into", "that", "this", "when", "where",
-}
-
-def tokens(value):
-    return [
-        t for t in re.findall(r"[a-z0-9]+", value.lower())
-        if len(t) > 3 and t not in stop
-    ]
-
-for subject in subjects:
-    lower = subject.lower()
-    if lower.startswith(("release:", "chore(release)", "bump version")):
-        continue
-    useful = tokens(subject)
-    if not useful:
-        continue
-    hits = sum(1 for t in useful if t in section_text)
-    if hits == 0:
-        print(f"- {subject}")
-PY_CHANGELOG_GAPS
-""",
-  )
+fn release_commit_stats(cfg, latest_tag) {
+  return checked(cfg, "git log --stat --oneline --no-renames --no-merges " + log_range_arg(latest_tag))
 }
 
 fn count_lines(text) {
@@ -512,20 +413,32 @@ fn count_lines(text) {
   return len(t.split("\n"))
 }
 
-fn truncate_text(text, max_chars) {
-  let t = text ?? ""
-  let limit = max_chars ?? 4000
-  if len(t) <= limit {
-    return t
-  }
-  return t[0:limit] + "\n... truncated " + "${len(t) - limit}" + " chars ..."
-}
-
 fn changelog_section_for_agent(analysis) {
   if analysis.changelog_top == analysis.next_version {
     return truncate_text(analysis.changelog_section, 8000)
   }
+  let unreleased = trim(analysis.changelog_unreleased_section ?? "")
+  if unreleased != "" {
+    return "No `v${analysis.next_version}` section exists yet. CHANGELOG.md has this non-empty `## Unreleased` section that will be promoted or replaced during prepare; preserve these existing entries and fold in only the missing post-tag release notes:\n\n"
+      + truncate_text(unreleased, 10000)
+  }
   return "No `v${analysis.next_version}` section exists yet. CHANGELOG.md currently starts at `v${analysis.changelog_top}`; draft the next section from the post-tag commit/file evidence instead of summarizing the old release."
+}
+
+fn first_post_tag_commit(analysis) {
+  let commits = trim(analysis.commits_since_latest_tag ?? "")
+  if commits == "" {
+    return "(none)"
+  }
+  return trim(commits.split("\n")[0])
+}
+
+fn post_tag_commit_count(analysis) {
+  let commits = trim(analysis.commits_since_latest_tag ?? "")
+  if commits == "" {
+    return 0
+  }
+  return len(commits.split("\n").filter({ line -> trim(line) != "" }))
 }
 
 fn compact_agent_analysis(analysis) {
@@ -538,26 +451,80 @@ fn compact_agent_analysis(analysis) {
     base_branch: analysis.base_branch,
     current_version: analysis.current_version,
     next_version: analysis.next_version,
+    operator_focus: analysis.operator_focus ?? "",
     latest_tag: analysis.latest_tag,
     changelog_top: analysis.changelog_top,
     dirty_files: analysis.dirty_files,
     diff_names: truncate_text(analysis.diff_names, 1000),
-    commits_since_latest_tag: truncate_text(analysis.commits_since_latest_tag, 4000),
-    commit_file_changes_since_latest_tag: truncate_text(analysis.commit_file_changes_since_latest_tag, 3000),
+    post_tag_commit_count: post_tag_commit_count(analysis),
+    latest_post_tag_commit: first_post_tag_commit(analysis),
+    commits_since_latest_tag: truncate_text(analysis.commits_since_latest_tag, 8000),
+    commit_stats_since_latest_tag: truncate_text(analysis.commit_stats_since_latest_tag, 12000),
+    commit_file_changes_since_latest_tag: truncate_text(analysis.commit_file_changes_since_latest_tag, 12000),
     changelog_section: changelog_section_for_agent(analysis),
-    changelog_gap_candidates: truncate_text(analysis.changelog_gap_candidates, 2000),
+    changelog_unreleased_section: truncate_text(analysis.changelog_unreleased_section ?? "", 10000),
     release_scripts: analysis.release_scripts,
     workflows: analysis.workflows,
     deterministic_findings: analysis.deterministic_findings,
-    recent_merged_prs: truncate_text(analysis.recent_merged_prs ?? "", 1500),
+    recent_merged_prs: truncate_text(analysis.recent_merged_prs ?? "", 5000),
     suggested_read_only_inspections: [
-      "git log --oneline --no-merges ${analysis.latest_tag}..HEAD",
-      "git show --stat --oneline --no-renames ${analysis.latest_tag}..HEAD",
+      "git log --oneline --no-merges --max-count=80 ${analysis.latest_tag}..HEAD",
+      "git diff --stat --stat-count=80 ${analysis.latest_tag}..HEAD",
+      "git show --stat --oneline --no-renames --max-count=20 ${analysis.latest_tag}..HEAD",
       "sed -n '1,120p' CHANGELOG.md",
       "sed -n '1,180p' scripts/release_ship.sh",
       "sed -n '1,180p' .github/workflows/publish-release.yml",
     ],
   }
+}
+
+fn release_finalization_prompt(analysis) {
+  return render(
+    "@prompts/release_finalization.harn.prompt",
+    {
+      target_version: "v${analysis.next_version}",
+      tag_range: "${analysis.latest_tag}..HEAD",
+      first_post_tag_commit: first_post_tag_commit(analysis),
+      release_fact_sheet: release_fact_sheet(analysis),
+    },
+  )
+}
+
+fn release_fact_sheet(analysis) {
+  return """
+- Repo: `${analysis.repo}`.
+- Mode: `${analysis.mode}`.
+- Version: `${analysis.current_version}` -> `${analysis.next_version}` (${analysis.bump}).
+- Latest tag/range: `${analysis.latest_tag}..HEAD`.
+- Post-tag commit count: ${post_tag_commit_count(analysis)}.
+- First post-tag commit: `${first_post_tag_commit(analysis)}`.
+- Release-note source rule: use only commits in `${analysis.latest_tag}..HEAD`
+  plus authored `## Unreleased` content. Recent merged PRs are historical
+  context only when they are not in that post-tag range.
+- Operator focus: ${if trim(analysis.operator_focus ?? "") == "" {
+    "none"
+  } else {
+    analysis.operator_focus
+  }}.
+- Current CHANGELOG top: `${analysis.changelog_top}`.
+- Deterministic findings: ${if len(analysis.deterministic_findings ?? []) == 0 {
+    "none"
+  } else {
+    join(analysis.deterministic_findings, "; ")
+  }}.
+
+Authored CHANGELOG content to preserve or update:
+${changelog_section_for_agent(analysis)}
+
+Recent post-tag commits:
+${truncate_text(analysis.commits_since_latest_tag, 8000)}
+
+Representative per-commit stats:
+${truncate_text(analysis.commit_stats_since_latest_tag, 12000)}
+
+Representative per-commit file changes:
+${truncate_text(analysis.commit_file_changes_since_latest_tag, 12000)}
+"""
 }
 
 fn probe_ok(cfg, command) {
@@ -573,325 +540,328 @@ fn optional_output(cfg, command) {
   return ""
 }
 
-fn contains_shell_metachar(command) {
-  return contains(command, "\n") || contains(command, ";") || contains(command, "&&")
-    || contains(command, "||")
-    || contains(command, "|")
-    || contains(command, ">")
-    || contains(command, "<")
-    || contains(command, "`")
-    || contains(command, "$")
-}
-
-fn safe_shell_arg(value) {
-  if contains(value, "'") || contains(value, "\n") {
-    return nil
-  }
-  return "'" + value + "'"
-}
-
-fn require_shell_arg(value, label) {
-  let arg = safe_shell_arg(value)
-  if arg == nil {
-    throw "${label} contains unsupported shell quoting characters"
-  }
-  return arg
-}
-
-fn command_matches_prefix(command, prefix) {
-  return command == prefix || starts_with(command, prefix + " ")
-}
-
-fn allowed_read_command(command) {
-  for prefix in ALLOWED_RELEASE_RUN_COMMANDS {
-    if command_matches_prefix(command, prefix) {
-      return true
+fn argv_contains_any(argv, disallowed) {
+  for arg in argv {
+    for flag in disallowed {
+      if arg == flag || starts_with(arg, flag + "=") {
+        return true
+      }
     }
   }
   return false
 }
 
-fn allowed_command_message() {
-  return "blocked: release_run runs with cwd already set to the Harn repo; pass a single command, not `cd ... && ...`, pipes, redirects, or shell chaining. For truncation use flags like `git log --max-count=40`, `sed -n '1,80p' FILE`, or `head -80 FILE`. Allowed read-oriented prefixes: "
-    + ALLOWED_RELEASE_RUN_COMMANDS.join(", ")
-}
-
-fn blocked_command_message(cfg, command) {
-  if starts_with(trim(command), "cd ") {
-    return "blocked: release_run already runs from repo cwd `${cfg.repo}`; remove the leading `cd ... &&` and retry with a single read command such as `git log --oneline --max-count=40 <latest-tag>..HEAD`, `sed -n '1,80p' CHANGELOG.md`, or `head -80 CHANGELOG.md`."
+fn release_run_policy(request, _args) {
+  let argv = request?.argv ?? []
+  if len(argv) < 2 {
+    return true
   }
-  if contains_shell_metachar(command) {
-    return "blocked: release_run accepts one command only and rejects shell metacharacters. Do not use pipes, redirects, `&&`, `||`, command substitution, or leading `cd`; use command flags instead, e.g. `git log --oneline --max-count=40 <latest-tag>..HEAD` or `head -80 CHANGELOG.md`."
-  }
-  return allowed_command_message()
-}
-
-fn agent_result_text(result) {
-  let visible = trim(result.visible_text ?? "")
-  let text = trim(result.text ?? "")
-  if text != "" && contains(text, "##DONE##") && !contains(visible, "##DONE##") {
-    return text
-  }
-  if visible != "" {
-    return visible
-  }
-  if text != "" {
-    return text
-  }
-  return "Agent review returned no visible text. Raw result:\n```json\n" + json_stringify(result)
-    + "\n```"
-}
-
-fn referenced_script_paths(text) {
-  let normalized = regex_replace_all("[^A-Za-z0-9_./-]+", "\n", text)
-  var refs = []
-  for raw in normalized.split("\n") {
-    let token = trim(raw)
-    if token == "" {
-      continue
-    }
-    let path = if starts_with(token, "./") {
-      token[2:len(token)]
-    } else {
-      token
-    }
-    if starts_with(path, "scripts/") && ends_with(path, ".sh") {
-      refs = refs + [path]
+  if argv[0] == "git" && argv[1] == "tag" {
+    if argv_contains_any(
+      argv,
+      ["-a", "-d", "-f", "-m", "-s", "--annotate", "--delete", "--force", "--message", "--sign"],
+    ) {
+      return "release_run is read-only; git tag creation, deletion, signing, and force flags are blocked"
     }
   }
-  return refs
-}
-
-fn validate_agent_completion(result, text) {
-  var findings = []
-  let status = result.status ?? ""
-  if status != "done" {
-    if contains(text, "##DONE##") {
-      // Some local models emit a valid completion sentinel while Harn reports a
-      // conservative loop status (usually after a verifier nudge). Let content
-      // validation decide whether the audit is usable instead of forcing an
-      // unnecessary repair loop.
-      findings = findings
-    } else {
-      findings = findings
-        + ["agent_loop ended with status `${status}` instead of `done`; the audit text may be incomplete"]
-      findings = findings + ["agent audit did not include the required `##DONE##` completion sentinel"]
+  if argv[0] == "git" && argv[1] == "branch" {
+    if argv_contains_any(argv, ["-c", "-C", "-d", "-D", "-m", "-M", "--copy", "--delete", "--move"]) {
+      return "release_run is read-only; git branch mutation flags are blocked"
     }
   }
-  if trim(text) == "" {
-    findings = findings + ["agent audit returned empty text"]
-  }
-  return findings
-}
-
-fn validate_agent_review(cfg, text) {
-  var findings = []
-  for path in referenced_script_paths(text) {
-    let path_arg = safe_shell_arg(path)
-    if path_arg == nil {
-      findings = findings + ["agent referenced an unquotable script path: ${path}"]
-      continue
-    }
-    let check = run_cmd(cfg, "test -e " + path_arg)
-    if !check.success {
-      let listed = run_cmd(cfg, "ls scripts")
-      findings = findings
-        + [
-        "agent referenced missing script `${path}`; `test -e ${path}` exited ${check.status}; scripts directory:\n${trim(listed.stdout)}",
-      ]
+  if argv[0] == "gh" {
+    if argv_contains_any(argv, ["--web"]) {
+      return "release_run is non-interactive; gh --web is blocked"
     }
   }
-  return findings
+  return true
 }
 
-fn validate_agent_premature_release_claims(analysis, lower_text) {
-  if analysis.mode != "ship-pr" {
-    return []
+fn mock_argv_command(args) {
+  if type_of(args?.argv) == "list" && len(args.argv) > 0 {
+    return args.argv.join(" ")
   }
-  if contains(lower_text, "merged to `main`") || contains(lower_text, "merged to main")
-    || contains(lower_text, "tagged `v")
-    || contains(lower_text, "tagged v")
-    || contains(lower_text, "tag `v")
-    || contains(lower_text, "--finalize")
-    || contains(lower_text, "release is ready for the merge-queue finalization workflow") {
-    return [
-      "agent audit claims the release was merged, tagged, finalized, or ready for finalize before PR completion",
-    ]
-  }
-  return []
+  return args?.command ?? ""
 }
 
-fn validate_agent_unsupported_aggregate_stats(lower_text) {
-  if contains(lower_text, "diff covers ") || contains(lower_text, "files (+")
-    || contains(lower_text, "files changed (+") {
-    return [
-      "agent audit includes aggregate diff statistics that were not part of the compact release analysis",
-    ]
-  }
-  return []
+fn mock_release_tools(cfg, run_id) {
+  var tools = tool_registry()
+  tools = tool_define(
+    tools,
+    "release_read",
+    "Read a file from the mocked Harn repo.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> truncate_text(read_repo_file(cfg, args.path), 12000) },
+    },
+  )
+  tools = tool_define(
+    tools,
+    "release_search",
+    "Search the mocked Harn repo.",
+    {
+      parameters: {pattern: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "search", side_effect_level: "read_only"},
+      handler: { args ->
+        let pattern = safe_shell_arg(args.pattern)
+        if pattern == nil {
+          return "blocked: search pattern contains unsupported shell quoting characters"
+        }
+        let r = run_cmd(cfg, "rg -n -- " + pattern + " README.md CHANGELOG.md docs/src scripts .github")
+        if r.success {
+          r.stdout
+        } else {
+          r.stderr
+        }
+      },
+    },
+  )
+  tools = tool_define(
+    tools,
+    "release_run",
+    "Run one read-only mocked release inspection command. Prefer argv arrays, for example {argv: [\"git\", \"log\", \"--oneline\", \"vX.Y.Z..HEAD\", \"--max-count=40\"]}.",
+    {
+      parameters: {
+        argv: {type: "array", items: {type: "string"}, required: false},
+        command: {type: "string", required: false},
+      },
+      returns: {type: "string"},
+      annotations: {kind: "execute", side_effect_level: "process_exec"},
+      handler: { args ->
+        let command = mock_argv_command(args)
+        let r = run_cmd(cfg, command)
+        return truncate_text("exit=${r.status}\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}", 20000)
+      },
+    },
+  )
+  return add_release_artifact_tools(tools, run_id)
 }
 
-fn validate_agent_review_content(cfg, analysis, text) {
-  if cfg.mock || starts_with(text, "Agent review returned no visible text. Raw result:") {
-    return []
+fn add_release_artifact_tools(tools, run_id) {
+  var out = tools
+  out = tool_define(
+    out,
+    "release_artifact_tail",
+    "Read the last 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> read_artifact_window(run_id, args.path, 12000, false) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_artifact_head",
+    "Read the first 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> read_artifact_window(run_id, args.path, 12000, true) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_artifact_search",
+    "Search a release-run artifact or live log with ripgrep and return matching lines. Use this before reading a large log.",
+    {
+      parameters: {path: {type: "string"}, pattern: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> search_artifact(run_id, args.path, args.pattern) },
+    },
+  )
+  return out
+}
+
+fn release_repair_relative_path(path) {
+  let raw = trim(path ?? "")
+  if raw == "" {
+    throw "release repair path must be non-empty"
   }
-  var findings = []
-  if !contains(text, analysis.next_version) {
-    findings = findings
-      + ["agent audit does not mention expected next version `${analysis.next_version}`"]
+  let normalized = raw.replace("\\", "/")
+  if starts_with(normalized, "/") || contains(normalized, "..") {
+    throw "release repair path must be repo-relative and must not contain '..'"
   }
-  if !(contains(text, "CHANGELOG") || contains(text, "changelog")) {
-    findings = findings + ["agent audit does not discuss CHANGELOG coverage"]
+  return normalized
+}
+
+fn require_release_repair_file(cfg, path) {
+  let rel = release_repair_relative_path(path)
+  let rel_arg = require_shell_arg(rel, "release repair path")
+  let status = run_cmd(cfg, "git status --porcelain --untracked-files=no -- " + rel_arg)
+  if !status.success || trim(status.stdout) == "" {
+    throw "release repair edits are limited to tracked files already modified by the generated release diff: ${rel}"
   }
-  if !(contains(text, "BEGIN_DRAFT_CHANGELOG") && contains(text, "END_DRAFT_CHANGELOG")) {
-    findings = findings
-      + ["agent audit does not include a BEGIN_DRAFT_CHANGELOG / END_DRAFT_CHANGELOG block"]
+  let full = path_join(cfg.repo, rel)
+  if !file_exists(full) {
+    throw "release repair file does not exist: ${rel}"
   }
-  if contains(text, "<assistant prose truncated by turn policy") {
-    findings = findings
-      + [
-      "agent audit was truncated by turn policy; increase max_prose_chars or make the draft more concise before applying it",
-    ]
+  return {rel: rel, full: full}
+}
+
+fn release_replace_file(cfg, args) {
+  let path = require_release_repair_file(cfg, args.path)
+  let old_text = args.old_text ?? ""
+  let new_text = args.new_text ?? ""
+  if old_text == "" {
+    throw "release_replace_file requires non-empty old_text"
   }
-  let draft = agent_changelog_section(text, analysis.next_version)
-  if contains(draft, "<assistant prose truncated by turn policy") {
-    findings = findings
-      + ["agent draft changelog was truncated by turn policy and is unsafe to apply"]
+  let before = read_file(path.full)
+  let pieces = before.split(old_text)
+  let count = len(pieces) - 1
+  if count == 0 {
+    throw "old_text was not found in " + path.rel
   }
-  if contains(draft, "(``)") || contains(draft, "(``,") || contains(draft, "``)") {
-    findings = findings
-      + [
-      "agent draft changelog contains empty inline-code spans, likely from stripped tool-protocol tags; rephrase without literal protocol tags",
-    ]
+  let expected = args?.expected_replacements ?? nil
+  if expected != nil && count != expected {
+    throw "expected ${expected} replacement(s) in ${path.rel}, found ${count}"
   }
-  let lower_text = lowercase(text)
-  findings = findings + validate_agent_premature_release_claims(analysis, lower_text)
-  findings = findings + validate_agent_unsupported_aggregate_stats(lower_text)
-  let commits = trim(analysis.commits_since_latest_tag ?? "")
-  if commits != "" {
-    let first_line = trim(commits.split("\n")[0])
-    let first_hash = trim(first_line.split(" ")[0])
-    if first_hash != "" && !contains(text, first_hash) {
-      findings = findings
-        + ["agent audit does not mention the first post-tag commit `${first_hash}`"]
+  write_file(path.full, before.replace(old_text, new_text))
+  return "replaced ${count} occurrence(s) in ${path.rel}"
+}
+
+fn release_write_file(cfg, args) {
+  let path = require_release_repair_file(cfg, args.path)
+  let content = args.content ?? ""
+  write_file(path.full, content)
+  return "wrote ${len(content)} bytes to ${path.rel}"
+}
+
+fn add_release_repair_tools(tools, cfg) {
+  var out = tools
+  out = tool_define(
+    out,
+    "release_replace_file",
+    "Replace exact text in a tracked file already modified by the generated release diff. Use this for small release-note, lint, or generated-content repairs.",
+    {
+      parameters: {
+        path: {type: "string"},
+        old_text: {type: "string"},
+        new_text: {type: "string"},
+        expected_replacements: {type: "integer", required: false},
+      },
+      returns: {type: "string"},
+      annotations: {kind: "edit", side_effect_level: "filesystem_write"},
+      handler: { args -> release_replace_file(cfg, args) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_write_file",
+    "Overwrite a tracked file already modified by the generated release diff. Prefer release_replace_file for small edits.",
+    {
+      parameters: {path: {type: "string"}, content: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "edit", side_effect_level: "filesystem_write"},
+      handler: { args -> release_write_file(cfg, args) },
+    },
+  )
+  return out
+}
+
+fn release_host_tools(cfg, run_id) {
+  let tools = agent_host_tools(
+    nil,
+    {
+      root: cfg.repo,
+      cwd: cfg.repo,
+      max_inline_bytes: 12000,
+      read_bytes: 12000,
+      tail_bytes: 12000,
+      search_max_matches: 120,
+      exclude_globs: [".git/**", ".harn-runs/**", "target/**"],
+      allow_argv_prefixes: RELEASE_RUN_ARGV_PREFIXES,
+      command_policy: release_run_policy,
+      names: {
+        read_file: "release_read",
+        read_file_tail: "release_read_tail",
+        search_files: "release_search",
+        git_inspect: "release_git",
+        run_command: "release_run",
+        read_command_output: "release_run_output",
+        read_command_output_tail: "release_run_tail",
+      },
+      descriptions: {
+        read_file: "Read a UTF-8 file under the Harn repo by repo-relative path. Prefer bounded reads with limit_bytes; the harness caps returned content.",
+        search_files: "Search Harn repo contents. Provide a pattern; use path/glob only to narrow the search.",
+        git_inspect: "Inspect git status, diff, log, show, blame, branches, or remotes without mutating the repo.",
+        run_command: "Run one bounded read-only release inspection command from the Harn repo. Pass argv as an array of strings; shell command strings are not accepted. Inline output is capped, and large output can be read with release_run_output or release_run_tail using the returned command_id.",
+      },
+      result_formatter: release_host_tool_formatter,
+      annotations: {run_command: {workflow_phase: "release_audit"}},
+      output_format: "json",
+    },
+  )
+  return add_release_artifact_tools(tools, run_id)
+}
+
+fn release_tools(cfg, run_id) {
+  if cfg.mock {
+    return mock_release_tools(cfg, run_id)
+  }
+  return release_host_tools(cfg, run_id)
+}
+
+fn release_repair_tools(cfg, run_id) {
+  return add_release_repair_tools(release_tools(cfg, run_id), cfg)
+}
+
+fn release_review_post_turn(payload, analysis) {
+  let successful = payload?.successful_tool_names ?? []
+  if successful.contains("release_run") {
+    let final_tools = tool_registry()
+    return {
+      message: release_finalization_prompt(analysis),
+      llm_options: {tool_choice: "none", tools: final_tools, max_tokens: 2200},
+      next_options: {tools: final_tools, loop_until_done: false, max_nudges: 0},
     }
   }
-  return findings
+  return nil
 }
 
-fn validate_agent_attempt(cfg, analysis, result, text) {
-  var findings = validate_agent_completion(result, text)
-  if !starts_with(text, "Agent review returned no visible text. Raw result:") {
-    findings = findings + validate_agent_review(cfg, text)
-    findings = findings + validate_agent_review_content(cfg, analysis, text)
+fn release_host_tool_formatter(value, _key) {
+  if type_of(value) != "dict" {
+    return json_stringify(value)
   }
-  return findings
+  var out = value
+  if type_of(out?.content) == "string" {
+    out = out
+      + {content: truncate_text(out.content, 12000), content_truncated_by_harness: len(out.content) > 12000}
+  }
+  if type_of(out?.stdout) == "string" {
+    out = out
+      + {stdout: truncate_text(out.stdout, 12000), stdout_truncated_by_harness: len(out.stdout) > 12000}
+  }
+  if type_of(out?.stderr) == "string" {
+    out = out
+      + {stderr: truncate_text(out.stderr, 4000), stderr_truncated_by_harness: len(out.stderr) > 4000}
+  }
+  return json_stringify(out)
 }
 
-fn agent_repair_prompt(validation_findings) {
-  return """
-The previous release audit ended incomplete or failed deterministic validation.
-Treat this as reviewer feedback on your prior answer, not as new release evidence.
+fn validate_agent_attempt(_cfg, analysis, result, text) {
+  return validate_release_agent_audit(analysis.next_version, result, text)
+}
 
-Validation findings:
-```text
-${validation_findings.join("\n")}
-```
-
-Do not call tools in this repair turn. Reuse the evidence already gathered in
-this release session and consolidate it into a valid final audit. The original
-agent turn was required to gather local tool evidence before repair, so this
-step exists only to correct shape, completeness, and wording.
-
-Return the actual corrected concise release audit now. Include the expected
-next version, CHANGELOG coverage gaps, post-tag commits that need release-note
-coverage, release quality risks, and the next concrete command. Do not answer
-with a meta statement about preparing or compiling the audit. Also include a
-ready-to-paste markdown changelog section between BEGIN_DRAFT_CHANGELOG and
-END_DRAFT_CHANGELOG markers. End with ##DONE##.
-
-Keep the changelog draft conservative: do not merge distinct named lints or
-grammar features, do not include unsupported implementation claims, and do not
-write literal compact tool-protocol angle-bracket tags. Say "compact text-tool
-aliases" if that change needs coverage.
-
-In ship-pr mode, do not claim the PR is merged, the tag exists, release
-publishing has happened, or finalization should run unless that was explicit
-evidence in the deterministic payload. Do not invent aggregate diff totals,
-file counts, insertion/deletion counts, or CI results.
-
-A commit titled `Release vX.Y.Z` means only that the release branch has a
-release commit. It is not evidence that the PR merged, a tag was created, or
-publishing ran.
-"""
+fn agent_repair_prompt(validation_findings, _prior_text, analysis) {
+  return render(
+    "@prompts/release_repair_prompt.harn.prompt",
+    {
+      validation_findings: validation_findings.join("\n"),
+      release_fact_sheet: release_fact_sheet(analysis),
+      target_version: "v${analysis.next_version}",
+      first_post_tag_commit: first_post_tag_commit(analysis),
+    },
+  )
 }
 
 fn agent_repair_system() {
-  return """
-You are finalizing a Harn release audit after deterministic validation feedback.
-Do not call tools in this repair turn; there are no tools available. Use the
-existing release-session context and return one concise final audit with a
-BEGIN_DRAFT_CHANGELOG / END_DRAFT_CHANGELOG block. End with ##DONE##.
-"""
-}
-
-fn raw_agent_changelog_section(text) {
-  let start_marker = "BEGIN_DRAFT_CHANGELOG"
-  let end_marker = "END_DRAFT_CHANGELOG"
-  var in_block = false
-  var lines = []
-  for line in text.split("\n") {
-    if trim(line) == start_marker {
-      in_block = true
-      continue
-    }
-    if trim(line) == end_marker {
-      break
-    }
-    if in_block {
-      lines = lines + [line]
-    }
-  }
-  return trim(lines.join("\n"))
-}
-
-fn agent_changelog_section(text, next_version) {
-  let raw = raw_agent_changelog_section(text)
-  if raw == "" {
-    return ""
-  }
-  let expected_heading = "## v${next_version}"
-  var seen_expected = false
-  var skip_section = false
-  var lines = []
-  for line in raw.split("\n") {
-    let t = trim(line)
-    if !seen_expected {
-      if t == expected_heading {
-        seen_expected = true
-        lines = lines + [line]
-      }
-      continue
-    }
-    if starts_with(t, "## v") {
-      break
-    }
-    if starts_with(t, "### ") {
-      skip_section = !(t == "### Added" || t == "### Changed" || t == "### Fixed"
-        || t == "### Internal")
-    }
-    if skip_section {
-      continue
-    }
-    if t == "..." {
-      continue
-    }
-    lines = lines + [line]
-  }
-  if !seen_expected {
-    return raw
-  }
-  return trim(lines.join("\n"))
+  return render("@prompts/release_repair_system.harn.prompt", {})
 }
 
 fn persist_agent_changelog(run_id, text, next_version) {
@@ -944,7 +914,7 @@ fn analyze_release(cfg) {
   let next = if prepared_release {
     current
   } else {
-    next_version(current, cfg.bump)
+    next_semver(current, cfg.bump)
   }
   let baseline = if prepared_release {
     version_from_tag(latest_tag)
@@ -964,10 +934,11 @@ fn analyze_release(cfg) {
   } else {
     diff_names(cfg)
   }
-  let commits = checked(cfg, "git log --oneline --decorate --no-merges " + log_range_arg(latest_tag))
+  let commits = checked(cfg, "git log --oneline --no-merges " + log_range_arg(latest_tag))
   let commit_file_changes = release_file_changes(cfg, latest_tag)
+  let commit_stats = release_commit_stats(cfg, latest_tag)
   let section = changelog_section(cfg)
-  let gap_candidates = changelog_gap_candidates(cfg, latest_tag)
+  let unreleased_section = changelog_unreleased_section(cfg)
   let recent_merged_prs = optional_output(
     cfg,
     "gh pr list --state merged --base " + require_shell_arg(cfg.base, "--base")
@@ -995,9 +966,6 @@ fn analyze_release(cfg) {
   if cfg.mode != "audit" && branch != expected_branch {
     findings = findings + ["current branch is ${branch}; branch setup will target ${expected_branch}"]
   }
-  if trim(gap_candidates) != "" {
-    findings = findings + ["possible CHANGELOG coverage gaps; review changelog_gap_candidates"]
-  }
   if !scripts.release_ship || !scripts.release_gate {
     findings = findings + ["release scripts are missing or not executable"]
   }
@@ -1015,6 +983,7 @@ fn analyze_release(cfg) {
     model: cfg.model,
     provider: cfg.provider,
     mock: cfg.mock,
+    operator_focus: cfg.release_focus,
     branch: branch,
     expected_branch: expected_branch,
     base_branch: cfg.base,
@@ -1029,9 +998,10 @@ fn analyze_release(cfg) {
     diff_names: diff_name_list,
     commits_since_latest_tag: commits,
     commit_file_changes_since_latest_tag: commit_file_changes,
+    commit_stats_since_latest_tag: commit_stats,
     recent_merged_prs: recent_merged_prs,
     changelog_section: section,
-    changelog_gap_candidates: gap_candidates,
+    changelog_unreleased_section: unreleased_section,
     release_scripts: scripts,
     workflows: workflows,
     deterministic_findings: findings,
@@ -1104,103 +1074,15 @@ fn search_artifact(run_id, path, pattern) {
   return out
 }
 
-fn release_tools(cfg, run_id) {
-  var tools = tool_registry()
-  tools = tool_define(
-    tools,
-    "release_read",
-    "Read a file from the Harn repo",
-    {
-      parameters: {path: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "read", side_effect_level: "read_only"},
-      handler: { args -> truncate_text(read_repo_file(cfg, args.path), 12000) },
-    },
-  )
-  tools = tool_define(
-    tools,
-    "release_search",
-    "Search the Harn repo with ripgrep",
-    {
-      parameters: {pattern: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "read", side_effect_level: "read_only"},
-      handler: { args ->
-        let pattern = safe_shell_arg(args.pattern)
-        if pattern == nil {
-          return "blocked: search pattern contains unsupported shell quoting characters"
-        }
-        let r = run_cmd(
-          cfg,
-          "rg -n -- " + pattern
-            + " README.md CHANGELOG.md docs/src scripts .github 2>/dev/null | head -120",
-        )
-        if r.success {
-          r.stdout
-        } else {
-          r.stderr
-        }
-      },
-    },
-  )
-  tools = tool_define(
-    tools,
-    "release_run",
-    "Run one read-only release inspection command. The command already runs with cwd set to the Harn repo, so do not include `cd`, pipes, redirects, or shell chaining. Prefer bounded flags such as `git log --max-count=40`, `sed -n '1,80p' FILE`, and `head -80 FILE`.",
-    {
-      parameters: {command: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "execute", side_effect_level: "process_exec"},
-      handler: { args ->
-        let command = args.command
-        if !allowed_read_command(command) {
-          return blocked_command_message(cfg, command)
-        }
-        if contains_shell_metachar(command) {
-          return blocked_command_message(cfg, command)
-        }
-        let r = run_cmd(cfg, command)
-        return truncate_text("exit=${r.status}\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}", 20000)
-      },
-    },
-  )
-  tools = tool_define(
-    tools,
-    "release_artifact_tail",
-    "Read the last 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
-    {
-      parameters: {path: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "read", side_effect_level: "read_only"},
-      handler: { args -> read_artifact_window(run_id, args.path, 12000, false) },
-    },
-  )
-  tools = tool_define(
-    tools,
-    "release_artifact_head",
-    "Read the first 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
-    {
-      parameters: {path: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "read", side_effect_level: "read_only"},
-      handler: { args -> read_artifact_window(run_id, args.path, 12000, true) },
-    },
-  )
-  tools = tool_define(
-    tools,
-    "release_artifact_search",
-    "Search a release-run artifact or live log with ripgrep and return matching lines. Use this before reading a large log.",
-    {
-      parameters: {path: {type: "string"}, pattern: {type: "string"}},
-      returns: {type: "string"},
-      annotations: {kind: "read", side_effect_level: "read_only"},
-      handler: { args -> search_artifact(run_id, args.path, args.pattern) },
-    },
-  )
-  return tools
-}
-
-fn run_release_agent_loop(cfg, analysis, system, prompt, run_id, require_tool_evidence) {
+fn run_release_agent_loop(
+  cfg,
+  analysis,
+  system,
+  prompt,
+  run_id,
+  require_tool_evidence,
+  session_suffix,
+) {
   let paths = agent_artifact_paths(run_id)
   var options = {
     provider: if cfg.mock {
@@ -1217,6 +1099,11 @@ fn run_release_agent_loop(cfg, analysis, system, prompt, run_id, require_tool_ev
     } else {
       cfg.model
     },
+    max_tokens: if require_tool_evidence {
+      2048
+    } else {
+      2200
+    },
     profile: "verifier",
     tools: if require_tool_evidence {
       release_tools(cfg, run_id)
@@ -1226,25 +1113,35 @@ fn run_release_agent_loop(cfg, analysis, system, prompt, run_id, require_tool_ev
     tool_format: "native",
     native_tool_fallback: "allow_once",
     thinking: {mode: "disabled"},
-    persistent: true,
+    timeout: 900,
+    idle_timeout: 180,
+    loop_until_done: require_tool_evidence,
     max_iterations: if require_tool_evidence {
-      8
+      6
     } else {
-      2
+      1
     },
     max_nudges: if require_tool_evidence {
       1
     } else {
       0
     },
-    done_judge: true,
-    turn_policy: {allow_done_sentinel: true, max_prose_chars: 30000},
+    done_sentinel: nil,
+    done_judge: nil,
+    turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
+    post_turn_callback: if require_tool_evidence {
+      { payload -> release_review_post_turn(payload, analysis) }
+    } else {
+      nil
+    },
     compaction: {strategy: "hybrid", keep_last_n: 8},
-    session_id: release_session_id(cfg, analysis, run_id),
+    session_id: release_session_id(cfg, analysis, run_id) + session_suffix,
     llm_transcript_dir: paths.llm_transcript_dir,
   }
   if require_tool_evidence {
     options = {...options, require_successful_tools: ["release_run"]}
+  } else {
+    options = {...options, tool_choice: "none"}
   }
   return agent_loop(prompt, system, options)
 }
@@ -1282,23 +1179,7 @@ fn recovery_session_id(cfg, analysis, run_id, step_name) {
 
 fn run_recovery_agent_loop(cfg, analysis, prompt, run_id, step_name) {
   let paths = recovery_artifact_paths(run_id, step_name)
-  let system = """
-You are diagnosing a hiccup during the Harn release handoff. The operator wants
-the run transcript to be auditable and wants shell failures fed back into model
-context instead of hidden in deterministic logs.
-
-Use the read/search/run tools to inspect current local state if needed. If the
-failure context names a `live_log`, use `release_artifact_search`,
-`release_artifact_head`, or `release_artifact_tail` to inspect that log instead
-of relying on inline stdout/stderr. The tools are intentionally read-only; do
-not claim that you changed files, pushed, or fixed the repository. If the
-failure is a known green-test pre-push hook budget timeout, say so explicitly
-and recommend the documented no-verify retry. For all other failures, identify
-the most likely root cause, the safest next manual or harness command, and
-whether the release branch/commit can be reused.
-
-End with ##DONE##.
-"""
+  let system = render("@prompts/release_recovery_system.harn.prompt", {})
   return agent_loop(
     prompt,
     system,
@@ -1318,15 +1199,18 @@ End with ##DONE##.
         cfg.model
       },
       profile: "verifier",
-      tools: release_tools(cfg, run_id),
+      tools: release_repair_tools(cfg, run_id),
       tool_format: "native",
       native_tool_fallback: "allow_once",
       thinking: {mode: "disabled"},
-      persistent: true,
+      timeout: 900,
+      idle_timeout: 180,
+      loop_until_done: true,
       max_iterations: 8,
       max_nudges: 1,
-      done_judge: true,
-      turn_policy: {allow_done_sentinel: true, max_prose_chars: 9000},
+      done_sentinel: nil,
+      done_judge: nil,
+      turn_policy: {allow_done_sentinel: false, max_prose_chars: 9000},
       compaction: {strategy: "hybrid", keep_last_n: 6},
       session_id: recovery_session_id(cfg, analysis, run_id, step_name),
       llm_transcript_dir: paths.llm_transcript_dir,
@@ -1345,17 +1229,16 @@ fn recovery_agent_advice(cfg, analysis, steps, failed_step, run_id) {
           {
             id: "recovery_run_1",
             name: "release_run",
-            arguments: {command: "git status --porcelain --untracked-files=normal"},
+            arguments: {argv: ["git", "status", "--porcelain", "--untracked-files=normal"]},
           },
         ],
       },
     )
     llm_mock(
       {
-        text: "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry with `git push --no-verify -u origin ${analysis.expected_branch}` and keep both attempts in the run artifacts.\n##DONE##",
+        text: "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry with `git push --no-verify -u origin ${analysis.expected_branch}` and keep both attempts in the run artifacts.",
       },
     )
-    llm_mock({text: "{\"verdict\":\"done\",\"reasoning\":\"recovery advice is concrete\"}"})
   }
   let prompt = "Release handoff failure context:\n```json\n"
     + json_stringify(
@@ -1412,6 +1295,73 @@ fn maybe_recovery_advice_step(cfg, analysis, steps, failed_step, run_id) {
   ]
 }
 
+fn retry_commands_after_agent_repair(step) {
+  if step.name == "commit" {
+    return [
+      {name: "stage-after-agent-repair-commit", command: "git add -u"},
+      {name: "commit-after-agent-repair", command: step.command},
+    ]
+  }
+  return []
+}
+
+fn run_retry_commands_after_agent_repair(cfg, steps, retry_commands, run_id) {
+  var out = steps
+  for retry_step in retry_commands {
+    release_log_event(run_id, "step_started", {step: retry_step.name, command: retry_step.command})
+    let result = append_command_step(cfg, out, retry_step.name, retry_step.command)
+    out = result.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: retry_step.name, success: result.success, status: result.status},
+    )
+    if !result.success {
+      return {steps: out, success: false}
+    }
+  }
+  return {steps: out, success: true}
+}
+
+fn release_generated_content_checks(_cfg, _analysis) {
+  return [{name: "release-markdown-lint", command: "make -s lint-md"}]
+}
+
+fn run_release_generated_content_checks(cfg, analysis, steps, run_id) {
+  var out = steps
+  for check in release_generated_content_checks(cfg, analysis) {
+    release_log_event(run_id, "step_started", {step: check.name, command: check.command})
+    let result = append_command_step(cfg, out, check.name, check.command)
+    out = result.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: check.name, success: result.success, status: result.status},
+    )
+    if result.success {
+      continue
+    }
+    let failed_step = out[len(out) - 1]
+    out = maybe_recovery_advice_step(cfg, analysis, out, failed_step, run_id)
+    if cfg.agent {
+      let retry_name = check.name + "-after-agent-repair"
+      release_log_event(run_id, "step_started", {step: retry_name, command: check.command})
+      let retry_result = append_command_step(cfg, out, retry_name, check.command)
+      out = retry_result.steps
+      release_log_event(
+        run_id,
+        "step_finished",
+        {step: retry_name, success: retry_result.success, status: retry_result.status},
+      )
+      if retry_result.success {
+        continue
+      }
+    }
+    return {steps: out, success: false}
+  }
+  return {steps: out, success: true}
+}
+
 fn agent_review(cfg, analysis, run_id) {
   require_agent_tool_model(cfg)
   if cfg.mock {
@@ -1423,86 +1373,22 @@ fn agent_review(cfg, analysis, run_id) {
           {
             id: "run_1",
             name: "release_run",
-            arguments: {command: "git log --oneline v0.7.52..HEAD --max-count=30"},
+            arguments: {argv: ["git", "log", "--oneline", "v0.7.52..HEAD", "--max-count=30"]},
           },
         ],
       },
     )
     llm_mock(
       {
-        text: "- release shape matches v0.7.53 expectations\n- changelog has a matching v0.7.53 top entry\n- mocked prepare/PR path is ready\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG\n\n##DONE##",
+        text: "- release shape matches v0.7.53 expectations\n- changelog has a matching v0.7.53 top entry\n- mocked prepare/PR path is ready\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
       },
     )
-    llm_mock(
-      {text: "{\"verdict\":\"done\",\"reasoning\":\"release audit includes a draft changelog\"}"},
-    )
   }
-  let system = """
-You are auditing the Harn release workflow. Use only local evidence and the
-provided tools. Do not recommend publishing directly. The desired flow is:
-prepare one Release vX.Y.Z PR, enable auto-merge, then let GitHub Actions
-publish and build binaries after the PR lands.
-
-Before writing the final audit, make at least one successful read-only tool call
-to ground the review in the repo. Do not complete from the JSON alone. Emit
-##DONE## only after you have received tool evidence.
-
-  The compact release analysis JSON is a map, not a substitute for judgement.
-  It includes the deterministic commit log, file-level changes, recent merged
-  PRs, and relevant CHANGELOG state. Use the tools to inspect representative
-  files or diffs for each major change area before writing release notes. Stop
-  once the release impact is clear; do not exhaustively reread every file just
-  because it changed.
-
-You must specifically audit CHANGELOG coverage at a cursory release-quality
-level: compare the top CHANGELOG section against the commit log, file-level
-changes, and any relevant files you read. Call out likely omissions or say that
-no obvious CHANGELOG gaps were found. If the deterministic analysis already
-shows the top CHANGELOG version is not the expected next version, report that as
-the primary changelog gap without re-reading the old release section.
-
-Also produce a user-facing changelog draft based on your evidence review, not
-on commit-title rewriting alone. Group related commits into a small number of
-human-readable release-note bullets. It must be ready to paste into CHANGELOG.md
-and wrapped exactly like this:
-
-BEGIN_DRAFT_CHANGELOG
-## vX.Y.Z
-
-### Added
-
-- **Clear user-facing title.** Human-readable impact summary, not just the
-  commit subject.
-END_DRAFT_CHANGELOG
-
-Proofread the draft before finalizing: avoid split words, preserve exact script
-names, PR numbers, versions, and public technical names, and do not invent
-features that are not supported by the commit/file evidence.
-
-Quality constraints for the draft:
-- If two commits touch adjacent files, do not merge their named features unless
-  the evidence shows they are one feature. Keep distinct lint rules and language
-  grammar changes distinct.
-- Avoid exact line counts, test-pass claims, auth mechanism details, or
-  implementation guarantees unless you inspected evidence for them.
-- In `ship-pr` mode, do not claim the release PR has merged, the tag exists,
-  publishing/finalization has happened, or `--finalize` should run unless the
-  deterministic payload explicitly says so. The normal next step is to shepherd
-  the open Release PR through CI and auto-merge.
-- A commit titled `Release vX.Y.Z` only means the release branch has a release
-  commit. It is not evidence that the PR merged, a tag was created, or release
-  publishing happened.
-- Do not invent aggregate diff totals, file counts, insertion/deletion totals,
-  or check results that are not present in the compact release analysis.
-- Do not write literal compact tool-protocol tags such as HTML-like angle
-  bracket tags. Harn may parse those as protocol syntax in transcripts; say
-  "compact text-tool aliases" instead.
-
-Output concise audit bullets plus that draft block, then end with ##DONE##.
-"""
-  let prompt = "Compact release analysis JSON:\n```json\n" + json_stringify(compact_agent_analysis(analysis))
-    + "\n```\nReview readiness, CHANGELOG coverage gaps, release quality risks, and the next concrete command."
-  var result = run_release_agent_loop(cfg, analysis, system, prompt, run_id, true)
+  let system = render("@prompts/release_agent_system.harn.prompt", {})
+  let prompt = "Compact release analysis JSON follows as raw JSON:\n"
+    + json_stringify(compact_agent_analysis(analysis))
+    + "\nReview readiness, CHANGELOG coverage gaps, release quality risks, and the next concrete command."
+  var result = run_release_agent_loop(cfg, analysis, system, prompt, run_id, true, "")
   var text = agent_result_text(result)
   var validation_findings = validate_agent_attempt(cfg, analysis, result, text)
   var attempts = [
@@ -1516,8 +1402,16 @@ Output concise audit bullets plus that draft block, then end with ##DONE##.
     },
   ]
   while len(validation_findings) > 0 && len(attempts) < 3 {
-    let repair_prompt = agent_repair_prompt(validation_findings)
-    result = run_release_agent_loop(cfg, analysis, agent_repair_system(), repair_prompt, run_id, false)
+    let repair_prompt = agent_repair_prompt(validation_findings, text, analysis)
+    result = run_release_agent_loop(
+      cfg,
+      analysis,
+      agent_repair_system(),
+      repair_prompt,
+      run_id,
+      false,
+      "-repair-${len(attempts)}",
+    )
     text = agent_result_text(result)
     validation_findings = validate_agent_attempt(cfg, analysis, result, text)
     attempts = attempts
@@ -1589,7 +1483,7 @@ fn require_agent_tool_model(cfg) {
   if !(caps.native_tools ?? false) {
     let provider = info.provider ?? "unknown"
     let model = info.id ?? cfg.model
-    throw "agent review model ${cfg.model} resolves to ${provider}/${model}, which does not support Harn tools; choose a tool-capable local model such as qwen3.6-35b-a3b-ud-q4-k-xl served through the harn.toml llamacpp provider, qwen3.6:35b-a3b-coding-nvfp4 through Ollama, or run without --agent"
+    throw "agent review model ${cfg.model} resolves to ${provider}/${model}, which does not support Harn tools; choose a tool-capable local model such as qwen3.6:35b-a3b-coding-nvfp4 through Ollama, or run without --agent"
   }
   return info
 }
@@ -1598,96 +1492,6 @@ fn require_live_confirmation(cfg) {
   if !cfg.mock && !cfg.yes_live_release {
     throw "live ${cfg.mode} mode requires --yes-live-release"
   }
-}
-
-fn recorded_step(name, command, r) {
-  return {
-    name: name,
-    command: command,
-    success: r.success,
-    status: r.status,
-    stdout: r.stdout,
-    stderr: r.stderr,
-    classification: step_classification(command, r),
-    recovery_hint: step_recovery_hint(command, r),
-  }
-}
-
-fn command_output(r) {
-  return r.stdout + "\n" + r.stderr
-}
-
-fn recovery_step_ref(step) {
-  if step == nil {
-    return nil
-  }
-  return {
-    name: step.name,
-    command: step.command,
-    success: step.success,
-    status: step.status,
-    classification: step.classification ?? "",
-    recovery_hint: step.recovery_hint ?? "",
-    live_log: step.live_log ?? "",
-    stdout: if step.live_log ?? "" == "" {
-      step.stdout
-    } else {
-      "(full output is in live_log)"
-    },
-    stderr: if step.live_log ?? "" == "" {
-      step.stderr
-    } else {
-      "(full output is in live_log)"
-    },
-  }
-}
-
-fn recovery_step_refs(steps) {
-  var out = []
-  for step in steps ?? [] {
-    out = out + [recovery_step_ref(step)]
-  }
-  return out
-}
-
-fn push_hook_budget_exceeded(command, r) {
-  if r.success || !starts_with(command, "git push ") {
-    return false
-  }
-  let out = lowercase(command_output(r))
-  let hook_like = contains(out, "pre-push") || contains(out, "pre push")
-    || contains(out, "hook")
-  let budget_like = contains(out, "budget") || contains(out, "timed out")
-    || contains(out, "timeout")
-    || contains(out, "exceeded")
-  let green_like = contains(out, "passed") || contains(out, "test result: ok")
-    || contains(out, "0 failed")
-    || contains(out, "/3187")
-    || contains(out, "3187/3187")
-  return hook_like && budget_like && green_like
-}
-
-fn step_classification(command, r) {
-  if r.success {
-    return "ok"
-  }
-  if push_hook_budget_exceeded(command, r) {
-    return "push_hook_budget_exceeded_after_green_tests"
-  }
-  if starts_with(command, "git push ") {
-    return "push_failed"
-  }
-  return "command_failed"
-}
-
-fn step_recovery_hint(command, r) {
-  if push_hook_budget_exceeded(command, r) {
-    return "Tests reported green before the pre-push hook exceeded its wall-clock budget. release_harn retries this exact class with `git push --no-verify` and records both attempts."
-  }
-  if !r.success && starts_with(command, "git push ") {
-    return "Push failed for a reason that was not classified as a green-test hook budget timeout. Keep the release branch and commit, inspect stdout/stderr in the run artifacts, then rerun or push manually after fixing the hook failure."
-  }
-  return ""
 }
 
 fn run_events_path(run_id) {
@@ -1740,6 +1544,45 @@ fn append_command_step(cfg, steps, name, command) {
   }
 }
 
+fn retryable_gh_cli_failure(command, r) {
+  if r.success || !starts_with(command, "gh ") {
+    return false
+  }
+  return gh_cli_transient_failure(command_output(r))
+}
+
+fn append_github_command_step(cfg, steps, name, command) {
+  var attempts = []
+  var attempt = 1
+  var r = fail(127, "GitHub CLI retry loop did not run")
+  while attempt <= 3 {
+    let actual_command = if attempt == 1 {
+      command
+    } else {
+      "sleep ${gh_retry_delay_seconds(attempt)} && " + command
+    }
+    r = run_cmd(cfg, actual_command)
+    attempts = attempts
+      + [
+      {
+        attempt: attempt,
+        command: actual_command,
+        success: r.success,
+        status: r.status,
+        stdout: r.stdout,
+        stderr: r.stderr,
+      },
+    ]
+    if r.success || !retryable_gh_cli_failure(command, r) || attempt == 3 {
+      let step = {...recorded_step(name, command, r), attempts: attempts}
+      return {steps: steps + [step], success: r.success, status: r.status, stdout: r.stdout, stderr: r.stderr}
+    }
+    attempt = attempt + 1
+  }
+  let step = {...recorded_step(name, command, r), attempts: attempts}
+  return {steps: steps + [step], success: r.success, status: r.status, stdout: r.stdout, stderr: r.stderr}
+}
+
 fn local_branch_exists(cfg, branch) {
   return probe_ok(cfg, "git show-ref --verify --quiet refs/heads/${branch}")
 }
@@ -1748,16 +1591,123 @@ fn remote_branch_exists(cfg, branch) {
   return probe_ok(cfg, "git show-ref --verify --quiet refs/remotes/origin/${branch}")
 }
 
+fn target_release_checkout_state(cfg, analysis) {
+  let branch = checked(cfg, "git branch --show-current")
+  let current = current_version(cfg)
+  let top = changelog_top(cfg)
+  return {
+    branch: branch,
+    current_version: current,
+    changelog_top: top,
+    matches: branch == analysis.expected_branch && current == analysis.next_version
+      && top == analysis.next_version,
+  }
+}
+
+fn release_branch_push_command(cfg, branch, no_verify) {
+  var parts = ["git", "push"]
+  if no_verify {
+    parts = parts + ["--no-verify"]
+  }
+  if remote_branch_exists(cfg, branch) {
+    parts = parts + ["--force-with-lease"]
+  }
+  parts = parts + ["-u", "origin", branch]
+  return parts.join(" ")
+}
+
+fn normalize_release_analysis_checkout(cfg, run_id) {
+  if cfg.mock || cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
+    return
+  }
+  let current_branch = checked(cfg, "git branch --show-current")
+  let release_version = version_from_release_branch(current_branch)
+  if release_version == "" {
+    return
+  }
+  let status = checked(cfg, "git status --porcelain --untracked-files=normal")
+  if trim(status) != "" {
+    release_log_event(
+      run_id,
+      "checkout_normalization_dirty_release_branch",
+      {from_branch: current_branch, status: status},
+    )
+    let reset_dirty_release = run_cmd(cfg, "git reset --hard --quiet")
+    if !reset_dirty_release.success {
+      throw "failed to reset dirty generated release branch ${current_branch} before release rerun checkout normalization:\n${trim(reset_dirty_release.stderr)}"
+    }
+  }
+  let current = current_version(cfg)
+  let top = changelog_top(cfg)
+  let latest_tag = checked(cfg, "git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true")
+  if release_version == current && top == current && version_from_tag(latest_tag) != current {
+    release_log_event(
+      run_id,
+      "checkout_normalization_skipped_prepared_release_branch",
+      {branch: current_branch, version: current, latest_tag: latest_tag},
+    )
+    return
+  }
+  let base_arg = require_shell_arg(cfg.base, "--base")
+  release_log_event(
+    run_id,
+    "checkout_normalization_started",
+    {from_branch: current_branch, base: cfg.base},
+  )
+  let fetch = run_cmd(cfg, "git fetch origin --prune --quiet")
+  if !fetch.success {
+    throw "failed to fetch before release rerun checkout normalization:\n${trim(fetch.stderr)}"
+  }
+  let switched = run_cmd(cfg, "git switch " + base_arg)
+  if !switched.success {
+    throw "failed to switch from ${current_branch} to ${cfg.base} before release analysis:\n${trim(switched.stderr)}"
+  }
+  let pulled = run_cmd(cfg, "git pull --ff-only origin " + base_arg + " --quiet")
+  if !pulled.success {
+    throw "failed to fast-forward ${cfg.base} before release analysis:\n${trim(pulled.stderr)}"
+  }
+  release_log_event(
+    run_id,
+    "checkout_normalization_finished",
+    {from_branch: current_branch, base: cfg.base, release_version: release_version},
+  )
+}
+
 fn setup_release_branch(cfg, analysis) {
   var steps = []
   let current_branch = checked(cfg, "git branch --show-current")
   let target_branch = analysis.expected_branch
-  if current_branch == target_branch {
-    return steps
-  }
+  let target_branch_arg = require_shell_arg(target_branch, "target release branch")
   let status = checked(cfg, "git status --porcelain --untracked-files=normal")
   var stashed = false
   if trim(status) != "" {
+    if current_branch == target_branch {
+      steps = steps
+        + [
+        recorded_step(
+          "dirty-release-branch",
+          "git status --porcelain --untracked-files=normal",
+          fail(
+            2,
+            "refusing to rebuild dirty generated release branch ${target_branch}; clean or stash local changes before running live release",
+          ),
+        ),
+      ]
+      return steps
+    } else if current_branch == cfg.base {
+      steps = steps
+        + [
+        recorded_step(
+          "dirty-base-branch",
+          "git status --porcelain --untracked-files=normal",
+          fail(
+            2,
+            "refusing to create ${target_branch} from dirty base branch ${cfg.base}; clean, commit, or move unrelated work before running live release",
+          ),
+        ),
+      ]
+      return steps
+    }
     let stash_message = "release_harn branch setup ${analysis.next_version} ${uuid_v7()}"
     let stash_arg = safe_shell_arg(stash_message)
     if stash_arg == nil {
@@ -1799,29 +1749,17 @@ fn setup_release_branch(cfg, analysis) {
       return steps
     }
   }
-  if current_branch == "" && !local_branch_exists(cfg, target_branch)
-    && !remote_branch_exists(cfg, target_branch) {
-    steps = steps
-      + [
-      recorded_step(
-        "switch-release-branch",
-        "git switch ${target_branch}",
-        fail(2, "detached HEAD and ${target_branch} does not already exist locally or on origin"),
-      ),
-    ]
-    if stashed {
-      let restore = append_command_step(cfg, steps, "restore-stash-after-switch-failure", "git stash pop --index")
-      steps = restore.steps
-    }
-    return steps
+  let base_ref_arg = require_shell_arg("origin/${cfg.base}", "origin base ref")
+  var switch_step = "create-release-branch-from-base"
+  var switch_command = "git switch -c " + target_branch_arg + " " + base_ref_arg
+  if current_branch == target_branch {
+    switch_step = "reset-release-branch-to-base"
+    switch_command = "git reset --hard " + base_ref_arg
+  } else if local_branch_exists(cfg, target_branch) || remote_branch_exists(cfg, target_branch) {
+    switch_step = "reset-release-branch-to-base"
+    switch_command = "git switch -C " + target_branch_arg + " " + base_ref_arg
   }
-  var switch_command = "git switch -c ${target_branch}"
-  if local_branch_exists(cfg, target_branch) {
-    switch_command = "git switch ${target_branch}"
-  } else if remote_branch_exists(cfg, target_branch) {
-    switch_command = "git switch --track origin/${target_branch}"
-  }
-  let switched = append_command_step(cfg, steps, "switch-release-branch", switch_command)
+  let switched = append_command_step(cfg, steps, switch_step, switch_command)
   steps = switched.steps
   if !switched.success {
     if stashed {
@@ -1849,106 +1787,33 @@ fn setup_release_branch(cfg, analysis) {
   return steps
 }
 
-fn draft_release_notes_command(analysis, notes_path) {
-  let next_arg = require_shell_arg(analysis.next_version, "next version")
-  let latest_tag_arg = require_shell_arg(analysis.latest_tag, "latest tag")
-  let notes_arg = if notes_path == nil {
-    "''"
-  } else {
-    require_shell_arg(notes_path, "agent changelog path")
+fn read_agent_notes(notes_path) {
+  if notes_path == nil || notes_path == "" || !file_exists(notes_path) {
+    return ""
   }
-  return "python3 - " + next_arg + " " + latest_tag_arg + " " + notes_arg + " <<'PY_RELEASE_NOTES'\n"
-    + """
-from pathlib import Path
-import re
-import sys
-import textwrap
+  return trim(read_file(notes_path))
+}
 
-next_version = sys.argv[1]
-latest_tag = sys.argv[2]
-agent_notes_path = sys.argv[3]
-changelog = Path("CHANGELOG.md")
-if not changelog.exists():
-    raise SystemExit("missing CHANGELOG.md")
-
-text = changelog.read_text()
-first = re.search(r"^## v([0-9]+\.[0-9]+\.[0-9]+)\s*$", text, re.M)
-unreleased = re.search(r"^## Unreleased\s*$", text, re.M)
-if (
-    first
-    and first.group(1) == next_version
-    and not (unreleased and unreleased.start() < first.start())
-):
-    print(f"ok: CHANGELOG.md already starts with v{next_version}")
-    raise SystemExit(0)
-
-agent_notes = ""
-if agent_notes_path:
-    note_path = Path(agent_notes_path)
-    if note_path.exists():
-        agent_notes = note_path.read_text().strip()
-        if "<assistant prose truncated by turn policy" in agent_notes:
-            raise SystemExit("agent draft changelog was truncated by turn policy; refusing to apply")
-        if not re.search(rf"^## v{re.escape(next_version)}\s*$", agent_notes, re.M):
-            raise SystemExit(f"agent draft changelog does not start with ## v{next_version}")
-if not agent_notes:
-    raise SystemExit(
-        "missing validated agent draft changelog; rerun with --agent or add CHANGELOG.md "
-        f"section ## v{next_version} manually before prepare"
-    )
-
-def wrap_release_notes(markdown):
-    out = []
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            out.append("")
-            continue
-        if (
-            line.startswith("#")
-            or line.startswith("```")
-            or line.startswith("|")
-            or line.startswith("    ")
-        ):
-            out.append(line)
-            continue
-        if line.startswith("- "):
-            wrapped = textwrap.wrap(
-                line,
-                width=100,
-                subsequent_indent="  ",
-                break_long_words=False,
-                break_on_hyphens=False,
-            )
-            out.extend(wrapped if wrapped else [line])
-            continue
-        wrapped = textwrap.wrap(
-            line,
-            width=100,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-        out.extend(wrapped if wrapped else [line])
-    return "\n".join(out).rstrip()
-
-draft_text = wrap_release_notes(agent_notes) + "\n\n"
-
-if unreleased and (not first or unreleased.start() < first.start()):
-    replace_start = unreleased.start()
-    replace_end = first.start() if first else len(text)
-    new_text = text[:replace_start] + draft_text + text[replace_end:]
-else:
-    insert_at = first.start() if first else len(text)
-    new_text = text[:insert_at] + draft_text + text[insert_at:]
-changelog.write_text(new_text)
-verb = "promoted" if unreleased and (not first or unreleased.start() < first.start()) else "inserted"
-print(f"ok: {verb} agent-authored CHANGELOG.md section for v{next_version}")
-PY_RELEASE_NOTES
-"""
+fn apply_draft_release_notes(cfg, analysis, notes_path) {
+  let changelog_path = path_join(cfg.repo, "CHANGELOG.md")
+  if !cfg.mock && !file_exists(changelog_path) {
+    return fail(1, "missing CHANGELOG.md")
+  }
+  let original = read_repo_file(cfg, "CHANGELOG.md")
+  let update = changelog_release_section_update(original, analysis.next_version, read_agent_notes(notes_path))
+  if !update.success {
+    return fail(1, update.message)
+  }
+  if update.changed && !cfg.mock {
+    write_file(changelog_path, update.text)
+  }
+  return ok("ok: " + update.message + "\n")
 }
 
 fn ensure_release_notes(cfg, analysis, agent_review_result) {
-  if analysis.changelog_top == analysis.next_version {
+  let draft_path = agent_review_result.draft_changelog ?? nil
+  let current_top = changelog_top(cfg)
+  if current_top == analysis.next_version && draft_path == nil {
     return [
       recorded_step(
         "release-notes-current",
@@ -1957,8 +1822,7 @@ fn ensure_release_notes(cfg, analysis, agent_review_result) {
       ),
     ]
   }
-  let command = draft_release_notes_command(analysis, agent_review_result.draft_changelog ?? nil)
-  let r = run_cmd(cfg, command)
+  let r = apply_draft_release_notes(cfg, analysis, draft_path)
   return [
     recorded_step(
       "draft-release-notes",
@@ -1980,9 +1844,6 @@ fn prepared_release_findings(raw, original) {
     findings = findings
       + ["current branch is ${raw.branch}; expected prepared release branch ${original.expected_branch}"]
   }
-  if trim(raw.changelog_gap_candidates) != "" {
-    findings = findings + ["possible CHANGELOG coverage gaps; review changelog_gap_candidates"]
-  }
   if !raw.release_scripts.release_ship || !raw.release_scripts.release_gate {
     findings = findings + ["release scripts are missing or not executable"]
   }
@@ -1998,6 +1859,7 @@ fn prepared_release_analysis(raw, original) {
     current_version: original.current_version,
     next_version: original.next_version,
     expected_branch: original.expected_branch,
+    operator_focus: original.operator_focus ?? "",
     deterministic_findings: prepared_release_findings(raw, original),
   }
 }
@@ -2009,10 +1871,6 @@ fn execution_has_step(execution, name) {
     }
   }
   return false
-}
-
-fn markdown_multiline(value) {
-  return trim(regex_replace_all("\\\\n", "\n", value ?? ""))
 }
 
 fn pr_body_text(analysis, agent_review_result, execution) {
@@ -2074,14 +1932,6 @@ Generated by `release_harn.harn`.
 """
 }
 
-fn single_line_or(value, fallback) {
-  let t = trim(value ?? "")
-  if t == "" {
-    return fallback
-  }
-  return regex_replace_all("\\s+", ", ", t)
-}
-
 fn execution_table(execution) {
   var lines = ["| Step | Status | Classification |", "|------|--------|----------------|"]
   for step in execution {
@@ -2102,179 +1952,76 @@ fn write_pr_body(run_id, analysis, agent_review_result, execution) {
   return body_path
 }
 
-fn json_array_from_stdout(stdout) {
-  let t = trim(stdout ?? "")
-  if t == "" {
-    return []
+fn append_pr_auto_merge_steps(cfg, steps, pr_url, run_id) {
+  let pr_arg = safe_shell_arg(pr_url)
+  if pr_arg == nil || pr_url == "" {
+    return {
+      steps: steps
+        + [
+        recorded_step(
+          "auto-merge",
+          "gh pr merge <pr-url> --auto",
+          fail(2, "could not determine PR URL for release PR"),
+        ),
+      ],
+      success: false,
+      pr_arg: "",
+    }
   }
-  return json_parse(t)
-}
-
-fn json_object_from_stdout(stdout) {
-  let t = trim(stdout ?? "")
-  if t == "" {
-    return {}
-  }
-  return json_parse(t)
-}
-
-fn release_pr_title_or_branch_matches(pr, analysis) {
-  let title = pr.title ?? ""
-  let head = pr.headRefName ?? ""
-  let version = analysis.next_version
-  return head == analysis.expected_branch || contains(title, "Release v${version}")
-    || contains(title, "Bump version to ${version}")
-    || contains(title, "Bump Harn to v${version}")
-}
-
-fn release_pr_touches_version_bump(pr) {
-  let files_text = json_stringify(pr.files ?? [])
-  return contains(files_text, "CHANGELOG.md")
-    && (contains(files_text, "Cargo.toml") || contains(files_text, "Cargo.lock"))
-}
-
-fn release_pr_has_auto_merge(pr) {
-  return pr.autoMergeRequest != nil
-}
-
-fn release_pr_detail_matches(pr, analysis) {
-  return release_pr_title_or_branch_matches(pr, analysis) && release_pr_has_auto_merge(pr)
-    && release_pr_touches_version_bump(pr)
-}
-
-fn existing_pr_list_command(cfg) {
-  return "gh pr list --base " + require_shell_arg(cfg.base, "--base")
-    + " --state open --json number,url,title,headRefName,baseRefName,autoMergeRequest,mergeStateStatus,statusCheckRollup,files --limit 50"
-}
-
-fn existing_pr_view_command(pr_url) {
-  return "gh pr view " + require_shell_arg(pr_url, "PR URL")
-    + " --json number,url,title,headRefName,baseRefName,autoMergeRequest,mergeStateStatus,statusCheckRollup,files,commits"
-}
-
-fn find_existing_auto_merge_release_pr(cfg, analysis, run_id) {
-  var steps = []
-  let list_cmd = existing_pr_list_command(cfg)
+  let auto_merge_probe_command = "gh pr view " + pr_arg
+    + " --json autoMergeRequest --jq '.autoMergeRequest != null'"
   release_log_event(
     run_id,
     "step_started",
-    {step: "scan-open-auto-merge-release-prs", command: list_cmd},
+    {step: "inspect-auto-merge", command: auto_merge_probe_command},
   )
-  let listed = append_command_step(cfg, steps, "scan-open-auto-merge-release-prs", list_cmd)
-  steps = listed.steps
-  if !listed.success {
-    return {steps: steps, pr: nil}
-  }
-  for pr in json_array_from_stdout(listed.stdout) {
-    if !release_pr_title_or_branch_matches(pr, analysis) {
-      continue
-    }
-    if !release_pr_has_auto_merge(pr) {
-      continue
-    }
-    var detail = pr
-    if !release_pr_touches_version_bump(detail) {
-      let view_cmd = existing_pr_view_command(pr.url ?? "")
-      let viewed = append_command_step(cfg, steps, "inspect-existing-release-pr", view_cmd)
-      steps = viewed.steps
-      if !viewed.success {
-        return {steps: steps, pr: nil}
-      }
-      detail = json_object_from_stdout(viewed.stdout)
-    }
-    if release_pr_detail_matches(detail, analysis) {
-      return {steps: steps, pr: detail}
-    }
-  }
-  return {steps: steps, pr: nil}
-}
-
-fn shepherd_existing_release_pr(cfg, analysis, agent_review_result, run_id, initial_steps, pr) {
-  var steps = initial_steps
-  let pr_url = pr.url ?? ""
-  let pr_arg = require_shell_arg(pr_url, "PR URL")
-  let body_path = write_pr_body(run_id, analysis, agent_review_result, steps)
-  let body_arg = safe_shell_arg(body_path)
-  if body_arg == nil {
-    steps = steps
-      + [
-      recorded_step(
-        "refresh-existing-pr-body",
-        "gh pr edit <pr-url> --body-file <path>",
-        fail(2, "failed to quote PR body path"),
-      ),
-    ]
-    return steps
-  }
-  let edit_command = "gh pr edit " + pr_arg + " --title \"Release v${analysis.next_version}\" --body-file "
-    + body_arg
-  release_log_event(run_id, "step_started", {step: "refresh-existing-pr-body", command: edit_command})
-  let edited = append_command_step(cfg, steps, "refresh-existing-pr-body", edit_command)
-  steps = edited.steps
+  let probe = append_github_command_step(cfg, steps, "inspect-auto-merge", auto_merge_probe_command)
+  var out = probe.steps
   release_log_event(
     run_id,
     "step_finished",
-    {step: "refresh-existing-pr-body", success: edited.success, status: edited.status},
+    {step: "inspect-auto-merge", success: probe.success, status: probe.status},
   )
-  if !edited.success {
-    return steps
+  if !probe.success {
+    return {steps: out, success: false, pr_arg: pr_arg}
   }
-  let checks_cmd = "gh pr checks " + pr_arg + " --watch --interval 15"
-  release_log_event(run_id, "step_started", {step: "existing-pr-checks", command: checks_cmd})
-  let checks = append_command_step(cfg, steps, "existing-pr-checks", checks_cmd)
-  steps = checks.steps
+  if trim(probe.stdout) == "true" {
+    out = out
+      + [
+      recorded_step(
+        "auto-merge-already-enabled",
+        "autoMergeRequest present on " + pr_url,
+        ok("release PR already has auto-merge enabled\n"),
+      ),
+    ]
+    return {steps: out, success: true, pr_arg: pr_arg}
+  }
+  let auto_merge_command = "gh pr merge " + pr_arg + " --auto"
+  release_log_event(run_id, "step_started", {step: "auto-merge", command: auto_merge_command})
+  let auto_merge = append_github_command_step(cfg, out, "auto-merge", auto_merge_command)
+  out = auto_merge.steps
   release_log_event(
     run_id,
     "step_finished",
-    {step: "existing-pr-checks", success: checks.success, status: checks.status},
+    {step: "auto-merge", success: auto_merge.success, status: auto_merge.status},
   )
-  if !checks.success {
-    return steps
+  if auto_merge.success {
+    return {steps: out, success: true, pr_arg: pr_arg}
   }
-  steps = steps
-    + [
-    recorded_step(
-      "existing-pr-auto-merge-already-enabled",
-      "autoMergeRequest present on " + pr_url,
-      ok("existing release PR already has auto-merge enabled\n"),
-    ),
-  ]
-  let final_body_path = write_pr_body(run_id, analysis, agent_review_result, steps)
-  let final_body_arg = safe_shell_arg(final_body_path)
-  if final_body_arg == nil {
-    steps = steps
-      + [
-      recorded_step(
-        "refresh-existing-pr-body-final",
-        "gh pr edit <pr-url> --body-file <path>",
-        fail(2, "failed to quote final PR body path"),
-      ),
-    ]
-    return steps
-  }
-  let final_edit_command = "gh pr edit " + pr_arg + " --title \"Release v${analysis.next_version}\" --body-file "
-    + final_body_arg
+  let fallback_command = "gh pr merge " + pr_arg + " --auto --squash"
   release_log_event(
     run_id,
     "step_started",
-    {step: "refresh-existing-pr-body-final", command: final_edit_command},
+    {step: "auto-merge-with-squash-fallback", command: fallback_command},
   )
-  let final_edit = append_command_step(cfg, steps, "refresh-existing-pr-body-final", final_edit_command)
-  steps = final_edit.steps
+  let fallback = append_github_command_step(cfg, out, "auto-merge-with-squash-fallback", fallback_command)
+  out = fallback.steps
   release_log_event(
     run_id,
     "step_finished",
-    {step: "refresh-existing-pr-body-final", success: final_edit.success, status: final_edit.status},
+    {step: "auto-merge-with-squash-fallback", success: fallback.success, status: fallback.status},
   )
-  if !final_edit.success {
-    return steps
-  }
-  release_log_event(
-    run_id,
-    "existing_pr_takeover",
-    {url: pr_url, number: pr.number ?? nil, body_path: final_body_path},
-  )
-  return steps
+  return {steps: out, success: fallback.success, pr_arg: pr_arg}
 }
 
 fn run_output_dir(run_id) {
@@ -2346,8 +2093,9 @@ fn deterministic_fixture_events(payload) {
         expected_version: a.next_version,
         changelog_top: a.changelog_top,
         changelog_section: a.changelog_section,
-        gap_candidates: a.changelog_gap_candidates,
+        changelog_unreleased_section: a.changelog_unreleased_section ?? "",
         commits_since_latest_tag: a.commits_since_latest_tag,
+        commit_stats_since_latest_tag: a.commit_stats_since_latest_tag,
         commit_file_changes_since_latest_tag: a.commit_file_changes_since_latest_tag,
       },
     },
@@ -2525,7 +2273,7 @@ fn tool_observation_events(payload) {
       timestamp: payload.started_iso,
       data: {
         tool: "shell",
-        command: "git log --oneline --decorate --no-merges " + log_range_arg(a.latest_tag),
+        command: "git log --oneline --no-merges " + log_range_arg(a.latest_tag),
         success: true,
         status: 0,
         stdout: a.commits_since_latest_tag,
@@ -2558,6 +2306,20 @@ fn tool_observation_events(payload) {
         success: true,
         status: 0,
         stdout: a.changelog_section,
+        stderr: "",
+      },
+    },
+    {
+      schema_version: "release_harn.crystallization_input.v1",
+      event_type: "tool_observation",
+      source: "deterministic",
+      timestamp: payload.started_iso,
+      data: {
+        tool: "read_file",
+        path: "CHANGELOG.md#Unreleased",
+        success: true,
+        status: 0,
+        stdout: a.changelog_unreleased_section ?? "",
         stderr: "",
       },
     },
@@ -2705,7 +2467,27 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
     "phase_started",
     {phase: "prepare", message: "starting release branch setup and prepare"},
   )
-  var steps = setup_release_branch(cfg, analysis)
+  var steps = []
+  let initial_target_state = target_release_checkout_state(cfg, analysis)
+  if initial_target_state.matches {
+    steps = steps
+      + [
+      recorded_step(
+        "prepare-already-complete",
+        "prepared release branch already has v${analysis.next_version} release content",
+        ok(
+          "skipped prepare because branch ${initial_target_state.branch}, Cargo version ${initial_target_state.current_version}, and CHANGELOG top v${initial_target_state.changelog_top} already target v${analysis.next_version}",
+        ),
+      ),
+    ]
+    release_log_event(
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
+  }
+  steps = setup_release_branch(cfg, analysis)
   if execution_failed(steps) {
     release_log_event(
       run_id,
@@ -2723,6 +2505,25 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
       {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
     )
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
+  }
+  let target_state = target_release_checkout_state(cfg, analysis)
+  if target_state.matches {
+    steps = steps
+      + [
+      recorded_step(
+        "prepare-already-complete",
+        "prepared release branch already has v${analysis.next_version} release content",
+        ok(
+          "skipped prepare because branch ${target_state.branch}, Cargo version ${target_state.current_version}, and CHANGELOG top v${target_state.changelog_top} already target v${analysis.next_version}",
+        ),
+      ),
+    ]
+    release_log_event(
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
   }
   let cmd = prepare_command(cfg)
   let live_log = command_live_log_path(run_id, "prepare")
@@ -2757,36 +2558,14 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
 
 fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   require_live_confirmation(cfg)
-  let takeover = find_existing_auto_merge_release_pr(cfg, analysis, run_id)
-  if execution_failed(takeover.steps) {
-    return takeover.steps
-  }
-  if takeover.pr != nil {
-    return shepherd_existing_release_pr(
-      cfg,
-      analysis,
-      agent_review_result,
-      run_id,
-      takeover.steps,
-      takeover.pr,
-    )
-  }
-  var steps = []
-  if analysis.prepared_release ?? false {
-    steps = steps
-      + [
-      recorded_step(
-        "prepare-already-complete",
-        "prepared release branch already has v${analysis.next_version} release content",
-        ok(
-          "skipped prepare because Cargo version, branch name, and CHANGELOG top entry already target v${analysis.next_version}",
-        ),
-      ),
-    ]
-  } else {
-    steps = execute_prepare(cfg, analysis, agent_review_result, run_id)
-  }
+  var steps = execute_prepare(cfg, analysis, agent_review_result, run_id)
   if execution_failed(steps) {
+    return steps
+  }
+  let validation_analysis = prepared_release_analysis(analyze_release(cfg), analysis)
+  let validation = run_release_generated_content_checks(cfg, validation_analysis, steps, run_id)
+  steps = validation.steps
+  if !validation.success {
     return steps
   }
   let post_prepare_analysis = prepared_release_analysis(analyze_release(cfg), analysis)
@@ -2794,6 +2573,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   let branch = "release/v${version}"
   let base_arg = require_shell_arg(cfg.base, "--base")
   let base_ref_arg = require_shell_arg("origin/${cfg.base}", "origin base ref")
+  let push_command = release_branch_push_command(cfg, branch, false)
   var commands = []
   var committed_release_content = false
   if trim(post_prepare_analysis.status ?? "") == ""
@@ -2811,13 +2591,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       ),
     ]
   } else {
+    commands = commands + [{name: "stage-tracked-release-content", command: "git add -u"}]
     commands = commands + [{name: "commit", command: "git commit -m \"Release v${version}\""}]
   }
   commands = commands
     + [
     {name: "fetch-base", command: "git fetch origin " + base_arg},
     {name: "rebase-base", command: "git rebase " + base_ref_arg},
-    {name: "push", command: "git push -u origin ${branch}"},
+    {name: "push", command: push_command},
   ]
   for step in commands {
     release_log_event(run_id, "step_started", {step: step.name, command: step.command})
@@ -2833,7 +2614,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       if step.name == "push" {
         steps = maybe_recovery_advice_step(cfg, post_prepare_analysis, steps, failed_step, run_id)
         if push_hook_budget_exceeded(failed_step.command, failed_step) {
-          let retry_command = "git push --no-verify -u origin ${branch}"
+          let retry_command = release_branch_push_command(cfg, branch, true)
           let push_retry = append_command_step(cfg, steps, "push-no-verify-after-green-hook-budget", retry_command)
           steps = push_retry.steps
           if push_retry.success {
@@ -2842,6 +2623,14 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
         }
       } else {
         steps = maybe_recovery_advice_step(cfg, post_prepare_analysis, steps, failed_step, run_id)
+        let retry_commands = retry_commands_after_agent_repair(step)
+        if len(retry_commands) > 0 {
+          let repair_retry = run_retry_commands_after_agent_repair(cfg, steps, retry_commands, run_id)
+          steps = repair_retry.steps
+          if repair_retry.success {
+            continue
+          }
+        }
       }
       return steps
     }
@@ -2850,7 +2639,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   let existing_pr_command = "gh pr list --base " + base_arg
     + " --head ${branch} --state open --json url --jq '.[0].url // \"\"'"
   release_log_event(run_id, "step_started", {step: "find-existing-pr", command: existing_pr_command})
-  let existing_pr = append_command_step(cfg, steps, "find-existing-pr", existing_pr_command)
+  let existing_pr = append_github_command_step(cfg, steps, "find-existing-pr", existing_pr_command)
   steps = existing_pr.steps
   release_log_event(
     run_id,
@@ -2878,7 +2667,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       + " --head ${branch} --title \"Release v${version}\" --body-file "
       + body_arg
     release_log_event(run_id, "step_started", {step: "create-pr", command: create_command})
-    let created = append_command_step(cfg, steps, "create-pr", create_command)
+    let created = append_github_command_step(cfg, steps, "create-pr", create_command)
     steps = created.steps
     release_log_event(
       run_id,
@@ -2906,7 +2695,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     let edit_command = "gh pr edit " + pr_edit_arg + " --title \"Release v${version}\" --body-file "
       + body_arg
     release_log_event(run_id, "step_started", {step: "refresh-existing-pr-body", command: edit_command})
-    let edited = append_command_step(cfg, steps, "refresh-existing-pr-body", edit_command)
+    let edited = append_github_command_step(cfg, steps, "refresh-existing-pr-body", edit_command)
     steps = edited.steps
     release_log_event(
       run_id,
@@ -2917,30 +2706,12 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       return steps
     }
   }
-  let pr_arg = safe_shell_arg(pr_url)
-  if pr_arg == nil || pr_url == "" {
-    steps = steps
-      + [
-      recorded_step(
-        "auto-merge",
-        "gh pr merge <pr-url> --auto --squash",
-        fail(2, "could not determine PR URL for ${branch}"),
-      ),
-    ]
+  let merge_handoff = append_pr_auto_merge_steps(cfg, steps, pr_url, run_id)
+  steps = merge_handoff.steps
+  if !merge_handoff.success {
     return steps
   }
-  let auto_merge_command = "gh pr merge " + pr_arg + " --auto --squash"
-  release_log_event(run_id, "step_started", {step: "auto-merge", command: auto_merge_command})
-  let auto_merge = append_command_step(cfg, steps, "auto-merge", auto_merge_command)
-  steps = auto_merge.steps
-  release_log_event(
-    run_id,
-    "step_finished",
-    {step: "auto-merge", success: auto_merge.success, status: auto_merge.status},
-  )
-  if !auto_merge.success {
-    return steps
-  }
+  let pr_arg = merge_handoff.pr_arg
   let final_body_path = write_pr_body(run_id, post_prepare_analysis, agent_review_result, steps)
   let final_body_arg = safe_shell_arg(final_body_path)
   if final_body_arg == nil {
@@ -2961,7 +2732,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     "step_started",
     {step: "refresh-pr-body-final", command: final_edit_command},
   )
-  let final_edit = append_command_step(cfg, steps, "refresh-pr-body-final", final_edit_command)
+  let final_edit = append_github_command_step(cfg, steps, "refresh-pr-body-final", final_edit_command)
   steps = final_edit.steps
   release_log_event(
     run_id,
@@ -2969,40 +2740,6 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     {step: "refresh-pr-body-final", success: final_edit.success, status: final_edit.status},
   )
   return steps
-}
-
-fn execution_failed(execution) {
-  if execution == nil {
-    return false
-  }
-  var recovered_budget_push = false
-  for step in execution {
-    if step.name == "push-no-verify-after-green-hook-budget" && step.success {
-      recovered_budget_push = true
-    }
-  }
-  for step in execution {
-    if !step.success {
-      if step.classification == "push_hook_budget_exceeded_after_green_tests" && recovered_budget_push {
-        continue
-      }
-      return true
-    }
-  }
-  return false
-}
-
-fn last_failed_step(execution) {
-  var failed = nil
-  if execution == nil {
-    return nil
-  }
-  for step in execution {
-    if !step.success {
-      failed = step
-    }
-  }
-  return failed
 }
 
 fn add_recovery_for_last_failure(cfg, analysis, steps, run_id) {
@@ -3051,6 +2788,7 @@ pipeline main() {
   println("   bump : ${cfg.bump}")
   println("   events: ${run_events}")
   println("   tail : tail -f ${run_events}")
+  normalize_release_analysis_checkout(cfg, run_id)
   release_log_event(run_id, "analysis_started", {})
   let analysis = analyze_release(cfg)
   release_log_event(

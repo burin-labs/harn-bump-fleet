@@ -36,7 +36,7 @@ harn run bump_fleet.harn -- --dry-run
 harn run bump_fleet.harn -- --only burin-labs/harn-cloud
 
 # Use a different local LLM for the summary.
-HARN_BUMP_FLEET_MODEL=qwen3.6:35b-a3b-coding-nvfp4 \
+HARN_BUMP_FLEET_MODEL=gemma4:26b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
   harn run bump_fleet.harn
 ```
@@ -45,37 +45,25 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
 
 - `harn` v0.7.x.
 - `gh` CLI, authenticated — the script never embeds tokens, just shells out.
-- A local Ollama or llama.cpp model for the end-of-run summary; defaults to the
-  repo-local `llamacpp` provider in `harn.toml`, serving Qwen3.6 on
-  `http://127.0.0.1:8001`. Override via `HARN_BUMP_FLEET_MODEL` /
-  `HARN_BUMP_FLEET_PROVIDER`.
+- A local Ollama model for the end-of-run summary; defaults to
+  `gemma4:26b` via Harn's built-in `ollama` provider. Override via
+  `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER`.
 
-Recommended local llama.cpp server for Qwen3.6:
+Recommended local Ollama model:
 
 ```sh
-llama-server \
-  --model ~/models/qwen3.6/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  --alias qwen3.6-35b-a3b-ud-q4-k-xl \
-  --host 127.0.0.1 \
-  --port 8001 \
-  --ctx-size 100000 \
-  --n-gpu-layers auto \
-  --cache-type-k q4_0 \
-  --cache-type-v q4_0 \
-  --jinja \
-  --reasoning-format deepseek \
-  --metrics \
-  --flash-attn auto
+ollama pull gemma4:26b
 ```
 
-That host/port/model alias is what `harn.toml` uses, so normal invocations do
-not need LLM environment variables.
+Normal invocations do not need LLM environment variables when Ollama is running
+on its default `http://localhost:11434` endpoint.
 
 ## CI
 
 GitHub Actions runs `harn check`, `harn fmt --check`, and `harn lint` across
-all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
-`.harn-version` to avoid compiling Harn from source on every run.
+all tracked `*.harn` files, then runs `harn test tests/` when local tests are
+present. CI installs the pinned prebuilt Harn binary from `.harn-version` to
+avoid compiling Harn from source on every run.
 
 ## What it does, in order
 
@@ -85,22 +73,31 @@ all tracked `*.harn` files. CI installs the pinned prebuilt Harn binary from
 2. **Resolve** the target Harn release. Defaults to
    `gh api repos/burin-labs/harn/releases/latest`; an explicit `vX.Y.Z` arg
    overrides.
-3. **Idempotency pre-check** per repo (no side effects):
+3. **Idempotency pre-check** per repo:
+   - Read origin/main directly from GitHub. Local worktrees are only used for
+     discovery and as a fallback audit hint.
    - If origin/main's `.harn-version` (or `harn-vm = "..."` in `Cargo.toml`)
      already matches the target, status is `already_current` and no workflow
      is dispatched.
-   - If an open PR on `automation/bump-harn-runtime` already targets the
-     target version, ensure auto-merge is on and status is `pr_already_set`.
+   - If an open PR on `automation/bump-harn-runtime` has a head pin that
+     already matches the target, ensure auto-merge is on and status is
+     `pr_already_set`.
+   - If that automation PR is stale, close it before redispatching so an old
+     version bump cannot accidentally sit in the merge queue.
 4. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
    the resulting workflow run to completion, locate the PR the workflow
-   pushed, and idempotently call `gh pr merge --auto --squash` on it.
+   pushed, verify its head pin matches the target, and idempotently call
+   `gh pr merge --auto --squash` on it. A successful workflow with no matching
+   PR and no matching origin/main pin is a failed fleet outcome.
 5. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
    record.
-6. **Summarize**: a single read-only `llm_call` against the local model
-   produces a short bullet list of anomalies for the operator. The LLM is
-   **never** allowed to drive a side-effect — the audit is finalized first.
+6. **Summarize**: a read-only `llm_call` against the local model produces a
+   short bullet list of anomalies for the operator. The LLM is **never**
+   allowed to drive a side-effect. If the local model returns anything other
+   than plain markdown bullets after one repair attempt, the harness records
+   the summary as unavailable instead of leaking reasoning text into the audit.
 
 ## Idempotency guarantees
 
@@ -116,18 +113,20 @@ A second invocation against an unchanged fleet is essentially a no-op:
   HTTP).
 - `render(...)` against a `.harn.prompt` template + `[asset_roots]` alias
   for the audit markdown.
-- `llm_call` with `model: "local:..."` routing through Ollama for an
-  on-machine summary; the default route is the repo-local llama.cpp provider
-  defined in `harn.toml`.
+- `llm_call` through Ollama for an on-machine summary. The default summary
+  model is intentionally separate from the tool-driving release model so this
+  read-only audit task can use a smaller model that reliably emits compact
+  bullets.
 - `sha3_256` + `uuid_v7` for cryptographically tagged audit identity.
 - `regex_captures`, `json_parse`/`json_stringify`, `mkdir`, `file_exists`,
   `read_file`/`write_file` from the stdlib.
-- `harn check`, `harn fmt`, and `harn lint` as pre-commit gates — the
-  script is structured to pass all three with no warnings.
+- `harn check`, `harn fmt`, `harn lint`, and focused `harn test` coverage as
+  pre-commit gates — the scripts are structured to pass all checks with no
+  warnings.
 
 ## Output
 
-```
+```text
 ~/projects/harn-bump-fleet/.harn-runs/bump-fleet/<run-id>/
 ├── audit.json    # machine-readable: every per-repo outcome, with
 │                 # run/PR URLs, pre-pin, duration, auto-merge status
@@ -193,12 +192,11 @@ Options:
   `patch`.
 - `--agent` gives a local model a bounded read/search/run tool surface for
   release readiness review. It defaults to `HARN_RELEASE_MODEL` or
-  `qwen3.6-35b-a3b-ud-q4-k-xl` via the repo-local `llamacpp` provider in
-  `harn.toml`, which points at `http://127.0.0.1:8001`. Agent runs persist the
-  raw result, trace, and Harn `llm_transcript.jsonl` sidecar under the run
-  directory.
+  `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in `ollama` provider. Agent
+  runs persist the raw result, trace, and Harn `llm_transcript.jsonl` sidecar
+  under the run directory.
 - `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
-  `HARN_RELEASE_PROVIDER` or `llamacpp`.
+  `HARN_RELEASE_PROVIDER` or `ollama`.
 - `--skip-audit` and `--skip-dry-run` pass through to
   `scripts/release_ship.sh --prepare`.
 
@@ -236,10 +234,10 @@ Reports are written to:
 
 The `crystallization-input/` directory is a self-contained fixture for the
 Harn crystallization importer tracked in
-https://github.com/burin-labs/harn/issues/1146. It keeps deterministic release
-facts separate from model-authored audit/recovery text, and preserves command
-observations with stdout/stderr so failed pushes or hooks can be replayed
-offline without reading sibling run artifacts.
+[burin-labs/harn#1146](https://github.com/burin-labs/harn/issues/1146). It
+keeps deterministic release facts separate from model-authored audit/recovery
+text, and preserves command observations with stdout/stderr so failed pushes or
+hooks can be replayed offline without reading sibling run artifacts.
 
 For live runs, `run-events.jsonl` is append-only and safe to tail while the
 harness is still running. Long `scripts/release_ship.sh --prepare` output is
