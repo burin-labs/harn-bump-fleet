@@ -6,18 +6,20 @@
 // Defaults to audit-only. Live mutation requires --yes-live-release.
 // Use --mock to exercise the end-to-end flow without touching the real repo.
 import { agent_host_tools } from "std/agent/host_tools"
+import { agent_preset } from "std/agent/presets"
+import { command_output_range, command_output_tail } from "std/command"
 import {
   changelog_latest_version_section_from_text,
   changelog_named_section_from_text,
   changelog_release_section_update,
   changelog_top_from_text,
 } from "lib/changelog"
-import { gh_cli_transient_failure, gh_retry_delay_seconds } from "lib/github_cli"
 import {
   agent_changelog_section,
   agent_result_text,
   validate_release_agent_audit,
 } from "lib/release_audit"
+import { append_std_command_step, append_std_github_command_step } from "lib/release_commands"
 import {
   execution_failed,
   last_failed_step,
@@ -27,7 +29,7 @@ import {
   recovery_step_refs,
 } from "lib/release_execution"
 import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
-import { command_output, fail, ok, require_shell_arg, safe_shell_arg } from "lib/shell_util"
+import { fail, ok, require_shell_arg, safe_shell_arg } from "lib/shell_util"
 import { markdown_multiline, single_line_or, truncate_text } from "lib/text_util"
 
 let DEFAULT_REPO = path_join(env_or("HOME", ""), "projects/harn")
@@ -1022,6 +1024,9 @@ fn artifact_path_for_tool(run_id, path) {
     return path_join(cwd(), p)
   }
   if starts_with(p, "/") {
+    if contains(p, "/harn-command-") {
+      return p
+    }
     return nil
   }
   return path_join(root, p)
@@ -1035,18 +1040,38 @@ fn read_artifact_window(run_id, path, max_chars, from_start) {
   if !file_exists(resolved) {
     return "missing artifact: ${resolved}"
   }
-  let text = read_file(resolved)
   let limit = max_chars ?? 12000
-  let size = stat(resolved).size
+  let read = try {
+    if from_start ?? false {
+      command_output_range({path: resolved}, {offset: 0, length: limit})
+    } else {
+      command_output_tail({path: resolved}, {length: limit})
+    }
+  } catch (_e) {
+    nil
+  }
+  if read != nil {
+    let shown = if read.total_bytes <= limit {
+      "full"
+    } else {
+      if from_start ?? false {
+        "first ${limit} bytes"
+      } else {
+        "last ${limit} bytes"
+      }
+    }
+    return "path: ${resolved}\nsize: ${read.total_bytes}\nshown: ${shown}\n\n" + read.content
+  }
+  let text = read_file(resolved)
   if len(text) <= limit {
-    return "path: ${resolved}\nsize: ${size}\nshown: full\n\n" + text
+    return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: full\n\n" + text
   }
   if from_start ?? false {
-    return "path: ${resolved}\nsize: ${size}\nshown: first ${limit} chars\n\n"
+    return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: first ${limit} chars\n\n"
       + text[0:limit]
       + "\n\n... output continues; use release_artifact_search or read from the end ..."
   }
-  return "path: ${resolved}\nsize: ${size}\nshown: last ${limit} chars\n\n"
+  return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: last ${limit} chars\n\n"
     + text[len(text) - limit:len(text)]
 }
 
@@ -1084,60 +1109,57 @@ fn run_release_agent_loop(
   session_suffix,
 ) {
   let paths = agent_artifact_paths(run_id)
-  var options = {
-    provider: if cfg.mock {
-      "mock"
-    } else {
-      if cfg.provider == "auto" {
-        "auto"
-      } else {
-        cfg.provider
-      }
-    },
-    model: if cfg.mock {
-      MOCK_AGENT_MODEL
-    } else {
-      cfg.model
-    },
-    max_tokens: if require_tool_evidence {
-      2048
-    } else {
-      2200
-    },
-    profile: "verifier",
-    tools: if require_tool_evidence {
-      release_tools(cfg, run_id)
-    } else {
-      tool_registry()
-    },
-    tool_format: "native",
-    native_tool_fallback: "allow_once",
-    thinking: {mode: "disabled"},
-    timeout: 900,
-    idle_timeout: 180,
-    loop_until_done: require_tool_evidence,
-    max_iterations: if require_tool_evidence {
-      6
-    } else {
-      1
-    },
-    max_nudges: if require_tool_evidence {
-      1
-    } else {
-      0
-    },
-    done_sentinel: nil,
-    done_judge: nil,
-    turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
-    post_turn_callback: if require_tool_evidence {
-      { payload -> release_review_post_turn(payload, analysis) }
-    } else {
-      nil
-    },
-    compaction: {strategy: "hybrid", keep_last_n: 8},
-    session_id: release_session_id(cfg, analysis, run_id) + session_suffix,
-    llm_transcript_dir: paths.llm_transcript_dir,
+  let role = if require_tool_evidence {
+    "audit"
+  } else {
+    "summary"
   }
+  let tools = if require_tool_evidence {
+    release_tools(cfg, run_id)
+  } else {
+    tool_registry()
+  }
+  var options = agent_preset(
+    role,
+    {
+      provider: if cfg.mock {
+        "mock"
+      } else {
+        if cfg.provider == "auto" {
+          "auto"
+        } else {
+          cfg.provider
+        }
+      },
+      model: if cfg.mock {
+        MOCK_AGENT_MODEL
+      } else {
+        cfg.model
+      },
+      max_tokens: if require_tool_evidence {
+        2048
+      } else {
+        2200
+      },
+      tools: tools,
+      timeout: 900,
+      idle_timeout: 180,
+      iteration_budget: if require_tool_evidence {
+        {mode: "adaptive", initial: 4, max: 8, extend_by: 2}
+      } else {
+        {mode: "fixed", initial: 1, max: 1, extend_by: 0}
+      },
+      turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
+      post_turn_callback: if require_tool_evidence {
+        { payload -> release_review_post_turn(payload, analysis) }
+      } else {
+        nil
+      },
+      compaction: {strategy: "hybrid", keep_last_n: 8},
+      session_id: release_session_id(cfg, analysis, run_id) + session_suffix,
+      llm_transcript_dir: paths.llm_transcript_dir,
+    },
+  )
   if require_tool_evidence {
     options = {...options, require_successful_tools: ["release_run"]}
   } else {
@@ -1178,25 +1200,38 @@ fn recovery_session_id(cfg, analysis, run_id, step_name) {
 }
 
 fn live_log_failure_context(step) {
-  let log_path = step?.live_log ?? ""
-  if log_path == "" || !file_exists(log_path) {
+  let log_path = step?.output_path ?? step?.live_log ?? ""
+  if log_path == "" {
     return nil
   }
-  let text = read_file(log_path)
-  let limit = 12000
-  let tail = if len(text) > limit {
-    text[len(text) - limit:len(text)]
+  let tail_read = try {
+    command_output_tail(step, {length: 12000})
+  } catch (_e) {
+    nil
+  }
+  let tail = if tail_read != nil {
+    tail_read.content
   } else {
-    text
+    if file_exists(log_path) {
+      let text = read_file(log_path)
+      let limit = 12000
+      if len(text) > limit {
+        text[len(text) - limit:len(text)]
+      } else {
+        text
+      }
+    } else {
+      step?.tail ?? step?.stderr ?? ""
+    }
   }
   let pattern_arg = safe_shell_arg("fail|failed|error|ERROR|Summary:|MD[0-9]+")
   let path_arg = safe_shell_arg(log_path)
-  let matches = if pattern_arg != nil && path_arg != nil {
+  let matches = if file_exists(log_path) && pattern_arg != nil && path_arg != nil {
     trim(shell("rg -n -- " + pattern_arg + " " + path_arg + " | tail -80").stdout)
   } else {
     ""
   }
-  return {path: log_path, matches: matches, tail: tail}
+  return {path: log_path, command_id: step?.command_id ?? "", matches: matches, tail: tail}
 }
 
 fn run_recovery_agent_loop(cfg, analysis, prompt, run_id, step_name) {
@@ -1205,38 +1240,34 @@ fn run_recovery_agent_loop(cfg, analysis, prompt, run_id, step_name) {
   return agent_loop(
     prompt,
     system,
-    {
-      provider: if cfg.mock {
-        "mock"
-      } else {
-        if cfg.provider == "auto" {
-          "auto"
+    agent_preset(
+      "repair",
+      {
+        provider: if cfg.mock {
+          "mock"
         } else {
-          cfg.provider
-        }
+          if cfg.provider == "auto" {
+            "auto"
+          } else {
+            cfg.provider
+          }
+        },
+        model: if cfg.mock {
+          MOCK_AGENT_MODEL
+        } else {
+          cfg.model
+        },
+        tools: release_repair_tools(cfg, run_id),
+        timeout: 900,
+        idle_timeout: 180,
+        max_nudges: 1,
+        iteration_budget: {mode: "adaptive", initial: 4, max: 10, extend_by: 2},
+        turn_policy: {allow_done_sentinel: false, max_prose_chars: 9000},
+        compaction: {strategy: "hybrid", keep_last_n: 6},
+        session_id: recovery_session_id(cfg, analysis, run_id, step_name),
+        llm_transcript_dir: paths.llm_transcript_dir,
       },
-      model: if cfg.mock {
-        MOCK_AGENT_MODEL
-      } else {
-        cfg.model
-      },
-      profile: "verifier",
-      tools: release_repair_tools(cfg, run_id),
-      tool_format: "native",
-      native_tool_fallback: "allow_once",
-      thinking: {mode: "disabled"},
-      timeout: 900,
-      idle_timeout: 180,
-      loop_until_done: true,
-      max_iterations: 8,
-      max_nudges: 1,
-      done_sentinel: nil,
-      done_judge: nil,
-      turn_policy: {allow_done_sentinel: false, max_prose_chars: 9000},
-      compaction: {strategy: "hybrid", keep_last_n: 6},
-      session_id: recovery_session_id(cfg, analysis, run_id, step_name),
-      llm_transcript_dir: paths.llm_transcript_dir,
-    },
+    ),
   )
 }
 
@@ -1262,18 +1293,21 @@ fn recovery_agent_advice(cfg, analysis, steps, failed_step, run_id) {
       },
     )
   }
-  let prompt = "Release handoff failure context:\n```json\n"
-    + json_stringify(
+  let prompt = render(
+    "@prompts/release_recovery_prompt.harn.prompt",
     {
-      analysis: analysis,
-      failed_step: recovery_step_ref(failed_step),
-      live_log_excerpt: live_log_failure_context(failed_step),
-      execution_so_far: recovery_step_refs(steps),
-      classification: failed_step.classification ?? "",
-      recovery_hint: failed_step.recovery_hint ?? "",
+      failure_context_json: json_stringify(
+        {
+          analysis: analysis,
+          failed_step: recovery_step_ref(failed_step),
+          live_log_excerpt: live_log_failure_context(failed_step),
+          execution_so_far: recovery_step_refs(steps),
+          classification: failed_step.classification ?? "",
+          recovery_hint: failed_step.recovery_hint ?? "",
+        },
+      ),
     },
   )
-    + "\n```\nDiagnose this hiccup from local evidence and recommend the next concrete action."
   let result = run_recovery_agent_loop(cfg, analysis, prompt, run_id, failed_step.name)
   let text = agent_result_text(result)
   let paths = recovery_artifact_paths(run_id, failed_step.name)
@@ -1349,23 +1383,18 @@ fn run_retry_commands_after_agent_repair(cfg, steps, retry_commands, run_id) {
 fn retry_prepare_after_agent_repair(cfg, steps, failed_step, run_id) {
   let retry_name = "prepare-after-agent-repair"
   let cmd = failed_step.command ?? ""
-  let live_log = command_live_log_path(run_id, retry_name)
-  mkdir(dirname(live_log), true)
-  release_log_event(
-    run_id,
-    "step_started",
-    {step: retry_name, command: cmd, live_log: live_log, tail_hint: "tail -f " + live_log},
-  )
-  let r = if cfg.mock {
-    run_cmd(cfg, cmd)
-  } else {
-    run_cmd(cfg, live_logged_command(cmd, live_log))
-  }
-  let out = steps + [{...recorded_step(retry_name, cmd, r), live_log: live_log}]
+  release_log_event(run_id, "step_started", {step: retry_name, command: cmd})
+  let result = append_command_step(cfg, steps, retry_name, cmd)
+  let out = result.steps
   release_log_event(
     run_id,
     "step_finished",
-    {step: retry_name, success: r.success, status: r.status, live_log: live_log},
+    {
+      step: retry_name,
+      success: result.success,
+      status: result.status,
+      live_log: result.step.live_log ?? "",
+    },
   )
   return out
 }
@@ -1432,9 +1461,10 @@ fn agent_review(cfg, analysis, run_id) {
     )
   }
   let system = render("@prompts/release_agent_system.harn.prompt", {})
-  let prompt = "Compact release analysis JSON follows as raw JSON:\n"
-    + json_stringify(compact_agent_analysis(analysis))
-    + "\nReview readiness, CHANGELOG coverage gaps, release quality risks, and the next concrete command."
+  let prompt = render(
+    "@prompts/release_agent_user.harn.prompt",
+    {analysis_json: json_stringify(compact_agent_analysis(analysis))},
+  )
   var result = run_release_agent_loop(cfg, analysis, system, prompt, run_id, true, "")
   var text = agent_result_text(result)
   var validation_findings = validate_agent_attempt(cfg, analysis, result, text)
@@ -1545,10 +1575,6 @@ fn run_events_path(run_id) {
   return path_join(cwd(), RUN_ROOT, run_id, "run-events.jsonl")
 }
 
-fn live_logs_dir(run_id) {
-  return path_join(cwd(), RUN_ROOT, run_id, "live-logs")
-}
-
 fn release_log_event(run_id, event_type, data) {
   let path = run_events_path(run_id)
   mkdir(dirname(path), true)
@@ -1567,67 +1593,19 @@ fn release_log_event(run_id, event_type, data) {
   return path
 }
 
-fn command_live_log_path(run_id, name) {
-  let safe_name = regex_replace_all("[^A-Za-z0-9_.-]+", "-", name)
-  return path_join(live_logs_dir(run_id), safe_name + ".log")
-}
-
-fn live_logged_command(command, log_path) {
-  let log_arg = require_shell_arg(log_path, "live log path")
-  return command + " > " + log_arg
-    + " 2>&1; __harn_status=$?; printf 'full output: %s\\n' "
-    + log_arg
-    + "; exit $__harn_status"
-}
-
-fn append_command_step(cfg, steps, name, command) {
-  let r = run_cmd(cfg, command)
-  return {
-    steps: steps + [recorded_step(name, command, r)],
-    success: r.success,
-    status: r.status,
-    stdout: r.stdout,
-    stderr: r.stderr,
+fn release_command_runner(cfg) {
+  if !cfg.mock {
+    return nil
   }
+  return { spec, _options -> fake_command(spec.command ?? "", cfg) }
 }
 
-fn retryable_gh_cli_failure(command, r) {
-  if r.success || !starts_with(command, "gh ") {
-    return false
-  }
-  return gh_cli_transient_failure(command_output(r))
+fn append_command_step(cfg, steps, name, command, extra = nil) {
+  return append_std_command_step(cfg, steps, name, command, release_command_runner(cfg), extra)
 }
 
 fn append_github_command_step(cfg, steps, name, command) {
-  var attempts = []
-  var attempt = 1
-  var r = fail(127, "GitHub CLI retry loop did not run")
-  while attempt <= 3 {
-    let actual_command = if attempt == 1 {
-      command
-    } else {
-      "sleep ${gh_retry_delay_seconds(attempt)} && " + command
-    }
-    r = run_cmd(cfg, actual_command)
-    attempts = attempts
-      + [
-      {
-        attempt: attempt,
-        command: actual_command,
-        success: r.success,
-        status: r.status,
-        stdout: r.stdout,
-        stderr: r.stderr,
-      },
-    ]
-    if r.success || !retryable_gh_cli_failure(command, r) || attempt == 3 {
-      let step = {...recorded_step(name, command, r), attempts: attempts}
-      return {steps: steps + [step], success: r.success, status: r.status, stdout: r.stdout, stderr: r.stderr}
-    }
-    attempt = attempt + 1
-  }
-  let step = {...recorded_step(name, command, r), attempts: attempts}
-  return {steps: steps + [step], success: r.success, status: r.status, stdout: r.stdout, stderr: r.stderr}
+  return append_std_github_command_step(cfg, steps, name, command, release_command_runner(cfg))
 }
 
 fn local_branch_exists(cfg, branch) {
@@ -1939,44 +1917,33 @@ fn pr_body_text(analysis, agent_review_result, execution) {
   } else {
     execution_table(execution)
   }
-  return """
-Release v${analysis.next_version}
-
-This PR was prepared by `release_harn.harn` from a fresh release snapshot.
-${preparation_note}
-
-## Post-prepare summary
-
-- Version: `${analysis.current_version}` -> `${analysis.next_version}`
-- Branch: `${analysis.branch}` targeting `${analysis.base_branch}`
-- Latest tag used for release delta: `${analysis.latest_tag}`
-- Changed files: `${single_line_or(analysis.diff_names, "none")}`
-- Deterministic findings: ${if len(analysis.deterministic_findings) == 0 { "none" } else { "review run artifact" }}
-
-## Changelog section
-
-```markdown
-${changelog_section}
-```
-
-## Commits covered
-
-```text
-${analysis.commits_since_latest_tag}
-```
-
-## Execution transcript
-
-${execution_summary}
-
-## Agent artifacts
-
-- Audit JSONL transcript: `${agent_artifacts.llm_transcript_jsonl ?? "not generated"}`
-- Draft changelog: `${draft_path}`
-- Agent validation findings: ${if len(validation) == 0 { "none" } else { validation.join("; ") }}
-
-Generated by `release_harn.harn`.
-"""
+  return render(
+    "@prompts/release_pr_body.harn.prompt",
+    {
+      next_version: analysis.next_version,
+      preparation_note: preparation_note,
+      current_version: analysis.current_version,
+      branch: analysis.branch,
+      base_branch: analysis.base_branch,
+      latest_tag: analysis.latest_tag,
+      changed_files: single_line_or(analysis.diff_names, "none"),
+      deterministic_findings: if len(analysis.deterministic_findings) == 0 {
+        "none"
+      } else {
+        "review run artifact"
+      },
+      changelog_section: changelog_section,
+      commits_since_latest_tag: analysis.commits_since_latest_tag,
+      execution_summary: execution_summary,
+      audit_transcript: agent_artifacts.llm_transcript_jsonl ?? "not generated",
+      draft_changelog: draft_path,
+      validation_findings: if len(validation) == 0 {
+        "none"
+      } else {
+        validation.join("; ")
+      },
+    },
+  )
 }
 
 fn execution_table(execution) {
@@ -2442,36 +2409,20 @@ fn fixture_manifest(run_id, payload, report_paths, paths) {
 }
 
 fn fixture_readme(payload) {
-  return """
-# release_harn Crystallization Input
-
-This directory is a self-contained fixture bundle for Harn crystallization
-experiments. It is intentionally boring JSON/JSONL so another repo can ingest it
-without knowing the rest of `.harn-runs/release-harn`.
-
-## Files
-
-- `manifest.json`: schema/version metadata, release identity, and file map.
-- `release-run.json`: the full release harness run payload.
-- `deterministic-events.jsonl`: deterministic release facts, findings, and step records.
-- `agent-events.jsonl`: model-authored review, changelog synthesis, and recovery advice.
-- `tool-observations.jsonl`: command/read/tool observations, including failed command stdout/stderr.
-
-## Source Split
-
-Rows with `"source":"deterministic"` are harness-owned facts or command
-results. Rows with `"source":"agent"` are model-authored text, tool summaries,
-or recovery recommendations and must be treated as advisory.
-
-## Release
-
-- Repo: `${payload.analysis.repo}`
-- Mode: `${payload.analysis.mode}`
-- Mock: `${payload.analysis.mock}`
-- Version: `${payload.analysis.current_version}` -> `${payload.analysis.next_version}`
-- Branch: `${payload.analysis.branch}` -> `${payload.analysis.expected_branch}`
-- Latest tag: `${payload.analysis.latest_tag}`
-"""
+  let a = payload.analysis
+  return render(
+    "@prompts/release_fixture_readme.harn.prompt",
+    {
+      repo: a.repo,
+      mode: a.mode,
+      mock: a.mock,
+      current_version: a.current_version,
+      next_version: a.next_version,
+      branch: a.branch,
+      expected_branch: a.expected_branch,
+      latest_tag: a.latest_tag,
+    },
+  )
 }
 
 fn write_crystallization_fixture(run_id, payload, report_paths) {
@@ -2573,23 +2524,18 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
     return steps
   }
   let cmd = prepare_command(cfg)
-  let live_log = command_live_log_path(run_id, "prepare")
-  mkdir(dirname(live_log), true)
-  release_log_event(
-    run_id,
-    "step_started",
-    {step: "prepare", command: cmd, live_log: live_log, tail_hint: "tail -f " + live_log},
-  )
-  let r = if cfg.mock {
-    run_cmd(cfg, cmd)
-  } else {
-    run_cmd(cfg, live_logged_command(cmd, live_log))
-  }
-  steps = steps + [{...recorded_step("prepare", cmd, r), live_log: live_log}]
+  release_log_event(run_id, "step_started", {step: "prepare", command: cmd})
+  let prepare = append_command_step(cfg, steps, "prepare", cmd)
+  steps = prepare.steps
   release_log_event(
     run_id,
     "step_finished",
-    {step: "prepare", success: r.success, status: r.status, live_log: live_log},
+    {
+      step: "prepare",
+      success: prepare.success,
+      status: prepare.status,
+      live_log: prepare.step.live_log ?? "",
+    },
   )
   if execution_failed(steps) {
     release_log_event(
