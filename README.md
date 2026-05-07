@@ -93,7 +93,7 @@ avoid compiling Harn from source on every run.
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
    record.
-6. **Summarize**: a read-only `llm_call` against the local model produces a
+6. **Summarize**: a read-only `summary_agent` against the local model produces a
    short bullet list of anomalies for the operator. The LLM is **never**
    allowed to drive a side-effect. If the local model returns anything other
    than plain markdown bullets after one repair attempt, the harness records
