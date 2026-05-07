@@ -93,7 +93,7 @@ avoid compiling Harn from source on every run.
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
    record.
-6. **Summarize**: a read-only `llm_call` against the local model produces a
+6. **Summarize**: a read-only `summary_agent` against the local model produces a
    short bullet list of anomalies for the operator. The LLM is **never**
    allowed to drive a side-effect. If the local model returns anything other
    than plain markdown bullets after one repair attempt, the harness records
@@ -109,14 +109,15 @@ A second invocation against an unchanged fleet is essentially a no-op:
 - `pipeline main()` as entry point with exit-code-as-return-value semantics.
 - `parallel settle … with { max_concurrent: 4 }` for bounded fan-out, with
   per-repo failure isolation via `Result.Err`.
-- `shell()` / `shell_at()` for every external interaction (no embedded
-  HTTP).
+- `std/command` command steps for release command execution, retries, tails,
+  and artifact references; `shell()` / `shell_at()` remain for small discovery
+  probes and mocked fixtures.
 - `render(...)` against a `.harn.prompt` template + `[asset_roots]` alias
-  for the audit markdown.
-- `llm_call` through Ollama for an on-machine summary. The default summary
-  model is intentionally separate from the tool-driving release model so this
-  read-only audit task can use a smaller model that reliably emits compact
-  bullets.
+  for audit markdown, PR bodies, recovery prompts, and fixture readmes.
+- `summary_agent` through Ollama for an on-machine summary. The default
+  summary model is intentionally separate from the tool-driving release model
+  so this read-only audit task can use a smaller model that reliably emits
+  compact bullets.
 - `sha3_256` + `uuid_v7` for cryptographically tagged audit identity.
 - `regex_captures`, `json_parse`/`json_stringify`, `mkdir`, `file_exists`,
   `read_file`/`write_file` from the stdlib.
@@ -219,8 +220,6 @@ Reports are written to:
 ```text
 .harn-runs/release-harn/<run-id>/
 ├── run-events.jsonl
-├── live-logs/
-│   └── prepare.log
 ├── release-audit.json
 ├── release-audit.md
 └── crystallization-input/
@@ -240,9 +239,9 @@ text, and preserves command observations with stdout/stderr so failed pushes or
 hooks can be replayed offline without reading sibling run artifacts.
 
 For live runs, `run-events.jsonl` is append-only and safe to tail while the
-harness is still running. Long `scripts/release_ship.sh --prepare` output is
-also redirected to `live-logs/prepare.log`, which can be tailed separately
-while `shell_at()` is still waiting for the child process to exit.
+harness is still running. Long command output is captured by `std/command`; the
+step records include `command_id` / `output_path` references that can be read
+with the command artifact readers or the release artifact tools during recovery.
 
 The script intentionally keeps the agent advisory. Deterministic checks and
 the repo's own `scripts/release_ship.sh` / `scripts/release_gate.sh` own the
