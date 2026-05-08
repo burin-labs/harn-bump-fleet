@@ -1,0 +1,201 @@
+name: Bump Harn Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional Harn tag to bump to, for example v0.7.62. Defaults to the latest published release."
+        required: false
+        type: string
+  schedule:
+    - cron: "43 9 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-harn-runtime
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.8.1
+        with:
+          shared-key: bump-harn-runtime
+
+      - name: Resolve target Harn release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "${VERSION}" ]; then
+            VERSION="$(gh api repos/burin-labs/harn/releases/latest --jq '.tag_name')"
+          fi
+          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected tag like v0.7.62, got '${VERSION}'" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for published Harn crate
+        id: published
+        env:
+          VERSION_NO_V: ${{ steps.version.outputs.version_no_v }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..30}; do
+            if cargo info "harn-cli@${VERSION_NO_V}" >/dev/null 2>&1; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "harn-cli ${VERSION_NO_V} is published." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "Skipping bump: harn-cli ${VERSION_NO_V} is not published yet." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop when release is not ready
+        if: steps.published.outputs.ready != 'true'
+        run: exit 0
+
+      - name: Update .harn-version
+        id: update
+        if: steps.published.outputs.ready == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${VERSION}" > .harn-version
+          if git diff --quiet -- .harn-version; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install target Harn
+        if: steps.update.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_NO_V: ${{ steps.version.outputs.version_no_v }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          HARN_INSTALL_ROOT="${RUNNER_TEMP}/harn-${VERSION_NO_V}" bash scripts/install_harn.sh "${VERSION}"
+
+      - name: Refresh Harn files
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          harn --version
+          harn install --locked
+          mapfile -t harn_files < <(git ls-files '*.harn')
+          if (( ${#harn_files[@]} > 0 )); then
+            harn fmt "${harn_files[@]}"
+            harn check "${harn_files[@]}"
+            harn lint "${harn_files[@]}"
+          fi
+          if [ -d tests ]; then
+            harn test tests/ --verbose
+          fi
+
+      - name: Stop when repo is already current
+        if: steps.published.outputs.ready == 'true' && steps.update.outputs.changed != 'true'
+        run: |
+          echo "Harn pin already matches ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Commit and push bump branch
+        if: steps.update.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="automation/bump-harn-runtime"
+          git config user.name "harn-release-bot[bot]"
+          git config user.email "harn-release-bot[bot]@users.noreply.github.com"
+          git checkout -B "${BRANCH}"
+          git add .harn-version
+          while IFS= read -r -d '' file; do
+            git add "$file"
+          done < <(git ls-files -z '*.harn')
+          git commit -m "chore: bump Harn runtime to ${VERSION}"
+          git push --force-with-lease origin HEAD:${BRANCH}
+
+      - name: Create or refresh PR
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_NO_V: ${{ steps.version.outputs.version_no_v }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="automation/bump-harn-runtime"
+          TITLE="Bump Harn runtime to ${VERSION}"
+          BODY_FILE="$(mktemp)"
+          cat > "${BODY_FILE}" <<EOF
+          ## Summary
+          - bump the pinned Harn crate tag in \`.harn-version\` to \`${VERSION}\`
+          - refresh formatter output with \`harn ${VERSION_NO_V}\`
+          - let normal CI rerun the Harn static checks against the published release
+
+          ## Verification
+          - \`harn fmt\`
+          - \`harn check\`
+          - \`harn lint\`
+          - \`harn test tests/ --verbose\`
+          EOF
+
+          PR_NUMBER="$(gh pr list --repo "${REPO}" --head "${BRANCH}" --base main --json number --jq '.[0].number // ""')"
+          if [ -n "${PR_NUMBER}" ]; then
+            gh pr edit "${PR_NUMBER}" --repo "${REPO}" --title "${TITLE}" --body-file "${BODY_FILE}"
+          else
+            gh pr create \
+              --repo "${REPO}" \
+              --base main \
+              --head "${BRANCH}" \
+              --title "${TITLE}" \
+              --body-file "${BODY_FILE}"
+          fi
+
+          PR_NUMBER="$(gh pr list --repo "${REPO}" --head "${BRANCH}" --base main --json number --jq '.[0].number // ""')"
+          if [ -n "${PR_NUMBER}" ]; then
+            if gh pr merge "${PR_NUMBER}" --repo "${REPO}" --auto --squash; then
+              echo "Enabled auto-merge for #${PR_NUMBER}." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Created or refreshed #${PR_NUMBER}, but auto-merge is not enabled for this repository." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
