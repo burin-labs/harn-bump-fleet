@@ -43,7 +43,7 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
 
 ## Dependencies
 
-- `harn` v0.7.x.
+- `harn` v0.8.x.
 - `gh` CLI, authenticated — the script never embeds tokens, just shells out.
 - A local Ollama model for the end-of-run summary; defaults to
   `gemma4:26b` via Harn's built-in `ollama` provider. Override via
@@ -62,8 +62,14 @@ on its default `http://localhost:11434` endpoint.
 
 GitHub Actions runs `harn check`, `harn fmt --check`, and `harn lint` across
 all tracked `*.harn` files, then runs `harn test tests/` when local tests are
-present. CI installs the pinned prebuilt Harn binary from `.harn-version` to
-avoid compiling Harn from source on every run.
+present. CI installs the pinned published `harn-cli` crate version from
+`.harn-version` through `scripts/install_harn.sh`.
+
+This repo also ships `.github/workflows/bump-harn.yml`, so future fleet runs
+can update `harn-bump-fleet` itself through the same
+`automation/bump-harn-runtime` PR flow as the connector repos. This repository
+stores `.harn-version` as the release tag (`vX.Y.Z`) while the installer and
+fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
 
 ## What it does, in order
 
@@ -98,6 +104,10 @@ avoid compiling Harn from source on every run.
    allowed to drive a side-effect. If the local model returns anything other
    than plain markdown bullets after one repair attempt, the harness records
    the summary as unavailable instead of leaking reasoning text into the audit.
+7. **Clean up**: after a live run, if the local `harn-bump-fleet` checkout is
+   clean, use `std/git` to fetch `origin`, switch back to `main`, and
+   fast-forward it. Dirty local worktrees are left untouched and the skip is
+   recorded in the audit.
 
 ## Idempotency guarantees
 
@@ -214,6 +224,17 @@ classification, and execution transcript are fed back through a recovery
 automatic bypass is the documented pre-push case where the hook output reports
 green tests and a wall-clock budget timeout; that retry uses
 `git push --no-verify` and records both attempts.
+
+After a successful live `ship-pr`, the harness performs the same conservative
+`std/git` checkout cleanup in the target Harn repo: if the release checkout is
+clean, it fetches `origin`, switches to the base branch, and fast-forwards it.
+Dirty worktrees are left in place and recorded as skipped cleanup, so failed or
+manual recovery runs still preserve local evidence.
+
+The local LLM summary path uses `std/llm/handlers.with_retry` rather than the
+deprecated `llm_retries` option. The release audit handoff likewise avoids the
+deprecated `post_turn_callback.llm_options` patch and carries next-turn tool
+changes through `next_options`.
 
 Reports are written to:
 
