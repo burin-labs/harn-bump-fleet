@@ -79,7 +79,11 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
 2. **Resolve** the target Harn release. Defaults to
    `gh api repos/burin-labs/harn/releases/latest`; an explicit `vX.Y.Z` arg
    overrides.
-3. **Idempotency pre-check** per repo:
+3. **Wait for release readiness** on live runs. Before dispatching anything,
+   the fleet waits for `harn-cli@X.Y.Z` to be visible on crates.io and for the
+   Linux release binary asset to exist on the GitHub release. Dry runs skip
+   this wait.
+4. **Idempotency pre-check** per repo:
    - Read origin/main directly from GitHub. Local worktrees are only used for
      discovery and as a fallback audit hint.
    - If origin/main's `.harn-version` (or `harn-vm = "..."` in `Cargo.toml`)
@@ -90,21 +94,21 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
      `pr_already_set`.
    - If that automation PR is stale, close it before redispatching so an old
      version bump cannot accidentally sit in the merge queue.
-4. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
+5. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
    the resulting workflow run to completion, locate the PR the workflow
    pushed, verify its head pin matches the target, and idempotently call
    `gh pr merge --auto --squash` on it. A successful workflow with no matching
    PR and no matching origin/main pin is a failed fleet outcome.
-5. **Audit**: write `audit.json` and a rendered markdown report to
+6. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
    record.
-6. **Summarize**: a read-only `summary_agent` against the local model produces a
+7. **Summarize**: a read-only `summary_agent` against the local model produces a
    short bullet list of anomalies for the operator. The LLM is **never**
    allowed to drive a side-effect. If the local model returns anything other
    than plain markdown bullets after one repair attempt, the harness records
    the summary as unavailable instead of leaking reasoning text into the audit.
-7. **Clean up**: after a live run, if the local `harn-bump-fleet` checkout is
+8. **Clean up**: after a live run, if the local `harn-bump-fleet` checkout is
    clean, use `std/git` to fetch `origin`, switch back to `main`, and
    fast-forward it. Dirty local worktrees are left untouched and the skip is
    recorded in the audit.
