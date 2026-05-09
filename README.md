@@ -85,10 +85,14 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
    this wait.
 4. **Idempotency pre-check** per repo:
    - Read origin/main directly from GitHub. Local worktrees are only used for
-     discovery and as a fallback audit hint.
+     discovery and as an audit signal.
    - If origin/main's `.harn-version` (or `harn-vm = "..."` in `Cargo.toml`)
      already matches the target, status is `already_current` and no workflow
      is dispatched.
+   - Record both the local checkout pin and the remote main pin. A stale local
+     checkout no longer gets hidden behind the remote idempotency check; the
+     audit calls out local checkout drift while still treating remote main as
+     the source of truth for dispatch decisions.
    - If an open PR on `automation/bump-harn-runtime` has a head pin that
      already matches the target, ensure auto-merge is on and status is
      `pr_already_set`.
@@ -108,9 +112,9 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
    allowed to drive a side-effect. If the local model returns anything other
    than plain markdown bullets after one repair attempt, the harness renders
    deterministic fallback bullets from status counts, dispatched repo count,
-   failures, auto-merge failures, and duration outliers instead of erasing the
-   summary. The audit JSON keeps deterministic summary facts, model attempts,
-   and the selected summary source separate.
+   failures, auto-merge failures, local checkout drift, and duration outliers
+   instead of erasing the summary. The audit JSON keeps deterministic summary
+   facts, model attempts, and the selected summary source separate.
 8. **Clean up**: after a live run, if the local `harn-bump-fleet` checkout is
    clean, use `std/git` to fetch `origin`, switch back to `main`, and
    fast-forward it. Dirty local worktrees are left untouched and the skip is
