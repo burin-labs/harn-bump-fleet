@@ -18,6 +18,7 @@ import { checkout_cleanup } from "lib/checkout_cleanup"
 import {
   agent_changelog_section,
   agent_result_text,
+  raw_agent_changelog_section,
   validate_release_agent_audit_with_context,
 } from "lib/release_audit"
 import { append_std_command_step, append_std_github_command_step } from "lib/release_commands"
@@ -98,6 +99,8 @@ Flags:
   --bump patch|minor|major  Version bump type. Defaults to patch.
   --mode audit|prepare|ship-pr
   --agent                 Ask a local model to review the release evidence with read/search/run tools.
+                          Live prepare/ship-pr requires --agent unless CHANGELOG.md
+                          already starts with the target version.
   --model MODEL           Local model id for --agent. Defaults to HARN_RELEASE_MODEL or qwen3.6:35b-a3b-coding-nvfp4.
   --provider PROVIDER     LLM provider for --agent. Defaults to HARN_RELEASE_PROVIDER or ollama.
   --mock                  Use fake command/file tools for a v0.7.52 -> v0.7.53 release rehearsal.
@@ -446,6 +449,55 @@ fn post_tag_commit_count(analysis) {
   return len(commits.split("\n").filter({ line -> trim(line) != "" }))
 }
 
+fn pr_numbers_from_commits(commits) {
+  var seen = {}
+  var out = []
+  for line in split(commits ?? "", "\n") {
+    for m in regex_captures("\\(#([0-9]+)\\)", line) {
+      let number = m.groups[0]
+      if seen[number] ?? false {
+        continue
+      }
+      seen[number] = true
+      out = out + [number]
+    }
+  }
+  return out
+}
+
+fn release_pr_details(cfg, commits) {
+  let numbers = pr_numbers_from_commits(commits)
+  if len(numbers) == 0 {
+    return ""
+  }
+  if cfg.mock {
+    return "PR #998\n{\"number\":998,\"title\":\"release: consolidate harn release PR flow\",\"body\":\"Mock PR body describing the one-PR release handoff, auto-merge enablement, and release workflow consolidation.\",\"files\":[\"CHANGELOG.md\",\"scripts/release_ship.sh\"]}"
+  }
+  let jq = require_shell_arg("{number,title,url,body,files:[.files[].path]}", "gh pr view --jq")
+  var blocks = []
+  for number in numbers {
+    if len(blocks) >= 20 {
+      break
+    }
+    let r = run_cmd(
+      cfg,
+      "gh pr view " + number
+        + " --json number,title,url,body,files --jq "
+        + jq,
+    )
+    if r.success && trim(r.stdout) != "" {
+      blocks = blocks + ["PR #${number}\n" + truncate_text(trim(r.stdout), 5000)]
+    } else {
+      blocks = blocks
+        + [
+        "PR #${number}\nmetadata unavailable from `gh pr view`: "
+          + truncate_text(trim(r.stderr ?? r.stdout ?? ""), 1000),
+      ]
+    }
+  }
+  return truncate_text(blocks.join("\n\n---\n\n"), 24000)
+}
+
 fn compact_agent_analysis(analysis) {
   return {
     repo: analysis.repo,
@@ -466,6 +518,8 @@ fn compact_agent_analysis(analysis) {
     commits_since_latest_tag: truncate_text(analysis.commits_since_latest_tag, 8000),
     commit_stats_since_latest_tag: truncate_text(analysis.commit_stats_since_latest_tag, 12000),
     commit_file_changes_since_latest_tag: truncate_text(analysis.commit_file_changes_since_latest_tag, 12000),
+    post_tag_pr_numbers: analysis.post_tag_pr_numbers ?? [],
+    post_tag_pr_details: truncate_text(analysis.post_tag_pr_details ?? "", 12000),
     changelog_section: changelog_section_for_agent(analysis),
     changelog_unreleased_section: truncate_text(analysis.changelog_unreleased_section ?? "", 10000),
     release_scripts: analysis.release_scripts,
@@ -535,6 +589,13 @@ ${changelog_section_for_agent(analysis)}
 
 Recent post-tag commits:
 ${truncate_text(analysis.commits_since_latest_tag, 8000)}
+
+Post-tag PR descriptions and touched files:
+${if trim(analysis.post_tag_pr_details ?? "") == "" {
+    "(none)"
+  } else {
+    truncate_text(analysis.post_tag_pr_details, 12000)
+  }}
 
 Representative per-commit stats:
 ${truncate_text(analysis.commit_stats_since_latest_tag, 12000)}
@@ -829,12 +890,30 @@ fn release_repair_tools(cfg, run_id) {
 }
 
 fn release_review_post_turn(payload, analysis) {
-  let successful = payload?.successful_tool_names ?? []
-  if successful.contains("release_run") {
+  let successful = payload?.session_successful_tools ?? payload?.successful_tool_names ?? []
+  let has_delta_command = successful.contains("release_run") || successful.contains("release_git")
+  let has_content_evidence = successful.contains("release_read") || successful.contains("release_search")
+    || successful.contains("release_git") || successful.contains("release_run_output")
+    || successful.contains("release_run_tail")
+  if has_delta_command && (has_content_evidence || analysis.mock) {
     let final_tools = tool_registry()
     return {
       message: release_finalization_prompt(analysis),
-      next_options: {tools: final_tools, tool_choice: "none", max_tokens: 2200, loop_until_done: false, max_nudges: 0},
+      next_options: {
+        tools: final_tools,
+        tool_choice: "none",
+        max_tokens: 2200,
+        loop_until_done: false,
+        max_iterations: 1,
+        max_nudges: 0,
+        iteration_budget: {mode: "fixed", initial: 1, max: 1, extend_by: 0},
+        post_turn_callback: nil,
+      },
+    }
+  }
+  if has_delta_command && !has_content_evidence {
+    return {
+      message: "Before finalizing, inspect at least one concrete content source with release_read, release_search, release_git, release_run_output, or release_run_tail. Prefer PR bodies, touched docs, or representative diffs over commit titles.",
     }
   }
   return nil
@@ -861,12 +940,39 @@ fn release_host_tool_formatter(value, _key) {
 }
 
 fn validate_agent_attempt(_cfg, analysis, result, text) {
-  return validate_release_agent_audit_with_context(
+  var findings = validate_release_agent_audit_with_context(
     analysis.next_version,
     result,
     text,
     {first_post_tag_commit: first_post_tag_commit(analysis)},
   )
+  let successful = result?.tools?.successful ?? []
+  if len(successful) > 0 && starts_with(trim(text), "Audit:")
+    && raw_agent_changelog_section(text) != "" {
+    var filtered = []
+    for finding in findings {
+      if starts_with(finding, "agent_loop ended with status `budget_exhausted`") {
+        continue
+      }
+      filtered = filtered + [finding]
+    }
+    findings = filtered
+  }
+  if len(successful) > 0 {
+    let has_delta = successful.contains("release_run") || successful.contains("release_git")
+    let has_content = successful.contains("release_read") || successful.contains("release_search")
+      || successful.contains("release_git") || successful.contains("release_run_output")
+      || successful.contains("release_run_tail")
+    if !has_delta {
+      findings = findings
+        + ["agent did not successfully inspect the release delta with release_run or release_git"]
+    }
+    if !has_content && !analysis.mock {
+      findings = findings
+        + ["agent did not successfully inspect concrete PR, file, or diff evidence before drafting"]
+    }
+  }
+  return findings
 }
 
 fn agent_repair_prompt(validation_findings, _prior_text, analysis) {
@@ -959,6 +1065,8 @@ fn analyze_release(cfg) {
   let commits = checked(cfg, "git log --oneline --no-merges " + log_range_arg(latest_tag))
   let commit_file_changes = release_file_changes(cfg, latest_tag)
   let commit_stats = release_commit_stats(cfg, latest_tag)
+  let post_tag_pr_numbers = pr_numbers_from_commits(commits)
+  let post_tag_pr_details = release_pr_details(cfg, commits)
   let section = changelog_section(cfg)
   let unreleased_section = changelog_unreleased_section(cfg)
   let recent_merged_prs = optional_output(
@@ -1021,6 +1129,8 @@ fn analyze_release(cfg) {
     commits_since_latest_tag: commits,
     commit_file_changes_since_latest_tag: commit_file_changes,
     commit_stats_since_latest_tag: commit_stats,
+    post_tag_pr_numbers: post_tag_pr_numbers,
+    post_tag_pr_details: post_tag_pr_details,
     recent_merged_prs: recent_merged_prs,
     changelog_section: section,
     changelog_unreleased_section: unreleased_section,
@@ -1180,9 +1290,7 @@ fn run_release_agent_loop(
       llm_transcript_dir: paths.llm_transcript_dir,
     },
   )
-  if require_tool_evidence {
-    options = {...options, require_successful_tools: ["release_run"]}
-  } else {
+  if !require_tool_evidence {
     options = {...options, tool_choice: "none"}
   }
   return agent_loop(prompt, system, options)
@@ -1581,14 +1689,21 @@ fn agent_review(cfg, analysis, run_id) {
             name: "release_run",
             arguments: {argv: ["git", "log", "--oneline", "v0.7.52..HEAD", "--max-count=30"]},
           },
+          {
+            id: "read_1",
+            name: "release_read",
+            arguments: {path: "CHANGELOG.md"},
+          },
         ],
       },
     )
-    llm_mock(
-      {
-        text: "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
-      },
-    )
+    let mock_final = {
+      text: "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
+    }
+    llm_mock(mock_final)
+    llm_mock(mock_final)
+    llm_mock(mock_final)
+    llm_mock(mock_final)
   }
   let system = render("@prompts/release_agent_system.harn.prompt", {})
   let prompt = render(
@@ -2015,6 +2130,20 @@ fn release_notes_draft_path(run_id, analysis, agent_review_result) {
   return write_deterministic_release_notes(run_id, analysis)
 }
 
+fn live_release_notes_blocker(cfg, analysis) {
+  if cfg.mode == "audit" || cfg.agent || analysis.changelog_top == analysis.next_version {
+    return nil
+  }
+  return recorded_step(
+    "release-notes-agent-required",
+    "require agent-authored or manually prepared release notes before live release side effects",
+    fail(
+      2,
+      "live ${cfg.mode} would need to draft CHANGELOG.md v${analysis.next_version}, but --agent was not enabled. Rerun with --agent so the harness can inspect PR bodies/files/diffs, or manually add a ## v${analysis.next_version} section before running live release.",
+    ),
+  )
+}
+
 fn ensure_release_notes_with_run_id(cfg, analysis, agent_review_result, run_id) {
   let current_top = changelog_top(cfg)
   if current_top == analysis.next_version {
@@ -2291,6 +2420,8 @@ fn deterministic_fixture_events(payload) {
         commits_since_latest_tag: a.commits_since_latest_tag,
         commit_stats_since_latest_tag: a.commit_stats_since_latest_tag,
         commit_file_changes_since_latest_tag: a.commit_file_changes_since_latest_tag,
+        post_tag_pr_numbers: a.post_tag_pr_numbers ?? [],
+        post_tag_pr_details: a.post_tag_pr_details ?? "",
       },
     },
   ]
@@ -3054,6 +3185,8 @@ pipeline main() {
         fail(2, "agent review failed validation:\n" + agent_review_result.validation_findings.join("\n")),
       ),
     ]
+  } else if live_release_notes_blocker(cfg, analysis) != nil {
+    execution = [live_release_notes_blocker(cfg, analysis)]
   } else if cfg.mode == "prepare" {
     println("== running prepare ...")
     release_log_event(run_id, "mode_execution_started", {mode: "prepare"})
