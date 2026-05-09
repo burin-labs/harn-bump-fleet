@@ -1,0 +1,1046 @@
+#!/usr/bin/env harn
+//
+// One-off meta-audit harness for the release and fleet scripts.
+//
+// This is intentionally not wired into CI or the normal release/bump loops. It
+// gathers deterministic facts from recent .harn-runs artifacts, then gives a
+// local model read-only tools over ~/projects so it can cross-reference the
+// harness and Harn implementations before writing recommendations.
+import { agent_host_tools } from "std/agent/host_tools"
+import { agent_preset } from "std/agent/presets"
+import { agent_result_text } from "lib/release_audit"
+import { safe_shell_arg } from "lib/shell_util"
+import { truncate_text } from "lib/text_util"
+
+let RUN_ROOT = ".harn-runs/harness-self-review"
+
+let DEFAULT_MODEL = env_or("HARN_SELF_REVIEW_MODEL", env_or("HARN_RELEASE_MODEL", "qwen3.6:35b-a3b-coding-nvfp4"))
+
+let DEFAULT_PROVIDER = env_or("HARN_SELF_REVIEW_PROVIDER", env_or("HARN_RELEASE_PROVIDER", "ollama"))
+
+let DEFAULT_TOOL_FORMAT = env_or("HARN_SELF_REVIEW_TOOL_FORMAT", "text")
+
+let DEFAULT_PROJECTS_ROOT = path_join(env_or("HOME", ""), "projects")
+
+let DEFAULT_HARN_REPO = path_join(DEFAULT_PROJECTS_ROOT, "harn")
+
+let IMPORTANT_RELEASE_RUNS = [
+  "019e0859-b02f-7263-ba03-112aaa31b3aa",
+  "019e0868-036a-7a22-a646-a20b1a2e1223",
+  "019e08a6-66fd-78f0-bce6-1021fcf11c96",
+]
+
+let IMPORTANT_BUMP_RUNS = ["019e08b0-b18f-7622-9f61-5d70bcec6bf6", "019e08b5-06d7-71e0-ae01-335f27df13a4"]
+
+let AUDIT_RUN_ARGV_PREFIXES = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "branch"],
+  ["git", "rev-parse"],
+  ["git", "ls-files"],
+  ["rg"],
+  ["grep"],
+  ["sed", "-n"],
+  ["head"],
+  ["tail"],
+  ["wc"],
+  ["ls"],
+  ["find"],
+]
+
+fn usage() {
+  return """
+Usage:
+  harn run harness_self_review.harn
+  harn run harness_self_review.harn -- --facts-only
+  harn run harness_self_review.harn -- --recent 10 --model qwen3.6:35b-a3b-coding-nvfp4
+
+Flags:
+  --facts-only           Gather deterministic facts and skip the local model.
+  --recent N             Include the N latest release and fleet runs. Defaults to 6.
+  --model MODEL          Local model id. Defaults to HARN_SELF_REVIEW_MODEL, HARN_RELEASE_MODEL, or qwen3.6.
+  --provider PROVIDER    LLM provider. Defaults to HARN_SELF_REVIEW_PROVIDER, HARN_RELEASE_PROVIDER, or ollama.
+  --tool-format text|native  Tool protocol for the review agent. Defaults to text.
+  --with-tools           Use the experimental read-only agent tool loop before synthesis.
+  --projects-root PATH   Read-only tool root. Defaults to ~/projects.
+  --harn-repo PATH       Harn repo path mentioned in the audit facts. Defaults to ~/projects/harn.
+"""
+}
+
+@complexity(allow)
+fn parse_args(args) {
+  var cfg = {
+    facts_only: false,
+    help: false,
+    recent: 6,
+    model: DEFAULT_MODEL,
+    provider: DEFAULT_PROVIDER,
+    tool_format: DEFAULT_TOOL_FORMAT,
+    with_tools: false,
+    projects_root: DEFAULT_PROJECTS_ROOT,
+    harn_repo: DEFAULT_HARN_REPO,
+  }
+  var i = 0
+  while i < len(args) {
+    let a = args[i]
+    if a == "--facts-only" {
+      cfg.facts_only = true
+    } else if a == "--help" || a == "-h" {
+      cfg.help = true
+    } else if a == "--recent" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--recent requires a positive integer"
+      }
+      cfg.recent = to_int(args[i])
+      if cfg.recent <= 0 {
+        throw "--recent must be positive"
+      }
+    } else if a == "--model" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--model requires a value"
+      }
+      cfg.model = args[i]
+    } else if a == "--provider" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--provider requires a value"
+      }
+      cfg.provider = args[i]
+    } else if a == "--tool-format" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--tool-format requires text or native"
+      }
+      if args[i] != "text" && args[i] != "native" {
+        throw "--tool-format must be text or native"
+      }
+      cfg.tool_format = args[i]
+    } else if a == "--with-tools" {
+      cfg.with_tools = true
+    } else if a == "--projects-root" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--projects-root requires a path"
+      }
+      cfg.projects_root = args[i]
+    } else if a == "--harn-repo" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--harn-repo requires a path"
+      }
+      cfg.harn_repo = args[i]
+    } else {
+      throw "unknown flag: ${a}"
+    }
+    i = i + 1
+  }
+  return cfg
+}
+
+fn run_output_dir(run_id) {
+  return path_join(cwd(), RUN_ROOT, run_id)
+}
+
+fn review_artifact_paths(run_id) {
+  let out_dir = run_output_dir(run_id)
+  return {
+    out_dir: out_dir,
+    facts_json: path_join(out_dir, "facts.json"),
+    report_md: path_join(out_dir, "review.md"),
+    raw_result_json: path_join(out_dir, "agent-result.json"),
+    trace_json: path_join(out_dir, "agent-trace.json"),
+    llm_transcript_dir: path_join(out_dir, "agent-llm"),
+    llm_transcript_jsonl: path_join(out_dir, "agent-llm/llm_transcript.jsonl"),
+  }
+}
+
+fn basename(path) {
+  let parts = (path ?? "").split("/").filter({ p -> p != "" })
+  if len(parts) == 0 {
+    return path ?? ""
+  }
+  return parts[len(parts) - 1]
+}
+
+fn relative_to(root, path) {
+  let prefix = root + "/"
+  if starts_with(path, prefix) {
+    return path[len(prefix):len(path)]
+  }
+  return path
+}
+
+fn count_occurrences(text, needle) {
+  if needle == "" {
+    return 0
+  }
+  return len((text ?? "").split(needle)) - 1
+}
+
+fn artifact_text(path) {
+  let p = path ?? ""
+  if p == "" || !file_exists(p) {
+    return ""
+  }
+  return read_file(p)
+}
+
+fn read_json_file(path) {
+  if !file_exists(path) {
+    return nil
+  }
+  return try {
+    json_parse(read_file(path))
+  } catch (_e) {
+    nil
+  }
+}
+
+fn read_jsonl(path) {
+  var events = []
+  if !file_exists(path) {
+    return events
+  }
+  for line in read_file(path).split("\n") {
+    let t = trim(line)
+    if t == "" {
+      continue
+    }
+    let event = try {
+      json_parse(t)
+    } catch (_e) {
+      nil
+    }
+    if event != nil {
+      events = events + [event]
+    }
+  }
+  return events
+}
+
+fn add_count(counts, key) {
+  let k = key ?? ""
+  if k == "" {
+    return counts
+  }
+  var out = counts
+  out[k] = out[k] ?? 0 + 1
+  return out
+}
+
+fn contains_any_arg(argv, disallowed) {
+  for arg in argv {
+    for flag in disallowed {
+      if arg == flag || starts_with(arg, flag + "=") {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+fn audit_run_policy(request, _args) {
+  let argv = request?.argv ?? []
+  if len(argv) < 1 {
+    return true
+  }
+  if argv[0] == "find" && contains_any_arg(argv, ["-delete", "-exec", "-execdir", "-ok", "-okdir"]) {
+    return "audit_run is read-only; find mutation/execution actions are blocked"
+  }
+  if len(argv) >= 2 && argv[0] == "git" && argv[1] == "tag" {
+    if contains_any_arg(
+      argv,
+      ["-a", "-d", "-f", "-m", "-s", "--annotate", "--delete", "--force", "--message", "--sign"],
+    ) {
+      return "audit_run is read-only; git tag mutation flags are blocked"
+    }
+  }
+  if len(argv) >= 2 && argv[0] == "git" && argv[1] == "branch" {
+    if contains_any_arg(argv, ["-c", "-C", "-d", "-D", "-m", "-M", "--copy", "--delete", "--move"]) {
+      return "audit_run is read-only; git branch mutation flags are blocked"
+    }
+  }
+  return true
+}
+
+fn audit_safe_tool_text(text) {
+  return (text ?? "")
+    .replace("{", "[open-brace]")
+    .replace("}", "[close-brace]")
+    .replace(
+    "<",
+    "[lt]",
+  )
+    .replace(
+    ">",
+    "[gt]",
+  )
+}
+
+fn audit_tool_formatter(value, _key) {
+  if type_of(value) != "dict" {
+    return "value: " + audit_safe_tool_text(to_string(value))
+  }
+  var lines = []
+  if value?.path != nil {
+    lines = lines + ["path: " + to_string(value.path)]
+  }
+  if value?.status != nil {
+    lines = lines + ["status: " + to_string(value.status)]
+  }
+  if value?.exit_code != nil {
+    lines = lines + ["exit_code: " + to_string(value.exit_code)]
+  }
+  if value?.command_id != nil {
+    lines = lines + ["command_id: " + to_string(value.command_id)]
+  }
+  if type_of(value?.content) == "string" {
+    lines = lines
+      + [
+      "content_truncated_by_harness: " + to_string(len(value.content) > 8000),
+      "content:",
+      audit_safe_tool_text(truncate_text(value.content, 8000)),
+    ]
+  }
+  if type_of(value?.stdout) == "string" {
+    lines = lines
+      + [
+      "stdout_truncated_by_harness: " + to_string(len(value.stdout) > 8000),
+      "stdout:",
+      audit_safe_tool_text(truncate_text(value.stdout, 8000)),
+    ]
+  }
+  if type_of(value?.stderr) == "string" && value.stderr != "" {
+    lines = lines
+      + [
+      "stderr_truncated_by_harness: " + to_string(len(value.stderr) > 5000),
+      "stderr:",
+      audit_safe_tool_text(truncate_text(value.stderr, 5000)),
+    ]
+  }
+  if len(lines) == 0 {
+    return "value: " + audit_safe_tool_text(json_stringify(value))
+  }
+  return lines.join("\n")
+}
+
+fn latest_dirs(root, limit) {
+  if !file_exists(root) {
+    return []
+  }
+  let root_arg = safe_shell_arg(root)
+  if root_arg == nil {
+    return []
+  }
+  let r = shell("find " + root_arg + " -mindepth 1 -maxdepth 1 -type d | sort | tail -n " + to_string(limit))
+  if !r.success {
+    return []
+  }
+  return r.stdout.split("\n").map({ d -> trim(d) }).filter({ d -> d != "" })
+}
+
+fn maybe_run_dir(root, run_id) {
+  let p = path_join(root, run_id)
+  if file_exists(p) {
+    return [p]
+  }
+  return []
+}
+
+fn unique_paths(paths) {
+  var seen = {}
+  var out = []
+  for path in paths {
+    if path == "" || seen[path] ?? false {
+      continue
+    }
+    seen[path] = true
+    out = out + [path]
+  }
+  return out
+}
+
+fn selected_run_dirs(root, important_run_ids, recent) {
+  var out = []
+  for run_id in important_run_ids {
+    out = out + maybe_run_dir(root, run_id)
+  }
+  out = out + latest_dirs(root, recent)
+  return unique_paths(out)
+}
+
+fn find_files(root, glob_name) {
+  if !file_exists(root) {
+    return []
+  }
+  let root_arg = safe_shell_arg(root)
+  let glob_arg = safe_shell_arg(glob_name)
+  if root_arg == nil || glob_arg == nil {
+    return []
+  }
+  let r = shell("find " + root_arg + " -type f -name " + glob_arg + " | sort")
+  if !r.success {
+    return []
+  }
+  return r.stdout.split("\n").map({ p -> trim(p) }).filter({ p -> p != "" })
+}
+
+fn transcript_summary(path) {
+  let events = read_jsonl(path)
+  let raw = artifact_text(path)
+  var provider_requests = 0
+  var provider_responses = 0
+  var tool_schema_count = 0
+  var native_tool_counts = []
+  var tool_choice_counts = {}
+  var response_tool_counts = {}
+  var response_tool_sequence = []
+  var response_protocol_leaks = 0
+  var response_code_fence_mentions = 0
+  var final_request = nil
+  var final_no_tools_request_seen = false
+  for event in events {
+    let typ = event?.type ?? ""
+    if typ == "tool_schemas" {
+      tool_schema_count = len(event?.schemas ?? [])
+    } else if typ == "provider_call_request" {
+      provider_requests = provider_requests + 1
+      let native_count = event?.native_tool_count ?? 0
+      let choice = event?.tool_choice ?? "(null)"
+      native_tool_counts = native_tool_counts + [native_count]
+      tool_choice_counts = add_count(tool_choice_counts, choice)
+      final_request = {
+        native_tool_count: native_count,
+        tool_choice: choice,
+        tool_format: event?.tool_format ?? "",
+        model: event?.model ?? "",
+        provider: event?.provider ?? "",
+        message_count: event?.message_count ?? nil,
+      }
+      if native_count == 0 && choice == "none" {
+        final_no_tools_request_seen = true
+      }
+    } else if typ == "provider_call_response" {
+      provider_responses = provider_responses + 1
+      let text = event?.text ?? ""
+      if contains(text, "<tool_call>") || contains(text, "<function=") || contains(text, "</function>") {
+        response_protocol_leaks = response_protocol_leaks + 1
+      }
+      if contains(text, "```") {
+        response_code_fence_mentions = response_code_fence_mentions + 1
+      }
+      for call in event?.tool_calls ?? [] {
+        let name = call?.name ?? ""
+        response_tool_counts = add_count(response_tool_counts, name)
+        response_tool_sequence = response_tool_sequence + [name]
+      }
+    }
+  }
+  var adjacent_repeats = []
+  var previous = ""
+  for name in response_tool_sequence {
+    if name != "" && name == previous {
+      adjacent_repeats = adjacent_repeats + [name]
+    }
+    previous = name
+  }
+  return {
+    path: path,
+    exists: file_exists(path),
+    bytes: if file_exists(path) {
+      stat(path).size
+    } else {
+      0
+    },
+    event_count: len(events),
+    provider_requests: provider_requests,
+    provider_responses: provider_responses,
+    tool_schema_count: tool_schema_count,
+    native_tool_counts: native_tool_counts,
+    tool_choice_counts: tool_choice_counts,
+    final_request: final_request,
+    final_no_tools_request_seen: final_no_tools_request_seen,
+    response_tool_counts: response_tool_counts,
+    adjacent_repeated_tool_names: adjacent_repeats,
+    response_protocol_leak_count: response_protocol_leaks,
+    response_code_fence_count: response_code_fence_mentions,
+    required_tool_missing_mentions: count_occurrences(raw, "required tools missing"),
+    done_judge_mentions: count_occurrences(raw, "done_judge") + count_occurrences(raw, "done-judge"),
+    done_prompt_mentions: count_occurrences(raw, "done_prompt") + count_occurrences(raw, "done-prompt"),
+    think_tag_mentions: count_occurrences(raw, "<think>"),
+  }
+}
+
+fn agent_result_summary(path) {
+  let raw = artifact_text(path)
+  let parsed = read_json_file(path)
+  if parsed == nil {
+    return {path: path, exists: file_exists(path), parseable: false}
+  }
+  let final_result = parsed?.final_result ?? parsed
+  let attempts = parsed?.attempts ?? []
+  return {
+    path: path,
+    exists: true,
+    parseable: true,
+    status: final_result?.status ?? "",
+    attempt_count: len(attempts),
+    attempt_statuses: attempts.map({ a -> {name: a?.name ?? "", status: a?.status ?? ""} }),
+    tool_mode: final_result?.tools?.mode ?? "",
+    successful_tools: final_result?.tools?.successful ?? [],
+    rejected_tools: final_result?.tools?.rejected ?? [],
+    required_tool_missing_mentions: count_occurrences(raw, "required tools missing"),
+    max_iterations_mentions: count_occurrences(raw, "max iterations"),
+  }
+}
+
+fn execution_step_refs(steps) {
+  var out = []
+  for step in steps ?? [] {
+    if type_of(step) != "dict" {
+      continue
+    }
+    out = out
+      + [
+      {
+        name: step?.name ?? "",
+        success: step?.success ?? step?.ok ?? nil,
+        status: step?.status ?? "",
+        classification: step?.classification ?? "",
+        command: step?.command ?? "",
+        recovery_hint: step?.recovery_hint ?? "",
+      },
+    ]
+  }
+  return out
+}
+
+fn release_run_summary(dir) {
+  let audit_path = path_join(dir, "release-audit.json")
+  let events_path = path_join(dir, "run-events.jsonl")
+  let result_path = path_join(dir, "agent-result.json")
+  let audit = read_json_file(audit_path)
+  let events = read_jsonl(events_path)
+  let primary_transcript = path_join(dir, "agent-llm/llm_transcript.jsonl")
+  let transcripts = find_files(dir, "llm_transcript.jsonl")
+  return {
+    kind: "release-harn",
+    run_id: basename(dir),
+    dir: dir,
+    audit_path: if file_exists(audit_path) {
+      audit_path
+    } else {
+      nil
+    },
+    events_path: if file_exists(events_path) {
+      events_path
+    } else {
+      nil
+    },
+    agent_result: agent_result_summary(result_path),
+    transcript_paths: transcripts,
+    primary_transcript: if file_exists(primary_transcript) {
+      transcript_summary(primary_transcript)
+    } else {
+      nil
+    },
+    recovery_transcripts: transcripts
+      .filter({ p -> p != primary_transcript })
+      .map({ p -> transcript_summary(p) }),
+    event_count: len(events),
+    event_types: events.map({ e -> e?.event_type ?? e?.type ?? "" }),
+    mode: audit?.mode ?? "",
+    started_iso: audit?.started_iso ?? "",
+    finished_iso: audit?.finished_iso ?? "",
+    current_version: audit?.analysis?.current_version ?? "",
+    next_version: audit?.analysis?.next_version ?? "",
+    branch: audit?.analysis?.branch ?? "",
+    changelog_top: audit?.analysis?.changelog_top ?? "",
+    deterministic_findings: audit?.analysis?.deterministic_findings ?? [],
+    agent_validation_findings: audit?.agent_review_detail?.validation_findings ?? [],
+    execution_steps: execution_step_refs(audit?.execution ?? []),
+    cleanup: audit?.cleanup ?? nil,
+  }
+}
+
+fn status_counts(outcomes) {
+  var counts = {}
+  for outcome in outcomes ?? [] {
+    counts = add_count(counts, outcome?.status ?? "")
+  }
+  return counts
+}
+
+fn bump_run_summary(dir) {
+  let audit_path = path_join(dir, "audit.json")
+  let md_path = path_join(dir, "audit.md")
+  let audit = read_json_file(audit_path)
+  return {
+    kind: "bump-fleet",
+    run_id: basename(dir),
+    dir: dir,
+    audit_path: if file_exists(audit_path) {
+      audit_path
+    } else {
+      nil
+    },
+    md_path: if file_exists(md_path) {
+      md_path
+    } else {
+      nil
+    },
+    started_iso: audit?.started_iso ?? "",
+    finished_iso: audit?.finished_iso ?? "",
+    mode: audit?.mode ?? "",
+    target_version: audit?.target_version ?? "",
+    repos_total: audit?.repos_total ?? nil,
+    repos_dispatched: audit?.repos_dispatched ?? nil,
+    status_counts: status_counts(audit?.outcomes ?? []),
+    summary_model: audit?.summary_model ?? "",
+    summary_text: audit?.summary_text ?? "",
+    cleanup: audit?.cleanup ?? nil,
+    outcome_refs: (audit?.outcomes ?? [])
+      .map(
+      { o -> {
+        slug: o?.slug ?? "",
+        status: o?.status ?? "",
+        detail: truncate_text(o?.detail ?? "", 400),
+        pr_url: o?.pr_url ?? nil,
+        run_url: o?.run_url ?? nil,
+      } },
+    ),
+  }
+}
+
+fn validation_ladder_summary() {
+  let root = path_join(cwd(), ".harn-runs/validation-ladder")
+  if !file_exists(root) {
+    return {exists: false}
+  }
+  let transcripts = find_files(root, "llm_transcript.jsonl")
+  return {
+    exists: true,
+    root: root,
+    audit_json_paths: find_files(root, "*audit.json"),
+    transcript_paths: transcripts,
+    transcripts: transcripts.map({ p -> transcript_summary(p) }),
+  }
+}
+
+fn self_review_run_summary(dir) {
+  let result_path = path_join(dir, "agent-result.json")
+  let transcript_path = path_join(dir, "agent-llm/llm_transcript.jsonl")
+  let synthesis_transcript_path = path_join(dir, "synthesis-llm/llm_transcript.jsonl")
+  let report_path = path_join(dir, "review.md")
+  return {
+    kind: "harness-self-review",
+    run_id: basename(dir),
+    dir: dir,
+    agent_result: agent_result_summary(result_path),
+    agent_transcript: if file_exists(transcript_path) {
+      transcript_summary(transcript_path)
+    } else {
+      nil
+    },
+    synthesis_transcript: if file_exists(synthesis_transcript_path) {
+      transcript_summary(synthesis_transcript_path)
+    } else {
+      nil
+    },
+    report_excerpt: truncate_text(artifact_text(report_path), 1200),
+  }
+}
+
+fn transcript_digest(summary) {
+  if summary == nil {
+    return "(none)"
+  }
+  return "requests=${summary.provider_requests}, responses=${summary.provider_responses}, tools="
+    + json_stringify(summary.response_tool_counts)
+    + ", final_no_tools="
+    + to_string(summary.final_no_tools_request_seen)
+    + ", required_tool_missing_mentions="
+    + to_string(summary.required_tool_missing_mentions)
+    + ", protocol_leaks="
+    + to_string(summary.response_protocol_leak_count)
+    + ", final_request="
+    + json_stringify(summary.final_request)
+}
+
+fn facts_digest(facts) {
+  var lines = []
+  lines = lines
+    + ["Run id: ${facts.run_id}", "Facts schema: ${facts.schema_version}", "Selected release runs:"]
+  for run in facts.release_runs {
+    lines = lines
+      + [
+      "- ${run.run_id}: mode=${run.mode}, next=${run.next_version}, branch=${run.branch}, events=${run.event_count}, primary=${transcript_digest(run.primary_transcript)}",
+    ]
+    for recovery in run.recovery_transcripts ?? [] {
+      lines = lines
+        + [
+        "  recovery ${basename(recovery.path)}: requests=${recovery.provider_requests}, tools=${json_stringify(recovery.response_tool_counts)}, adjacent_repeats=${json_stringify(recovery.adjacent_repeated_tool_names)}",
+      ]
+    }
+    if len(run.execution_steps ?? []) > 0 {
+      lines = lines
+        + [
+        "  execution steps: "
+          + json_stringify(
+          run.execution_steps
+            .map(
+            { step -> {name: step.name, success: step.success, classification: step.classification} },
+          ),
+        ),
+      ]
+    }
+  }
+  lines = lines + ["Selected bump-fleet runs:"]
+  for run in facts.bump_runs {
+    lines = lines
+      + [
+      "- ${run.run_id}: mode=${run.mode}, target=${run.target_version}, repos=${run.repos_total}, dispatched=${run.repos_dispatched}, statuses=${json_stringify(run.status_counts)}, summary=${run.summary_text}",
+    ]
+  }
+  lines = lines + ["Validation ladder:"]
+  for transcript in facts.validation_ladder?.transcripts ?? [] {
+    lines = lines
+      + ["- ${transcript.path}: ${transcript_digest(transcript)}"]
+  }
+  lines = lines + ["Prior self-review attempts:"]
+  for run in facts.self_review_runs ?? [] {
+    lines = lines
+      + [
+      "- ${run.run_id}: status=${run.agent_result?.status ?? \"\"}, transcript=${transcript_digest(run.agent_transcript)}, report_excerpt=${single_line_report_excerpt(run.report_excerpt)}",
+    ]
+  }
+  lines = lines + ["Source refs: " + json_stringify(facts.source_refs)]
+  return lines.join("\n")
+}
+
+fn single_line_report_excerpt(text) {
+  return truncate_text(regex_replace_all("\\s+", " ", trim(text ?? "")), 500)
+}
+
+fn rg_excerpt(label, path, pattern) {
+  if !file_exists(path) {
+    return "## ${label}\nmissing: ${path}"
+  }
+  let path_arg = safe_shell_arg(path)
+  let pattern_arg = safe_shell_arg(pattern)
+  if path_arg == nil || pattern_arg == nil {
+    return "## ${label}\nskipped: unsupported shell quoting"
+  }
+  let r = shell("rg -n -- " + pattern_arg + " " + path_arg + " | head -80")
+  let body = if trim(r.stdout) != "" {
+    r.stdout
+  } else {
+    "(no matches)"
+  }
+  return "## ${label}\npath: ${path}\npattern: ${pattern}\n"
+    + audit_safe_tool_text(truncate_text(body, 5000))
+}
+
+fn source_evidence_digest(cfg) {
+  let items = [
+    {
+      label: "release harness agent/tool plumbing",
+      path: path_join(cwd(), "release_harn.harn"),
+      pattern: "release_host_tools|release_review_post_turn|require_successful_tools|run_recovery_agent_loop|llm_transcript_dir|release_run_policy|release_replace_file|release_write_file|release_artifact",
+    },
+    {
+      label: "fleet summary and cleanup behavior",
+      path: path_join(cwd(), "bump_fleet.harn"),
+      pattern: "summarize_with_local_llm|summary_format_ok|restore_local_checkout_to_main|wait_for_target_release_readiness|discover_repos",
+    },
+    {
+      label: "release agent prompt guidance",
+      path: path_join(cwd(), "prompts/release_agent_system.harn.prompt"),
+      pattern: "tool|CHANGELOG|markdown|final|draft|prompt|Do not|must",
+    },
+    {
+      label: "release recovery prompt guidance",
+      path: path_join(cwd(), "prompts/release_recovery_system.harn.prompt"),
+      pattern: "markdown|lint|repair|live_log|tool|Do not",
+    },
+    {
+      label: "Harn host tool stdlib",
+      path: path_join(cfg.harn_repo, "crates/harn-stdlib/src/stdlib/agent/host_tools.harn"),
+      pattern: "output_format|result_formatter|resolve_path|read_file|run_command|tool_define",
+    },
+    {
+      label: "Harn agent loop completion/gating",
+      path: path_join(cfg.harn_repo, "crates/harn-stdlib/src/stdlib/agent/loop.harn"),
+      pattern: "require_successful_tools|required tools missing|done_judge|done_prompt|llm_transcript_dir|post_turn_callback",
+    },
+    {
+      label: "Harn agent presets",
+      path: path_join(cfg.harn_repo, "crates/harn-stdlib/src/stdlib/agent/presets.harn"),
+      pattern: "audit|repair|summary|iteration_budget|tool_format|done_judge|loop_until_done",
+    },
+  ]
+  var parts = []
+  for item in items {
+    parts = parts + [rg_excerpt(item.label, item.path, item.pattern)]
+  }
+  return parts.join("\n\n")
+}
+
+fn source_file_refs(cfg) {
+  let local = [
+    "release_harn.harn",
+    "bump_fleet.harn",
+    "prompts/release_agent_system.harn.prompt",
+    "prompts/release_agent_prompt.harn.prompt",
+    "prompts/release_recovery_system.harn.prompt",
+    "prompts/release_recovery_prompt.harn.prompt",
+    "prompts/bump_summary_system.harn.prompt",
+    "prompts/bump_summary_retry.harn.prompt",
+    "lib/release_audit.harn",
+    "lib/release_commands.harn",
+    "lib/release_execution.harn",
+    "lib/checkout_cleanup.harn",
+  ]
+  let harn_candidates = [
+    "crates/harn-stdlib/src",
+    "crates/harn-vm/src",
+    "crates/harn-runtime/src",
+    "crates/harn-cli/src",
+    "docs/src",
+  ]
+  return {
+    harn_bump_fleet_root: cwd(),
+    harn_repo: cfg.harn_repo,
+    harn_bump_fleet_files: local.map({ p -> {path: p, exists: file_exists(path_join(cwd(), p))} }),
+    harn_source_areas: harn_candidates
+      .map(
+      { p -> {path: path_join(cfg.harn_repo, p), exists: file_exists(path_join(cfg.harn_repo, p))} },
+    ),
+  }
+}
+
+fn gather_facts(cfg, run_id) {
+  let release_root = path_join(cwd(), ".harn-runs/release-harn")
+  let bump_root = path_join(cwd(), ".harn-runs/bump-fleet")
+  let self_root = path_join(cwd(), RUN_ROOT)
+  let release_dirs = selected_run_dirs(release_root, IMPORTANT_RELEASE_RUNS, cfg.recent)
+  let bump_dirs = selected_run_dirs(bump_root, IMPORTANT_BUMP_RUNS, cfg.recent)
+  let self_dirs = latest_dirs(self_root, cfg.recent).filter({ dir -> basename(dir) != run_id })
+  return {
+    schema_version: "harn_bump_fleet.self_review.v1",
+    run_id: run_id,
+    generated_at: date_now_iso(),
+    purpose: "one-off local-model audit of recent release/fleet harness artifacts and source guidance",
+    model: cfg.model,
+    provider: cfg.provider,
+    tool_format: cfg.tool_format,
+    projects_root: cfg.projects_root,
+    harn_repo: cfg.harn_repo,
+    selected_release_runs: release_dirs,
+    selected_bump_runs: bump_dirs,
+    release_runs: release_dirs.map({ dir -> release_run_summary(dir) }),
+    bump_runs: bump_dirs.map({ dir -> bump_run_summary(dir) }),
+    self_review_runs: self_dirs.map({ dir -> self_review_run_summary(dir) }),
+    validation_ladder: validation_ladder_summary(),
+    source_refs: source_file_refs(cfg),
+  }
+}
+
+fn review_tools(cfg) {
+  return agent_host_tools(
+    nil,
+    {
+      root: cfg.projects_root,
+      cwd: cwd(),
+      max_inline_bytes: 8000,
+      read_bytes: 8000,
+      tail_bytes: 8000,
+      search_max_matches: 160,
+      exclude_globs: [".git/**", "target/**", ".worktrees/**", "node_modules/**", "dist/**", "build/**"],
+      allow_argv_prefixes: AUDIT_RUN_ARGV_PREFIXES,
+      command_policy: audit_run_policy,
+      names: {
+        read_file: "audit_read",
+        read_file_tail: "audit_read_tail",
+        search_files: "audit_search",
+        git_inspect: "audit_git",
+        run_command: "audit_run",
+        read_command_output: "audit_run_output",
+        read_command_output_tail: "audit_run_tail",
+      },
+      descriptions: {
+        read_file: "Read a UTF-8 file under ~/projects by relative path, such as harn-bump-fleet/release_harn.harn or harn/crates/harn-stdlib/src/lib.rs.",
+        search_files: "Search under ~/projects. Narrow with path/glob before broad searches; avoid target, .git, node_modules, and generated build output.",
+        git_inspect: "Inspect git status, diff, log, show, blame, branches, or remotes without mutating a repository.",
+        run_command: "Run a bounded read-only inspection command from the harness repo. Pass argv as an array of strings; shell command strings are not accepted.",
+      },
+      result_formatter: audit_tool_formatter,
+      annotations: {run_command: {workflow_phase: "harness_self_review"}},
+      output_format: "display",
+    },
+  )
+}
+
+fn run_review_agent(cfg, facts, paths, run_id) {
+  let system = render("@prompts/harness_self_review_system.harn.prompt", {})
+  let prompt = render(
+    "@prompts/harness_self_review_prompt.harn.prompt",
+    {
+      facts_json_path: paths.facts_json,
+      facts_json_relative_path: relative_to(cfg.projects_root, paths.facts_json),
+      facts_digest: facts_digest(facts),
+      harn_bump_fleet_root: cwd(),
+      harn_repo: cfg.harn_repo,
+      projects_root: cfg.projects_root,
+    },
+  )
+  return agent_loop(
+    prompt,
+    system,
+    agent_preset(
+      "audit",
+      {
+        provider: cfg.provider,
+        model: cfg.model,
+        max_tokens: 5000,
+        tools: review_tools(cfg),
+        tool_format: cfg.tool_format,
+        timeout: 1200,
+        idle_timeout: 240,
+        iteration_budget: {mode: "adaptive", initial: 6, max: 12, extend_by: 2},
+        require_successful_tools: ["audit_read"],
+        turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
+        compaction: {strategy: "hybrid", keep_last_n: 10},
+        session_id: "harn-bump-fleet-self-review-" + cfg.tool_format + "-" + run_id,
+        llm_transcript_dir: paths.llm_transcript_dir,
+      },
+    ),
+  )
+}
+
+fn synthesis_artifact_paths(paths) {
+  return {
+    raw_result_json: path_join(paths.out_dir, "synthesis-result.json"),
+    trace_json: path_join(paths.out_dir, "synthesis-trace.json"),
+    llm_transcript_dir: path_join(paths.out_dir, "synthesis-llm"),
+    llm_transcript_jsonl: path_join(paths.out_dir, "synthesis-llm/llm_transcript.jsonl"),
+  }
+}
+
+fn run_synthesis_agent(cfg, facts, paths, run_id, tool_attempt) {
+  let synthesis_paths = synthesis_artifact_paths(paths)
+  let system = render("@prompts/harness_self_review_system.harn.prompt", {})
+  let prompt = render(
+    "@prompts/harness_self_review_synthesis_prompt.harn.prompt",
+    {
+      facts_json_path: paths.facts_json,
+      facts_json_relative_path: relative_to(cfg.projects_root, paths.facts_json),
+      facts_digest: facts_digest(facts),
+      source_evidence_digest: source_evidence_digest(cfg),
+      tool_attempt_json: json_stringify(tool_attempt),
+      harn_bump_fleet_root: cwd(),
+      harn_repo: cfg.harn_repo,
+      projects_root: cfg.projects_root,
+    },
+  )
+  let result = agent_loop(
+    prompt,
+    system,
+    agent_preset(
+      "summary",
+      {
+        provider: cfg.provider,
+        model: cfg.model,
+        max_tokens: 5000,
+        tools: tool_registry(),
+        tool_choice: "none",
+        loop_until_done: false,
+        max_nudges: 0,
+        timeout: 900,
+        idle_timeout: 240,
+        session_id: "harn-bump-fleet-self-review-synthesis-" + run_id,
+        llm_transcript_dir: synthesis_paths.llm_transcript_dir,
+      },
+    ),
+  )
+  write_file(synthesis_paths.raw_result_json, json_stringify(result) + "\n")
+  write_file(synthesis_paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  return result
+}
+
+pipeline main() {
+  let cfg = parse_args(argv)
+  if cfg.help {
+    println(usage())
+    return 0
+  }
+  let run_id = uuid_v7()
+  let paths = review_artifact_paths(run_id)
+  let mode_label = if cfg.facts_only {
+    "facts-only"
+  } else {
+    "local-agent"
+  }
+  mkdir(paths.out_dir, true)
+  println("== harness self-review ${run_id}")
+  println("   mode          : ${mode_label}")
+  println("   model         : ${cfg.model}")
+  println("   provider      : ${cfg.provider}")
+  println("   tool format   : ${cfg.tool_format}")
+  println("   artifacts     : ${paths.out_dir}")
+  let facts = gather_facts(cfg, run_id)
+  write_file(paths.facts_json, json_stringify(facts) + "\n")
+  println("   facts         : ${paths.facts_json}")
+  if cfg.facts_only {
+    return 0
+  }
+  var tool_attempt = {
+    mode: "skipped",
+    reason: "default synthesis mode; pass --with-tools to exercise the read-only agent tool loop",
+    status: "",
+    error: "",
+    text: "",
+  }
+  if cfg.with_tools {
+    println("== running experimental tool-loop self-review ...")
+    let tool_result = try {
+      run_review_agent(cfg, facts, paths, run_id)
+    } catch (e) {
+      {status: "error", error: to_string(e)}
+    }
+    let tool_text = to_string(tool_result?.visible_text ?? tool_result?.text ?? tool_result?.error ?? "")
+    tool_attempt = {
+      mode: "with-tools",
+      reason: "experimental read-only agent tool loop was requested",
+      status: tool_result?.status ?? "",
+      error: tool_result?.error ?? "",
+      text: tool_text,
+    }
+    write_file(paths.raw_result_json, json_stringify(tool_result) + "\n")
+    write_file(paths.trace_json, json_stringify(tool_result?.trace ?? {}) + "\n")
+    if tool_result?.status ?? "" == "done" {
+      let final_tool_text = agent_result_text(tool_result)
+      write_file(paths.report_md, final_tool_text + "\n")
+      println("   report        : ${paths.report_md}")
+      println("   transcript    : ${paths.llm_transcript_jsonl}")
+      println("   status        : ${tool_result.status}")
+      return 0
+    }
+    println("   tool-loop status: ${tool_attempt.status}")
+  }
+  println("== running one-shot synthesis ...")
+  let result = run_synthesis_agent(cfg, facts, paths, run_id, tool_attempt)
+  let text = agent_result_text(result)
+  write_file(paths.report_md, text + "\n")
+  println("   report        : ${paths.report_md}")
+  println("   transcript    : ${synthesis_artifact_paths(paths).llm_transcript_jsonl}")
+  println("   status        : ${result.status ?? \"\"}")
+  if result.status ?? "" != "done" && result.status ?? "" != "" {
+    return 1
+  }
+  return 0
+}
