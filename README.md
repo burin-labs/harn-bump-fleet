@@ -106,8 +106,11 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
 7. **Summarize**: a read-only `summary_agent` against the local model produces a
    short bullet list of anomalies for the operator. The LLM is **never**
    allowed to drive a side-effect. If the local model returns anything other
-   than plain markdown bullets after one repair attempt, the harness records
-   the summary as unavailable instead of leaking reasoning text into the audit.
+   than plain markdown bullets after one repair attempt, the harness renders
+   deterministic fallback bullets from status counts, dispatched repo count,
+   failures, auto-merge failures, and duration outliers instead of erasing the
+   summary. The audit JSON keeps deterministic summary facts, model attempts,
+   and the selected summary source separate.
 8. **Clean up**: after a live run, if the local `harn-bump-fleet` checkout is
    clean, use `std/git` to fetch `origin`, switch back to `main`, and
    fast-forward it. Dirty local worktrees are left untouched and the skip is
@@ -130,8 +133,9 @@ A second invocation against an unchanged fleet is essentially a no-op:
   for audit markdown, PR bodies, recovery prompts, and fixture readmes.
 - `summary_agent` through Ollama for an on-machine summary. The default
   summary model is intentionally separate from the tool-driving release model
-  so this read-only audit task can use a smaller model that reliably emits
-  compact bullets.
+  so this read-only audit task can use a smaller model. Deterministic summary
+  facts are always recorded so local-model formatting quirks cannot remove the
+  useful audit summary.
 - `sha3_256` + `uuid_v7` for cryptographically tagged audit identity.
 - `regex_captures`, `json_parse`/`json_stringify`, `mkdir`, `file_exists`,
   `read_file`/`write_file` from the stdlib.
