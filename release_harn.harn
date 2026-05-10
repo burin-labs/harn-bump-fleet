@@ -9,10 +9,9 @@ import { agent_host_tools } from "std/agent/host_tools"
 import { agent_preset } from "std/agent/presets"
 import { command_output_range, command_output_tail } from "std/command"
 import {
-  changelog_inject_existing_release_section,
   changelog_latest_version_section_from_text,
   changelog_named_section_from_text,
-  changelog_release_section_body,
+  changelog_promote_pin_time_unreleased,
   changelog_release_section_update,
   changelog_top_from_text,
 } from "lib/changelog"
@@ -97,9 +96,16 @@ Usage:
   harn run release_harn.harn -- --repo ~/projects/harn --mode prepare --yes-live-release
 
 Modes:
-  audit     Inspect release readiness and write an audit report. Default.
-  prepare   Run ./scripts/release_ship.sh --prepare --bump <type>.
-  ship-pr   Prepare, commit, rebase, push, open Release vX.Y.Z PR, and enable auto-merge.
+  audit    Inspect release readiness and write an audit report. Default.
+  prepare  Run ./scripts/release_ship.sh --prepare --bump <type>.
+  ship-pr  Prepare, commit, push, tag, open Release vX.Y.Z PR, and enable
+           auto-merge. Auto-detects an existing open release/v$next PR and
+           switches to repair mode: recovers the original pin via
+           `git merge-base`, recreates the branch on fresh `<base>`,
+           re-derives v$next from pin-time `## Unreleased` (preserving
+           any post-pin drift on the current Unreleased), skips audit /
+           dry-run / re-tagging when those gates already passed, and
+           force-pushes.
 
 Flags:
   --repo PATH             Harn repo path. Defaults to ~/projects/harn.
@@ -147,7 +153,7 @@ fn parse_args(args) {
     skip_tag: false,
     fixup_tag: "",
     fixup_pr_url: "",
-    fixup_existing_release_body: "",
+    fixup_pin_unreleased: "",
   }
   var i = 0
   while i < len(args) {
@@ -999,7 +1005,7 @@ fn release_review_post_turn(payload, analysis) {
       next_options: {
         tools: final_tools,
         tool_choice: "none",
-        max_tokens: 2200,
+        max_tokens: 8000,
         loop_until_done: false,
         max_iterations: 1,
         max_nudges: 0,
@@ -1008,6 +1014,9 @@ fn release_review_post_turn(payload, analysis) {
       },
     }
   }
+  // Sized for a comprehensive `## Unreleased` rewrite (20+ bullets,
+  // detail-heavy prose). Earlier 2200 cap truncated drafts mid-sentence
+  // on releases with substantial post-tag content.
   if has_delta_command && !has_content_evidence {
     return {
       message: "Before finalizing, inspect at least one concrete content source with release_read, release_search, release_git, release_run_output, or release_run_tail. Prefer PR bodies, touched docs, or representative diffs over commit titles.",
@@ -1403,7 +1412,7 @@ fn run_release_agent_loop(
       max_tokens: if require_tool_evidence {
         2048
       } else {
-        2200
+        8000
       },
       tools: tools,
       timeout: 900,
@@ -1424,6 +1433,9 @@ fn run_release_agent_loop(
       llm_transcript_dir: paths.llm_transcript_dir,
     },
   )
+  // Single-turn finalize budget. Sized for a comprehensive
+  // `## Unreleased` rewrite (20+ bullets); earlier 2200 cap
+  // truncated drafts mid-sentence on substantial releases.
   if !require_tool_evidence {
     options = {...options, tool_choice: "none"}
   }
@@ -2333,33 +2345,35 @@ fn apply_draft_release_notes(cfg, analysis, notes_path) {
 }
 
 /**
- * Post-publish fixup CHANGELOG path. Read the originally-shipped
- * `## v${next_version}` body cached on cfg (from
- * `git show v${ver}:CHANGELOG.md` during fixup detection) and inject it
- * into the current CHANGELOG above the next-older version heading. The
- * `## Unreleased` section is preserved as-is — its entries describe
- * post-publish work that ISN'T in the shipped binary and belongs in a
- * future release.
+ * Repair / fixup CHANGELOG path. Used when an open release/v${next_version}
+ * PR is detected at startup — either a re-run on a not-yet-shipped PR
+ * (the previous run made it partway through) or a post-publish paperwork
+ * pass after the artifact already shipped.
  *
- * The model is not invoked here. The shipped artifact is already on
- * crates.io, so the v${next_version} release notes are authoritative;
- * the fixup PR's job is to land that section while leaving `<base>`'s
- * authored Unreleased content intact.
+ * Treats pin-time `## Unreleased` (read from `git show <pin>:CHANGELOG.md`
+ * during detection) as the authoritative description of v${next_version}.
+ * `changelog_promote_pin_time_unreleased` smart-subtracts those bullets
+ * from the current Unreleased so post-pin drift on `<base>` (other
+ * sessions appending entries while this PR was open) is preserved as
+ * future-release work.
+ *
+ * The model is not invoked here. Pin-time Unreleased was authored by the
+ * operator; the harness just promotes it deterministically.
  */
 fn apply_fixup_release_notes(cfg, analysis) {
   let changelog_path = path_join(cfg.repo, "CHANGELOG.md")
   if !cfg.mock && !file_exists(changelog_path) {
     return fail(1, "missing CHANGELOG.md")
   }
-  let existing = trim(cfg.fixup_existing_release_body ?? "")
-  if existing == "" {
+  let pin_unreleased = trim(cfg.fixup_pin_unreleased ?? "")
+  if pin_unreleased == "" {
     return fail(
       1,
-      "fixup mode set but no existing v${analysis.next_version} release body cached; rerun without fixup auto-detection or recover the tag manually",
+      "fixup mode set but no pin-time `## Unreleased` body cached; the original pin SHA's CHANGELOG.md may be unreadable",
     )
   }
   let original = read_repo_file(cfg, "CHANGELOG.md")
-  let update = changelog_inject_existing_release_section(original, analysis.next_version, existing)
+  let update = changelog_promote_pin_time_unreleased(original, analysis.next_version, pin_unreleased)
   if !update.success {
     return fail(1, update.message)
   }
@@ -2370,21 +2384,32 @@ fn apply_fixup_release_notes(cfg, analysis) {
 }
 
 /**
- * Detect post-publish fixup state for `analysis.next_version`.
+ * Detect repair / fixup state for `analysis.next_version`.
  *
- * Returns `nil` when this is a normal release (or fixup is not safe to
- * auto-trigger). Returns `{tag, pr_url, existing_body}` when the
- * v${next_version} GitHub release exists AND a release/${tag} PR is open
- * on `<base>`. In that state the publish artifact already shipped, so
- * the harness must NOT re-tag, must NOT re-publish, and should fold any
- * post-publish `## Unreleased` drift into the originally-shipped release
- * body when bringing the open PR up to date.
+ * Returns `nil` when this is a normal first-time release. Returns
+ * `{tag, pr_url, original_pin, pin_unreleased, tag_exists, release_exists}`
+ * when an open release/v${next_version} PR exists on `<base>`.
+ *
+ * Two flavors collapse into one detection path:
+ *   - Re-run on a still-open release PR (artifact may or may not have
+ *     shipped). The previous run got partway and left the PR open;
+ *     we need to recreate the branch, fix any content regressions,
+ *     and force-push.
+ *   - Documented post-publish drift: artifact shipped, operator added
+ *     more bullets to Unreleased that describe the NEXT release; the
+ *     re-run should land the v${next_version} paperwork without
+ *     clobbering those drift bullets.
+ *
+ * Both share the same recovery: recover the original pin SHA via
+ * `git merge-base origin/release/v$ver origin/<base>`, then read
+ * pin-time `## Unreleased` from that commit. That gives us the bullets
+ * the operator INTENDED to ship — the source of truth regardless of
+ * what was actually published (in case the original ship truncated
+ * the changelog).
  *
  * Conservative gating:
- *   - mock/audit/non-live runs never auto-detect (avoid surprising the
- *     user during read-only inspection or rehearsal).
- *   - The original release body must be readable from the tag's
- *     CHANGELOG.md, otherwise we cannot reconstruct the merge target.
+ *   - mock/audit/non-live runs never auto-detect.
+ *   - Pin-time CHANGELOG must be readable, otherwise we can't recover.
  */
 fn detect_fixup_state(cfg, analysis) {
   if cfg.mock {
@@ -2398,13 +2423,9 @@ fn detect_fixup_state(cfg, analysis) {
     return nil
   }
   let tag = "v${version}"
-  let tag_arg = require_shell_arg(tag, "release tag")
-  let release_check = run_cmd(cfg, "gh release view " + tag_arg + " --json tagName --jq .tagName")
-  if !release_check.success || trim(release_check.stdout) != tag {
-    return nil
-  }
+  let branch = "release/" + tag
   let base_arg = require_shell_arg(cfg.base, "--base")
-  let head_arg = require_shell_arg("release/" + tag, "release branch")
+  let head_arg = require_shell_arg(branch, "release branch")
   let pr_check = run_cmd(
     cfg,
     "gh pr list --base " + base_arg + " --head " + head_arg
@@ -2417,16 +2438,45 @@ fn detect_fixup_state(cfg, analysis) {
   if pr_url == "" {
     return nil
   }
-  let cl_arg = require_shell_arg(tag + ":CHANGELOG.md", "tag CHANGELOG ref")
-  let cl_show = run_cmd(cfg, "git show " + cl_arg)
-  if !cl_show.success {
+  // Recover the original pin SHA: the common ancestor of the existing
+  // release branch and the current base. That commit was `<base>` HEAD
+  // when the original run started, and is the point we want pin-time
+  // Unreleased read from.
+  let merge_base_arg = require_shell_arg("origin/" + branch, "remote release branch")
+  let base_ref_arg = require_shell_arg("origin/" + cfg.base, "remote base ref")
+  let merge_base = run_cmd(cfg, "git merge-base " + merge_base_arg + " " + base_ref_arg)
+  if !merge_base.success {
     return nil
   }
-  let body = changelog_release_section_body(cl_show.stdout, version)
-  if trim(body) == "" {
+  let original_pin = trim(merge_base.stdout)
+  if original_pin == "" {
     return nil
   }
-  return {tag: tag, pr_url: pr_url, existing_body: body}
+  let pin_arg = require_shell_arg(original_pin + ":CHANGELOG.md", "pin CHANGELOG ref")
+  let pin_show = run_cmd(cfg, "git show " + pin_arg)
+  if !pin_show.success {
+    return nil
+  }
+  let pin_unreleased = changelog_named_section_from_text(pin_show.stdout, "## Unreleased")
+  if trim(pin_unreleased) == "" {
+    return nil
+  }
+  // Optional informational signals — control which gates we skip but do
+  // not gate detection itself.
+  let tag_arg = require_shell_arg("refs/tags/" + tag, "release tag ref")
+  let tag_check = run_cmd(cfg, "git ls-remote origin " + tag_arg)
+  let tag_exists = tag_check.success && trim(tag_check.stdout) != ""
+  let release_arg = require_shell_arg(tag, "release tag")
+  let release_check = run_cmd(cfg, "gh release view " + release_arg + " --json tagName --jq .tagName 2>/dev/null || true")
+  let release_exists = release_check.success && trim(release_check.stdout) == tag
+  return {
+    tag: tag,
+    pr_url: pr_url,
+    original_pin: original_pin,
+    pin_unreleased: pin_unreleased,
+    tag_exists: tag_exists,
+    release_exists: release_exists,
+  }
 }
 
 fn with_fixup_state(cfg, fixup) {
@@ -2436,12 +2486,12 @@ fn with_fixup_state(cfg, fixup) {
   return {
     ...cfg,
     fixup_mode: true,
-    skip_tag: true,
+    skip_tag: fixup.tag_exists,
     skip_audit: true,
     skip_dry_run: true,
     fixup_tag: fixup.tag,
     fixup_pr_url: fixup.pr_url,
-    fixup_existing_release_body: fixup.existing_body,
+    fixup_pin_unreleased: fixup.pin_unreleased,
   }
 }
 
@@ -2534,8 +2584,8 @@ fn ensure_release_notes_with_run_id(cfg, analysis, agent_review_result, run_id) 
     let r = apply_fixup_release_notes(cfg, analysis)
     return [
       recorded_step(
-        "fixup-inject-release-notes",
-        "inject shipped v${analysis.next_version} body from tag ${cfg.fixup_tag}; preserve Unreleased",
+        "fixup-promote-pin-time-unreleased",
+        "promote pin-time `## Unreleased` to v${analysis.next_version}; smart-subtract from current Unreleased to preserve post-pin drift",
         r,
       ),
     ]
@@ -2623,22 +2673,22 @@ fn execution_status_summary(execution) {
 }
 
 fn fixup_changelog_block(analysis) {
-  let shipped = trim(markdown_multiline(analysis.changelog_section ?? ""))
+  let promoted = trim(markdown_multiline(analysis.changelog_section ?? ""))
   let unreleased = trim(markdown_multiline(analysis.changelog_unreleased_section ?? ""))
   var parts = [
-    "**Shipped v${analysis.next_version}** (verbatim from tag `${analysis.fixup_tag}`):",
+    "**v${analysis.next_version}** (promoted from pin-time `## Unreleased`):",
     "",
     "```markdown",
     "## v${analysis.next_version}",
     "",
-    shipped,
+    promoted,
     "```",
   ]
   if unreleased != "" {
     parts = parts
       + [
       "",
-      "**Held in `## Unreleased`** (post-publish drift on `${analysis.base_branch}` — belongs in the next release, not this one):",
+      "**Held in `## Unreleased`** (post-pin drift on `${analysis.base_branch}` — describes work landing AFTER this release):",
       "",
       "```markdown",
       "## Unreleased",
@@ -2647,7 +2697,7 @@ fn fixup_changelog_block(analysis) {
       "```",
     ]
   } else {
-    parts = parts + ["", "_No `## Unreleased` drift since the original publish._"]
+    parts = parts + ["", "_No `## Unreleased` drift since the original pin._"]
   }
   return parts.join("\n")
 }
@@ -2672,12 +2722,12 @@ fn pr_body_text(analysis, agent_review_result, execution, run_id) {
     "(`--at-sha ${analysis.pin_sha_input}`)"
   }
   let fixup_note = if analysis.fixup_mode ?? false {
-    "\n\n> **Post-publish paperwork.** `${analysis.fixup_tag}` is already shipped — crates.io and the GitHub release for that exact commit are live. This PR re-runs from fresh `${analysis.base_branch}` to land the Cargo.toml/CHANGELOG bump only. `## Unreleased` content on `${analysis.base_branch}` describes work that isn't in the shipped binary and is preserved for the next release. The tag will not move."
+    "\n\n> **Repair pass for an existing release PR.** Recovered the original pin SHA via `git merge-base`, recreated the branch on fresh `${analysis.base_branch}`, and re-derived v${analysis.next_version} from pin-time `## Unreleased`. Post-pin bullets on the current `## Unreleased` are preserved — they describe work landing AFTER this release. Auto-merge state is left untouched so the operator can review the corrective diff before merging."
   } else {
     ""
   }
   let tag_publish_note = if analysis.fixup_mode ?? false {
-    "already pushed and shipped; this rerun does not re-tag."
+    "tag handling depends on origin state: skipped if `v${analysis.next_version}` already exists on origin (artifact shipped); otherwise pushed pre-PR like a normal first-time release."
   } else {
     "pushed pre-PR; `publish-release.yml` ships from the tag so post-PR drift on `${analysis.base_branch}` cannot leak into the artifact."
   }
@@ -2775,6 +2825,20 @@ fn append_pr_auto_merge_steps(cfg, steps, pr_url, run_id) {
         "auto-merge-already-enabled",
         "autoMergeRequest present on " + pr_url,
         ok("release PR already has auto-merge enabled\n"),
+      ),
+    ]
+    return {steps: out, success: true, pr_arg: pr_arg}
+  }
+  // Fixup mode means we're repairing an existing release PR. The operator
+  // typically disabled auto-merge so they can review the corrective diff
+  // before letting it land — re-enabling would defeat that.
+  if cfg.fixup_mode ?? false {
+    out = out
+      + [
+      recorded_step(
+        "auto-merge-skipped",
+        "fixup mode: leaving auto-merge disabled so the operator can review the repaired diff",
+        ok("auto-merge state preserved (fixup mode)\n"),
       ),
     ]
     return {steps: out, success: true, pr_arg: pr_arg}
@@ -3375,7 +3439,11 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   // commit gives the audit a path from HEAD back to the tag, so the
   // ancestry check passes; on squash-merge the merge commit is collapsed
   // away and main ends up with a single commit applying the bump.
-  if cfg.fixup_mode ?? false && trim(cfg.fixup_tag ?? "") != "" {
+  // Only ours-merge when the tag actually exists on origin (cfg.skip_tag
+  // implies the tag is already pushed and shipped). When fixup_mode is on
+  // because the PR exists but the tag was never pushed, there is no
+  // shipped tag to merge in.
+  if cfg.fixup_mode ?? false && cfg.skip_tag ?? false && trim(cfg.fixup_tag ?? "") != "" {
     let tag_arg = require_shell_arg(cfg.fixup_tag, "fixup tag")
     let merge_msg = require_shell_arg(
       "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
@@ -3656,19 +3724,30 @@ pipeline main() {
     release_log_event(run_id, "option_derived", {bootstrap_new_crates: true})
   }
   if fixup_state != nil {
-    let shipped_count = changelog_bullet_count(fixup_state.existing_body)
+    let pin_count = changelog_bullet_count(fixup_state.pin_unreleased)
     let unreleased_count = changelog_bullet_count(analysis.changelog_unreleased_section ?? "")
-    println("== fixup mode (post-publish paperwork)")
-    println("   tag       : ${fixup_state.tag} (shipped artifact unchanged; tag will not move)")
+    let label = if fixup_state.release_exists {
+      "post-publish paperwork"
+    } else {
+      "repair existing PR"
+    }
+    println("== fixup mode (${label})")
+    let tag_state = if fixup_state.tag_exists {
+      "${fixup_state.tag} (already pushed; tag will not move)"
+    } else {
+      "${fixup_state.tag} (not yet pushed; will be tagged on this run)"
+    }
+    println("   tag       : ${tag_state}")
     println("   pr        : ${fixup_state.pr_url}")
+    println("   pin       : ${fixup_state.original_pin} (recovered via merge-base)")
     println(
-      "   shipped   : v${analysis.next_version} body has ${shipped_count} entries (preserved verbatim)",
+      "   v${analysis.next_version} : ${pin_count} pin-time Unreleased entries (smart-subtracted from current Unreleased)",
     )
     println(
-      "   deferred  : ${unreleased_count} ## Unreleased entries on ${cfg.base} (post-publish drift; will land in the next release, not this one)",
+      "   drift     : ${unreleased_count} current ## Unreleased entries on ${cfg.base}; post-pin bullets stay in Unreleased",
     )
     println(
-      "   plan      : recreate release branch on fresh ${cfg.base}, inject shipped body, version bump, force-push, refresh PR body.",
+      "   plan      : recreate release branch on fresh ${cfg.base}, promote pin-time Unreleased to v${analysis.next_version}, version bump, force-push, refresh PR body.",
     )
     release_log_event(
       run_id,
@@ -3676,9 +3755,12 @@ pipeline main() {
       {
         tag: fixup_state.tag,
         pr_url: fixup_state.pr_url,
-        existing_body_chars: len(fixup_state.existing_body),
-        shipped_bullet_count: shipped_count,
-        deferred_bullet_count: unreleased_count,
+        original_pin: fixup_state.original_pin,
+        tag_exists: fixup_state.tag_exists,
+        release_exists: fixup_state.release_exists,
+        pin_unreleased_chars: len(fixup_state.pin_unreleased),
+        pin_bullet_count: pin_count,
+        current_unreleased_bullet_count: unreleased_count,
       },
     )
   }
