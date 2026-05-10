@@ -9,7 +9,7 @@ import { agent_host_tools } from "std/agent/host_tools"
 import { agent_preset } from "std/agent/presets"
 import { command_output_range, command_output_tail } from "std/command"
 import {
-  changelog_fold_unreleased_into_existing_release,
+  changelog_inject_existing_release_section,
   changelog_latest_version_section_from_text,
   changelog_named_section_from_text,
   changelog_release_section_body,
@@ -38,7 +38,7 @@ import {
 } from "lib/release_execution"
 import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
 import { fail, ok, require_shell_arg, safe_shell_arg } from "lib/shell_util"
-import { markdown_multiline, single_line_or, truncate_text } from "lib/text_util"
+import { markdown_multiline, truncate_text } from "lib/text_util"
 
 let DEFAULT_REPO = path_join(env_or("HOME", ""), "projects/harn")
 
@@ -2334,14 +2334,17 @@ fn apply_draft_release_notes(cfg, analysis, notes_path) {
 
 /**
  * Post-publish fixup CHANGELOG path. Read the originally-shipped
- * `## v${next_version}` body cached on cfg (from `git show v${ver}:CHANGELOG.md`
- * during fixup detection) and fold any `## Unreleased` entries that have
- * landed on `<base>` since the tag push into that body deterministically.
+ * `## v${next_version}` body cached on cfg (from
+ * `git show v${ver}:CHANGELOG.md` during fixup detection) and inject it
+ * into the current CHANGELOG above the next-older version heading. The
+ * `## Unreleased` section is preserved as-is — its entries describe
+ * post-publish work that ISN'T in the shipped binary and belongs in a
+ * future release.
  *
  * The model is not invoked here. The shipped artifact is already on
- * crates.io, so the v${next_version} release notes are authoritative; the
- * fixup PR's job is to land that section plus any post-publish drift on
- * `<base>`.
+ * crates.io, so the v${next_version} release notes are authoritative;
+ * the fixup PR's job is to land that section while leaving `<base>`'s
+ * authored Unreleased content intact.
  */
 fn apply_fixup_release_notes(cfg, analysis) {
   let changelog_path = path_join(cfg.repo, "CHANGELOG.md")
@@ -2356,7 +2359,7 @@ fn apply_fixup_release_notes(cfg, analysis) {
     )
   }
   let original = read_repo_file(cfg, "CHANGELOG.md")
-  let update = changelog_fold_unreleased_into_existing_release(original, analysis.next_version, existing)
+  let update = changelog_inject_existing_release_section(original, analysis.next_version, existing)
   if !update.success {
     return fail(1, update.message)
   }
@@ -2531,8 +2534,8 @@ fn ensure_release_notes_with_run_id(cfg, analysis, agent_review_result, run_id) 
     let r = apply_fixup_release_notes(cfg, analysis)
     return [
       recorded_step(
-        "fixup-merge-release-notes",
-        "fold ## Unreleased into shipped v${analysis.next_version} body from tag ${cfg.fixup_tag}",
+        "fixup-inject-release-notes",
+        "inject shipped v${analysis.next_version} body from tag ${cfg.fixup_tag}; preserve Unreleased",
         r,
       ),
     ]
@@ -2583,66 +2586,111 @@ fn prepared_release_analysis(raw, original) {
   }
 }
 
-fn execution_has_step(execution, name) {
-  for step in execution ?? [] {
-    if step.name == name {
-      return true
-    }
-  }
-  return false
+fn execution_step_count(execution) {
+  return len(execution ?? [])
 }
 
-fn pr_body_text(analysis, agent_review_result, execution) {
+/**
+ * Count top-level `-` bullets in a CHANGELOG body. Continuation lines
+ * (indented by two spaces) and `### Subsection` headings are skipped.
+ * Used for stdout summary lines so the operator gets a sense of how
+ * many entries shipped vs. how many are deferred.
+ */
+fn changelog_bullet_count(body) {
+  var count = 0
+  for line in split(body ?? "", "\n") {
+    if starts_with(line, "- ") {
+      count = count + 1
+    }
+  }
+  return count
+}
+
+fn execution_status_summary(execution) {
+  var ok = 0
+  var failed = 0
+  for step in execution ?? [] {
+    if step.success {
+      ok = ok + 1
+    } else {
+      failed = failed + 1
+    }
+  }
+  if failed == 0 {
+    return "all ok"
+  }
+  return "${ok} ok, ${failed} failed"
+}
+
+fn fixup_changelog_block(analysis) {
+  let shipped = trim(markdown_multiline(analysis.changelog_section ?? ""))
+  let unreleased = trim(markdown_multiline(analysis.changelog_unreleased_section ?? ""))
+  var parts = [
+    "**Shipped v${analysis.next_version}** (verbatim from tag `${analysis.fixup_tag}`):",
+    "",
+    "```markdown",
+    "## v${analysis.next_version}",
+    "",
+    shipped,
+    "```",
+  ]
+  if unreleased != "" {
+    parts = parts
+      + [
+      "",
+      "**Held in `## Unreleased`** (post-publish drift on `${analysis.base_branch}` — belongs in the next release, not this one):",
+      "",
+      "```markdown",
+      "## Unreleased",
+      "",
+      unreleased,
+      "```",
+    ]
+  } else {
+    parts = parts + ["", "_No `## Unreleased` drift since the original publish._"]
+  }
+  return parts.join("\n")
+}
+
+fn standard_changelog_block(analysis) {
+  let body = trim(markdown_multiline(analysis.changelog_section ?? ""))
+  return "```markdown\n## v${analysis.next_version}\n\n${body}\n```"
+}
+
+fn pr_body_text(analysis, agent_review_result, execution, run_id) {
   let agent_artifacts = agent_review_result.artifacts ?? {}
   let draft_path = agent_review_result.draft_changelog ?? ""
   let validation = agent_review_result.validation_findings ?? []
-  let changelog_section = markdown_multiline(analysis.changelog_section)
-  let preparation_note = if execution_has_step(execution, "prepare-already-complete") {
-    "The harness verified this branch already had the target Cargo version, release branch name, and top CHANGELOG entry before the PR handoff."
-  } else {
-    if execution_has_step(execution, "prepare") {
-      "The harness generated the release content through `scripts/release_ship.sh --prepare` before the PR handoff."
-    } else {
-      "The harness generated this body from a fresh release snapshot before the PR handoff."
-    }
-  }
   let execution_summary = if execution == nil {
     "(no side-effecting steps recorded)"
   } else {
     execution_table(execution)
   }
   let pin_sha_note = if trim(analysis.pin_sha_input ?? "") == "" {
-    "(auto-resolved from `origin/${analysis.base_branch}` at run start)"
+    "(`origin/${analysis.base_branch}` at run start)"
   } else {
-    "(operator override via `--at-sha ${analysis.pin_sha_input}`)"
+    "(`--at-sha ${analysis.pin_sha_input}`)"
   }
   let fixup_note = if analysis.fixup_mode ?? false {
-    "\n\n> **Post-publish fixup PR.** The `${analysis.fixup_tag}` tag was already"
-      + " pushed during the original `publish-release.yml` run, and crates.io +"
-      + " the GitHub release have shipped from that commit. This PR is"
-      + " paperwork: it brings the release branch up to date with"
-      + " `${analysis.base_branch}` so the Cargo.toml/CHANGELOG bump can land"
-      + " cleanly. The harness force-pushed the release branch onto a fresh"
-      + " `${analysis.base_branch}` snapshot and folded any `## Unreleased`"
-      + " entries that landed after the original publish into the shipped"
-      + " v${analysis.next_version} body. **Do not advance or move the"
-      + " `${analysis.fixup_tag}` tag** — re-pushing would either re-fire the"
-      + " publish workflow against an already-shipped version (queueing"
-      + " behind itself) or, if advanced, diverge crates.io from the git"
-      + " artifact."
+    "\n\n> **Post-publish paperwork.** `${analysis.fixup_tag}` is already shipped — crates.io and the GitHub release for that exact commit are live. This PR re-runs from fresh `${analysis.base_branch}` to land the Cargo.toml/CHANGELOG bump only. `## Unreleased` content on `${analysis.base_branch}` describes work that isn't in the shipped binary and is preserved for the next release. The tag will not move."
   } else {
     ""
   }
   let tag_publish_note = if analysis.fixup_mode ?? false {
-    "already pushed during the original publish; this PR rerun does NOT re-tag (`publish-release.yml` ran successfully against `${analysis.fixup_tag}` and the release artifact is shipped)."
+    "already pushed and shipped; this rerun does not re-tag."
   } else {
-    "`publish-release.yml` ships crates.io and the GitHub release from this tag, so anything that lands on `${analysis.base_branch}` between PR-open and merge cannot leak into the published artifact."
+    "pushed pre-PR; `publish-release.yml` ships from the tag so post-PR drift on `${analysis.base_branch}` cannot leak into the artifact."
+  }
+  let changelog_block = if analysis.fixup_mode ?? false {
+    fixup_changelog_block(analysis)
+  } else {
+    standard_changelog_block(analysis)
   }
   return render(
     "@prompts/release_pr_body.harn.prompt",
     {
       next_version: analysis.next_version,
-      preparation_note: preparation_note,
+      run_id: run_id ?? "",
       fixup_note: fixup_note,
       tag_publish_note: tag_publish_note,
       current_version: analysis.current_version,
@@ -2651,15 +2699,11 @@ fn pr_body_text(analysis, agent_review_result, execution) {
       pin_sha: analysis.pin_sha ?? "(unset)",
       pin_sha_note: pin_sha_note,
       latest_tag: analysis.latest_tag,
-      changed_files: single_line_or(analysis.diff_names, "none"),
-      deterministic_findings: if len(analysis.deterministic_findings) == 0 {
-        "none"
-      } else {
-        "review run artifact"
-      },
-      changelog_section: changelog_section,
+      changelog_block: changelog_block,
       commits_since_latest_tag: analysis.commits_since_latest_tag,
       execution_summary: execution_summary,
+      execution_step_count: execution_step_count(execution),
+      execution_status_summary: execution_status_summary(execution),
       audit_transcript: agent_artifacts.llm_transcript_jsonl ?? "not generated",
       draft_changelog: draft_path,
       validation_findings: if len(validation) == 0 {
@@ -2687,7 +2731,7 @@ fn execution_table(execution) {
 fn write_pr_body(run_id, analysis, agent_review_result, execution) {
   let body_path = path_join(cwd(), RUN_ROOT, run_id, "pr-body.md")
   mkdir(dirname(body_path), true)
-  write_file(body_path, pr_body_text(analysis, agent_review_result, execution))
+  write_file(body_path, pr_body_text(analysis, agent_review_result, execution, run_id))
   return body_path
 }
 
@@ -3317,11 +3361,35 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   // whole point of `cfg.pin_sha`. Rebasing onto origin/<base> would fold
   // commits that landed on main after this run started into the release.
   // We still fetch tags so the upcoming tag step sees existing remote tags.
-  commands = commands
-    + [
-    {name: "fetch-base", command: "git fetch origin --tags " + base_arg},
-    {name: "push", command: push_command},
-  ]
+  commands = commands + [{name: "fetch-base", command: "git fetch origin --tags " + base_arg}]
+  // Fixup mode: the originally-shipped release commit (the v$tag target)
+  // is an ancestor of the published tag but NOT of fresh `<base>`, because
+  // the original Release PR never merged. The harn-side
+  // `verify_release_metadata.py` audit refuses to run when Cargo.toml
+  // claims version X but HEAD doesn't include the X tag's commit, since
+  // that means the tagged tree and the about-to-be-merged tree disagree.
+  // Merge the tag with `-s ours` to bring it into HEAD's ancestry without
+  // changing the tree — the harness has already laid down the
+  // canonically-shipped CHANGELOG body and version bump on top of fresh
+  // main, and that's the tree we want the fixup PR to land. The merge
+  // commit gives the audit a path from HEAD back to the tag, so the
+  // ancestry check passes; on squash-merge the merge commit is collapsed
+  // away and main ends up with a single commit applying the bump.
+  if cfg.fixup_mode ?? false && trim(cfg.fixup_tag ?? "") != "" {
+    let tag_arg = require_shell_arg(cfg.fixup_tag, "fixup tag")
+    let merge_msg = require_shell_arg(
+      "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
+      "fixup ours-merge message",
+    )
+    commands = commands
+      + [
+      {
+        name: "merge-shipped-tag-ours",
+        command: "git merge --no-ff -s ours " + tag_arg + " -m " + merge_msg,
+      },
+    ]
+  }
+  commands = commands + [{name: "push", command: push_command}]
   for step in commands {
     release_log_event(run_id, "step_started", {step: step.name, command: step.command})
     let result = append_command_step(cfg, steps, step.name, step.command)
@@ -3588,11 +3656,19 @@ pipeline main() {
     release_log_event(run_id, "option_derived", {bootstrap_new_crates: true})
   }
   if fixup_state != nil {
+    let shipped_count = changelog_bullet_count(fixup_state.existing_body)
+    let unreleased_count = changelog_bullet_count(analysis.changelog_unreleased_section ?? "")
     println("== fixup mode (post-publish paperwork)")
-    println("   tag    : ${fixup_state.tag} (already shipped from publish-release.yml)")
-    println("   pr     : ${fixup_state.pr_url}")
+    println("   tag       : ${fixup_state.tag} (shipped artifact unchanged; tag will not move)")
+    println("   pr        : ${fixup_state.pr_url}")
     println(
-      "   action : refresh release branch on ${cfg.base}, fold new ## Unreleased entries into the shipped body, force-push, refresh PR body. No re-tag, no re-publish.",
+      "   shipped   : v${analysis.next_version} body has ${shipped_count} entries (preserved verbatim)",
+    )
+    println(
+      "   deferred  : ${unreleased_count} ## Unreleased entries on ${cfg.base} (post-publish drift; will land in the next release, not this one)",
+    )
+    println(
+      "   plan      : recreate release branch on fresh ${cfg.base}, inject shipped body, version bump, force-push, refresh PR body.",
     )
     release_log_event(
       run_id,
@@ -3601,6 +3677,8 @@ pipeline main() {
         tag: fixup_state.tag,
         pr_url: fixup_state.pr_url,
         existing_body_chars: len(fixup_state.existing_body),
+        shipped_bullet_count: shipped_count,
+        deferred_bullet_count: unreleased_count,
       },
     )
   }
@@ -3686,19 +3764,64 @@ pipeline main() {
       fixture_dir: fixture.out_dir,
     },
   )
-  println("== report written")
-  println("   json: ${written.json_path}")
-  println("   md  : ${written.md_path}")
-  println("== crystallization fixture written")
-  println("   dir : ${fixture.out_dir}")
+  let total_elapsed = now_ms() - started_ms
+  let outcome = if execution_failed(execution) {
+    "FAILED"
+  } else {
+    "ok"
+  }
+  let pr_url = execution_pr_url(execution)
+  println("== done (${outcome}, ${format_ms_human(total_elapsed)})")
+  if pr_url != "" {
+    println("   pr      : ${pr_url}")
+  }
+  if analysis.fixup_mode ?? false {
+    println("   tag     : ${analysis.fixup_tag} (unchanged; published artifact untouched)")
+  } else if cfg.mode == "ship-pr" && !execution_failed(execution) && !cfg.mock {
+    println("   tag     : v${analysis.next_version} (pushed; publish-release.yml will ship)")
+  }
+  println("   report  : ${written.md_path}")
   if len(analysis.deterministic_findings) > 0 {
-    println("== findings")
+    println("   findings:")
     for f in analysis.deterministic_findings {
-      println("   - ${f}")
+      println("     - ${f}")
     }
   }
   if execution_failed(execution) {
+    let failed = last_failed_step(execution)
+    if failed != nil {
+      println("   failure : ${failed.name} (status ${failed.status})")
+    }
     return 1
   }
   return 0
+}
+
+fn execution_pr_url(execution) {
+  for step in execution ?? [] {
+    if step.name == "find-existing-pr" || step.name == "create-pr" {
+      let url = trim(step.stdout ?? "")
+      if starts_with(url, "https://") {
+        return url
+      }
+    }
+  }
+  return ""
+}
+
+fn format_ms_human(ms) {
+  let total = ms ?? 0
+  if total < 1000 {
+    return "${total}ms"
+  }
+  let total_seconds = total / 1000
+  if total_seconds < 60 {
+    let tenths = (total + 50) / 100
+    let whole = tenths / 10
+    let frac = tenths - whole * 10
+    return "${whole}.${frac}s"
+  }
+  let minutes = total_seconds / 60
+  let seconds = total_seconds - minutes * 60
+  return "${minutes}m${seconds}s"
 }

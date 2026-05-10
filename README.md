@@ -266,10 +266,16 @@ fixup mode the harness:
   dropped — the branch ends up with the version bump as its single new
   commit on top of current `<base>`.
 - Reads the originally-shipped `## v<next_version>` section from
-  `git show v<next_version>:CHANGELOG.md` and folds any `## Unreleased`
-  entries that landed on `<base>` after the original publish into that
-  body deterministically (`changelog_fold_unreleased_into_existing_release`),
-  preserving subsection structure (`### Added`, `### Changed`, etc.).
+  `git show v<next_version>:CHANGELOG.md` and **injects it verbatim**
+  above the next-older version heading via
+  `changelog_inject_existing_release_section`. **`## Unreleased` is
+  preserved as-is.** Entries that landed in `## Unreleased` after the
+  original publish describe behavior that isn't in the shipped binary
+  and belong in the NEXT release — folding them into v<next_version>
+  would mislabel the changelog. The harness leaves them where they
+  are. (If a particular entry actually belongs in the shipped version,
+  the operator must manually move it from Unreleased to v<next_version>
+  before merge; `--agent` flags candidates.)
 - **Skips the tag step entirely.** Re-pushing `v<next_version>` would
   either re-fire `publish-release.yml` against an already-shipped version
   (queueing behind itself) or, if the harness were to advance the tag,
@@ -280,9 +286,11 @@ fixup mode the harness:
   shipped and the tag will not move.
 - With `--agent`, runs a fixup-specific audit prompt instead of the
   standard release prompt — the model is told the artifact has already
-  shipped and asked to verify the fold (flag misclassified entries),
-  not to author release notes. No `BEGIN_DRAFT_CHANGELOG` block is
-  expected or accepted.
+  shipped and asked to verify the inject (flag any `## Unreleased`
+  entries that should actually be in the shipped version, or anything
+  in v<next_version> that doesn't match the tag), not to author
+  release notes. No `BEGIN_DRAFT_CHANGELOG` block is expected or
+  accepted.
 
 To bypass auto-detection (e.g. to advance the pin and re-tag because the
 original publish failed before the GitHub release was created), close the
