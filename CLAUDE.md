@@ -13,7 +13,12 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
 - `release_harn.harn` — Harn-native counterpart to the `~/projects/harn` `/release-harn`
   skill. Defaults to read-only audit; live mutation requires `--yes-live-release`. Owns
   release branch normalization, CHANGELOG drafting, `prepare`/`ship-pr` modes, recovery
-  agent loop, and post-merge checkout cleanup.
+  agent loop, and post-merge checkout cleanup. **Pin model:** every run resolves a
+  concrete `cfg.pin_sha` at startup (from `--at-sha` / `HARN_RELEASE_PIN_SHA`, else
+  `origin/<base>` HEAD). The release branch is parented at that SHA and never rebased
+  before push, the tag is pushed pre-PR, and the harn-side `publish-release.yml` ships
+  from the tag — so commits that land on `<base>` between PR-open and merge cannot leak
+  into the published artifact.
 - `harness_self_review.harn` — meta-audit; intentionally not wired into CI. Reads recent
   `.harn-runs/` artifacts and gives a local model read-only tools over `~/projects` for
   cross-referencing.

@@ -15,6 +15,7 @@ import {
   changelog_top_from_text,
 } from "lib/changelog"
 import { checkout_cleanup } from "lib/checkout_cleanup"
+import { release_log_range_arg } from "lib/git"
 import {
   agent_changelog_section,
   agent_result_text,
@@ -47,6 +48,10 @@ let DEFAULT_PROVIDER = env_or("HARN_RELEASE_PROVIDER", "ollama")
 let MOCK_AGENT_MODEL = "claude-sonnet-4-7"
 
 let RUN_ROOT = ".harn-runs/release-harn"
+
+// Mock-mode placeholder for the pinned base SHA. 40 hex chars so it
+// looks like a real commit SHA in audit reports, fixtures, and tests.
+let MOCK_PIN_SHA = "abcdef1234567890abcdef1234567890abcdef12"
 
 let RELEASE_RUN_ARGV_PREFIXES = [
   ["git", "status"],
@@ -98,6 +103,10 @@ Flags:
   --base BRANCH           Base branch for the release PR. Defaults to main.
   --bump patch|minor|major  Version bump type. Defaults to patch.
   --mode audit|prepare|ship-pr
+  --at-sha SHA            Pin the release to a concrete commit on `--base` (default:
+                          `origin/<base>` HEAD at startup). Locks the release branch's
+                          parent so commits that land on the base afterward cannot
+                          slip into the published artifact.
   --agent                 Ask a local model to review the release evidence with read/search/run tools.
                           Live prepare/ship-pr requires --agent unless CHANGELOG.md
                           already starts with the target version.
@@ -129,6 +138,8 @@ fn parse_args(args) {
     bootstrap_new_crates: env_or("HARN_RELEASE_BOOTSTRAP_NEW_CRATES", "") == "1",
     release_focus: env_or("HARN_RELEASE_FOCUS", ""),
     yes_live_release: false,
+    pin_sha_input: env_or("HARN_RELEASE_PIN_SHA", ""),
+    pin_sha: "",
   }
   var i = 0
   while i < len(args) {
@@ -187,6 +198,12 @@ fn parse_args(args) {
       cfg = {...cfg, release_focus: args[i]}
     } else if a == "--yes-live-release" {
       cfg = {...cfg, yes_live_release: true}
+    } else if a == "--at-sha" {
+      i = i + 1
+      if i >= len(args) {
+        throw "--at-sha requires a commit SHA"
+      }
+      cfg = {...cfg, pin_sha_input: args[i]}
     } else if a == "-h" || a == "--help" {
       cfg = {...cfg, help: true}
       return cfg
@@ -212,6 +229,45 @@ fn expand_home(path) {
     return env_or("HOME", "") + path[1:len(path)]
   }
   return path
+}
+
+/**
+ * Resolve `cfg.pin_sha_input` (or `origin/<base>` when no input is given)
+ * to a concrete 40-char commit SHA. Frozen here so every downstream step
+ * — branch creation, audit ranges, PR body, tag push — uses the same
+ * commit even if `origin/<base>` advances mid-run.
+ */
+fn resolve_pin_sha(cfg) {
+  if cfg.mock {
+    if cfg.pin_sha_input != "" {
+      return cfg.pin_sha_input
+    }
+    return MOCK_PIN_SHA
+  }
+  if cfg.pin_sha_input != "" {
+    let raw = trim(cfg.pin_sha_input)
+    let arg = require_shell_arg(raw + "^{commit}", "--at-sha")
+    let r = shell_at(cfg.repo, "git rev-parse --verify " + arg)
+    if !r.success {
+      throw "--at-sha did not resolve to a commit: ${raw}\n${trim(r.stderr)}"
+    }
+    return trim(r.stdout)
+  }
+  // For modes that mutate (prepare/ship-pr with --yes-live-release),
+  // refresh origin first so the pin reflects the latest base. Audit
+  // mode stays read-only and uses whatever is already cached locally.
+  if cfg.mode != "audit" || cfg.yes_live_release {
+    let f = shell_at(cfg.repo, "git fetch origin --prune --quiet")
+    if !f.success {
+      throw "failed to fetch origin before pinning the release SHA:\n${trim(f.stderr)}"
+    }
+  }
+  let base_arg = require_shell_arg("origin/${cfg.base}^{commit}", "origin base ref")
+  let r = shell_at(cfg.repo, "git rev-parse --verify " + base_arg)
+  if !r.success {
+    throw "failed to resolve origin/${cfg.base}:\n${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
 }
 
 fn run_cmd(cfg, command) {
@@ -320,6 +376,27 @@ fn fake_command(command, cfg) {
   if contains(command, "git fetch origin") || contains(command, "git rebase") {
     return ok("Current branch release/v0.7.53 is up to date.\n")
   }
+  if contains(command, "git rev-parse HEAD") {
+    return ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git rev-parse --verify") && contains(command, "origin/") {
+    return ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-parse -q --verify refs/tags/") {
+    return fail(1, "")
+  }
+  if contains(command, "git rev-parse --verify") {
+    return ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-list -n 1") {
+    return ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git tag -a") {
+    return ok("")
+  }
+  if contains(command, "git push origin 'v") {
+    return ok("To github.com:burin-labs/harn.git\n * [new tag]         v0.7.53 -> v0.7.53\n")
+  }
   if contains(command, "git reset --hard") {
     return ok("HEAD is now at abc1234 main\n")
   }
@@ -395,22 +472,20 @@ fn diff_names(cfg) {
   return checked(cfg, "git diff HEAD --name-only")
 }
 
-fn log_range_arg(latest_tag) {
-  if latest_tag == "" {
-    return "--max-count=50"
-  }
-  return "${latest_tag}..HEAD --max-count=80"
-}
-
 fn release_file_changes(cfg, latest_tag) {
   return checked(
     cfg,
-    "git log --name-status --pretty=format:'commit %h %s' --no-merges " + log_range_arg(latest_tag),
+    "git log --name-status --pretty=format:'commit %h %s' --no-merges "
+      + release_log_range_arg(latest_tag, cfg.pin_sha),
   )
 }
 
 fn release_commit_stats(cfg, latest_tag) {
-  return checked(cfg, "git log --stat --oneline --no-renames --no-merges " + log_range_arg(latest_tag))
+  return checked(
+    cfg,
+    "git log --stat --oneline --no-renames --no-merges "
+      + release_log_range_arg(latest_tag, cfg.pin_sha),
+  )
 }
 
 fn count_lines(text) {
@@ -506,6 +581,7 @@ fn compact_agent_analysis(analysis) {
     branch: analysis.branch,
     expected_branch: analysis.expected_branch,
     base_branch: analysis.base_branch,
+    pin_sha: analysis.pin_sha ?? "",
     current_version: analysis.current_version,
     next_version: analysis.next_version,
     operator_focus: analysis.operator_focus ?? "",
@@ -527,9 +603,9 @@ fn compact_agent_analysis(analysis) {
     deterministic_findings: analysis.deterministic_findings,
     recent_merged_prs: truncate_text(analysis.recent_merged_prs ?? "", 5000),
     suggested_read_only_inspections: [
-      "git log --oneline --no-merges --max-count=80 ${analysis.latest_tag}..HEAD",
-      "git diff --stat --stat-count=80 ${analysis.latest_tag}..HEAD",
-      "git show --stat --oneline --no-renames --max-count=20 ${analysis.latest_tag}..HEAD",
+      "git log --oneline --no-merges --max-count=80 ${analysis.latest_tag}..${analysis.pin_sha}",
+      "git diff --stat --stat-count=80 ${analysis.latest_tag}..${analysis.pin_sha}",
+      "git show --stat --oneline --no-renames --max-count=20 ${analysis.latest_tag}..${analysis.pin_sha}",
       "sed -n '1,120p' CHANGELOG.md",
       "sed -n '1,180p' scripts/release_ship.sh",
       "sed -n '1,180p' .github/workflows/publish-release.yml",
@@ -542,7 +618,7 @@ fn release_finalization_prompt(analysis) {
     "@prompts/release_finalization.harn.prompt",
     {
       target_version: "v${analysis.next_version}",
-      tag_range: "${analysis.latest_tag}..HEAD",
+      tag_range: "${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}",
       first_post_tag_commit: first_post_tag_commit(analysis),
       release_fact_sheet: release_fact_sheet(analysis),
       changelog_draft_instructions: release_changelog_draft_prompt(analysis),
@@ -555,7 +631,7 @@ fn release_changelog_draft_prompt(analysis) {
     "@prompts/release_changelog_draft.harn.prompt",
     {
       target_version: "v${analysis.next_version}",
-      tag_range: "${analysis.latest_tag}..HEAD",
+      tag_range: "${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}",
       first_post_tag_commit: first_post_tag_commit(analysis),
     },
   )
@@ -566,10 +642,11 @@ fn release_fact_sheet(analysis) {
 - Repo: `${analysis.repo}`.
 - Mode: `${analysis.mode}`.
 - Version: `${analysis.current_version}` -> `${analysis.next_version}` (${analysis.bump}).
-- Latest tag/range: `${analysis.latest_tag}..HEAD`.
+- Pinned base SHA: `${analysis.pin_sha ?? "(unset)"}` — release branch is anchored here; commits that landed on `${analysis.base_branch}` after this run started are excluded from the release.
+- Latest tag/range: `${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}`.
 - Post-tag commit count: ${post_tag_commit_count(analysis)}.
 - First post-tag commit: `${first_post_tag_commit(analysis)}`.
-- Release-note source rule: use only commits in `${analysis.latest_tag}..HEAD`
+- Release-note source rule: use only commits in `${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}`
   plus authored `## Unreleased` content. Recent merged PRs are historical
   context only when they are not in that post-tag range.
 - Operator focus: ${if trim(analysis.operator_focus ?? "") == "" {
@@ -1053,7 +1130,7 @@ fn analyze_release(cfg) {
   }
   let expected_branch = "release/v${next}"
   let committed_release_content = prepared_release && trim(status) == "" && branch == expected_branch
-  let release_diff_range = require_shell_arg("origin/${cfg.base}..HEAD", "release branch diff range")
+  let release_diff_range = require_shell_arg("${cfg.pin_sha}..HEAD", "release branch diff range")
   let diff_stat = if committed_release_content {
     checked(cfg, "git diff --stat " + release_diff_range)
   } else {
@@ -1064,7 +1141,7 @@ fn analyze_release(cfg) {
   } else {
     diff_names(cfg)
   }
-  let commits = checked(cfg, "git log --oneline --no-merges " + log_range_arg(latest_tag))
+  let commits = checked(cfg, "git log --oneline --no-merges " + release_log_range_arg(latest_tag, cfg.pin_sha))
   let commit_file_changes = release_file_changes(cfg, latest_tag)
   let commit_stats = release_commit_stats(cfg, latest_tag)
   let post_tag_pr_numbers = pr_numbers_from_commits(commits)
@@ -1119,6 +1196,8 @@ fn analyze_release(cfg) {
     branch: branch,
     expected_branch: expected_branch,
     base_branch: cfg.base,
+    pin_sha: cfg.pin_sha,
+    pin_sha_input: cfg.pin_sha_input ?? "",
     current_version: baseline,
     next_version: next,
     prepared_release: prepared_release,
@@ -1884,6 +1963,80 @@ fn release_branch_push_command(cfg, branch, no_verify) {
   return parts.join(" ")
 }
 
+/**
+ * Tag the release commit at HEAD as `vX.Y.Z` and push the tag.
+ *
+ * The tag is the source of truth for what gets published — the harn-side
+ * publish-release.yml fires on tag push and ships from the tag, so the
+ * release survives the merge queue rebasing the Release PR onto a moved
+ * main. Idempotent: if the tag already exists locally and points at the
+ * release HEAD, the create step no-ops; if it points elsewhere, fail
+ * with an actionable message rather than overwriting silently.
+ */
+fn ensure_release_tag_pushed(cfg, version, steps, run_id) {
+  let tag = "v${version}"
+  let tag_arg = require_shell_arg(tag, "release tag")
+  let head_probe = run_cmd(cfg, "git rev-parse HEAD")
+  if !head_probe.success {
+    return steps + [recorded_step("create-release-tag", "git rev-parse HEAD", head_probe)]
+  }
+  let head = trim(head_probe.stdout)
+  var pre_steps = steps
+  let local_tag_probe = run_cmd(cfg, "git rev-parse -q --verify refs/tags/" + tag_arg)
+  if local_tag_probe.success {
+    let tag_commit_probe = run_cmd(cfg, "git rev-list -n 1 " + tag_arg)
+    let tag_commit = if tag_commit_probe.success {
+      trim(tag_commit_probe.stdout)
+    } else {
+      ""
+    }
+    if tag_commit != head {
+      return pre_steps
+        + [
+        recorded_step(
+          "create-release-tag",
+          "git rev-list -n 1 " + tag,
+          fail(
+            2,
+            "tag ${tag} already exists locally at ${tag_commit}, but release HEAD is ${head}; delete the stale tag (`git tag -d ${tag}`) before re-running",
+          ),
+        ),
+      ]
+    }
+    pre_steps = pre_steps
+      + [
+      recorded_step(
+        "create-release-tag",
+        "tag ${tag} already pinned at HEAD",
+        ok("idempotent reuse of existing tag ${tag} at ${head}\n"),
+      ),
+    ]
+  } else {
+    let tag_msg = require_shell_arg("Release v${version}", "release tag message")
+    let create_command = "git tag -a " + tag_arg + " -m " + tag_msg
+    release_log_event(run_id, "step_started", {step: "create-release-tag", command: create_command})
+    let create = append_command_step(cfg, pre_steps, "create-release-tag", create_command)
+    pre_steps = create.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: "create-release-tag", success: create.success, status: create.status},
+    )
+    if !create.success {
+      return pre_steps
+    }
+  }
+  let push_tag_command = "git push origin " + tag_arg
+  release_log_event(run_id, "step_started", {step: "push-release-tag", command: push_tag_command})
+  let push_tag = append_command_step(cfg, pre_steps, "push-release-tag", push_tag_command)
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "push-release-tag", success: push_tag.success, status: push_tag.status},
+  )
+  return push_tag.steps
+}
+
 fn normalize_release_analysis_checkout(cfg, run_id) {
   if cfg.mock || cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
     return
@@ -2010,15 +2163,15 @@ fn setup_release_branch(cfg, analysis) {
       return steps
     }
   }
-  let base_ref_arg = require_shell_arg("origin/${cfg.base}", "origin base ref")
-  var switch_step = "create-release-branch-from-base"
-  var switch_command = "git switch -c " + target_branch_arg + " " + base_ref_arg
+  let pin_arg = require_shell_arg(cfg.pin_sha, "release pin SHA")
+  var switch_step = "create-release-branch-from-pin"
+  var switch_command = "git switch -c " + target_branch_arg + " " + pin_arg
   if current_branch == target_branch {
-    switch_step = "reset-release-branch-to-base"
-    switch_command = "git reset --hard " + base_ref_arg
+    switch_step = "reset-release-branch-to-pin"
+    switch_command = "git reset --hard " + pin_arg
   } else if local_branch_exists(cfg, target_branch) || remote_branch_exists(cfg, target_branch) {
-    switch_step = "reset-release-branch-to-base"
-    switch_command = "git switch -C " + target_branch_arg + " " + base_ref_arg
+    switch_step = "reset-release-branch-to-pin"
+    switch_command = "git switch -C " + target_branch_arg + " " + pin_arg
   }
   let switched = append_command_step(cfg, steps, switch_step, switch_command)
   steps = switched.steps
@@ -2217,6 +2370,11 @@ fn pr_body_text(analysis, agent_review_result, execution) {
   } else {
     execution_table(execution)
   }
+  let pin_sha_note = if trim(analysis.pin_sha_input ?? "") == "" {
+    "(auto-resolved from `origin/${analysis.base_branch}` at run start)"
+  } else {
+    "(operator override via `--at-sha ${analysis.pin_sha_input}`)"
+  }
   return render(
     "@prompts/release_pr_body.harn.prompt",
     {
@@ -2225,6 +2383,8 @@ fn pr_body_text(analysis, agent_review_result, execution) {
       current_version: analysis.current_version,
       branch: analysis.branch,
       base_branch: analysis.base_branch,
+      pin_sha: analysis.pin_sha ?? "(unset)",
+      pin_sha_note: pin_sha_note,
       latest_tag: analysis.latest_tag,
       changed_files: single_line_or(analysis.diff_names, "none"),
       deterministic_findings: if len(analysis.deterministic_findings) == 0 {
@@ -2393,7 +2553,7 @@ fn deterministic_fixture_events(payload) {
         current_version: a.current_version,
         next_version: a.next_version,
         latest_tag: a.latest_tag,
-        git_log_range: log_range_arg(a.latest_tag),
+        git_log_range: release_log_range_arg(a.latest_tag, a.pin_sha ?? ""),
         dirty_files: a.dirty_files,
         status: a.status,
       },
@@ -2589,7 +2749,7 @@ fn tool_observation_events(payload) {
       timestamp: payload.started_iso,
       data: {
         tool: "shell",
-        command: "git log --oneline --no-merges " + log_range_arg(a.latest_tag),
+        command: "git log --oneline --no-merges " + release_log_range_arg(a.latest_tag, a.pin_sha ?? ""),
         success: true,
         status: 0,
         stdout: a.commits_since_latest_tag,
@@ -2604,7 +2764,7 @@ fn tool_observation_events(payload) {
       data: {
         tool: "shell",
         command: "git log --name-status --pretty=format:'commit %h %s' --no-merges "
-          + log_range_arg(a.latest_tag),
+          + release_log_range_arg(a.latest_tag, a.pin_sha ?? ""),
         success: true,
         status: 0,
         stdout: a.commit_file_changes_since_latest_tag,
@@ -2867,7 +3027,6 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
   let version = post_prepare_analysis.next_version
   let branch = "release/v${version}"
   let base_arg = require_shell_arg(cfg.base, "--base")
-  let base_ref_arg = require_shell_arg("origin/${cfg.base}", "origin base ref")
   let push_command = release_branch_push_command(cfg, branch, false)
   var commands = []
   var committed_release_content = false
@@ -2881,7 +3040,7 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
         "commit-already-complete",
         "release branch already has v${version} commit content",
         ok(
-          "skipped commit because the working tree is clean and ${branch} already differs from origin/${cfg.base}",
+          "skipped commit because the working tree is clean and ${branch} already differs from pin ${cfg.pin_sha}",
         ),
       ),
     ]
@@ -2889,10 +3048,13 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
     commands = commands + [{name: "stage-tracked-release-content", command: "git add -u"}]
     commands = commands + [{name: "commit", command: "git commit -m \"Release v${version}\""}]
   }
+  // No `git rebase` here — pinning the release branch's parent is the
+  // whole point of `cfg.pin_sha`. Rebasing onto origin/<base> would fold
+  // commits that landed on main after this run started into the release.
+  // We still fetch tags so the upcoming tag step sees existing remote tags.
   commands = commands
     + [
-    {name: "fetch-base", command: "git fetch origin " + base_arg},
-    {name: "rebase-base", command: "git rebase " + base_ref_arg},
+    {name: "fetch-base", command: "git fetch origin --tags " + base_arg},
     {name: "push", command: push_command},
   ]
   for step in commands {
@@ -2929,6 +3091,16 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       }
       return steps
     }
+  }
+  // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
+  // fires on this tag push and ships crates.io + the GitHub release
+  // from the pinned commit; the PR that follows is paperwork (lands the
+  // Cargo.toml/CHANGELOG bump on main) and doesn't influence what was
+  // shipped. If the tag push fails, abort early so we don't open a PR
+  // for a release that hasn't been published.
+  steps = ensure_release_tag_pushed(cfg, version, steps, run_id)
+  if execution_failed(steps) {
+    return steps
   }
   let body_path = write_pr_body(run_id, post_prepare_analysis, agent_review_result, steps)
   let existing_pr_command = "gh pr list --base " + base_arg
@@ -3089,11 +3261,12 @@ fn write_report(run_id, payload) {
 }
 
 pipeline main() {
-  let cfg = parse_args(argv)
-  if cfg.help {
+  let raw_cfg = parse_args(argv)
+  if raw_cfg.help {
     println(usage())
     return 0
   }
+  let cfg = {...raw_cfg, pin_sha: resolve_pin_sha(raw_cfg)}
   let run_id = uuid_v7()
   let started_iso = date_now_iso()
   let started_ms = now_ms()
@@ -3105,12 +3278,21 @@ pipeline main() {
   let run_events = release_log_event(
     run_id,
     "run_started",
-    {repo: repo_label, mode: cfg.mode, bump: cfg.bump, agent: cfg.agent, mock: cfg.mock},
+    {
+      repo: repo_label,
+      mode: cfg.mode,
+      bump: cfg.bump,
+      agent: cfg.agent,
+      mock: cfg.mock,
+      pin_sha: cfg.pin_sha,
+      pin_sha_input: cfg.pin_sha_input,
+    },
   )
   println("== harn release harness ${run_id}")
   println("   repo : ${repo_label}")
   println("   mode : ${cfg.mode}")
   println("   bump : ${cfg.bump}")
+  println("   pin  : ${cfg.pin_sha}")
   println("   events: ${run_events}")
   println("   tail : tail -f ${run_events}")
   normalize_release_analysis_checkout(cfg, run_id)
