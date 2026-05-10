@@ -109,6 +109,20 @@ Use `std/llm/handlers.with_retry` rather than the deprecated `llm_retries` optio
 next-turn tool changes via `next_options` rather than the deprecated
 `post_turn_callback.llm_options`.
 
+Route boilerplate-prone patterns through the v0.8.6 stdlib helpers:
+- `std/cli::parse_args` for argv parsing (spec-driven; reserved `_extras`/`_errors`/`_help` keys).
+- `std/poll::poll_until` / `wait_for_status` / `retry_with_result` for any "probe until
+  truthy / terminal status / exponential-backoff" loop. Zero-arg closures must use
+  `fn() { return ... }` — the bare `{ -> ... }` form is stripped by `harn fmt` and
+  becomes ambiguous with a dict literal.
+- `std/settled::partition` / `map_settled` / `summary` for any `parallel settle`
+  follow-up that hand-walks the Result list.
+- `std/jsonl::read_jsonl` / `write_jsonl` for transcript/event files (lenient by default).
+- `std/config::env_str` / `env_bool` / `model_from_env` / `parse_model_id` for
+  env-derived configuration. Closures cannot mutate enclosing `var` bindings, so
+  manual `while now_ms() < deadline { ... attempt = attempt + 1 ... }` loops are
+  still the right shape for poll loops that need per-attempt progress prints.
+
 **Templates.** Markdown/PR-body templates live in `prompts/*.harn.prompt` and are referenced
 through the `[asset_roots] prompts = "prompts"` alias in `harn.toml`. Render via
 `render(...)`.
