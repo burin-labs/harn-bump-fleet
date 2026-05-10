@@ -224,6 +224,14 @@ Options:
   changelog/audit walk. Use to ship an older known-good commit while
   newer commits sit on the base. Honors `HARN_RELEASE_PIN_SHA` env var
   as a fallback.
+- `--repin-latest` advances an existing open `release/v$next` PR's pin
+  to current `origin/<base>` HEAD so commits that landed during the PR
+  window fold into the same release rather than splitting into a future
+  `v$next+1`. Requires `--mode ship-pr --yes-live-release`; refuses if
+  the `v$next` release already shipped (crates.io is immutable). Runs
+  the full audit + dry-run + bump, deletes the stale tag on origin, and
+  re-pushes at the new pin. TOCTTOU re-checks the release/tag state one
+  final time immediately before resetting the release branch.
 - `--agent` gives a local model a bounded read/search/run tool surface for
   release readiness review. It defaults to `HARN_RELEASE_MODEL` or
   `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in `ollama` provider. Agent
@@ -231,12 +239,6 @@ Options:
   under the run directory.
 - `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
   `HARN_RELEASE_PROVIDER` or `ollama`.
-- `--skip-audit` and `--skip-dry-run` pass through to
-  `scripts/release_ship.sh --prepare`. Helpful when rerunning `--mode ship-pr`
-  to bring an already-opened Release PR up to date — the merge-queue CI of
-  the open PR re-runs the same gates and is the ground truth for whether
-  the release is shippable, so re-running them locally on a rerun is
-  duplicative wall-clock cost.
 
 In `ship-pr`, the harness first scans only open PRs for an existing matching
 release/version-bump PR with auto-merge already enabled. If it finds one, it
@@ -259,8 +261,8 @@ artifact has already shipped from the originally-pushed tag — the open PR is
 paperwork that exists to land the Cargo.toml/CHANGELOG bump on `<base>`. In
 fixup mode the harness:
 
-- Skips the audit and the publish dry-run (`--skip-audit`/`--skip-dry-run`
-  are forced on; the merge-queue CI of the PR re-runs the same gates).
+- Skips the audit and the publish dry-run (the merge-queue CI of the PR
+  re-runs the same gates).
 - Force-recreates the release branch on top of fresh `origin/<base>` so any
   conflicts caused by other PRs landing after the original publish are
   dropped — the branch ends up with the version bump as its single new
@@ -304,7 +306,13 @@ To bypass auto-detection (e.g. to advance the pin and re-tag because the
 original publish failed before the GitHub release was created), close the
 open release PR or delete the tag manually before rerunning. Detection
 requires both signals (release artifact + open PR) so it cannot misfire
-on a tag that exists without a corresponding shipped artifact. Side-effecting failures are preserved in
+on a tag that exists without a corresponding shipped artifact.
+
+To advance the pin on an open release PR that has NOT yet shipped (so the
+release artifact does not yet exist on crates.io), use `--repin-latest`
+instead — it is the opt-in inverse of fixup mode that folds post-pin
+commits into the same `v$next` rather than splitting them into a future
+release. See the flag description above. Side-effecting failures are preserved in
 the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
 `agent_loop` sidecar with its own JSONL transcript under `recovery/`. The only
