@@ -265,6 +265,14 @@ fixup mode the harness:
   conflicts caused by other PRs landing after the original publish are
   dropped — the branch ends up with the version bump as its single new
   commit on top of current `<base>`.
+- Cherry-picks the original release branch's prepare commit(s) onto fresh
+  `<base>` (`git cherry-pick --no-commit --strategy-option=ours <shas>`)
+  instead of re-running `./scripts/release_ship.sh --prepare`. The
+  prepare-script rerun is byte-identical to the cherry-picked Cargo.toml
+  workspace bumps modulo CHANGELOG, but costs ~110s of generator reruns
+  and pre-commit `cargo check`; cherry-pick is ~seconds. CHANGELOG.md is
+  reset to fresh-`<base>` and overwritten by the deterministic
+  smart-subtract writer so cherry-pick conflict resolution stays moot.
 - Reads the originally-shipped `## v<next_version>` section from
   `git show v<next_version>:CHANGELOG.md` and **injects it verbatim**
   above the next-older version heading via

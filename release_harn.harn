@@ -1941,6 +1941,116 @@ fn prepare_command(cfg) {
   return cmd
 }
 
+/**
+ * Enumerate non-merge prepare commits on the existing release branch
+ * — the commits we want to cherry-pick onto fresh `<base>` during a
+ * fixup pass instead of re-running `./scripts/release_ship.sh --prepare`.
+ *
+ * Skips merges so the `Tie release/v$ver to shipped tag (ours)` merge
+ * commit that a prior fixup may have laid down does not get replayed
+ * (it has no tree delta and `execute_ship_pr` rebuilds it later if
+ * needed). Reads from `origin/release/v$ver` because by the time this
+ * runs we have already reset the local branch to fresh `<base>`; the
+ * authoritative shape is the remote.
+ */
+fn fixup_prepare_commits(cfg, analysis) {
+  let branch = "release/v${analysis.next_version}"
+  let base_ref_arg = require_shell_arg("origin/${cfg.base}", "remote base ref")
+  let release_ref_arg = require_shell_arg("origin/${branch}", "remote release branch")
+  let r = run_cmd(cfg, "git log --reverse --no-merges --format=%H " + base_ref_arg + ".." + release_ref_arg)
+  if !r.success {
+    return {success: false, commits: [], stderr: r.stderr ?? ""}
+  }
+  var commits = []
+  for line in split(r.stdout ?? "", "\n") {
+    let sha = trim(line)
+    if sha != "" {
+      commits = commits + [sha]
+    }
+  }
+  return {success: true, commits: commits, stderr: ""}
+}
+
+fn fixup_cherry_pick_command(commits) {
+  var args = []
+  for sha in commits {
+    args = args + [require_shell_arg(sha, "prepare commit SHA")]
+  }
+  return "git cherry-pick --no-commit --strategy-option=ours " + args.join(" ")
+}
+
+/**
+ * Replace `./scripts/release_ship.sh --prepare` (which re-derives the
+ * Cargo.toml workspace bumps and regenerated artifacts in ~110s on the
+ * full harn workspace) with a cherry-pick of the original release
+ * branch's prepare commits onto fresh `<base>`. `--strategy-option=ours`
+ * keeps fresh-`<base>` content for any conflicting hunk (most commonly
+ * CHANGELOG.md, where `<base>` drift collides with the prepare commit's
+ * `## Unreleased` → `## v$ver` rewrite); the follow-up `git checkout
+ * HEAD -- CHANGELOG.md` step in `execute_prepare` neutralizes any
+ * non-conflicting CHANGELOG hunks the cherry-pick still applied, so
+ * the smart-subtract CHANGELOG writer that runs next is unambiguously
+ * authoritative. `--no-commit` lets the downstream `git add -u` /
+ * `git commit -m "Release v$ver"` step in `execute_ship_pr` produce a
+ * single canonical release commit.
+ */
+fn execute_fixup_cherry_pick(cfg, analysis, steps, run_id) {
+  let probe = fixup_prepare_commits(cfg, analysis)
+  if !probe.success {
+    return steps
+      + [
+      recorded_step(
+        "fixup-list-prepare-commits",
+        "git log --reverse --no-merges origin/${cfg.base}..origin/release/v${analysis.next_version}",
+        fail(2, "could not enumerate prepare commits to cherry-pick:\n${trim(probe.stderr ?? "")}"),
+      ),
+    ]
+  }
+  if len(probe.commits) == 0 {
+    return steps
+      + [
+      recorded_step(
+        "fixup-list-prepare-commits",
+        "git log --reverse --no-merges origin/${cfg.base}..origin/release/v${analysis.next_version}",
+        fail(
+          2,
+          "no non-merge commits on origin/release/v${analysis.next_version} to cherry-pick; the existing release branch looks empty",
+        ),
+      ),
+    ]
+  }
+  let cmd = fixup_cherry_pick_command(probe.commits)
+  release_log_event(
+    run_id,
+    "step_started",
+    {step: "fixup-cherry-pick-prepare-commits", command: cmd, commit_count: len(probe.commits)},
+  )
+  let result = append_command_step(cfg, steps, "fixup-cherry-pick-prepare-commits", cmd)
+  release_log_event(
+    run_id,
+    "step_finished",
+    {
+      step: "fixup-cherry-pick-prepare-commits",
+      success: result.success,
+      status: result.status,
+      commit_count: len(probe.commits),
+    },
+  )
+  if result.success {
+    return result.steps
+  }
+  // Failure leaves CHERRY_PICK_HEAD set, which would block the next run.
+  // Abort defensively; `|| true` keeps the cleanup itself from masking
+  // the original failure when there is nothing to abort.
+  let abort = append_command_step(
+    cfg,
+    result.steps,
+    "fixup-cherry-pick-abort",
+    "git cherry-pick --abort 2>/dev/null || true",
+  )
+  return abort.steps
+}
+
 fn release_adds_workspace_crate(analysis) {
   let changes = analysis.commit_file_changes_since_latest_tag ?? ""
   return contains(changes, "A\tcrates/") && contains(changes, "/Cargo.toml")
@@ -3339,6 +3449,41 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
     )
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
   }
+  // Fixup: replace `release_ship.sh --prepare` (~110s of Cargo.toml
+  // workspace bumps + generator reruns + pre-commit `cargo check`) with
+  // a cherry-pick of the existing release branch's prepare commits onto
+  // fresh `<base>`. The smart-subtract CHANGELOG writer that runs next
+  // is the source of truth for CHANGELOG.md, so any CHANGELOG hunks the
+  // cherry-pick applied get reset to HEAD here — otherwise smart-subtract
+  // would see `## v$ver` already present and short-circuit, leaving
+  // potentially duplicated bullets between Unreleased and v$ver.
+  if cfg.fixup_mode ?? false {
+    steps = execute_fixup_cherry_pick(cfg, analysis, steps, run_id)
+    if execution_failed(steps) {
+      release_log_event(
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
+    }
+    release_log_event(run_id, "step_started", {step: "fixup-reset-changelog"})
+    let reset = append_command_step(cfg, steps, "fixup-reset-changelog", "git checkout HEAD -- CHANGELOG.md")
+    steps = reset.steps
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: "fixup-reset-changelog", success: reset.success, status: reset.status},
+    )
+    if execution_failed(steps) {
+      release_log_event(
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
+    }
+  }
   release_log_event(run_id, "step_started", {step: "ensure-release-notes"})
   steps = steps + ensure_release_notes_with_run_id(cfg, analysis, agent_review_result, run_id)
   if execution_failed(steps) {
@@ -3348,6 +3493,10 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
       {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
     )
     return add_recovery_for_last_failure(cfg, analysis, steps, run_id)
+  }
+  if cfg.fixup_mode ?? false {
+    release_log_event(run_id, "phase_finished", {phase: "prepare", success: true})
+    return steps
   }
   let target_state = target_release_checkout_state(cfg, analysis)
   if target_state.matches {
