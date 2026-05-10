@@ -164,8 +164,13 @@ the host harn binary.
 `release_harn.harn` is the matching Harn-native harness for the
 `~/projects/harn` `/release-harn` skill workflow. It does not publish
 directly. The live flow mirrors the skill: prepare one `Release vX.Y.Z` PR,
-enable auto-merge, then let the `publish-release` and
-`build-release-binaries` workflows ship after the PR lands.
+push `vX.Y.Z` at the pinned commit, enable auto-merge, then let the
+`publish-release` and `build-release-binaries` workflows ship from the
+tag. **Pin model:** the release branch is parented at `origin/<base>`
+HEAD captured at run start (or whatever `--at-sha` resolves to), and is
+NOT rebased before push. The pushed tag is the source of truth for what
+ships, so any commits that land on `<base>` between PR-open and merge
+cannot leak into the published artifact.
 
 Default mode is read-only audit:
 
@@ -213,6 +218,12 @@ Options:
 - `--base BRANCH` changes the release PR base; default is `main`.
 - `--bump patch|minor|major` controls the expected next version; default is
   `patch`.
+- `--at-sha SHA` overrides the auto-resolved pin (`origin/<base>` HEAD
+  at run start). The release branch is parented at this commit, the
+  tag is pushed pointing here, and `latest_tag..<pin>` bounds every
+  changelog/audit walk. Use to ship an older known-good commit while
+  newer commits sit on the base. Honors `HARN_RELEASE_PIN_SHA` env var
+  as a fallback.
 - `--agent` gives a local model a bounded read/search/run tool surface for
   release readiness review. It defaults to `HARN_RELEASE_MODEL` or
   `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in `ollama` provider. Agent
