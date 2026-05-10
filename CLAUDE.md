@@ -28,7 +28,14 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   belongs in the NEXT release), force-pushes, refreshes the PR body, and
   short-circuits the tag step (`cfg.skip_tag`). Audit + publish-dry-run are also
   force-skipped because the merge-queue CI of the open PR re-runs the same gates
-  and the publish artifact is already on crates.io.
+  and the publish artifact is already on crates.io. **Repin mode**
+  (`--repin-latest`) is the opt-in inverse for the in-flight case: when v$next
+  has NOT yet shipped, advance the pin to fresh `origin/<base>` HEAD so commits
+  that landed during the PR window fold into the same release. Runs the full
+  audit + dry-run + bump, deletes the stale tag on origin (the TOCTTOU re-check
+  immediately before branch reset confirms the remote tag has not moved since
+  startup), and re-pushes at the new pin. Requires `--mode ship-pr
+  --yes-live-release`; refuses if the release already shipped.
 - `harness_self_review.harn` — meta-audit; intentionally not wired into CI. Reads recent
   `.harn-runs/` artifacts and gives a local model read-only tools over `~/projects` for
   cross-referencing.

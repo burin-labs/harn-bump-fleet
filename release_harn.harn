@@ -36,6 +36,7 @@ import {
   recovery_step_ref,
   recovery_step_refs,
 } from "lib/release_execution"
+import { remote_tag_sha_from_ls_remote, repin_tocttou_decision } from "lib/release_repin"
 import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
 import { fail, ok, require_shell_arg, safe_shell_arg } from "lib/shell_util"
 import { markdown_multiline, truncate_text } from "lib/text_util"
@@ -117,14 +118,18 @@ Flags:
                           `origin/<base>` HEAD at startup). Locks the release branch's
                           parent so commits that land on the base afterward cannot
                           slip into the published artifact.
+  --repin-latest          Advance an existing open release/v$next PR's pin to current
+                          `origin/<base>` HEAD so commits that landed after the
+                          original pin fold into the same release. Requires
+                          `--mode ship-pr --yes-live-release`; refuses if the
+                          v$next release already shipped (crates.io is immutable).
+                          Re-runs audit + dry-run + bump and re-tags at the new pin.
   --agent                 Ask a local model to review the release evidence with read/search/run tools.
                           Live prepare/ship-pr requires --agent unless CHANGELOG.md
                           already starts with the target version.
   --model MODEL           Local model id for --agent. Defaults to HARN_RELEASE_MODEL or qwen3.6:35b-a3b-coding-nvfp4.
   --provider PROVIDER     LLM provider for --agent. Defaults to HARN_RELEASE_PROVIDER or ollama.
   --mock                  Use fake command/file tools for a v0.7.52 -> v0.7.53 release rehearsal.
-  --skip-audit            Pass through to release_ship.sh --prepare.
-  --skip-dry-run          Pass through to release_ship.sh --prepare.
   --bootstrap-new-crates  First release that adds a workspace crate depended on by published crates.
   --focus TEXT            Operator context the model must consider while compiling release notes.
   --yes-live-release      Required for live prepare/ship-pr modes.
@@ -143,8 +148,6 @@ fn parse_args(args) {
     provider: DEFAULT_PROVIDER,
     mock: false,
     help: false,
-    skip_audit: false,
-    skip_dry_run: false,
     bootstrap_new_crates: env_or("HARN_RELEASE_BOOTSTRAP_NEW_CRATES", "") == "1",
     release_focus: env_or("HARN_RELEASE_FOCUS", ""),
     yes_live_release: false,
@@ -155,6 +158,11 @@ fn parse_args(args) {
     fixup_tag: "",
     fixup_pr_url: "",
     fixup_pin_unreleased: "",
+    repin_latest: false,
+    repin_mode: false,
+    repin_tag: "",
+    repin_pr_url: "",
+    repin_initial_remote_tag_sha: "",
   }
   var i = 0
   while i < len(args) {
@@ -199,10 +207,8 @@ fn parse_args(args) {
       cfg = {...cfg, provider: args[i]}
     } else if a == "--mock" {
       cfg = {...cfg, mock: true}
-    } else if a == "--skip-audit" {
-      cfg = {...cfg, skip_audit: true}
-    } else if a == "--skip-dry-run" {
-      cfg = {...cfg, skip_dry_run: true}
+    } else if a == "--repin-latest" {
+      cfg = {...cfg, repin_latest: true}
     } else if a == "--bootstrap-new-crates" {
       cfg = {...cfg, bootstrap_new_crates: true}
     } else if a == "--focus" {
@@ -232,6 +238,15 @@ fn parse_args(args) {
   }
   if !(cfg.mode == "audit" || cfg.mode == "prepare" || cfg.mode == "ship-pr") {
     throw "--mode must be audit, prepare, or ship-pr"
+  }
+  if cfg.repin_latest && cfg.mode != "ship-pr" {
+    throw "--repin-latest requires --mode ship-pr"
+  }
+  if cfg.repin_latest && !cfg.yes_live_release && !cfg.mock {
+    throw "--repin-latest requires --yes-live-release"
+  }
+  if cfg.repin_latest && trim(cfg.pin_sha_input ?? "") != "" {
+    throw "--repin-latest and --at-sha are mutually exclusive: --repin-latest advances the pin to origin/<base>"
   }
   return cfg
 }
@@ -1933,12 +1948,6 @@ fn prepare_command(cfg) {
   if cfg.bootstrap_new_crates ?? false {
     cmd = "HARN_BOOTSTRAP_NEW_CRATES=1 " + cmd
   }
-  if cfg.skip_audit {
-    cmd = cmd + " --skip-audit"
-  }
-  if cfg.skip_dry_run {
-    cmd = cmd + " --skip-dry-run"
-  }
   return cmd
 }
 
@@ -2322,6 +2331,107 @@ fn normalize_release_analysis_checkout(cfg, run_id) {
   )
 }
 
+/**
+ * Repin mode: clean up stale `v$next` tags before re-tagging at the new
+ * pin. `fetch-base --tags` rehydrates the local tag from origin (when
+ * present), and `ensure_release_tag_pushed` refuses to overwrite a stale
+ * local tag pointing somewhere other than the release HEAD. Always
+ * delete locally; delete on origin only when the TOCTTOU re-check
+ * confirmed the remote tag was present at `repin_initial_remote_tag_sha`.
+ */
+fn maybe_delete_stale_repin_tag(cfg, version, steps, run_id) {
+  if !(cfg.repin_mode ?? false) {
+    return {steps: steps, success: true}
+  }
+  let tag = "v${version}"
+  let tag_arg = require_shell_arg(tag, "release tag")
+  let local_del_command = "git tag -d " + tag_arg + " 2>/dev/null || true"
+  release_log_event(
+    run_id,
+    "step_started",
+    {step: "repin-delete-local-tag", command: local_del_command},
+  )
+  let local_del = run_cmd(cfg, local_del_command)
+  var out = steps
+    + [recorded_step("repin-delete-local-tag", local_del_command, ok("ok: ${trim(local_del.stdout)}\n"))]
+  release_log_event(run_id, "step_finished", {step: "repin-delete-local-tag", success: true})
+  if trim(cfg.repin_initial_remote_tag_sha ?? "") == "" {
+    return {steps: out, success: true}
+  }
+  let remote_del_command = "git push origin --delete " + tag_arg
+  release_log_event(
+    run_id,
+    "step_started",
+    {step: "repin-delete-remote-tag", command: remote_del_command},
+  )
+  let remote_del = append_command_step(cfg, out, "repin-delete-remote-tag", remote_del_command)
+  out = remote_del.steps
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "repin-delete-remote-tag", success: remote_del.success, status: remote_del.status},
+  )
+  return {steps: out, success: remote_del.success}
+}
+
+/**
+ * TOCTTOU re-check executed immediately before the repin branch reset.
+ *
+ * `detect_repin_state` ran at startup and captured `initial_remote_tag_sha`.
+ * Between then and now the operator's environment continued to drift — other
+ * sessions may have published the release, moved the tag, or landed more
+ * commits on `<base>`. Re-fetch origin, re-probe every gate, and only then
+ * return the freshly-locked pin SHA the caller may safely reset to.
+ *
+ * Returns `{success, message, new_pin_sha}`. On `success=false` the caller
+ * must surface `message` and abort the mutation.
+ */
+fn run_repin_tocttou_recheck(cfg, analysis) {
+  let tag = "v${analysis.next_version}"
+  let tag_arg = require_shell_arg(tag, "release tag")
+  let fetch = run_cmd(cfg, "git fetch origin --tags --prune --quiet")
+  if !fetch.success {
+    return {
+      success: false,
+      message: "repin: failed to re-fetch origin before TOCTTOU recheck: ${trim(fetch.stderr)}",
+      new_pin_sha: "",
+    }
+  }
+  let release_probe = run_cmd(cfg, "gh release view " + tag_arg + " --json tagName --jq .tagName 2>/dev/null || true")
+  let release_exists = release_probe.success && trim(release_probe.stdout) == tag
+  let ls_arg = require_shell_arg("refs/tags/" + tag, "release tag ref")
+  let ls = run_cmd(cfg, "git ls-remote origin " + ls_arg)
+  if !ls.success {
+    return {
+      success: false,
+      message: "repin: failed to re-list remote tag ${tag}: ${trim(ls.stderr)}",
+      new_pin_sha: "",
+    }
+  }
+  let base_arg = require_shell_arg("origin/${cfg.base}^{commit}", "origin base ref")
+  let pin_probe = run_cmd(cfg, "git rev-parse --verify " + base_arg)
+  if !pin_probe.success {
+    return {
+      success: false,
+      message: "repin: failed to re-resolve origin/${cfg.base}: ${trim(pin_probe.stderr)}",
+      new_pin_sha: "",
+    }
+  }
+  let decision = repin_tocttou_decision(
+    {
+      release_exists: release_exists,
+      initial_remote_tag_sha: cfg.repin_initial_remote_tag_sha ?? "",
+      current_remote_tag_sha: remote_tag_sha_from_ls_remote(ls.stdout),
+      new_pin_sha: trim(pin_probe.stdout),
+      tag: tag,
+    },
+  )
+  if decision.action == "abort" {
+    return {success: false, message: "repin: aborting — ${decision.reason}", new_pin_sha: ""}
+  }
+  return {success: true, message: "", new_pin_sha: decision.new_pin_sha}
+}
+
 fn setup_release_branch(cfg, analysis) {
   var steps = []
   let current_branch = checked(cfg, "git branch --show-current")
@@ -2618,8 +2728,6 @@ fn with_fixup_state(cfg, fixup) {
     ...cfg,
     fixup_mode: true,
     skip_tag: fixup.tag_exists,
-    skip_audit: true,
-    skip_dry_run: true,
     fixup_tag: fixup.tag,
     fixup_pr_url: fixup.pr_url,
     fixup_pin_unreleased: fixup.pin_unreleased,
@@ -2631,6 +2739,85 @@ fn analysis_with_fixup_state(raw, fixup) {
     return {...raw, fixup_mode: false, fixup_tag: "", fixup_pr_url: ""}
   }
   return {...raw, fixup_mode: true, fixup_tag: fixup.tag, fixup_pr_url: fixup.pr_url}
+}
+
+/**
+ * Detect `--repin-latest` state for `analysis.next_version`.
+ *
+ * Returns `nil` unless the operator passed `--repin-latest` AND this is a
+ * live ship-pr run. Throws (with an actionable message) when the operator
+ * asked for repin but the preconditions aren't met:
+ *   - The v$next release already shipped. crates.io is immutable — the
+ *     pin cannot be advanced for a published release. The operator must
+ *     bump to v$next+1 instead.
+ *   - No open `release/v$next` PR exists. `--repin-latest` is a "second
+ *     take" — for a first-time release the operator uses normal prepare.
+ *
+ * On success returns `{tag, pr_url, initial_remote_tag_sha}`. The
+ * `initial_remote_tag_sha` is captured for a TOCTTOU re-check right
+ * before the destructive branch reset.
+ */
+fn detect_repin_state(cfg, analysis) {
+  if !(cfg.repin_latest ?? false) {
+    return nil
+  }
+  if cfg.mock {
+    return nil
+  }
+  if cfg.mode != "ship-pr" || !(cfg.yes_live_release ?? false) {
+    throw "--repin-latest requires --mode ship-pr --yes-live-release"
+  }
+  let version = trim(analysis.next_version ?? "")
+  if version == "" {
+    throw "--repin-latest could not resolve next version from CHANGELOG/Cargo state"
+  }
+  let tag = "v${version}"
+  let tag_arg = require_shell_arg(tag, "release tag")
+  let release_check = run_cmd(cfg, "gh release view " + tag_arg + " --json tagName --jq .tagName 2>/dev/null || true")
+  if release_check.success && trim(release_check.stdout) == tag {
+    throw "--repin-latest refused: release ${tag} already exists on origin. Re-shipping a published version is impossible (crates.io is immutable); bump to v$next+1 instead."
+  }
+  let branch = "release/" + tag
+  let base_arg = require_shell_arg(cfg.base, "--base")
+  let head_arg = require_shell_arg(branch, "release branch")
+  let pr_check = run_cmd(
+    cfg,
+    "gh pr list --base " + base_arg + " --head " + head_arg
+      + " --state open --json url --jq '.[0].url // \"\"'",
+  )
+  if !pr_check.success {
+    throw "--repin-latest could not query open release PRs: ${trim(pr_check.stderr)}"
+  }
+  let pr_url = trim(pr_check.stdout)
+  if pr_url == "" {
+    throw "--repin-latest refused: no open release/${tag} PR found. --repin-latest advances an in-flight PR's pin; for a first-time release use --mode ship-pr without --repin-latest."
+  }
+  let ls_arg = require_shell_arg("refs/tags/" + tag, "release tag ref")
+  let ls = run_cmd(cfg, "git ls-remote origin " + ls_arg)
+  if !ls.success {
+    throw "--repin-latest could not list remote tag ${tag}: ${trim(ls.stderr)}"
+  }
+  return {tag: tag, pr_url: pr_url, initial_remote_tag_sha: remote_tag_sha_from_ls_remote(ls.stdout)}
+}
+
+fn with_repin_state(cfg, repin) {
+  if repin == nil {
+    return cfg
+  }
+  return {
+    ...cfg,
+    repin_mode: true,
+    repin_tag: repin.tag,
+    repin_pr_url: repin.pr_url,
+    repin_initial_remote_tag_sha: repin.initial_remote_tag_sha,
+  }
+}
+
+fn analysis_with_repin_state(raw, repin) {
+  if repin == nil {
+    return {...raw, repin_mode: false, repin_tag: "", repin_pr_url: ""}
+  }
+  return {...raw, repin_mode: true, repin_tag: repin.tag, repin_pr_url: repin.pr_url}
 }
 
 fn release_commit_title(line) {
@@ -2760,10 +2947,14 @@ fn prepared_release_analysis(raw, original) {
     next_version: original.next_version,
     expected_branch: original.expected_branch,
     operator_focus: original.operator_focus ?? "",
+    pin_sha: original.pin_sha ?? raw.pin_sha ?? "",
     deterministic_findings: prepared_release_findings(raw, original),
     fixup_mode: original.fixup_mode ?? raw.fixup_mode ?? false,
     fixup_tag: original.fixup_tag ?? raw.fixup_tag ?? "",
     fixup_pr_url: original.fixup_pr_url ?? raw.fixup_pr_url ?? "",
+    repin_mode: original.repin_mode ?? raw.repin_mode ?? false,
+    repin_tag: original.repin_tag ?? raw.repin_tag ?? "",
+    repin_pr_url: original.repin_pr_url ?? raw.repin_pr_url ?? "",
   }
 }
 
@@ -2839,12 +3030,20 @@ fn pr_body_text(analysis, agent_review_result, execution, run_id) {
   let fixup_note = if analysis.fixup_mode ?? false {
     "\n\n> **Repair pass for an existing release PR.** Recovered the original pin SHA via `git merge-base`, recreated the branch on fresh `${analysis.base_branch}`, and re-derived v${analysis.next_version} from pin-time `## Unreleased`. Post-pin bullets on the current `## Unreleased` are preserved — they describe work landing AFTER this release. Auto-merge state is left untouched so the operator can review the corrective diff before merging."
   } else {
-    ""
+    if analysis.repin_mode ?? false {
+      "\n\n> **Repin pass: advanced pin to fresh `${analysis.base_branch}` HEAD.** TOCTTOU re-checked (no shipped release, remote tag unchanged) immediately before resetting the release branch. v${analysis.next_version} now folds in every commit that landed on `${analysis.base_branch}` after the original pin. The previous tag was deleted on origin and re-pushed at the new pin; `publish-release.yml` will fire on the new tag."
+    } else {
+      ""
+    }
   }
   let tag_publish_note = if analysis.fixup_mode ?? false {
     "tag handling depends on origin state: skipped if `v${analysis.next_version}` already exists on origin (artifact shipped); otherwise pushed pre-PR like a normal first-time release."
   } else {
-    "pushed pre-PR; `publish-release.yml` ships from the tag so post-PR drift on `${analysis.base_branch}` cannot leak into the artifact."
+    if analysis.repin_mode ?? false {
+      "stale `v${analysis.next_version}` tag deleted on origin and re-pushed at the new pin; `publish-release.yml` ships from the freshly pushed tag."
+    } else {
+      "pushed pre-PR; `publish-release.yml` ships from the tag so post-PR drift on `${analysis.base_branch}` cannot leak into the artifact."
+    }
   }
   let changelog_block = if analysis.fixup_mode ?? false {
     fixup_changelog_block(analysis)
@@ -3538,9 +3737,70 @@ fn execute_prepare(cfg, analysis, agent_review_result, run_id) {
   return steps
 }
 
-fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
-  require_live_confirmation(cfg)
-  var steps = execute_prepare(cfg, analysis, agent_review_result, run_id)
+/**
+ * Run the repin TOCTTOU re-check and return refreshed (cfg, analysis,
+ * prelude_steps). Returns `failed_steps != nil` when the operator must
+ * abort; otherwise mutates pin SHA in cfg/analysis to the freshly-locked
+ * value.
+ */
+fn repin_prelude(cfg, analysis, run_id) {
+  if !(cfg.repin_mode ?? false) {
+    return {cfg: cfg, analysis: analysis, steps: [], failed_steps: nil}
+  }
+  release_log_event(run_id, "step_started", {step: "repin-tocttou-recheck"})
+  let recheck = run_repin_tocttou_recheck(cfg, analysis)
+  if !recheck.success {
+    release_log_event(
+      run_id,
+      "step_finished",
+      {step: "repin-tocttou-recheck", success: false, message: recheck.message},
+    )
+    return {
+      cfg: cfg,
+      analysis: analysis,
+      steps: [],
+      failed_steps: [
+        recorded_step(
+          "repin-tocttou-recheck",
+          "repin TOCTTOU re-check before branch reset",
+          fail(2, recheck.message),
+        ),
+      ],
+    }
+  }
+  let old_pin = cfg.pin_sha
+  let msg = if recheck.new_pin_sha == old_pin {
+    "repin: TOCTTOU re-check passed; pin unchanged at ${recheck.new_pin_sha}\n"
+  } else {
+    "repin: TOCTTOU re-check passed; pin advanced from ${old_pin} to ${recheck.new_pin_sha}\n"
+  }
+  release_log_event(
+    run_id,
+    "step_finished",
+    {step: "repin-tocttou-recheck", success: true, new_pin: recheck.new_pin_sha},
+  )
+  return {
+    cfg: {...cfg, pin_sha: recheck.new_pin_sha},
+    analysis: {...analysis, pin_sha: recheck.new_pin_sha},
+    steps: [recorded_step("repin-tocttou-recheck", "repin TOCTTOU re-check before branch reset", ok(msg))],
+    failed_steps: nil,
+  }
+}
+
+@complexity(allow)
+fn execute_ship_pr(raw_cfg, raw_analysis, agent_review_result, run_id) {
+  require_live_confirmation(raw_cfg)
+  // Repin mode advances the pin to fresh `origin/<base>` HEAD. The TOCTTOU
+  // re-check (re-fetch origin, re-probe release+tag, re-resolve pin) runs
+  // once here so the locked pin propagates into setup_release_branch and
+  // the re-analysis after prepare. Abort cleanly if anything moved.
+  let pre = repin_prelude(raw_cfg, raw_analysis, run_id)
+  if pre.failed_steps != nil {
+    return pre.failed_steps
+  }
+  let cfg = pre.cfg
+  let analysis = pre.analysis
+  var steps = pre.steps + execute_prepare(cfg, analysis, agent_review_result, run_id)
   if execution_failed(steps) {
     return steps
   }
@@ -3646,6 +3906,11 @@ fn execute_ship_pr(cfg, analysis, agent_review_result, run_id) {
       }
       return steps
     }
+  }
+  let delete_outcome = maybe_delete_stale_repin_tag(cfg, version, steps, run_id)
+  steps = delete_outcome.steps
+  if !delete_outcome.success {
+    return steps
   }
   // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
   // fires on this tag push and ships crates.io + the GitHub release
@@ -3854,9 +4119,17 @@ pipeline main() {
   release_log_event(run_id, "analysis_started", {})
   let raw_analysis = analyze_release(cfg)
   let derived_cfg = with_derived_release_options(cfg, raw_analysis)
-  let fixup_state = detect_fixup_state(derived_cfg, raw_analysis)
-  let effective_cfg = with_fixup_state(derived_cfg, fixup_state)
-  let analysis = analysis_with_fixup_state(raw_analysis, fixup_state)
+  // Repin and fixup are mutually exclusive: --repin-latest is the opt-in
+  // inverse of fixup (advance the pin and fold drift in), so detect it
+  // first and bypass fixup auto-detection when the operator asked for repin.
+  let repin_state = detect_repin_state(derived_cfg, raw_analysis)
+  let fixup_state = if repin_state == nil {
+    detect_fixup_state(derived_cfg, raw_analysis)
+  } else {
+    nil
+  }
+  let effective_cfg = with_repin_state(with_fixup_state(derived_cfg, fixup_state), repin_state)
+  let analysis = analysis_with_repin_state(analysis_with_fixup_state(raw_analysis, fixup_state), repin_state)
   release_log_event(
     run_id,
     "analysis_finished",
@@ -3876,6 +4149,32 @@ pipeline main() {
   if effective_cfg.bootstrap_new_crates ?? false && !(cfg.bootstrap_new_crates ?? false) {
     println("   bootstrap new crates: auto-enabled from release delta")
     release_log_event(run_id, "option_derived", {bootstrap_new_crates: true})
+  }
+  if repin_state != nil {
+    println("== repin mode (advance pin to latest origin/${cfg.base})")
+    let tag_state = if trim(repin_state.initial_remote_tag_sha) == "" {
+      "${repin_state.tag} (not yet on origin; will be tagged on this run)"
+    } else {
+      "${repin_state.tag} (currently at ${repin_state.initial_remote_tag_sha}; will be retagged at the new pin)"
+    }
+    println("   tag       : ${tag_state}")
+    println("   pr        : ${repin_state.pr_url}")
+    println(
+      "   pin       : ${cfg.pin_sha} (latest origin/${cfg.base}; re-locked just before branch reset)",
+    )
+    println(
+      "   plan      : recreate release/v${analysis.next_version} on fresh ${cfg.base}, rename current ## Unreleased to v${analysis.next_version}, re-run audit + dry-run + bump, force-push new tag, refresh PR body.",
+    )
+    release_log_event(
+      run_id,
+      "repin_mode_detected",
+      {
+        tag: repin_state.tag,
+        pr_url: repin_state.pr_url,
+        new_pin: cfg.pin_sha,
+        initial_remote_tag_sha: repin_state.initial_remote_tag_sha,
+      },
+    )
   }
   if fixup_state != nil {
     let pin_count = changelog_bullet_count(fixup_state.pin_unreleased)
@@ -4023,6 +4322,10 @@ pipeline main() {
   }
   if analysis.fixup_mode ?? false {
     println("   tag     : ${analysis.fixup_tag} (unchanged; published artifact untouched)")
+  } else if analysis.repin_mode ?? false && !execution_failed(execution) && !cfg.mock {
+    println(
+      "   tag     : v${analysis.next_version} (re-pushed at advanced pin; publish-release.yml will ship)",
+    )
   } else if cfg.mode == "ship-pr" && !execution_failed(execution) && !cfg.mock {
     println("   tag     : v${analysis.next_version} (pushed; publish-release.yml will ship)")
   }
