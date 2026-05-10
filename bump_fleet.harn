@@ -14,7 +14,11 @@
 //   harn run bump_fleet.harn -- --dry-run         // discover-only, no dispatch
 //   harn run bump_fleet.harn -- v0.7.52 --dry-run
 import { summary_agent } from "std/agent/presets"
+import { parse_args } from "std/cli"
+import { model_from_env } from "std/config"
 import { default_llm_caller, with_retry } from "std/llm/handlers"
+import { poll_until } from "std/poll"
+import { map_settled } from "std/settled"
 import {
   bump_summary_format_ok,
   bump_summary_problem_outcome,
@@ -57,40 +61,26 @@ let RELEASE_READINESS_MAX_MS = 45 * 60 * 1000
 
 // Default summary model uses the local Ollama path. Override with
 // HARN_BUMP_FLEET_MODEL / HARN_BUMP_FLEET_PROVIDER when using another local provider.
-let SUMMARY_MODEL = env_or("HARN_BUMP_FLEET_MODEL", "gemma4:26b")
+let SUMMARY_MODEL = model_from_env("HARN_BUMP_FLEET_MODEL", "gemma4:26b")
 
-let SUMMARY_PROVIDER = env_or("HARN_BUMP_FLEET_PROVIDER", "ollama")
+let SUMMARY_PROVIDER = model_from_env("HARN_BUMP_FLEET_PROVIDER", "ollama")
 
-// -------------------------------------------------------------------------------------------------
-// Argument parsing — tiny, positional + --dry-run flag.
-// -------------------------------------------------------------------------------------------------
+let ARG_SPEC = [
+  {kind: "positional", name: "target", required: false},
+  {kind: "flag", name: "dry_run", flags: ["--dry-run"]},
+  {kind: "option", name: "only", flags: ["--only"]},
+]
 
-fn parse_args(args) {
-  var target = nil
-  var dry = false
-  var only = nil
-  var i = 0
-  while i < len(args) {
-    let a = args[i]
-    if a == "--dry-run" {
-      dry = true
-    } else if a == "--only" {
-      i = i + 1
-      if i >= len(args) {
-        throw "--only requires a slug like burin-labs/harn-cloud"
-      }
-      only = args[i]
-    } else if starts_with(a, "--") {
-      throw "unknown flag: ${a}"
-    } else {
-      if target != nil {
-        throw "extra positional arg: ${a}"
-      }
-      target = a
-    }
-    i = i + 1
+fn parse_fleet_args(args) {
+  let parsed = parse_args(args, ARG_SPEC)
+  let errors = parsed._errors ?? []
+  if len(parsed._extras) > 0 {
+    throw "unknown flag: " + parsed._extras[0]
   }
-  return {target: target, dry_run: dry, only: only}
+  if len(errors) > 0 {
+    throw join(errors, "; ")
+  }
+  return {target: parsed.target, dry_run: parsed.dry_run, only: parsed.only}
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -172,12 +162,10 @@ fn read_pre_pin(dir) {
 
 // -------------------------------------------------------------------------------------------------
 
-fn make_outcome(repo, local_pin, remote_pin) {
+fn base_outcome_fields(repo, local_pin, remote_pin) {
   return {
     dir: repo.dir,
     slug: repo.slug,
-    status: "pending",
-    detail: "",
     run_id: nil,
     run_url: nil,
     pr_number: nil,
@@ -188,6 +176,10 @@ fn make_outcome(repo, local_pin, remote_pin) {
     auto_merge: nil,
     duration_ms: 0,
   }
+}
+
+fn make_outcome(repo, local_pin, remote_pin) {
+  return base_outcome_fields(repo, local_pin, remote_pin) + {status: "pending", detail: ""}
 }
 
 /**
@@ -250,13 +242,16 @@ fn close_stale_pr(slug, pr, target, evidence) {
   }
 }
 
+fn finish_outcome(base, started_ms, fields) {
+  return base + fields + {duration_ms: now_ms() - started_ms}
+}
+
 fn dry_run_outcome(base, target, started_ms) {
-  return {
-    ...base,
-    status: "dry_run",
-    detail: "would dispatch bump-harn.yml with version=${target}",
-    duration_ms: now_ms() - started_ms,
-  }
+  return finish_outcome(
+    base,
+    started_ms,
+    {status: "dry_run", detail: "would dispatch bump-harn.yml with version=${target}"},
+  )
 }
 
 fn already_current_outcome(base, remote_pin, existing_pr, started_ms) {
@@ -270,14 +265,16 @@ fn already_current_outcome(base, remote_pin, existing_pr, started_ms) {
   } else {
     existing_pr.url
   }
-  return {
-    ...base,
-    status: "already_current",
-    detail: "remote main pin is ${remote_pin}; matches target" + local_pin_drift_detail(base, remote_pin),
-    pr_number: pr_n,
-    pr_url: pr_u,
-    duration_ms: now_ms() - started_ms,
-  }
+  return finish_outcome(
+    base,
+    started_ms,
+    {
+      status: "already_current",
+      detail: "remote main pin is ${remote_pin}; matches target" + local_pin_drift_detail(base, remote_pin),
+      pr_number: pr_n,
+      pr_url: pr_u,
+    },
+  )
 }
 
 fn local_pin_drift_detail(base, remote_pin) {
@@ -303,15 +300,17 @@ fn targeted_pr_outcome(base, slug, target, pr, started_ms) {
   } else {
     "pr_already_set"
   }
-  return {
-    ...base,
-    status: final_status,
-    detail: "PR #${pr.number} already targets ${target}; auto-merge: ${am}",
-    pr_number: pr.number,
-    pr_url: pr.url,
-    auto_merge: am,
-    duration_ms: now_ms() - started_ms,
-  }
+  return finish_outcome(
+    base,
+    started_ms,
+    {
+      status: final_status,
+      detail: "PR #${pr.number} already targets ${target}; auto-merge: ${am}",
+      pr_number: pr.number,
+      pr_url: pr.url,
+      auto_merge: am,
+    },
+  )
 }
 
 fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, started_ms) {
@@ -341,14 +340,16 @@ fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, started_m
       return {
         done: true,
         stale_note: "",
-        outcome: {
-          ...base,
-          status: "stale_pr_close_failed",
-          detail: closed,
-          pr_number: existing_pr.number,
-          pr_url: existing_pr.url,
-          duration_ms: now_ms() - started_ms,
-        },
+        outcome: finish_outcome(
+          base,
+          started_ms,
+          {
+            status: "stale_pr_close_failed",
+            detail: closed,
+            pr_number: existing_pr.number,
+            pr_url: existing_pr.url,
+          },
+        ),
       }
     }
     return {done: false, outcome: nil, stale_note: closed + "; "}
@@ -360,12 +361,7 @@ fn dispatch_bump_workflow(repo, base, target, started_ms) {
   let dispatch_ts = date_now_iso()
   let dispatch = gh_workflow_run(repo.slug, "bump-harn.yml", {version: target})
   if !dispatch.success {
-    return {
-      ...base,
-      status: "dispatch_failed",
-      detail: trim(dispatch.stderr),
-      duration_ms: now_ms() - started_ms,
-    }
+    return finish_outcome(base, started_ms, {status: "dispatch_failed", detail: trim(dispatch.stderr)})
   }
   sleep_ms(POST_DISPATCH_GRACE_MS)
   let polled = poll_for_completion(repo.slug, dispatch_ts)
@@ -475,31 +471,34 @@ fn pr_target_probe(slug, pr, target) {
   return {matches: pin == target_no_v, pin: pin, evidence: "PR head pin is ${pin}; target is ${target_no_v}"}
 }
 
-fn poll_for_completion(slug, after_iso) {
-  let stop_at_ms = now_ms() + MAX_POLL_MS
-  while now_ms() < stop_at_ms {
-    let runs = try {
-      gh_workflow_runs(slug, "bump-harn.yml", "workflow_dispatch", 10)
-    } catch (e) {
-      nil
-    }
-    if runs != nil {
-      // Pick the newest run created at-or-after our dispatch timestamp.
-      var best = nil
-      for r in runs {
-        if r.createdAt >= after_iso {
-          if best == nil || r.createdAt > best.createdAt {
-            best = r
-          }
-        }
-      }
-      if best != nil && best.status == "completed" {
-        return {id: best.databaseId, url: best.url, conclusion: best.conclusion ?? "unknown", status: best.status}
+fn completed_run_after(slug, after_iso) {
+  let runs = try {
+    gh_workflow_runs(slug, "bump-harn.yml", "workflow_dispatch", 10)
+  } catch (e) {
+    nil
+  }
+  if runs == nil {
+    return nil
+  }
+  var best = nil
+  for r in runs {
+    if r.createdAt >= after_iso {
+      if best == nil || r.createdAt > best.createdAt {
+        best = r
       }
     }
-    sleep_ms(POLL_INTERVAL_MS)
+  }
+  if best != nil && best.status == "completed" {
+    return {id: best.databaseId, url: best.url, conclusion: best.conclusion ?? "unknown", status: best.status}
   }
   return nil
+}
+
+fn poll_for_completion(slug, after_iso) {
+  return poll_until(
+    fn() { return completed_run_after(slug, after_iso) },
+    {timeout_ms: MAX_POLL_MS, interval_ms: POLL_INTERVAL_MS},
+  )
 }
 
 fn find_existing_pr(slug) {
@@ -534,29 +533,36 @@ fn find_existing_pr(slug) {
   return prs[0]
 }
 
+fn probe_post_dispatch_state(slug, target, target_no_v) {
+  let pr = find_existing_pr(slug)
+  let remote = read_remote_pin(slug)
+  let probe = if pr == nil {
+    nil
+  } else {
+    pr_target_probe(slug, pr, target)
+  }
+  let settled = (pr != nil && probe.matches) || (pr == nil && remote != nil && remote == target_no_v)
+  return {settled: settled, pr: pr, pr_probe: probe, remote_pin: remote}
+}
+
+fn settled_post_dispatch_state(slug, target, target_no_v) {
+  let snap = probe_post_dispatch_state(slug, target, target_no_v)
+  if snap.settled {
+    return snap
+  }
+  return nil
+}
+
 fn wait_for_post_dispatch_state(slug, target) {
   let target_no_v = strip_v(target)
-  let stop_at_ms = now_ms() + POST_RUN_SETTLE_MS
-  var last_pr = nil
-  var last_probe = nil
-  var last_remote = nil
-  while now_ms() < stop_at_ms {
-    let pr = find_existing_pr(slug)
-    let remote = read_remote_pin(slug)
-    last_remote = remote
-    if pr != nil {
-      let probe = pr_target_probe(slug, pr, target)
-      last_pr = pr
-      last_probe = probe
-      if probe.matches {
-        return {pr: pr, pr_probe: probe, remote_pin: remote}
-      }
-    } else if remote != nil && remote == target_no_v {
-      return {pr: nil, pr_probe: nil, remote_pin: remote}
-    }
-    sleep_ms(POST_RUN_SETTLE_POLL_MS)
+  let hit = poll_until(
+    fn() { return settled_post_dispatch_state(slug, target, target_no_v) },
+    {timeout_ms: POST_RUN_SETTLE_MS, interval_ms: POST_RUN_SETTLE_POLL_MS},
+  )
+  if hit != nil {
+    return hit
   }
-  return {pr: last_pr, pr_probe: last_probe, remote_pin: last_remote}
+  return probe_post_dispatch_state(slug, target, target_no_v)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -654,8 +660,12 @@ fn restore_local_checkout_to_main(dry_run) {
   return checkout_cleanup(nil, "main", cwd())
 }
 
+fn error_outcome_for_repo(repo, message) {
+  return base_outcome_fields(repo, read_pre_pin(repo.dir), nil) + {status: "error", detail: message}
+}
+
 pipeline main() {
-  let parsed = parse_args(argv)
+  let parsed = parse_fleet_args(argv)
   let target = parsed.target ?? resolve_latest_release()
   if !is_v_semver(target) {
     eprintln("error: target must look like vX.Y.Z, got '${target}'")
@@ -702,31 +712,12 @@ pipeline main() {
   let settled = parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
     bump_one(repo, target, parsed.dry_run)
   }
-  // Flatten Result.Ok / Result.Err into uniform RepoOutcome rows.
-  var outcomes = []
-  for {index, value} in settled.results.enumerate() {
-    let repo = repos[index]
-    let row = if is_ok(value) {
-      unwrap(value)
-    } else {
-      let msg = unwrap_err(value)
-      {
-        dir: repo.dir,
-        slug: repo.slug,
-        status: "error",
-        detail: msg,
-        run_id: nil,
-        run_url: nil,
-        pr_number: nil,
-        pr_url: nil,
-        pre_pin: read_pre_pin(repo.dir),
-        local_pin: read_pre_pin(repo.dir),
-        remote_pin: nil,
-        auto_merge: nil,
-        duration_ms: 0,
-      }
-    }
-    outcomes = outcomes + [row]
+  let outcomes = map_settled(
+    settled.results,
+    { value, _index -> value },
+    { msg, index -> error_outcome_for_repo(repos[index], msg) },
+  )
+  for row in outcomes {
     println("   ${row.slug}: ${row.status}")
   }
   let finished_iso = date_now_iso()
