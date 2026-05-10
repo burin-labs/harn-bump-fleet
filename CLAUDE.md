@@ -18,7 +18,15 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   `origin/<base>` HEAD). The release branch is parented at that SHA and never rebased
   before push, the tag is pushed pre-PR, and the harn-side `publish-release.yml` ships
   from the tag — so commits that land on `<base>` between PR-open and merge cannot leak
-  into the published artifact.
+  into the published artifact. **Post-publish fixup mode:** if `gh release view
+  v$next_version` succeeds AND a `release/v$next_version` PR is open, the harness
+  auto-detects that the artifact already shipped and switches into a paperwork-only
+  pass — recreates the release branch on fresh `<base>`, folds any `## Unreleased`
+  drift into the originally-shipped release body via
+  `changelog_fold_unreleased_into_existing_release`, force-pushes, refreshes the PR
+  body, and short-circuits the tag step (`cfg.skip_tag`). Audit + publish-dry-run
+  are also force-skipped because the merge-queue CI of the open PR re-runs the same
+  gates and the publish artifact is already on crates.io.
 - `harness_self_review.harn` — meta-audit; intentionally not wired into CI. Reads recent
   `.harn-runs/` artifacts and gives a local model read-only tools over `~/projects` for
   cross-referencing.

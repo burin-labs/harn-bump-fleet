@@ -232,7 +232,11 @@ Options:
 - `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
   `HARN_RELEASE_PROVIDER` or `ollama`.
 - `--skip-audit` and `--skip-dry-run` pass through to
-  `scripts/release_ship.sh --prepare`.
+  `scripts/release_ship.sh --prepare`. Helpful when rerunning `--mode ship-pr`
+  to bring an already-opened Release PR up to date — the merge-queue CI of
+  the open PR re-runs the same gates and is the ground truth for whether
+  the release is shippable, so re-running them locally on a rerun is
+  duplicative wall-clock cost.
 
 In `ship-pr`, the harness first scans only open PRs for an existing matching
 release/version-bump PR with auto-merge already enabled. If it finds one, it
@@ -240,7 +244,51 @@ checks/shepherds that PR instead of repeating the release work; closed PRs are
 ignored so empirical test PRs can be closed safely. Otherwise, the PR body is
 generated from a fresh post-prepare snapshot instead of the initial audit text.
 If the PR already exists on the release branch, the harness refreshes its
-title/body before enabling auto-merge. Side-effecting failures are preserved in
+title/body before enabling auto-merge.
+
+### Post-publish fixup mode
+
+If a live `--mode ship-pr` run starts and the harness detects:
+
+- a published GitHub release for `v<next_version>` (i.e.
+  `gh release view v<next_version>` returns the tag name), and
+- an open `release/v<next_version>` PR on `<base>`,
+
+it switches into **post-publish fixup mode** automatically. The release
+artifact has already shipped from the originally-pushed tag — the open PR is
+paperwork that exists to land the Cargo.toml/CHANGELOG bump on `<base>`. In
+fixup mode the harness:
+
+- Skips the audit and the publish dry-run (`--skip-audit`/`--skip-dry-run`
+  are forced on; the merge-queue CI of the PR re-runs the same gates).
+- Force-recreates the release branch on top of fresh `origin/<base>` so any
+  conflicts caused by other PRs landing after the original publish are
+  dropped — the branch ends up with the version bump as its single new
+  commit on top of current `<base>`.
+- Reads the originally-shipped `## v<next_version>` section from
+  `git show v<next_version>:CHANGELOG.md` and folds any `## Unreleased`
+  entries that landed on `<base>` after the original publish into that
+  body deterministically (`changelog_fold_unreleased_into_existing_release`),
+  preserving subsection structure (`### Added`, `### Changed`, etc.).
+- **Skips the tag step entirely.** Re-pushing `v<next_version>` would
+  either re-fire `publish-release.yml` against an already-shipped version
+  (queueing behind itself) or, if the harness were to advance the tag,
+  diverge crates.io from the git artifact. The shipped tag is left
+  untouched.
+- Refreshes the open PR body with a clearly-labeled
+  "Post-publish fixup PR" callout that explains the artifact is already
+  shipped and the tag will not move.
+- With `--agent`, runs a fixup-specific audit prompt instead of the
+  standard release prompt — the model is told the artifact has already
+  shipped and asked to verify the fold (flag misclassified entries),
+  not to author release notes. No `BEGIN_DRAFT_CHANGELOG` block is
+  expected or accepted.
+
+To bypass auto-detection (e.g. to advance the pin and re-tag because the
+original publish failed before the GitHub release was created), close the
+open release PR or delete the tag manually before rerunning. Detection
+requires both signals (release artifact + open PR) so it cannot misfire
+on a tag that exists without a corresponding shipped artifact. Side-effecting failures are preserved in
 the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
 `agent_loop` sidecar with its own JSONL transcript under `recovery/`. The only
