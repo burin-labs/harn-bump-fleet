@@ -21,12 +21,14 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   into the published artifact. **Post-publish fixup mode:** if `gh release view
   v$next_version` succeeds AND a `release/v$next_version` PR is open, the harness
   auto-detects that the artifact already shipped and switches into a paperwork-only
-  pass — recreates the release branch on fresh `<base>`, folds any `## Unreleased`
-  drift into the originally-shipped release body via
-  `changelog_fold_unreleased_into_existing_release`, force-pushes, refreshes the PR
-  body, and short-circuits the tag step (`cfg.skip_tag`). Audit + publish-dry-run
-  are also force-skipped because the merge-queue CI of the open PR re-runs the same
-  gates and the publish artifact is already on crates.io.
+  pass — recreates the release branch on fresh `<base>`, injects the
+  originally-shipped release body verbatim via
+  `changelog_inject_existing_release_section`, **preserves `## Unreleased` as-is**
+  (those entries describe post-publish work that isn't in the shipped binary and
+  belongs in the NEXT release), force-pushes, refreshes the PR body, and
+  short-circuits the tag step (`cfg.skip_tag`). Audit + publish-dry-run are also
+  force-skipped because the merge-queue CI of the open PR re-runs the same gates
+  and the publish artifact is already on crates.io.
 - `harness_self_review.harn` — meta-audit; intentionally not wired into CI. Reads recent
   `.harn-runs/` artifacts and gives a local model read-only tools over `~/projects` for
   cross-referencing.
