@@ -20,6 +20,13 @@ import {
   changelog_release_section_update,
   changelog_top_from_text,
 } from "lib/changelog"
+import {
+  chat_cfg_from_run_dir,
+  chat_enabled,
+  pick_recent_run,
+  pre_release_gate,
+  run_chat_loop,
+} from "lib/chat_loop"
 import { checkout_cleanup } from "lib/checkout_cleanup"
 import { release_log_range_arg, release_log_range_args } from "lib/git"
 import { gh_argv } from "lib/github_cli"
@@ -138,6 +145,22 @@ Flags:
   --bootstrap-new-crates  First release that adds a workspace crate depended on by published crates.
   --focus TEXT            Operator context the model must consider while compiling release notes.
   --yes-live-release      Required for live prepare/ship-pr modes.
+
+Chat (interactive postmortem / pre-release review):
+  Defaults to ON whenever stdin is a controlling terminal (/dev/tty
+  reachable) and the HARN_CHAT env var is not 0. CI never enters chat
+  because /dev/tty is unreachable from a piped/non-TTY context.
+
+  --no-chat               Hard kill switch; skip every chat hook even on a TTY.
+  --chat-only             Skip the release pipeline entirely; open the chat
+                          loop over a prior run. Use --chat-run to pick one;
+                          omit it for a carousel of recent runs.
+  --chat-run RUN_ID|DIR   Preselect the run to discuss. Accepts a bare uuid
+                          (resolved under .harn-runs/release-harn/), an
+                          absolute path to a run dir, or a path to a
+                          release-audit.json.
+  --chat-timeout-s N      Start-typing timeout in seconds before the chat
+                          ends automatically. Defaults to 60.
 """
 }
 
@@ -156,6 +179,10 @@ let RELEASE_ARG_SPEC = [
   {kind: "flag", name: "yes_live_release", flags: ["--yes-live-release"]},
   {kind: "option", name: "pin_sha_input", flags: ["--at-sha"], default: ""},
   {kind: "flag", name: "repin_latest", flags: ["--repin-latest"]},
+  {kind: "flag", name: "no_chat", flags: ["--no-chat"]},
+  {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
+  {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
+  {kind: "option", name: "chat_timeout_s", flags: ["--chat-timeout-s"], default: "60"},
 ]
 
 fn parse_release_args(args) {
@@ -202,6 +229,10 @@ fn parse_release_args(args) {
     repin_tag: "",
     repin_pr_url: "",
     repin_initial_remote_tag_sha: "",
+    no_chat: parsed.no_chat,
+    chat_only: parsed.chat_only,
+    chat_run: parsed.chat_run,
+    chat_timeout_s: to_int(parsed.chat_timeout_s) ?? 60,
   }
   if cfg.help {
     return cfg
@@ -3944,11 +3975,98 @@ fn write_report(run_id, payload) {
   return {json_path: json_path, md_path: md_path}
 }
 
+fn release_chat_only(raw_cfg) {
+  if !chat_enabled(raw_cfg) {
+    eprintln("--chat-only requires an interactive terminal (and HARN_CHAT != 0)")
+    return 2
+  }
+  let kind = "release-harn"
+  let target_dir = if trim(raw_cfg.chat_run ?? "") != "" {
+    resolve_chat_run_path(kind, raw_cfg.chat_run)
+  } else {
+    let pick = pick_recent_run(kind, 12)
+    if pick == nil {
+      nil
+    } else {
+      pick.dir
+    }
+  }
+  if target_dir == nil {
+    println("(no run selected; exiting)")
+    return 0
+  }
+  let chat_cfg = chat_cfg_from_run_dir(
+    {
+      provider: raw_cfg.provider,
+      model: raw_cfg.model,
+      repo: expand_home(raw_cfg.repo),
+      mock: raw_cfg.mock,
+      timeout_s: raw_cfg.chat_timeout_s,
+      tools: release_repair_tools({...raw_cfg, repo: expand_home(raw_cfg.repo)}, path_basename(target_dir)),
+      no_chat: raw_cfg.no_chat,
+    },
+    kind,
+    target_dir,
+  )
+  run_chat_loop(chat_cfg)
+  return 0
+}
+
+fn resolve_chat_run_path(kind, raw) {
+  let value = trim(raw ?? "")
+  if value == "" {
+    return nil
+  }
+  if starts_with(value, "/") && file_exists(value) {
+    if ends_with_str(value, ".json") {
+      return parent_dir(value)
+    }
+    return value
+  }
+  let candidate = path_join(cwd(), ".harn-runs", kind, value)
+  if file_exists(candidate) {
+    return candidate
+  }
+  let inside = path_join(cwd(), value)
+  if file_exists(inside) {
+    if ends_with_str(value, ".json") {
+      return parent_dir(inside)
+    }
+    return inside
+  }
+  return nil
+}
+
+fn ends_with_str(s, suffix) {
+  let raw = s ?? ""
+  let suf = suffix ?? ""
+  if len(suf) > len(raw) {
+    return false
+  }
+  return raw[len(raw) - len(suf):len(raw)] == suf
+}
+
+fn parent_dir(p) {
+  let parts = (p ?? "").split("/")
+  if len(parts) <= 1 {
+    return cwd()
+  }
+  return join(parts[0:len(parts) - 1], "/")
+}
+
+fn path_basename(p) {
+  let parts = (p ?? "").split("/")
+  return parts[len(parts) - 1]
+}
+
 pipeline main() {
   let raw_cfg = parse_release_args(argv)
   if raw_cfg.help {
     println(usage())
     return 0
+  }
+  if raw_cfg.chat_only {
+    return release_chat_only(raw_cfg)
   }
   let cfg = {...raw_cfg, pin_sha: resolve_pin_sha(raw_cfg)}
   let run_id = uuid_v7()
@@ -4122,6 +4240,39 @@ pipeline main() {
     )
   }
   let agent_text = agent_review_result.text
+  if cfg.mode != "audit"
+    && cfg.agent
+    && chat_enabled(effective_cfg)
+    && agent_review_result.draft_changelog != nil {
+    let draft_path = agent_review_result.draft_changelog ?? ""
+    let changelog_text = if draft_path != "" && file_exists(draft_path) {
+      read_file(draft_path)
+    } else {
+      ""
+    }
+    let pr_body_preview = try {
+      pr_body_text(analysis, agent_review_result, [], run_id)
+    } catch (_e) {
+      ""
+    }
+    let gate = pre_release_gate(
+      {
+        provider: cfg.provider,
+        model: cfg.model,
+        mock: cfg.mock,
+        tools: release_repair_tools(effective_cfg, run_id),
+        timeout_s: cfg.chat_timeout_s,
+      },
+      {changelog: changelog_text, pr_body: pr_body_preview, findings: analysis.deterministic_findings},
+      {mode: cfg.mode, next_version: analysis.next_version, repo: cfg.repo, run_id: run_id},
+    )
+    if gate.decision == "abort" {
+      release_log_event(run_id, "pre_release_gate_aborted", {reason: gate.reason})
+      println("== chat: aborting before live release side effects (${gate.reason})")
+      return 2
+    }
+    release_log_event(run_id, "pre_release_gate_approved", {reason: gate.reason})
+  }
   var execution = nil
   if cfg.agent && cfg.mode != "audit" && len(agent_review_result.validation_findings) > 0 {
     execution = [
@@ -4200,14 +4351,35 @@ pipeline main() {
       println("     - ${f}")
     }
   }
-  if execution_failed(execution) {
+  let exit_code = if execution_failed(execution) {
     let failed = last_failed_step(execution)
     if failed != nil {
       println("   failure : ${failed.name} (status ${failed.status})")
     }
-    return 1
+    1
+  } else {
+    0
   }
-  return 0
+  if chat_enabled(effective_cfg) {
+    let chat_cfg = {
+      harness_kind: "release-harn",
+      run_id: run_id,
+      run_dir: path_join(cwd(), RUN_ROOT, run_id),
+      audit_md_path: written.md_path,
+      audit_json_path: written.json_path,
+      llm_transcript_path: agent_artifact_paths(run_id).llm_transcript_jsonl,
+      provider: cfg.provider,
+      model: cfg.model,
+      repo: cfg.repo,
+      mode_hint: cfg.mode,
+      outcome: outcome,
+      tools: release_repair_tools(effective_cfg, run_id),
+      timeout_s: cfg.chat_timeout_s,
+      no_chat: cfg.no_chat,
+    }
+    run_chat_loop(chat_cfg)
+  }
+  return exit_code
 }
 
 fn execution_pr_url(execution) {

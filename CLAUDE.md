@@ -86,6 +86,13 @@ Models are confined to:
 - `agent_preset` with a bounded `agent_host_tools` allowlist (`RELEASE_RUN_ARGV_PREFIXES`)
   in `release_harn.harn` for release readiness review and recovery loops.
 - A read-only audit agent in `harness_self_review.harn`.
+- `run_chat_loop` from `lib/chat_loop.harn` (post-run + pre-release-gate
+  interactive agent). Auto-enabled when stdin is a controlling terminal
+  (`/dev/tty` openable) — CI never enters chat because `/dev/tty` is
+  unreachable from a piped/non-TTY context. `--no-chat` / `HARN_CHAT=0`
+  are hard kill-switches. The chat agent gets the same read+edit tool
+  surface as the recovery loop (`release_repair_tools` /
+  `bump_chat_tools`), so it can apply meta-fixes when the operator asks.
 
 When adding a new model touchpoint, follow the same pattern: shape inputs deterministically,
 let the agent produce text, then validate/parse before letting it influence output. If model
