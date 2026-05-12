@@ -4,89 +4,44 @@
 //
 // Public API:
 //   chat_enabled(cfg) -> bool
-//   is_tty() -> bool                                      (memoized first-call)
-//   read_user_line(prompt, timeout_s) -> string?          (nil = timeout/eof)
-//   render_paged(title, body) -> bool                     (true if paged)
-//   pick_recent_run(harness_kind, limit) -> dict?
-//   pre_release_gate(cfg, classifier_inputs, ctx) -> dict {decision: "approve"|"abort"|"edit", ...}
+//   pick_recent_run(harness_kind, limit) -> {dir, run_id, summary}?
+//   pre_release_gate(cfg, classifier_inputs, ctx) -> {decision, reason}
 //   run_chat_loop(chat_cfg) -> nil
-//
-// Upstream gaps tracked in burin-labs/harn issues #1542-#1547. The shell-out
-// dance around /dev/tty and the bash `read -t` timeout disappear once those
-// land.
+//   chat_cfg_from_run_dir(base, kind, run_dir) -> dict
+//   summarize_release_run(run_dir) / summarize_bump_run(run_dir) -> dict
+//   classifier_payload(inputs) -> dict
+import { agent_chat_loop, agent_chat_route_input } from "std/agent/chat"
 import { command_run } from "std/command"
 import { env_str } from "std/config"
-import { read_jsonl } from "std/jsonl"
+import { is_tty, read_line } from "std/io"
 import { default_llm_caller, with_retry } from "std/llm/handlers"
+import { page, rule, select_from } from "std/tui"
 import { truncate_text } from "./text_util"
 
-// ANSI helpers — kept tiny so we don't pull in a colour lib.
-let ANSI_RESET = "[0m"
+let ANSI_RESET = "[0m"
 
-let ANSI_DIM = "[2m"
+let ANSI_DIM = "[2m"
 
-let ANSI_BOLD = "[1m"
+let ANSI_BOLD = "[1m"
 
-let ANSI_CYAN = "[36m"
+let ANSI_CYAN = "[36m"
 
-let ANSI_MAGENTA = "[35m"
+let ANSI_MAGENTA = "[35m"
 
-let ANSI_YELLOW = "[33m"
+let ANSI_YELLOW = "[33m"
 
-let ANSI_GREEN = "[32m"
+let ANSI_GREEN = "[32m"
 
-let ANSI_RED = "[31m"
+let ANSI_RED = "[31m"
 
 let DEFAULT_TIMEOUT_S = 60
 
 let CAROUSEL_LIMIT = 12
 
-// Cached /dev/tty probe — see is_tty(). We can't read it inline because Harn
-// has no first-class top-level mutable; thread the result through env on first
-// call so subsequent calls are O(1).
-let TTY_PROBE_ENV = "_HARN_CHAT_TTY_PROBE"
-
-/**
- * is_tty — returns true when /dev/tty is openable for both read and write.
- *
- * Why /dev/tty rather than `[ -t 0 ]`: command_run always pipes child stdio,
- * so `[ -t 0 ]` evaluated inside the subshell would always be false. The
- * controlling terminal is reachable via /dev/tty regardless of how stdio is
- * wired, so probing /dev/tty correctly distinguishes "running interactively"
- * from "piped/CI" even from inside a sandboxed child.
- */
-pub fn is_tty() -> bool {
-  let cached = env_str(TTY_PROBE_ENV)
-  if cached == "yes" {
-    return true
-  }
-  if cached == "no" {
-    return false
-  }
-  let probe = try {
-    command_run(
-      {
-        mode: "shell",
-        shell_id: "bash",
-        command: "(exec </dev/tty) 2>/dev/null && echo yes || echo no",
-        env: {[TTY_PROBE_ENV]: ""},
-        env_mode: "patch",
-        timeout_ms: 2000,
-      },
-    )
-  } catch (_e) {
-    nil
-  }
-  if probe == nil {
-    return false
-  }
-  let stdout = trim(probe?.stdout ?? "")
-  return stdout == "yes"
-}
-
 /**
  * chat_enabled — combines the user's opt-out, an env kill switch, and TTY
- * detection. CI never enters the chat path because /dev/tty is unreachable.
+ * detection. CI never enters chat because std/io::is_tty(0) reports false
+ * when stdin is piped/redirected/captured.
  */
 pub fn chat_enabled(cfg) -> bool {
   if cfg?.no_chat ?? false {
@@ -95,104 +50,16 @@ pub fn chat_enabled(cfg) -> bool {
   if env_str("HARN_CHAT") == "0" {
     return false
   }
-  return is_tty()
+  return is_tty(0)
 }
 
-/**
- * read_user_line — block on a single line from /dev/tty with an optional
- * timeout (seconds). Returns the trimmed line on success, or nil on
- * timeout / EOF / interrupt.
- *
- * The shell redirects fd 0 + 2 to /dev/tty so `read -p` writes its prompt
- * to the operator's terminal and reads keystrokes back even though
- * command_run pipes the child's stdio. The reply is printed on captured
- * stdout via printf, so command_run.stdout = the answer.
- */
-pub fn read_user_line(prompt, timeout_s) -> any {
-  let effective_timeout = timeout_s ?? DEFAULT_TIMEOUT_S
-  // Bash variable refs use bare `$NAME` form because Harn double-quoted
-  // strings interpolate `${NAME}` (even inside triple-quoted blocks; the
-  // backslash escape doesn't help). Bare `$NAME` passes through literally.
-  let script = "exec </dev/tty 2>/dev/tty\n"
-    + "if [ -n \"$HARN_CHAT_TIMEOUT\" ] && [ \"$HARN_CHAT_TIMEOUT\" -gt 0 ] 2>/dev/null; then\n"
-    + "  IFS= read -r -p \"$HARN_CHAT_PROMPT\" -t \"$HARN_CHAT_TIMEOUT\" reply\n"
-    + "else\n"
-    + "  IFS= read -r -p \"$HARN_CHAT_PROMPT\" reply\n"
-    + "fi\n"
-    + "rc=$?\n"
-    + "printf '%s' \"$reply\"\n"
-    + "exit $rc\n"
-  let res = try {
-    command_run(
-      {
-        mode: "shell",
-        shell_id: "bash",
-        command: script,
-        env: {HARN_CHAT_PROMPT: prompt ?? "", HARN_CHAT_TIMEOUT: to_string(effective_timeout)},
-        env_mode: "patch",
-        timeout_ms: (effective_timeout + 30) * 1000,
-      },
-    )
-  } catch (_e) {
-    nil
-  }
-  if res == nil {
+fn prompt_line(label, timeout_s) -> any {
+  let effective = timeout_s ?? DEFAULT_TIMEOUT_S
+  let result = read_line({prompt: label ?? "", timeout_ms: effective * 1000, trim: true})
+  if !(result?.ok ?? false) {
     return nil
   }
-  // bash `read -t` exits with status > 128 on timeout, 1 on EOF (Ctrl+D),
-  // 0 on success. Treat anything non-zero as "no input".
-  if !(res?.success ?? false) {
-    return nil
-  }
-  let line = res?.stdout ?? ""
-  return trim(line)
-}
-
-/**
- * render_paged — display a long block of text/markdown. Pipes through
- * `less -R` against /dev/tty when available, otherwise prints the whole body
- * with a header/footer rule.
- */
-pub fn render_paged(title, body) -> bool {
-  let header = ANSI_BOLD + "── " + title ?? "" + " ──" + ANSI_RESET
-  let footer = ANSI_DIM + "── end: " + title ?? "" + " ──" + ANSI_RESET
-  if !is_tty() {
-    println(header)
-    println(body ?? "")
-    println(footer)
-    return false
-  }
-  let tmp_dir = path_join(env_or("TMPDIR", "/tmp"), "harn-chat")
-  mkdir(tmp_dir, true)
-  let tmp_path = path_join(tmp_dir, "page-" + uuid_v7() + ".txt")
-  write_file(tmp_path, body ?? "")
-  let res = try {
-    command_run(
-      {
-        mode: "shell",
-        shell_id: "bash",
-        command: "PAGER_BIN=${PAGER:-less}; if command -v \"$PAGER_BIN\" >/dev/null 2>&1; then \"$PAGER_BIN\" -R -F -X -- \"$HARN_PAGE_PATH\" </dev/tty >/dev/tty 2>/dev/null; else cat -- \"$HARN_PAGE_PATH\"; fi",
-        env: {HARN_PAGE_PATH: tmp_path},
-        env_mode: "patch",
-        timeout_ms: 600000,
-      },
-    )
-  } catch (_e) {
-    nil
-  }
-  // Best-effort cleanup; ignore failures.
-  try {
-    command_run({argv: ["rm", "-f", tmp_path], timeout_ms: 2000})
-  } catch (_e) {
-    nil
-  }
-  if res == nil || !(res?.success ?? false) {
-    println(header)
-    println(body ?? "")
-    println(footer)
-    return false
-  }
-  return true
+  return result?.value
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -307,39 +174,83 @@ pub fn summarize_bump_run(run_dir) {
 }
 
 fn list_recent_run_dirs(harness_kind, limit) {
-  let root = ".harn-runs/" + harness_kind
-  let res = try {
-    command_run(
-      {
-        mode: "shell",
-        shell_id: "bash",
-        command: "ls -1t -- \"$HARN_RUNS_ROOT\" 2>/dev/null | head -n \"$HARN_RUNS_LIMIT\"",
-        env: {HARN_RUNS_ROOT: root, HARN_RUNS_LIMIT: to_string(limit)},
-        env_mode: "patch",
-        timeout_ms: 3000,
-      },
-    )
-  } catch (_e) {
-    nil
-  }
-  if res == nil {
+  let root = path_join(cwd(), ".harn-runs", harness_kind)
+  if !file_exists(root) {
     return []
   }
-  let lines = (res?.stdout ?? "").split("\n")
-  var out = []
-  for line in lines {
-    let t = trim(line)
-    if t != "" {
-      out = out + [path_join(cwd(), root, t)]
+  let entries = try {
+    list_dir(root)
+  } catch (_e) {
+    []
+  }
+  var with_mtime = []
+  for name in entries {
+    let full = path_join(root, name)
+    let info = try {
+      stat(full)
+    } catch (_e) {
+      nil
     }
+    if info != nil && info?.is_dir {
+      with_mtime = with_mtime + [{dir: full, name: name, mtime: info?.mtime_ms ?? 0}]
+    }
+  }
+  // Sort newest first by mtime.
+  let sorted = with_mtime
+    .sort(
+    { a, b ->
+      if a.mtime > b.mtime {
+        -1
+      } else {
+        1
+      }
+    },
+  )
+  let capped = if len(sorted) > limit {
+    sorted[0:limit]
+  } else {
+    sorted
+  }
+  var out = []
+  for entry in capped {
+    out = out + [entry.dir]
   }
   return out
 }
 
+fn carousel_row(dir, harness_kind) {
+  let summary = if harness_kind == "release-harn" {
+    summarize_release_run(dir)
+  } else {
+    summarize_bump_run(dir)
+  }
+  let run_id = basename(dir)
+  let when_short = if len(summary.when) >= 19 {
+    summary.when[0:19].replace("T", " ")
+  } else {
+    summary.when
+  }
+  let mark = if summary.ok {
+    if contains(summary.outcome, "FAIL") {
+      "✗"
+    } else {
+      "✓"
+    }
+  } else {
+    "?"
+  }
+  return {
+    dir: dir,
+    run_id: run_id,
+    summary: summary,
+    label: "${mark}  ${when_short}  ${summary.version}  ${summary.headline}",
+  }
+}
+
 /**
  * pick_recent_run — render a numbered carousel and prompt for a choice.
- * Returns nil if the operator typed /exit, q, an out-of-range number, or
- * timed out.
+ * Returns nil if the operator cancelled. Otherwise returns
+ * {dir, run_id, summary}.
  */
 pub fn pick_recent_run(harness_kind, limit) -> any {
   let effective_limit = limit ?? CAROUSEL_LIMIT
@@ -348,95 +259,23 @@ pub fn pick_recent_run(harness_kind, limit) -> any {
     println("(no recent ${harness_kind} runs found under .harn-runs/${harness_kind}/)")
     return nil
   }
-  println("")
-  println(
-    ANSI_BOLD + "== recent ${harness_kind} runs" + ANSI_RESET + ANSI_DIM
-      + " (pick one, q to cancel)"
-      + ANSI_RESET,
-  )
   var rows = []
-  var idx = 1
   for d in dirs {
-    let summary = if harness_kind == "release-harn" {
-      summarize_release_run(d)
-    } else {
-      summarize_bump_run(d)
-    }
-    let mark = if summary.ok {
-      if contains(summary.outcome, "FAIL") {
-        ANSI_RED + "✗" + ANSI_RESET
-      } else {
-        ANSI_GREEN + "✓" + ANSI_RESET
-      }
-    } else {
-      ANSI_YELLOW + "?" + ANSI_RESET
-    }
-    let when_short = if len(summary.when) >= 19 {
-      summary.when[0:19].replace("T", " ")
-    } else {
-      summary.when
-    }
-    let run_id = path_basename(d)
-    println(
-      "  ${pad_left(to_string(idx), 2)}  ${mark}  ${pad_right(when_short, 19)}  ${pad_right(summary.version, 10)}  ${ANSI_DIM}${summary.headline}${ANSI_RESET}",
-    )
-    println("      " + ANSI_DIM + run_id + ANSI_RESET)
-    rows = rows + [{idx: idx, dir: d, run_id: run_id, summary: summary}]
-    idx = idx + 1
+    rows = rows + [carousel_row(d, harness_kind)]
   }
-  println("")
-  let line = read_user_line(ANSI_CYAN + "pick> " + ANSI_RESET, 120)
-  if line == nil {
-    println(ANSI_DIM + "(cancelled)" + ANSI_RESET)
+  let picked = select_from(
+    rows,
+    {
+      prompt: "pick a run",
+      header: "recent ${harness_kind} runs",
+      display: { row -> row.label },
+      preview: { row -> "${row.run_id}\n${row.summary.headline}\noutcome: ${row.summary.outcome}" },
+    },
+  )
+  if !(picked.ok ?? false) {
     return nil
   }
-  let trimmed = trim(line)
-  if trimmed == "" || trimmed == "q" || trimmed == "/exit" || trimmed == "/quit" {
-    return nil
-  }
-  let n = try {
-    to_int(trimmed)
-  } catch (_e) {
-    -1
-  }
-  if n < 1 || n > len(rows) {
-    println(ANSI_YELLOW + "(no such row: " + trimmed + ")" + ANSI_RESET)
-    return nil
-  }
-  return rows[n - 1]
-}
-
-fn path_basename(p) {
-  let parts = (p ?? "").split("/")
-  return parts[len(parts) - 1]
-}
-
-fn pad_left(s, width) {
-  let raw = s ?? ""
-  if len(raw) >= width {
-    return raw
-  }
-  var pad = ""
-  var i = 0
-  while i < width - len(raw) {
-    pad = pad + " "
-    i = i + 1
-  }
-  return pad + raw
-}
-
-fn pad_right(s, width) {
-  let raw = s ?? ""
-  if len(raw) >= width {
-    return raw
-  }
-  var pad = ""
-  var i = 0
-  while i < width - len(raw) {
-    pad = pad + " "
-    i = i + 1
-  }
-  return raw + pad
+  return picked.value
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -512,7 +351,6 @@ fn classify_triviality(cfg, inputs) {
     || metrics.section_lines >= 3
     || metrics.bullet_lines > 12
     || metrics.finding_count > 0
-  // Cheap deterministic floor — if these fire we don't need the LLM at all.
   if cheap_non_trivial {
     return {
       non_trivial: true,
@@ -520,8 +358,6 @@ fn classify_triviality(cfg, inputs) {
       source: "deterministic",
     }
   }
-  // Mocked runs skip the LLM call; treat as trivial so rehearsals don't pause
-  // on every iteration.
   if cfg?.mock ?? false {
     return {non_trivial: false, why: "mock release; classifier skipped", source: "mock"}
   }
@@ -551,7 +387,6 @@ fn classify_triviality(cfg, inputs) {
     nil
   }
   if parsed == nil {
-    // Fail open — safer to pause and ask than skip on parse failure.
     return {
       non_trivial: true,
       why: "classifier output unparseable, defaulting to non-trivial",
@@ -591,8 +426,6 @@ fn extract_first_json_object(text) {
   if start < 0 {
     return "{}"
   }
-  // Greedy: take from first { to last } — the classifier prompt asks for
-  // a single object so this is robust enough.
   let end = t.last_index_of("}")
   if end <= start {
     return "{}"
@@ -628,10 +461,16 @@ pub fn pre_release_gate(cfg, inputs, ctx) {
   println(
     "   non-trivial release (${triviality.source}): " + ANSI_YELLOW + triviality.why + ANSI_RESET,
   )
-  render_paged("v${ctx?.next_version ?? \"?\"} CHANGELOG delta", inputs?.changelog ?? "(empty)")
+  page(
+    {
+      title: "v${ctx?.next_version ?? \"?\"} CHANGELOG delta",
+      body: inputs?.changelog ?? "(empty)",
+      format: "markdown",
+    },
+  )
   let pr_body = inputs?.pr_body ?? ""
   if trim(pr_body) != "" {
-    render_paged("PR body", pr_body)
+    page({title: "PR body", body: pr_body, format: "markdown"})
   }
   println("")
   println(
@@ -640,7 +479,7 @@ pub fn pre_release_gate(cfg, inputs, ctx) {
       + ANSI_RESET,
   )
   while true {
-    let line = read_user_line(ANSI_CYAN + "gate> " + ANSI_RESET + "[a/q/c] ", 120)
+    let line = prompt_line(ANSI_CYAN + "gate> " + ANSI_RESET + "[a/q/c] ", 120)
     if line == nil {
       return {decision: "abort", reason: "no response within timeout"}
     }
@@ -686,67 +525,49 @@ fn run_gate_chat(cfg, inputs, ctx, triviality) {
       + "   ── pre-release chat ── /approve to ship, /abort to halt, /exit to back out to the gate prompt"
       + ANSI_RESET,
   )
-  var turn = 0
-  while true {
-    let line = read_user_line(ANSI_CYAN + "you> " + ANSI_RESET, cfg?.timeout_s ?? DEFAULT_TIMEOUT_S)
-    if line == nil {
-      println(ANSI_DIM + "   (chat timed out; returning to gate)" + ANSI_RESET)
-      return {}
-    }
-    let user = trim(line)
-    if user == "" {
-      continue
-    }
-    if starts_with(user, "/approve") {
-      return {decision: "approve", reason: "approved from chat"}
-    }
-    if starts_with(user, "/abort") {
-      return {decision: "abort", reason: "aborted from chat"}
-    }
-    if user == "/exit" || user == "/quit" {
-      return {}
-    }
-    if user == "/help" {
-      print_gate_help()
-      continue
-    }
-    let result = try {
-      agent_loop(
-        user,
-        system,
-        {
-          session_id: session_id,
-          provider: cfg?.provider ?? "ollama",
-          model: cfg?.model ?? "qwen3.6:35b-a3b-coding-nvfp4",
-          tools: tools,
-          max_iterations: 6,
-          iteration_budget: {mode: "adaptive", initial: 3, max: 6, extend_by: 2},
-          max_tokens: 4000,
-          temperature: 0.2,
-          llm_caller: with_retry(default_llm_caller(), {max_attempts: 2}),
-          llm_transcript_dir: transcript_dir,
-        },
-      )
-    } catch (e) {
-      println(ANSI_RED + "   (agent error: ${e})" + ANSI_RESET)
-      continue
-    }
-    let body = trim(result?.visible_text ?? result?.text ?? result?.prose ?? "")
-    println("")
-    println(ANSI_MAGENTA + "assistant>" + ANSI_RESET + " " + body)
-    println("")
-    turn = turn + 1
+  let gate_handlers = {
+    "/approve": { _req -> {kind: "exit", reason: "approved_from_chat"} },
+    "/abort": { _req -> {kind: "exit", reason: "aborted_from_chat"} },
   }
-}
-
-fn print_gate_help() {
-  println("")
-  println(ANSI_BOLD + "   pre-release chat — commands" + ANSI_RESET)
-  println("     /approve   accept the changelog/PR body and continue the release")
-  println("     /abort     stop the release; pipeline exits with code 2")
-  println("     /exit      back out to the gate prompt without deciding")
-  println("     /help      this help text")
-  println("")
+  let result = agent_chat_loop(
+    {
+      session_id: session_id,
+      provider: cfg?.provider ?? "ollama",
+      model: cfg?.model ?? "qwen3.6:35b-a3b-coding-nvfp4",
+      tools: tools,
+      system_prompt: system,
+      max_iterations: 6,
+      iteration_budget: {mode: "adaptive", initial: 3, max: 6, extend_by: 2},
+      max_tokens: 4000,
+      temperature: 0.2,
+      llm_caller: with_retry(default_llm_caller(), {max_attempts: 2}),
+      llm_transcript_dir: transcript_dir,
+      slash_commands: gate_handlers,
+      on_user_input: { state ->
+        let label = ANSI_CYAN + "you> " + ANSI_RESET
+        let line = prompt_line(label, cfg?.timeout_s ?? DEFAULT_TIMEOUT_S)
+        if line == nil {
+          return {kind: "exit", reason: "timeout"}
+        }
+        return agent_chat_route_input(line, state, gate_handlers)
+      },
+      on_model_turn: { turn, state ->
+        let body = trim(turn?.visible_text ?? turn?.text ?? "")
+        println("")
+        println(ANSI_MAGENTA + "assistant>" + ANSI_RESET + " " + body)
+        println("")
+        return nil
+      },
+    },
+  )
+  if result.stop_reason == "approved_from_chat" {
+    return {decision: "approve", reason: "approved from chat"}
+  }
+  if result.stop_reason == "aborted_from_chat" {
+    return {decision: "abort", reason: "aborted from chat"}
+  }
+  println(ANSI_DIM + "   (returning to gate prompt)" + ANSI_RESET)
+  return {}
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -759,38 +580,12 @@ fn load_seed_context(chat_cfg) {
   if audit_md_path != nil && file_exists(audit_md_path) {
     let body = truncate_text(read_file(audit_md_path), 14000)
     sections = sections
-      + ["## Run audit (${path_basename(audit_md_path)})\n\n${body}"]
+      + ["## Run audit (${basename(audit_md_path)})\n\n${body}"]
   }
   let audit_json_path = chat_cfg?.audit_json_path
   if audit_json_path != nil && file_exists(audit_json_path) {
     let body = truncate_text(read_file(audit_json_path), 10000)
     sections = sections + ["## Run audit JSON (truncated)\n\n```json\n${body}\n```"]
-  }
-  let transcript = chat_cfg?.llm_transcript_path
-  if transcript != nil && file_exists(transcript) {
-    let recs = try {
-      read_jsonl(transcript, {strict: false})
-    } catch (_e) {
-      []
-    }
-    if len(recs) > 0 {
-      let tail = if len(recs) > 12 {
-        recs[len(recs) - 12:len(recs)]
-      } else {
-        recs
-      }
-      var lines = []
-      for r in tail {
-        let kind = r?.type ?? r?.kind ?? "event"
-        let preview = truncate_text(json_stringify(r), 240)
-        lines = lines + ["- **${kind}** — ${preview}"]
-      }
-      sections = sections
-        + [
-        "## Prior agent transcript (last ${len(tail)} of ${len(recs)} events)\n\n"
-          + join(lines, "\n"),
-      ]
-    }
   }
   if len(sections) == 0 {
     return "(no audit artifacts available)"
@@ -837,7 +632,7 @@ fn chat_banner(chat_cfg) {
       + "   /help for commands · /exit to quit · ${chat_cfg?.timeout_s ?? DEFAULT_TIMEOUT_S}s start-typing timeout"
       + ANSI_RESET,
   )
-  println("")
+  println(ANSI_DIM + rule("─") + ANSI_RESET)
 }
 
 fn print_chat_help() {
@@ -845,224 +640,96 @@ fn print_chat_help() {
   println(ANSI_BOLD + "   commands" + ANSI_RESET)
   println("     /exit, /quit       end the chat")
   println("     /help              this help text")
-  println("     /cat <path>        print a file (under the run dir or repo)")
-  println("     /diff <path>       show `git diff` for a path (cwd or chat_cfg.repo)")
+  println("     /cat <path>        page a file (under the run dir or repo)")
+  println("     /diff <path?>      page `git diff` for a path (or whole tree)")
   println("     /runs              list recent runs of this harness")
-  println("     /load <run-id>     switch the chat to a different run (reseeds context)")
-  println("     /save <path>       save the chat transcript so far to a file")
-  println("     /pager <path>      open a file in the pager")
   println("     anything else      forward to the agent")
   println("")
 }
 
-fn handle_slash(line, state) {
-  let trimmed = trim(line ?? "")
-  if !starts_with(trimmed, "/") {
-    return {kind: "forward"}
-  }
-  let parts = trimmed.split(" ")
-  let cmd = parts[0]
-  let arg = if len(parts) > 1 {
-    trim(join(parts[1:len(parts)], " "))
-  } else {
-    ""
-  }
-  if cmd == "/exit" || cmd == "/quit" {
-    return {kind: "exit"}
-  }
-  if cmd == "/help" || cmd == "/?" {
-    print_chat_help()
-    return {kind: "handled", state: state}
-  }
-  if cmd == "/cat" {
-    handle_cat(arg, state)
-    return {kind: "handled", state: state}
-  }
-  if cmd == "/diff" {
-    handle_diff(arg, state)
-    return {kind: "handled", state: state}
-  }
-  if cmd == "/pager" {
-    handle_pager(arg, state)
-    return {kind: "handled", state: state}
-  }
-  if cmd == "/runs" {
-    handle_runs(state)
-    return {kind: "handled", state: state}
-  }
-  if cmd == "/load" {
-    let next_state = handle_load(arg, state)
-    return {kind: "handled", state: next_state}
-  }
-  if cmd == "/save" {
-    handle_save(arg, state)
-    return {kind: "handled", state: state}
-  }
-  println(ANSI_YELLOW + "   (unknown command: ${cmd}; try /help)" + ANSI_RESET)
-  return {kind: "handled", state: state}
-}
-
-fn handle_cat(arg, state) {
-  if arg == "" {
+fn handle_cat(args, chat_cfg) {
+  if len(args) == 0 {
     println(ANSI_YELLOW + "   /cat needs a path" + ANSI_RESET)
-    return nil
+    return
   }
-  let resolved = resolve_chat_path(arg, state)
+  let resolved = resolve_chat_path(args[0], chat_cfg)
   if !file_exists(resolved) {
     println(ANSI_YELLOW + "   no such file: ${resolved}" + ANSI_RESET)
-    return nil
+    return
   }
-  let body = read_file(resolved)
-  render_paged(resolved, body)
+  page({title: resolved, body: read_file(resolved)})
 }
 
-fn handle_pager(arg, state) {
-  handle_cat(arg, state)
-}
-
-fn handle_diff(arg, state) {
-  let path_arg = if arg == "" {
+fn handle_diff(args, chat_cfg) {
+  let path_arg = if len(args) > 0 {
+    args[0]
+  } else {
     ""
-  } else {
-    arg
   }
-  let repo = state?.chat_cfg?.repo
-  let argv = if repo != nil && repo != "" {
-    ["git", "-C", repo, "diff", "--", path_arg]
+  let repo = chat_cfg?.repo
+  var argv = if repo != nil && repo != "" {
+    ["git", "-C", repo, "diff"]
   } else {
-    ["git", "diff", "--", path_arg]
+    ["git", "diff"]
   }
-  let argv_filtered = if path_arg == "" {
-    if repo != nil && repo != "" {
-      ["git", "-C", repo, "diff"]
-    } else {
-      ["git", "diff"]
-    }
-  } else {
-    argv
+  if path_arg != "" {
+    argv = argv + ["--", path_arg]
   }
   let res = try {
-    command_run({argv: argv_filtered, timeout_ms: 10000})
+    command_run({argv: argv, timeout_ms: 10000})
   } catch (e) {
     println(ANSI_RED + "   git diff error: ${e}" + ANSI_RESET)
-    return nil
+    return
   }
   let out = res?.stdout ?? ""
   if trim(out) == "" {
     println(ANSI_DIM + "   (no diff)" + ANSI_RESET)
-    return nil
+    return
   }
-  render_paged("git diff " + path_arg, out)
+  page({title: "git diff " + path_arg, body: out})
 }
 
-fn handle_runs(state) {
-  let kind = state?.chat_cfg?.harness_kind ?? "release-harn"
+fn handle_runs(chat_cfg) {
+  let kind = chat_cfg?.harness_kind ?? "release-harn"
   let pick = pick_recent_run(kind, CAROUSEL_LIMIT)
   if pick == nil {
-    return nil
+    return
   }
-  println(ANSI_DIM + "   (use /load ${pick.run_id} to switch to that run)" + ANSI_RESET)
+  println(
+    ANSI_DIM
+      + "   (selected ${pick.run_id} — re-invoke with --chat-run ${pick.run_id} to chat over it)"
+      + ANSI_RESET,
+  )
 }
 
-fn handle_load(arg, state) {
-  if arg == "" {
-    println(ANSI_YELLOW + "   /load needs a run-id or path" + ANSI_RESET)
-    return state
+fn resolve_chat_path(raw, chat_cfg) {
+  let p = raw ?? ""
+  if starts_with(p, "/") {
+    return p
   }
-  let kind = state?.chat_cfg?.harness_kind ?? "release-harn"
-  let resolved = resolve_run_target(kind, arg)
-  if resolved == nil {
-    println(ANSI_YELLOW + "   couldn't find run: ${arg}" + ANSI_RESET)
-    return state
-  }
-  let next_cfg = chat_cfg_from_run_dir(state?.chat_cfg, kind, resolved)
-  let next_state = state + {chat_cfg: next_cfg, seed_loaded: false}
-  println(ANSI_DIM + "   loaded run: ${next_cfg.run_id} (next prompt re-seeds context)" + ANSI_RESET)
-  return next_state
-}
-
-fn handle_save(arg, state) {
-  let path = if arg == "" {
-    "chat-transcript-" + state?.chat_cfg?.run_id ?? uuid_v7() + ".md"
-  } else {
-    arg
-  }
-  let transcript = state?.transcript ?? []
-  if len(transcript) == 0 {
-    println(ANSI_DIM + "   (nothing to save yet)" + ANSI_RESET)
-    return nil
-  }
-  var lines = ["# Chat transcript — ${state?.chat_cfg?.run_id ?? \"?\"}", ""]
-  for entry in transcript {
-    let role = entry?.role ?? "?"
-    let text = entry?.text ?? ""
-    lines = lines + ["## ${role}", "", text, ""]
-  }
-  write_file(path, join(lines, "\n"))
-  println(ANSI_DIM + "   saved → ${path}" + ANSI_RESET)
-}
-
-fn resolve_chat_path(p, state) {
-  let raw = p ?? ""
-  if starts_with(raw, "/") {
-    return raw
-  }
-  let run_dir = state?.chat_cfg?.run_dir ?? ""
+  let run_dir = chat_cfg?.run_dir ?? ""
   if run_dir != "" {
-    let candidate = path_join(run_dir, raw)
+    let candidate = path_join(run_dir, p)
     if file_exists(candidate) {
       return candidate
     }
   }
-  let repo = state?.chat_cfg?.repo ?? ""
+  let repo = chat_cfg?.repo ?? ""
   if repo != "" {
-    let candidate = path_join(repo, raw)
+    let candidate = path_join(repo, p)
     if file_exists(candidate) {
       return candidate
     }
   }
-  return path_join(cwd(), raw)
-}
-
-fn resolve_run_target(harness_kind, arg) {
-  let root = ".harn-runs/" + harness_kind
-  // Direct dir path?
-  if starts_with(arg, "/") && file_exists(arg) {
-    return arg
-  }
-  // .harn-runs/... relative path?
-  if starts_with(arg, root) && file_exists(arg) {
-    return path_join(cwd(), arg)
-  }
-  // Bare run-id?
-  let candidate = path_join(cwd(), root, arg)
-  if file_exists(candidate) {
-    return candidate
-  }
-  // Path to audit json?
-  if ends_with(arg, ".json") && file_exists(arg) {
-    let parts = arg.split("/")
-    parts[len(parts) - 1] = ""
-    return join(parts, "/")
-  }
-  return nil
-}
-
-fn ends_with(s, suffix) {
-  let raw = s ?? ""
-  let suf = suffix ?? ""
-  if len(suf) > len(raw) {
-    return false
-  }
-  return raw[len(raw) - len(suf):len(raw)] == suf
+  return path_join(cwd(), p)
 }
 
 /**
  * chat_cfg_from_run_dir — rebuild a chat_cfg by inferring file paths from a
- * run directory. Used by /load and by --chat-run / --chat-only.
+ * run directory.
  */
 pub fn chat_cfg_from_run_dir(base, harness_kind, run_dir) {
-  let run_id = path_basename(run_dir)
+  let run_id = basename(run_dir)
   let audit_md = if harness_kind == "release-harn" {
     path_join(run_dir, "release-audit.md")
   } else {
@@ -1096,12 +763,7 @@ pub fn chat_cfg_from_run_dir(base, harness_kind, run_dir) {
   }
 }
 
-fn append_transcript(state, role, text) {
-  let next = state?.transcript ?? [] + [{role: role, text: text}]
-  return state + {transcript: next}
-}
-
-/** run_chat_loop — main entry point. */
+/** run_chat_loop — main entry point for post-run chat. */
 pub fn run_chat_loop(chat_cfg) {
   if chat_cfg == nil {
     return nil
@@ -1109,81 +771,86 @@ pub fn run_chat_loop(chat_cfg) {
   let session_id = "chat-" + chat_cfg?.harness_kind ?? "?" + "-" + chat_cfg?.run_id ?? uuid_v7()
   let transcript_dir = path_join(chat_cfg?.run_dir ?? path_join(cwd(), ".harn-runs", "ad-hoc"), "chat-llm")
   mkdir(transcript_dir, true)
+  // If the prior agent run wrote a JSONL sidecar, seed the new session from
+  // it so the prefix cache stays warm and the model picks up where the
+  // recovery loop left off. Falls back to a system-prompt-only session if
+  // the transcript is absent or malformed.
+  let prior_transcript = chat_cfg?.llm_transcript_path
+  if prior_transcript != nil && file_exists(prior_transcript) {
+    try {
+      agent_session_seed_from_jsonl(
+        prior_transcript,
+        {rename_session: session_id, truncate_to_last: 24, drop_tool_calls: false, validate: false},
+      )
+    } catch (_e) {
+      nil
+    }
+  }
   chat_banner(chat_cfg)
-  var state = {
-    chat_cfg: chat_cfg,
-    session_id: session_id,
-    transcript_dir: transcript_dir,
-    seed_loaded: false,
-    transcript: [],
-    turns: 0,
+  let seed_context = load_seed_context(chat_cfg)
+  let system = chat_system_prompt(chat_cfg, seed_context)
+  let timeout_s = chat_cfg?.timeout_s ?? DEFAULT_TIMEOUT_S
+  let slash_handlers = {
+    "/cat": { req ->
+      handle_cat(req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/diff": { req ->
+      handle_diff(req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/pager": { req ->
+      handle_cat(req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/runs": { _req ->
+      handle_runs(chat_cfg)
+      return {kind: "handled"}
+    },
   }
-  while true {
-    let prompt_label = if state.turns == 0 {
-      ANSI_CYAN + "you> " + ANSI_RESET + ANSI_DIM + "(/help to list commands) " + ANSI_RESET
-    } else {
-      ANSI_CYAN + "you> " + ANSI_RESET
-    }
-    let line = read_user_line(prompt_label, chat_cfg?.timeout_s ?? DEFAULT_TIMEOUT_S)
-    if line == nil {
-      println(
-        ANSI_DIM + "(no input within ${chat_cfg?.timeout_s ?? DEFAULT_TIMEOUT_S}s — ending chat)"
-          + ANSI_RESET,
-      )
-      return nil
-    }
-    let user = trim(line)
-    if user == "" {
-      continue
-    }
-    if starts_with(user, "/") {
-      let routed = handle_slash(user, state)
-      if routed.kind == "exit" {
-        println(ANSI_DIM + "(chat closed)" + ANSI_RESET)
+  let result = agent_chat_loop(
+    {
+      session_id: session_id,
+      provider: chat_cfg?.provider ?? "ollama",
+      model: chat_cfg?.model ?? "qwen3.6:35b-a3b-coding-nvfp4",
+      tools: chat_cfg?.tools ?? tool_registry(),
+      system_prompt: system,
+      max_iterations: 8,
+      iteration_budget: {mode: "adaptive", initial: 4, max: 8, extend_by: 2},
+      max_tokens: 4000,
+      temperature: 0.3,
+      llm_caller: with_retry(default_llm_caller(), {max_attempts: 2}),
+      llm_transcript_dir: transcript_dir,
+      slash_commands: slash_handlers,
+      on_user_input: { state ->
+        let label = if state.turns ?? 0 == 0 {
+          ANSI_CYAN + "you> " + ANSI_RESET + ANSI_DIM + "(/help to list commands) " + ANSI_RESET
+        } else {
+          ANSI_CYAN + "you> " + ANSI_RESET
+        }
+        let line = prompt_line(label, timeout_s)
+        if line == nil {
+          println(ANSI_DIM + "(no input within ${timeout_s}s — ending chat)" + ANSI_RESET)
+          return {kind: "exit", reason: "timeout"}
+        }
+        if line == "/help" || line == "/?" {
+          print_chat_help()
+          return {kind: "handled"}
+        }
+        return agent_chat_route_input(line, state, slash_handlers)
+      },
+      on_model_turn: { turn, _state ->
+        let body = trim(turn?.visible_text ?? turn?.text ?? "")
+        println("")
+        println(ANSI_MAGENTA + "assistant>" + ANSI_RESET + " " + body)
+        println("")
         return nil
-      }
-      state = routed?.state ?? state
-      continue
-    }
-    let seed_context = if state.seed_loaded {
-      ""
-    } else {
-      load_seed_context(state.chat_cfg)
-    }
-    let system = chat_system_prompt(state.chat_cfg, seed_context)
-    let user_message = if state.seed_loaded {
-      user
-    } else {
-      "Run context for this conversation:\n\n" + seed_context + "\n\nOperator question:\n" + user
-    }
-    state = state + {seed_loaded: true}
-    state = append_transcript(state, "user", user)
-    let result = try {
-      agent_loop(
-        user_message,
-        system,
-        {
-          session_id: session_id,
-          provider: state.chat_cfg?.provider ?? "ollama",
-          model: state.chat_cfg?.model ?? "qwen3.6:35b-a3b-coding-nvfp4",
-          tools: state.chat_cfg?.tools ?? tool_registry(),
-          max_iterations: 8,
-          iteration_budget: {mode: "adaptive", initial: 4, max: 8, extend_by: 2},
-          max_tokens: 4000,
-          temperature: 0.3,
-          llm_caller: with_retry(default_llm_caller(), {max_attempts: 2}),
-          llm_transcript_dir: transcript_dir,
-        },
-      )
-    } catch (e) {
-      println(ANSI_RED + "   (agent error: ${e})" + ANSI_RESET)
-      continue
-    }
-    let body = trim(result?.visible_text ?? result?.text ?? result?.prose ?? "")
-    println("")
-    println(ANSI_MAGENTA + "assistant>" + ANSI_RESET + " " + body)
-    println("")
-    state = append_transcript(state, "assistant", body)
-    state = state + {turns: state.turns + 1}
-  }
+      },
+    },
+  )
+  println(
+    ANSI_DIM + "(chat closed — ${result.turns} turn(s), reason: ${result.stop_reason})"
+      + ANSI_RESET,
+  )
+  return nil
 }

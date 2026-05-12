@@ -87,12 +87,15 @@ Models are confined to:
   in `release_harn.harn` for release readiness review and recovery loops.
 - A read-only audit agent in `harness_self_review.harn`.
 - `run_chat_loop` from `lib/chat_loop.harn` (post-run + pre-release-gate
-  interactive agent). Auto-enabled when stdin is a controlling terminal
-  (`/dev/tty` openable) — CI never enters chat because `/dev/tty` is
-  unreachable from a piped/non-TTY context. `--no-chat` / `HARN_CHAT=0`
-  are hard kill-switches. The chat agent gets the same read+edit tool
-  surface as the recovery loop (`release_repair_tools` /
-  `bump_chat_tools`), so it can apply meta-fixes when the operator asks.
+  interactive agent). Built on `std/agent/chat::agent_chat_loop`,
+  `std/io::is_tty`/`read_line`, `std/tui::page`/`select_from`, and
+  `agent_session_seed_from_jsonl` so the post-run session restarts from
+  the prior recovery transcript without re-priming the prefix cache.
+  Auto-enabled when `is_tty(0)` reports true; CI never enters chat
+  because stdin is captured. `--no-chat` / `HARN_CHAT=0` are hard
+  kill-switches. The chat agent gets the same read+edit tool surface as
+  the recovery loop (`release_repair_tools` / `bump_chat_tools`), so it
+  can apply meta-fixes when the operator asks.
 
 When adding a new model touchpoint, follow the same pattern: shape inputs deterministically,
 let the agent produce text, then validate/parse before letting it influence output. If model
@@ -116,7 +119,7 @@ Use `std/llm/handlers.with_retry` rather than the deprecated `llm_retries` optio
 next-turn tool changes via `next_options` rather than the deprecated
 `post_turn_callback.llm_options`.
 
-Route boilerplate-prone patterns through the v0.8.6 stdlib helpers:
+Route boilerplate-prone patterns through the stdlib helpers:
 - `std/cli::parse_args` for argv parsing (spec-driven; reserved `_extras`/`_errors`/`_help` keys).
 - `std/poll::poll_until` / `wait_for_status` / `retry_with_result` for any "probe until
   truthy / terminal status / exponential-backoff" loop. Zero-arg closures must use
@@ -129,6 +132,19 @@ Route boilerplate-prone patterns through the v0.8.6 stdlib helpers:
   env-derived configuration. Closures cannot mutate enclosing `var` bindings, so
   manual `while now_ms() < deadline { ... attempt = attempt + 1 ... }` loops are
   still the right shape for poll loops that need per-attempt progress prints.
+- `std/io::is_tty` / `read_line` and `std/tui::page` / `select_from` for
+  TTY-aware prompts, paged artifact display, and fzf-aware pickers — the
+  chat loop and pre-release gate use both.
+- `std/agent/chat::agent_chat_loop` (+ `agent_chat_route_input`) for
+  multi-turn operator chat with shared slash routing — wraps
+  `agent_session_open` / `agent_session_close` / `agent_loop` so callers
+  pass `on_user_input` / `on_model_turn` callbacks rather than driving
+  the loop by hand.
+- `agent_session_seed_from_jsonl(path, opts)` to lift an earlier run's
+  `llm_transcript.jsonl` sidecar into a fresh session so the prefix
+  cache stays warm across the recovery→chat handoff.
+- `std/signal::on_interrupt` / `with_interrupt` for cooperative SIGINT
+  cleanup on long-running operator-driven loops.
 
 **Templates.** Markdown/PR-body templates live in `prompts/*.harn.prompt` and are referenced
 through the `[asset_roots] prompts = "prompts"` alias in `harn.toml`. Render via
