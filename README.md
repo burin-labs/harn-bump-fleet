@@ -36,7 +36,7 @@ harn run bump_fleet.harn -- --dry-run
 harn run bump_fleet.harn -- --only burin-labs/harn-cloud
 
 # Use a different local LLM for the summary.
-HARN_BUMP_FLEET_MODEL=gemma4:26b \
+HARN_BUMP_FLEET_MODEL=gpt-oss:120b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
   harn run bump_fleet.harn
 ```
@@ -83,18 +83,42 @@ Slash commands inside the chat loop:
 During the pre-release gate, the chat also accepts `/approve` and
 `/abort` to resolve the decision and return to the main pipeline.
 
+### AMFI-shielded launcher (macOS)
+
+On macOS, AMFI sends SIGKILL to a running process if the executable file
+on disk is replaced (a fresh `cargo install harn-cli` mid-run is enough).
+Long fleet runs would otherwise need the manual
+`cp ~/.cargo/bin/harn ~/.cargo/bin/harn2` workaround.
+
+`scripts/harn_shielded.sh` resolves the source `harn` on `PATH` (or
+`$HARN_BIN`), stages a copy under
+`$XDG_CACHE_HOME/harn-shielded/harn` (default `~/Library/Caches/...`),
+and execs that copy. Re-stages only when the source binary's size+mtime
+changes, so warm runs cost ~50ms.
+
+```sh
+scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
+scripts/harn_shielded.sh run release_harn.harn -- --mode ship-pr
+```
+
+Drop-in for any `harn ...` invocation. CI environments don't need it
+because they don't rebuild `harn` mid-run.
+
 ## Dependencies
 
 - `harn` v0.8.x.
 - `gh` CLI, authenticated — the script never embeds tokens, just shells out.
-- A local Ollama model for the end-of-run summary; defaults to
-  `gemma4:26b` via Harn's built-in `ollama` provider. Override via
-  `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER`.
+- A local Ollama model for the end-of-run summary and the post-run chat
+  loop; defaults to `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in
+  `ollama` provider. This matches `release_harn.harn` so both harnesses
+  share one tool-capable model. Override per-harness with
+  `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
+  `HARN_RELEASE_MODEL` / `HARN_RELEASE_PROVIDER`.
 
 Recommended local Ollama model:
 
 ```sh
-ollama pull gemma4:26b
+ollama pull qwen3.6:35b-a3b-coding-nvfp4
 ```
 
 Normal invocations do not need LLM environment variables when Ollama is running
@@ -137,7 +161,7 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
      the source of truth for dispatch decisions.
    - If an open PR on `automation/bump-harn-runtime` has a head pin that
      already matches the target, ensure auto-merge is on and status is
-     `pr_already_set`.
+     `pr_open_for_target`.
    - If that automation PR is stale, close it before redispatching so an old
      version bump cannot accidentally sit in the merge queue.
 5. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
