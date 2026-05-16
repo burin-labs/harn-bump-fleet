@@ -48,6 +48,7 @@ import {
   recovery_step_ref,
   recovery_step_refs,
 } from "lib/release_execution"
+import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import { remote_tag_sha_from_ls_remote, repin_tocttou_decision } from "lib/release_repin"
 import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
 import { fail, ok, safe_shell_arg } from "lib/shell_util"
@@ -2463,6 +2464,17 @@ fn maybe_delete_stale_repin_tag(cfg, version, steps, run_id) {
   return {steps: out, success: remote_del.success}
 }
 
+fn release_asset_snapshot(cfg, tag) {
+  let probe = run_gh(cfg, ["release", "view", tag, "--json", "assets", "--jq", ".assets[].name"])
+  let assets = if probe.success {
+    split(probe.stdout ?? "", "\n").map({ name -> trim(name) }).filter({ name -> name != "" })
+  } else {
+    []
+  }
+  let missing = missing_release_assets(assets)
+  return {assets: assets, missing_assets: missing, ready: len(missing) == 0}
+}
+
 /**
  * TOCTTOU re-check executed immediately before the repin branch reset.
  *
@@ -2485,8 +2497,8 @@ fn run_repin_tocttou_recheck(cfg, analysis) {
       new_pin_sha: "",
     }
   }
-  let release_probe = run_gh(cfg, ["release", "view", tag, "--json", "tagName", "--jq", ".tagName"])
-  let release_exists = release_probe.success && trim(release_probe.stdout) == tag
+  let release_assets = release_asset_snapshot(cfg, tag)
+  let release_exists = release_assets.ready || harn_crate_published(analysis.next_version)
   let ls = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
   if !ls.success {
     return {
@@ -2719,7 +2731,7 @@ fn apply_fixup_release_notes(cfg, analysis) {
  * Detect repair / fixup state for `analysis.next_version`.
  *
  * Returns `nil` when this is a normal first-time release. Returns
- * `{tag, pr_url, original_pin, pin_unreleased, tag_exists, release_exists}`
+ * `{tag, pr_url, original_pin, pin_unreleased, tag_exists, release_exists, missing_assets}`
  * when an open release/v${next_version} PR exists on `<base>`.
  *
  * Two flavors collapse into one detection path:
@@ -2727,10 +2739,10 @@ fn apply_fixup_release_notes(cfg, analysis) {
  *     shipped). The previous run got partway and left the PR open;
  *     we need to recreate the branch, fix any content regressions,
  *     and force-push.
- *   - Documented post-publish drift: artifact shipped, operator added
- *     more bullets to Unreleased that describe the NEXT release; the
- *     re-run should land the v${next_version} paperwork without
- *     clobbering those drift bullets.
+ *   - Documented post-publish drift: required release assets shipped,
+ *     operator added more bullets to Unreleased that describe the NEXT
+ *     release; the re-run should land the v${next_version} paperwork
+ *     without clobbering those drift bullets.
  *
  * Both share the same recovery: recover the original pin SHA via
  * `git merge-base origin/release/v$ver origin/<base>`, then read
@@ -2804,8 +2816,8 @@ fn detect_fixup_state(cfg, analysis) {
   // not gate detection itself.
   let tag_check = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
   let tag_exists = tag_check.success && trim(tag_check.stdout) != ""
-  let release_check = run_gh(cfg, ["release", "view", tag, "--json", "tagName", "--jq", ".tagName"])
-  let release_exists = release_check.success && trim(release_check.stdout) == tag
+  let release_assets = release_asset_snapshot(cfg, tag)
+  let release_exists = release_assets.ready
   // Conflict state on the existing PR. After other PRs land on `<base>`
   // and touch CHANGELOG.md, release/v$ver collides at the top of
   // CHANGELOG. The repair pass resolves this implicitly by recreating
@@ -2821,6 +2833,7 @@ fn detect_fixup_state(cfg, analysis) {
     pin_unreleased: pin_unreleased,
     tag_exists: tag_exists,
     release_exists: release_exists,
+    missing_assets: release_assets.missing_assets,
     conflicting: conflicting,
   }
 }
@@ -2841,9 +2854,23 @@ fn with_fixup_state(cfg, fixup) {
 
 fn analysis_with_fixup_state(raw, fixup) {
   if fixup == nil {
-    return {...raw, fixup_mode: false, fixup_tag: "", fixup_pr_url: ""}
+    return {
+      ...raw,
+      fixup_mode: false,
+      fixup_tag: "",
+      fixup_pr_url: "",
+      fixup_release_exists: false,
+      fixup_missing_assets: [],
+    }
   }
-  return {...raw, fixup_mode: true, fixup_tag: fixup.tag, fixup_pr_url: fixup.pr_url}
+  return {
+    ...raw,
+    fixup_mode: true,
+    fixup_tag: fixup.tag,
+    fixup_pr_url: fixup.pr_url,
+    fixup_release_exists: fixup.release_exists,
+    fixup_missing_assets: fixup.missing_assets ?? [],
+  }
 }
 
 /**
@@ -4239,6 +4266,9 @@ pipeline main() {
         "   conflict  : PR is `CONFLICTING` against ${cfg.base} — recreating branch on fresh ${cfg.base} resolves it implicitly",
       )
     }
+    if !(fixup_state.release_exists ?? false) && len(fixup_state.missing_assets ?? []) > 0 {
+      println("   assets    : missing " + join(fixup_state.missing_assets, ", "))
+    }
     println("   pin       : ${fixup_state.original_pin} (recovered via merge-base)")
     println(
       "   v${analysis.next_version} : ${pin_count} pin-time Unreleased entries (smart-subtracted from current Unreleased)",
@@ -4258,6 +4288,7 @@ pipeline main() {
         original_pin: fixup_state.original_pin,
         tag_exists: fixup_state.tag_exists,
         release_exists: fixup_state.release_exists,
+        missing_assets: fixup_state.missing_assets ?? [],
         conflicting: fixup_state.conflicting ?? false,
         pin_unreleased_chars: len(fixup_state.pin_unreleased),
         pin_bullet_count: pin_count,
@@ -4392,7 +4423,11 @@ pipeline main() {
     println("   pr      : ${pr_url}")
   }
   if analysis.fixup_mode ?? false {
-    println("   tag     : ${analysis.fixup_tag} (unchanged; published artifact untouched)")
+    if analysis.fixup_release_exists ?? false {
+      println("   tag     : ${analysis.fixup_tag} (unchanged; published artifact untouched)")
+    } else {
+      println("   tag     : ${analysis.fixup_tag} (unchanged; release artifacts still need recovery)")
+    }
   } else if analysis.repin_mode ?? false && !execution_failed(execution) && !cfg.mock {
     println(
       "   tag     : v${analysis.next_version} (re-pushed at advanced pin; publish-release.yml will ship)",
