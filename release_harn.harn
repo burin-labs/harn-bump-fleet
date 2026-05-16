@@ -1672,9 +1672,61 @@ fn recovery_failure_class(failed_step, live_context) {
   return failed_step.classification ?? ""
 }
 
+/**
+ * Pre-warm the Ollama model before kicking the recovery agent off. The
+ * release pipeline keeps the model loaded during the up-front agent review
+ * but `prepare` can run for 5-15 minutes, by which point Ollama's default
+ * `keep_alive` (30m on the wire, but pressured by macOS memory reclaim
+ * during heavy cargo builds) has typically dropped the runner. The first
+ * recovery turn would then sit silently behind a generic
+ * `[INFO] [llm] warming up Ollama model …` line for 10-30s while the
+ * model paged back in. Doing the warmup here means the wait happens with
+ * a step prefix the operator can place in context, and refreshing
+ * `keep_alive` keeps the runner pinned through the rest of the recovery
+ * loop. Non-blocking: a warmup error never aborts the recovery — the
+ * agent_loop call still runs and will surface a real failure if Ollama
+ * is genuinely broken.
+ */
+fn warm_local_model_for_recovery(cfg) {
+  if cfg.mock ?? false {
+    return
+  }
+  let provider = if cfg.provider == "auto" {
+    "ollama"
+  } else {
+    cfg.provider
+  }
+  if provider != "ollama" {
+    return
+  }
+  let model = trim(cfg.model ?? "")
+  if model == "" {
+    return
+  }
+  println("   → warming local model ${model} (long prepare may have cooled it)")
+  let warm_started = now_ms()
+  let result = try {
+    llm_healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
+  } catch (e) {
+    {valid: false, status: "error", message: "${e}"}
+  }
+  let elapsed_ms = now_ms() - warm_started
+  let elapsed_s = (elapsed_ms + 500) / 1000
+  if result?.valid ?? false {
+    println("   ✓ warmed ${model} in ${elapsed_s}s")
+  } else {
+    let status = result?.status ?? "error"
+    let message = result?.message ?? "unknown"
+    println(
+      "   ⚠ model warmup non-blocking failure (${status}): ${message} — continuing into recovery anyway",
+    )
+  }
+}
+
 fn run_recovery_agent_loop(cfg, analysis, prompt, run_id, step_name) {
   let paths = recovery_artifact_paths(run_id, step_name)
   let system = render("@prompts/release_recovery_system.harn.prompt", {})
+  warm_local_model_for_recovery(cfg)
   var options = agent_preset(
     "repair",
     {
@@ -1769,6 +1821,10 @@ fn maybe_recovery_advice_step(cfg, analysis, steps, failed_step, run_id) {
   if !cfg.agent {
     return steps
   }
+  // The recovery agent can sit for tens of seconds while the model re-warms
+  // and the first turn lands. Print a step header up front so the operator
+  // sees harness progress instead of a silent terminal after the failure.
+  println("   → recovery diagnosis (agent_loop on failed step `${failed_step.name}`)")
   let advice = recovery_agent_advice(cfg, analysis, steps, failed_step, run_id)
   let r = ok(advice.text)
   let step = recorded_step(
@@ -4351,7 +4407,16 @@ pipeline main() {
         timeout_s: cfg.chat_timeout_s,
       },
       {changelog: changelog_text, pr_body: pr_body_preview, findings: analysis.deterministic_findings},
-      {mode: cfg.mode, next_version: analysis.next_version, repo: cfg.repo, run_id: run_id},
+      {
+        mode: cfg.mode,
+        next_version: analysis.next_version,
+        current_version: analysis.current_version,
+        repo: cfg.repo,
+        run_id: run_id,
+        base_branch: cfg.base,
+        latest_tag: analysis.latest_tag,
+        pin_sha: cfg.pin_sha,
+      },
     )
     if gate.decision == "abort" {
       release_log_event(run_id, "pre_release_gate_aborted", {reason: gate.reason})
