@@ -146,9 +146,9 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
    `gh api repos/burin-labs/harn/releases/latest`; an explicit `vX.Y.Z` arg
    overrides.
 3. **Wait for release readiness** on live runs. Before dispatching anything,
-   the fleet waits for `harn-cli@X.Y.Z` to be visible on crates.io and for the
-   Linux release binary asset to exist on the GitHub release. Dry runs skip
-   this wait.
+   the fleet waits for `harn-cli@X.Y.Z` to be visible on crates.io and for all
+   expected macOS, Linux, and Windows release binary assets to exist on the
+   GitHub release. Dry runs skip this wait.
 4. **Idempotency pre-check** per repo:
    - Read origin/main directly from GitHub. Local worktrees are only used for
      discovery and as an audit signal.
@@ -326,8 +326,7 @@ title/body before enabling auto-merge.
 
 If a live `--mode ship-pr` run starts and the harness detects:
 
-- a published GitHub release for `v<next_version>` (i.e.
-  `gh release view v<next_version>` returns the tag name), and
+- the required GitHub release assets for `v<next_version>`, and
 - an open `release/v<next_version>` PR on `<base>`,
 
 it switches into **post-publish fixup mode** automatically. The release
@@ -379,11 +378,12 @@ fixup mode the harness:
 To bypass auto-detection (e.g. to advance the pin and re-tag because the
 original publish failed before the GitHub release was created), close the
 open release PR or delete the tag manually before rerunning. Detection
-requires both signals (release artifact + open PR) so it cannot misfire
-on a tag that exists without a corresponding shipped artifact.
+requires both signals (the required release assets + open PR) so it cannot
+misfire on a tag or empty GitHub release page that exists without the
+corresponding shipped artifacts.
 
 To advance the pin on an open release PR that has NOT yet shipped (so the
-release artifact does not yet exist on crates.io), use `--repin-latest`
+release is not yet immutable on crates.io), use `--repin-latest`
 instead — it is the opt-in inverse of fixup mode that folds post-pin
 commits into the same `v$next` rather than splitting them into a future
 release. See the flag description above. Side-effecting failures are preserved in

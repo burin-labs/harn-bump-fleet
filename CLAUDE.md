@@ -26,8 +26,8 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   stale-prepare). The release branch is parented at that SHA and never rebased
   before push, the tag is pushed pre-PR, and the harn-side `publish-release.yml` ships
   from the tag — so commits that land on `<base>` between PR-open and merge cannot leak
-  into the published artifact. **Post-publish fixup mode:** if `gh release view
-  v$next_version` succeeds AND a `release/v$next_version` PR is open, the harness
+  into the published artifact. **Post-publish fixup mode:** if the required release
+  assets exist for `v$next_version` AND a `release/v$next_version` PR is open, the harness
   auto-detects that the artifact already shipped and switches into a paperwork-only
   pass — recreates the release branch on fresh `<base>`, injects the
   originally-shipped release body verbatim via
