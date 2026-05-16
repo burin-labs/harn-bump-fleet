@@ -15,7 +15,15 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   release branch normalization, CHANGELOG drafting, `prepare`/`ship-pr` modes, recovery
   agent loop, and post-merge checkout cleanup. **Pin model:** every run resolves a
   concrete `cfg.pin_sha` at startup (from `--at-sha` / `HARN_RELEASE_PIN_SHA`, else
-  `origin/<base>` HEAD). The release branch is parented at that SHA and never rebased
+  `origin/<base>` HEAD). Before resolving the pin in live mode (no `--at-sha`,
+  not audit, `--yes-live-release` set, and not already on a `release/v*` branch),
+  `pre_release_sync_local_base` stashes any dirty tracked/untracked changes under
+  `release_harn-auto-stash-<run-id>`, switches to `<base>` if needed, and
+  fast-forwards from origin — so the pin SHA we freeze reflects current
+  `origin/<base>` and the local checkout matches what we just pinned. The shared
+  primitive is `lib/checkout_cleanup::sync_base_branch`; release-branch checkouts
+  defer to `normalize_release_analysis_checkout` (which knows fresh-prepare from
+  stale-prepare). The release branch is parented at that SHA and never rebased
   before push, the tag is pushed pre-PR, and the harn-side `publish-release.yml` ships
   from the tag — so commits that land on `<base>` between PR-open and merge cannot leak
   into the published artifact. **Post-publish fixup mode:** if `gh release view

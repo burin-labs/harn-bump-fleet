@@ -258,7 +258,15 @@ harn run release_harn.harn -- --mock --agent
 harn run release_harn.harn -- --mock --agent --mode ship-pr
 ```
 
-Live modes require the explicit guard flag. The harness now normalizes the
+Live modes require the explicit guard flag. Before resolving the pin SHA, the
+harness fast-forwards the local base branch from `origin/<base>`: if the
+worktree is dirty it stashes the changes under
+`release_harn-auto-stash-<run-id>` (recover with `git stash list` →
+`git stash pop`), switches to `<base>` if the current branch is something
+else, and fast-forwards. The sync is skipped for `--mode audit`, when
+`--at-sha` pins a specific commit, and when the current branch is already a
+`release/v*` branch (those are handled by the downstream normalize step,
+which preserves prepared release content). The harness then normalizes the
 release branch before running the target repo's release script: if it starts
 from `main` or another branch, it stashes dirty tracked/untracked files when
 needed, fetches/syncs the base branch, switches or creates `release/vX.Y.Z`,
