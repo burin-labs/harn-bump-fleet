@@ -110,6 +110,39 @@ let the agent produce text, then validate/parse before letting it influence outp
 output fails to parse after one repair attempt, fall back to deterministic facts rather than
 erasing the audit (see `bump_summary` in `lib/`).
 
+**Planner + binder defaults.** All agent calls source their default
+provider/model from `lib/llm_defaults`:
+
+- `planner_defaults("HARN_<ROLE>")` — per-role env knob (e.g.
+  `HARN_RELEASE_MODEL`) > shared `HARN_PLANNER_*` > cloud cell
+  (OpenRouter DeepSeek V3.2 if `OPENROUTER_API_KEY` is in env) > local
+  Ollama (`qwen3.6:35b-a3b-coding-nvfp4`). Never bake `provider:
+  "ollama"` or `model: "qwen3.6:..."` into a new agent call site — route
+  through `planner_defaults` so the cloud/local switch stays in one
+  place.
+- `install_binder(tools)` — returns `{tools, tool_caller, audit}`. The
+  binder is the natural-language tool middleware from PR
+  burin-labs/harn#1814 (+18pp lift); it injects an optional `_nl_intent`
+  field on every tool schema and uses Cerebras GPT-OSS-120B by default
+  to canonicalize tool args. Off automatically when `CEREBRAS_API_KEY`
+  isn't set; force on/off with `HARN_BINDER=1`/`0`. Spread
+  `binder.tools` and `binder.tool_caller` into `agent_preset(...)`
+  options at every tool-using agent loop. When you add a NEW tool-using
+  agent call site, wire it through `install_binder` — the layer is
+  a passthrough when disabled, so the call is uniform.
+- `binder_audit_line(audit)` / `planner_audit_line(planner)` — one-line
+  console banners; release_harn prints both at the top of every run.
+
+**Env / `.env` loading.** Harn does not auto-load `.env`. Use
+`scripts/with_env.sh` to source `~/projects/burin-code/.env` (override
+with `HARN_BUMP_FLEET_ENV_FILE`) + `./.env` + `./.env.local` before
+exec'ing the rest of the command. Compose with the AMFI shield as
+needed:
+
+```sh
+scripts/with_env.sh scripts/harn_shielded.sh run release_harn.harn -- --mode ship-pr --agent --yes-live-release
+```
+
 **Audit artifacts.** Each harness writes to `.harn-runs/<harness>/<run-id>/` (gitignored).
 The release harness additionally emits `crystallization-input/` — a self-contained fixture
 for the Harn crystallization importer. Keep deterministic facts separate from

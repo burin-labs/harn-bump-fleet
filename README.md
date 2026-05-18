@@ -83,6 +83,67 @@ Slash commands inside the chat loop:
 During the pre-release gate, the chat also accepts `/approve` and
 `/abort` to resolve the decision and return to the main pipeline.
 
+### Local config & API keys (`scripts/with_env.sh`)
+
+The cloud-by-default planner/binder pair (see "Planner + tool binder" below)
+needs provider API keys in env. Harn does not auto-load `.env`, so the
+launcher script `scripts/with_env.sh` sources one or more local env files
+before exec'ing the rest of the command:
+
+```sh
+# Sources ~/projects/burin-code/.env (override with HARN_BUMP_FLEET_ENV_FILE),
+# then ./.env and ./.env.local from the repo root, then runs the harness.
+scripts/with_env.sh harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
+
+# Verbose mode prints which files were sourced.
+HARN_ENV_VERBOSE=1 scripts/with_env.sh harn run release_harn.harn
+```
+
+Discovery order (later entries override earlier ones):
+
+1. `$HARN_BUMP_FLEET_ENV_FILE` (default `~/projects/burin-code/.env`)
+2. `$HARN_BUMP_FLEET_ENV_FILES` (colon-separated list)
+3. `./.env` at the cwd
+4. `./.env.local` at the cwd
+
+Missing files are silently skipped. All `.env*` files are gitignored
+locally; never commit secrets.
+
+### Planner + tool binder
+
+By default the harnesses now route their planning calls through
+**OpenRouter DeepSeek V3.2** (planner) with **Cerebras GPT-OSS-120B** as
+a natural-language tool binder middleware — the empirical best cell from
+[burin-labs/harn#1814](https://github.com/burin-labs/harn/pull/1814)
+(+18pp lift on the PEAR-style tool-call accuracy harness). When the
+required cloud API keys aren't present in env, the defaults fall back to
+local Ollama (`qwen3.6:35b-a3b-coding-nvfp4`) so the local-only workflow
+keeps working without any setup.
+
+The binder runs as a `compose_tool_callers` middleware layer on every
+tool-using agent loop in the repo (release agent, recovery loop, harness
+self-review, post-run + pre-release chat). It only fires when the
+planner emits an optional `_nl_intent` field on a tool call; otherwise
+it short-circuits with `audit.binder.status = "skipped"` at zero
+latency cost.
+
+Knobs (all `env_str`-style, all optional):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `OPENROUTER_API_KEY` | (none) | Enables cloud planner default |
+| `CEREBRAS_API_KEY` | (none) | Auto-enables binder |
+| `HARN_BINDER` | `auto` | `0` to force off, `1` to force on |
+| `HARN_BINDER_PROVIDER` / `_MODEL` | `cerebras` / `gpt-oss-120b` | Override binder route |
+| `HARN_BINDER_TIMEOUT_MS` | `100` | Binder hop wall-clock budget |
+| `HARN_BINDER_MAX_TOKENS` | `1024` | Per [#1814 finding 3](https://github.com/burin-labs/harn/pull/1814) |
+| `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
+| `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
+
+`harn run release_harn.harn` prints a `planner` + `binder` line at the
+top of every run summarizing the resolved route.
+
 ### AMFI-shielded launcher (macOS)
 
 On macOS, AMFI sends SIGKILL to a running process if the executable file
