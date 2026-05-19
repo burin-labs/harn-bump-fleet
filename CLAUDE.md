@@ -44,6 +44,22 @@ A pure Harn-language project (no Python/shell glue) holding three top-level harn
   immediately before branch reset confirms the remote tag has not moved since
   startup), and re-pushes at the new pin. Requires `--mode ship-pr
   --yes-live-release`; refuses if the release already shipped.
+  **Post-merge drift mode** (third auto-mode after repin and fixup):
+  fires when a previous release cycle fully merged (PR closed, binary on
+  crates.io with all GitHub release assets) but main's `## v$current`
+  body diverges from pin-time `## Unreleased`. This happens when
+  GitHub's 3-way merge absorbs post-pin bullets that landed on
+  `## Unreleased` during the release PR window — `release-pr-drift-check`
+  warns about this, but if it isn't a required gate, auto-merge fires
+  anyway and only the CHANGELOG ends up wrong (binary is correct). The
+  next `release_harn ship-pr --yes-live-release` rerun auto-detects this
+  state via `detect_post_merge_drift` and opens a paperwork-only PR on
+  `paperwork/v$current-changelog-fix`: restores `## v$current` to
+  pin-time content (via `changelog_repair_post_merge_drift`) and moves
+  the absorbed drift back to `## Unreleased`. The commit carries an
+  `Allow-Retroactive-Changelog:` trailer so the harn-repo's
+  retroactive-edit guard accepts the post-publish fix-up. Idempotent
+  (returns early when a paperwork PR is already open).
 - `harness_self_review.harn` — meta-audit; intentionally not wired into CI. Reads recent
   `.harn-runs/` artifacts and gives a local model read-only tools over `~/projects` for
   cross-referencing.

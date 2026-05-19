@@ -18,6 +18,7 @@ import {
   changelog_named_section_from_text,
   changelog_promote_pin_time_unreleased,
   changelog_release_section_update,
+  changelog_repair_post_merge_drift,
   changelog_top_from_text,
 } from "lib/changelog"
 import {
@@ -2944,6 +2945,264 @@ fn analysis_with_fixup_state(raw, fixup) {
 }
 
 /**
+ * Post-merge drift detection — third auto-mode (after fixup, before normal release).
+ *
+ * Fires when a previous ship-pr cycle completed (release/v$ver PR merged, binary
+ * shipped) but GitHub's 3-way merge absorbed post-pin Unreleased bullets into
+ * `## v$ver` on `<base>`. The published binary doesn't contain those bullets;
+ * the CHANGELOG entry on `<base>` lies about what shipped. `release-pr-drift-check`
+ * warns about this on the release PR, but if the check wasn't required, auto-merge
+ * fires anyway and only the CHANGELOG ends up wrong. This detection lets the next
+ * `release_harn` re-run open a paperwork-only PR that restores `## v$ver` to
+ * pin-time content and moves the absorbed drift into `## Unreleased`.
+ *
+ * Conservative gating — `nil` unless ALL hold:
+ *   - live ship-pr (`--mode ship-pr --yes-live-release`, not mock/audit)
+ *   - working tree has no candidate release content (no in-flight release work)
+ *   - latest published version (`analysis.current_version`) is FULLY published:
+ *     crates.io + every required GitHub release asset.
+ *   - no open `release/v$current` PR (existing fixup_state handles that)
+ *   - pin-time `## Unreleased` (read from `git merge-base v$current origin/<base>`)
+ *     differs from current `## v$current` body on `<base>`.
+ *
+ * Returns `{kind: "drift", tag, version, original_pin, pin_unreleased,
+ *   current_section, paperwork_branch}` when drift is detected and the
+ *   paperwork PR should be opened.
+ *
+ * Returns `{kind: "paperwork_pr_open", pr_url, paperwork_branch}` when a
+ *   paperwork PR for this version is already open (idempotent re-run).
+ */
+fn detect_post_merge_drift(cfg, analysis) {
+  if cfg.mock {
+    return nil
+  }
+  if cfg.mode != "ship-pr" || !(cfg.yes_live_release ?? false) {
+    return nil
+  }
+  if analysis.dirty_files ?? 0 > 0 {
+    return nil
+  }
+  let version = trim(analysis.current_version ?? "")
+  if version == "" {
+    return nil
+  }
+  let tag = "v${version}"
+  let branch = "release/" + tag
+  let paperwork_branch = "paperwork/v${version}-changelog-fix"
+  let release_assets = release_asset_snapshot(cfg, tag)
+  if !release_assets.ready {
+    return nil
+  }
+  if !harn_crate_published(version) {
+    return nil
+  }
+  let pr_check = run_gh(
+    cfg,
+    [
+      "pr",
+      "list",
+      "--base",
+      cfg.base,
+      "--head",
+      branch,
+      "--state",
+      "open",
+      "--json",
+      "url",
+      "--jq",
+      ".[0].url // \"\"",
+    ],
+  )
+  if pr_check.success && trim(pr_check.stdout) != "" {
+    return nil
+  }
+  let paperwork_check = run_gh(
+    cfg,
+    [
+      "pr",
+      "list",
+      "--base",
+      cfg.base,
+      "--head",
+      paperwork_branch,
+      "--state",
+      "open",
+      "--json",
+      "url",
+      "--jq",
+      ".[0].url // \"\"",
+    ],
+  )
+  if paperwork_check.success && trim(paperwork_check.stdout) != "" {
+    return {
+      kind: "paperwork_pr_open",
+      pr_url: trim(paperwork_check.stdout),
+      paperwork_branch: paperwork_branch,
+    }
+  }
+  let tag_check = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
+  if !tag_check.success || trim(tag_check.stdout) == "" {
+    return nil
+  }
+  let tag_line_parts = split(trim(tag_check.stdout), "\t")
+  let tag_sha = if len(tag_line_parts) > 0 {
+    trim(tag_line_parts[0])
+  } else {
+    ""
+  }
+  if tag_sha == "" {
+    return nil
+  }
+  let merge_base = run_git(cfg, ["merge-base", tag_sha, "origin/" + cfg.base])
+  if !merge_base.success {
+    return nil
+  }
+  let original_pin = trim(merge_base.stdout)
+  if original_pin == "" {
+    return nil
+  }
+  let pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
+  if !pin_show.success {
+    return nil
+  }
+  let pin_unreleased = changelog_named_section_from_text(pin_show.stdout, "## Unreleased")
+  if trim(pin_unreleased) == "" {
+    return nil
+  }
+  let main_show = run_git(cfg, ["show", "origin/" + cfg.base + ":CHANGELOG.md"])
+  if !main_show.success {
+    return nil
+  }
+  let current_section = changelog_named_section_from_text(main_show.stdout, "## v" + version)
+  if trim(current_section) == "" {
+    return nil
+  }
+  if trim(current_section) == trim(pin_unreleased) {
+    return nil
+  }
+  return {
+    kind: "drift",
+    tag: tag,
+    version: version,
+    original_pin: original_pin,
+    pin_unreleased: pin_unreleased,
+    current_section: current_section,
+    paperwork_branch: paperwork_branch,
+  }
+}
+
+/**
+ * Open a paperwork-only PR that restores `## v${version}` to pin-time content
+ * and moves drift bullets into `## Unreleased`. Called when
+ * `detect_post_merge_drift` returns `kind: "drift"`. Sets `Allow-Retroactive-Changelog`
+ * commit trailer + the matching env var on push to bypass the harn-repo's
+ * retroactive-edit guard.
+ *
+ * Returns the exit code (0 success, non-zero failure). The caller short-circuits
+ * the normal release flow when this is invoked.
+ */
+fn run_post_merge_paperwork_pr(cfg, drift, run_id) {
+  let version = drift.version
+  let tag = drift.tag
+  let paperwork_branch = drift.paperwork_branch
+  let pin_short = drift.original_pin[0:10]
+  println("== post-merge paperwork mode (CHANGELOG drift detected for ${tag})")
+  println("   pin SHA   : ${drift.original_pin}")
+  println("   branch    : ${paperwork_branch}")
+  println(
+    "   plan      : restore `## ${tag}` to pin-time Unreleased; move drift bullets back into `## Unreleased`; force-push paperwork branch; open PR with auto-merge.",
+  )
+  release_log_event(
+    run_id,
+    "post_merge_drift_detected",
+    {tag: tag, version: version, original_pin: drift.original_pin, paperwork_branch: paperwork_branch},
+  )
+  let fetch_result = run_git(cfg, ["fetch", "origin", cfg.base])
+  if !fetch_result.success {
+    println("!! fetch ${cfg.base} failed: ${trim(fetch_result.stderr)}")
+    return 1
+  }
+  let branch_create = run_git(cfg, ["checkout", "-B", paperwork_branch, "origin/" + cfg.base])
+  if !branch_create.success {
+    println("!! branch create failed: ${trim(branch_create.stderr)}")
+    return 1
+  }
+  let changelog_path = path_join(cfg.repo, "CHANGELOG.md")
+  let original = read_file(changelog_path)
+  let update = changelog_repair_post_merge_drift(original, version, drift.pin_unreleased)
+  if !update.success {
+    println("!! post-merge repair failed: ${update.message}")
+    return 1
+  }
+  if !update.changed {
+    println("== post-merge paperwork: no changes needed (CHANGELOG matches pin-time already)")
+    return 0
+  }
+  write_file(changelog_path, update.text)
+  println("== ${update.message}")
+  let stage = run_git(cfg, ["add", "CHANGELOG.md"])
+  if !stage.success {
+    println("!! git add failed: ${trim(stage.stderr)}")
+    return 1
+  }
+  let commit_subject = "changelog: post-merge paperwork — restore ${tag} to shipped content"
+  let commit_body = "The ${tag} release branch merged with drift in `## ${tag}`:\nbullets that landed on `${cfg.base}` between the pin SHA ${pin_short}\nand the release PR merge were absorbed by GitHub's 3-way merge into\nthe ${tag} section. The shipped binary (tag ${tag} pinned at\n${pin_short}) does not contain these post-pin bullets — only the\nCHANGELOG entry lies.\n\nThis paperwork PR restores `## ${tag}` to the pin-time `## Unreleased`\ncontent and moves the absorbed drift bullets back to `## Unreleased`,\nwhere they will ship in the next release.\n\nAuto-generated by release_harn.harn post-merge drift detection.\n\nAllow-Retroactive-Changelog: post-merge drift cleanup — bullets did not\nship in ${tag}'s binary (tag is parented before the post-pin commits);\nthis PR aligns the published `${tag}` section with what shipped."
+  let full_commit = commit_subject + "\n\n" + commit_body
+  let commit = run_git(cfg, ["commit", "-m", full_commit], {env: {ALLOW_CHANGELOG_RETROACTIVE_EDIT: "1"}})
+  if !commit.success {
+    println("!! git commit failed: ${trim(commit.stderr)}")
+    return 1
+  }
+  let push = run_git(
+    cfg,
+    ["push", "-u", "origin", paperwork_branch, "--force-with-lease"],
+    {env: {ALLOW_CHANGELOG_RETROACTIVE_EDIT: "1"}},
+  )
+  if !push.success {
+    println("!! git push failed: ${trim(push.stderr)}")
+    return 1
+  }
+  let pr_title = "changelog: post-merge paperwork for ${tag}"
+  let pr_body = "## Summary\n- Post-merge drift detected on `${cfg.base}` for shipped tag `${tag}` (pin SHA ${pin_short}). Bullets that landed during the release PR window were absorbed by GitHub's 3-way merge into `## ${tag}`, but did not ship in the binary.\n- This PR restores `## ${tag}` to the pin-time `## Unreleased` content (the truth) and moves the absorbed drift bullets back to `## Unreleased` where they belong.\n\nPure paperwork — no source changes, no version bumps, no retagging.\n\n## Auto-generated\nOpened by `release_harn.harn` post-merge drift detection. Re-running `release_harn.harn -- --mode ship-pr --yes-live-release` after this lands will be a no-op (the auto-detector exits when `## ${tag}` already matches pin-time).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  let pr_create = run_gh(
+    cfg,
+    [
+      "pr",
+      "create",
+      "--base",
+      cfg.base,
+      "--head",
+      paperwork_branch,
+      "--title",
+      pr_title,
+      "--body",
+      pr_body,
+    ],
+  )
+  if !pr_create.success {
+    println("!! gh pr create failed: ${trim(pr_create.stderr)}")
+    return 1
+  }
+  let pr_url = trim(pr_create.stdout)
+  println("== paperwork PR opened: ${pr_url}")
+  let auto_merge = run_gh(cfg, ["pr", "merge", pr_url, "--auto", "--squash"])
+  if !auto_merge.success {
+    // Some repos require non-squash merge methods; try without strategy flag.
+    let auto_merge_retry = run_gh(cfg, ["pr", "merge", pr_url, "--auto"])
+    if !auto_merge_retry.success {
+      println("!! could not enable auto-merge on ${pr_url}: ${trim(auto_merge.stderr)}")
+    }
+  }
+  release_log_event(
+    run_id,
+    "post_merge_paperwork_pr_opened",
+    {pr_url: pr_url, paperwork_branch: paperwork_branch, tag: tag},
+  )
+  return 0
+}
+
+// Don't fail the whole run — the PR is open and reviewable.
+/**
  * Detect `--repin-latest` state for `analysis.next_version`.
  *
  * Returns `nil` unless the operator passed `--repin-latest` AND this is a
@@ -4262,6 +4521,37 @@ pipeline main() {
     detect_fixup_state(derived_cfg, raw_analysis)
   } else {
     nil
+  }
+  // Post-merge drift detection — only fires when neither repin nor fixup
+  // apply (i.e., the previous release cycle fully merged but main's
+  // `## v$current` body diverges from the pin-time `## Unreleased` that
+  // the published binary actually contains).
+  let drift_state = if repin_state == nil && fixup_state == nil {
+    detect_post_merge_drift(derived_cfg, raw_analysis)
+  } else {
+    nil
+  }
+  if drift_state != nil {
+    release_log_event(
+      run_id,
+      "analysis_finished",
+      {
+        current_version: raw_analysis.current_version,
+        next_version: raw_analysis.next_version,
+        branch: raw_analysis.branch,
+        changelog_top: raw_analysis.changelog_top,
+        dirty_files: raw_analysis.dirty_files,
+        deterministic_findings: raw_analysis.deterministic_findings,
+        fixup_mode: false,
+        post_merge_drift: true,
+      },
+    )
+    if drift_state.kind == "paperwork_pr_open" {
+      println("== post-merge paperwork PR already open: ${drift_state.pr_url}")
+      println("   no changes needed (the open PR already fixes the drift)")
+      return 0
+    }
+    return run_post_merge_paperwork_pr(derived_cfg, drift_state, run_id)
   }
   let effective_cfg = with_repin_state(with_fixup_state(derived_cfg, fixup_state), repin_state)
   let analysis = analysis_with_repin_state(analysis_with_fixup_state(raw_analysis, fixup_state), repin_state)
