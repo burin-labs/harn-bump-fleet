@@ -1,4 +1,4 @@
-import { process_run } from "std/runtime"
+import { command_json, command_run, command_try } from "std/command"
 import {
   actions_workflow_dispatch,
   actions_workflow_runs,
@@ -6,14 +6,9 @@ import {
   repos_get_text,
 } from "harn-github-connector/default"
 
-/** Run GitHub CLI with existing operator authentication. */
-pub fn gh_run(args) {
-  return shell("gh ${args}")
-}
-
 /** Run GitHub CLI with argv, avoiding shell quoting for structured calls. */
 pub fn gh_argv(args) {
-  return process_run(["gh", ...args])
+  return command_run(["gh", ...args])
 }
 
 fn gh_command_label(args) {
@@ -32,58 +27,15 @@ fn github_slug_parts(slug) {
   return {owner: parts[0], repo: parts[1]}
 }
 
-/**
- * Run `connector` against the parsed slug; on miss/nil/error, fall back to
- * `cli`. `normalize` shapes whichever payload won (connector or cli) into
- * the caller's expected return value. Returns nil when both attempts miss.
- */
-fn try_connector_then_cli(slug, connector, cli, normalize) {
-  let parts = github_slug_parts(slug)
-  if parts != nil {
-    let payload = try {
-      connector(parts)
-    } catch (e) {
-      nil
-    }
-    if payload != nil && !is_err(payload) {
-      return normalize(payload, "connector")
+fn connector_result(payload, source) {
+  if payload == nil || is_err(payload) {
+    return {
+      ok: false,
+      status: "miss",
+      error: {category: "miss", source: source, message: source + " returned no usable payload"},
     }
   }
-  let cli_payload = try {
-    cli()
-  } catch (e) {
-    return nil
-  }
-  if cli_payload == nil {
-    return nil
-  }
-  return normalize(cli_payload, "cli")
-}
-
-/** Run GitHub CLI and parse a JSON response, returning nil for empty output. */
-pub fn gh_json(args) {
-  let r = gh_run(args)
-  if !r.success {
-    throw "gh ${args} failed (exit ${r.status}): ${trim(r.stderr)}"
-  }
-  let body = trim(r.stdout)
-  if body == "" {
-    return nil
-  }
-  return json_parse(body)
-}
-
-/** Run GitHub CLI with argv and parse a JSON response, returning nil for empty output. */
-pub fn gh_json_argv(args) {
-  let r = gh_argv(args)
-  if !r.success {
-    throw gh_command_label(args) + " failed (exit ${r.status}): ${trim(r.stderr)}"
-  }
-  let body = trim(r.stdout)
-  if body == "" {
-    return nil
-  }
-  return json_parse(body)
+  return {ok: true, value: payload}
 }
 
 /** Read a repository file at a ref through `gh api`, returning decoded UTF-8 text or nil. */
@@ -105,18 +57,37 @@ fn __decode_contents(payload) {
 
 /** Read a repository file at a ref through `gh api`, returning decoded UTF-8 text or nil. */
 pub fn gh_file_text_at_ref(slug, path, ref) {
-  return try_connector_then_cli(
-    slug,
-    { parts -> repos_get_text(parts.owner, parts.repo, path, ref, gh_connector_auth()) },
-    fn() { return gh_json_argv(gh_contents_get_args(slug, path, ref)) },
-    { payload, source ->
-      if source == "connector" {
-        payload.text
-      } else {
-        __decode_contents(payload)
-      }
+  let parts = github_slug_parts(slug)
+  var attempts = []
+  if parts != nil {
+    attempts = attempts
+      + [
+      {
+        source: "connector",
+        run: fn() { return connector_result(
+          repos_get_text(parts.owner, parts.repo, path, ref, gh_connector_auth()),
+          "connector",
+        ) },
+      },
+    ]
+  }
+  attempts = attempts + [{source: "cli", spec: ["gh", ...gh_contents_get_args(slug, path, ref)]}]
+  let result = command_try(
+    attempts,
+    {
+      command_options: {allow_empty: true},
+      normalize: { payload, source ->
+        if source == "connector" {
+          return payload.text
+        }
+        return __decode_contents(payload)
+      },
     },
   )
+  if result.ok {
+    return result.value
+  }
+  return nil
 }
 
 /** Enable PR auto-merge across merge-queue and non-queue repositories. */
@@ -224,26 +195,41 @@ pub fn gh_workflow_runs(slug, workflow, event = nil, limit = 10) {
     cli_args = [...cli_args, "--event=" + event]
   }
   cli_args = [...cli_args, "--limit", to_string(limit), "--json", "databaseId,createdAt,status,conclusion,url"]
-  return try_connector_then_cli(
-    slug,
-    { parts ->
-      var opts = gh_connector_auth() + {workflow_id: workflow, per_page: limit}
-      if event != nil {
-        opts["event"] = event
-      }
-      actions_workflow_runs(parts.owner, parts.repo, opts)
-    },
-    fn() { return gh_json_argv(cli_args) },
-    { payload, source ->
-      let raw = if source == "connector" {
-        payload.workflow_runs ?? []
-      } else {
-        payload
-      }
-      raw.map({ r -> gh_normalize_workflow_run(r) })
+  let parts = github_slug_parts(slug)
+  var attempts = []
+  if parts != nil {
+    attempts = attempts
+      + [
+      {
+        source: "connector",
+        run: fn() {
+          var opts = gh_connector_auth() + {workflow_id: workflow, per_page: limit}
+          if event != nil {
+            opts["event"] = event
+          }
+          return connector_result(actions_workflow_runs(parts.owner, parts.repo, opts), "connector")
+        },
+      },
+    ]
+  }
+  attempts = attempts + [{source: "cli", spec: ["gh", ...cli_args]}]
+  let result = command_try(
+    attempts,
+    {
+      normalize: { payload, source ->
+        let raw = if source == "connector" {
+          payload.workflow_runs ?? []
+        } else {
+          payload
+        }
+        return raw.map({ r -> gh_normalize_workflow_run(r) })
+      },
     },
   )
-    ?? []
+  if result.ok {
+    return result.value
+  }
+  return []
 }
 
 /** Resolve a repository's latest GitHub release tag. */
@@ -262,7 +248,7 @@ pub fn gh_release_view_args(slug, tag) {
 
 /** Return the asset names attached to a GitHub release tag. */
 pub fn gh_release_asset_names(slug, tag) {
-  let release = gh_json_argv(gh_release_view_args(slug, tag))
+  let release = command_json(["gh", ...gh_release_view_args(slug, tag)])
   return (release?.assets ?? []).map({ a -> a.name })
 }
 
