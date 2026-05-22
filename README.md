@@ -113,13 +113,17 @@ locally; never commit secrets.
 ### Planner + tool binder
 
 By default the harnesses now route their planning calls through
-**OpenRouter DeepSeek V3.2** (planner) with **Cerebras GPT-OSS-120B** as
-a natural-language tool binder middleware, the empirical best cell from
-[burin-labs/harn#1814](https://github.com/burin-labs/harn/pull/1814)
-(+18pp lift on the PEAR-style tool-call accuracy harness). When the
-required cloud API keys aren't present in env, the defaults fall back to
-local Ollama (`qwen3.6:35b-a3b-coding-nvfp4`) so the local-only workflow
-keeps working without any setup.
+**OpenRouter `qwen/qwen3.6-35b-a3b`** (planner) with **Cerebras
+GPT-OSS-120B** as a natural-language tool binder middleware (the binder
+is the empirical best cell from
+[burin-labs/harn#1814](https://github.com/burin-labs/harn/pull/1814),
++18pp lift on the PEAR-style tool-call accuracy harness). The cloud
+planner matches the local Ollama fallback's family
+(`qwen3.6:35b-a3b-coding-nvfp4`) so behavior stays consistent across the
+local/cloud boundary, and costs $0.15/$1.00 per Mtok. When the required
+cloud API keys aren't present in env, the defaults fall back to the
+local Ollama model so the local-only workflow keeps working without any
+setup.
 
 The binder runs as a `compose_tool_callers` middleware layer on every
 tool-using agent loop in the repo (release agent, recovery loop, harness
@@ -171,9 +175,9 @@ because they don't rebuild `harn` mid-run.
 - Authenticated `gh` CLI. The script never embeds tokens; it shells out.
 - A local Ollama model for the end-of-run summary and the post-run chat
   loop when no cloud planner key is configured. The shared default path is
-  OpenRouter DeepSeek V3.2 when `OPENROUTER_API_KEY` is set, otherwise local
-  Ollama `qwen3.6:35b-a3b-coding-nvfp4`. Override per harness with
-  `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
+  OpenRouter `qwen/qwen3.6-35b-a3b` when `OPENROUTER_API_KEY` is set,
+  otherwise local Ollama `qwen3.6:35b-a3b-coding-nvfp4`. Override per
+  harness with `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
   `HARN_RELEASE_MODEL` / `HARN_RELEASE_PROVIDER`.
 
 Recommended local Ollama model:
