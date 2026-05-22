@@ -5,9 +5,9 @@
 Local Harn-version bump orchestrator. Auto-discovers every repo under
 `~/projects/{*harn*,*burin*}` that ships a `.github/workflows/bump-harn.yml`
 and drives them all to the latest published Harn release with auto-merge
-enabled — in parallel, idempotently, with a self-contained audit trail.
+enabled in parallel, idempotently, with a self-contained audit trail.
 
-This is a Harn-native script (`bump_fleet.harn`) — no Python glue, no shell
+This is a Harn-native script (`bump_fleet.harn`): no Python glue, no shell
 wrapper. It exists partly as a useful local tool, partly as a proof that
 Harn the language is viable beyond LLM orchestration.
 
@@ -29,7 +29,7 @@ harn run bump_fleet.harn
 # Pin to an explicit tag.
 harn run bump_fleet.harn -- v0.7.52
 
-# Discover-only — never dispatches anything, useful before a real run.
+# Discover-only: never dispatches anything, useful before a real run.
 harn run bump_fleet.harn -- --dry-run
 
 # Run on one repo only.
@@ -62,7 +62,7 @@ harn run bump_fleet.harn -- --chat-timeout-s 120
 ```
 
 `release_harn.harn` also runs a **non-trivial classifier** before live
-release side effects fire — when the CHANGELOG/PR body looks substantive
+release side effects fire. When the CHANGELOG/PR body looks substantive
 (breaking changes, new sections, >12 bullets, deterministic findings),
 the pipeline pauses on a pager view and asks you to approve `[a]`,
 abort `[q]`, or `[c]`hat first.
@@ -83,7 +83,7 @@ Slash commands inside the chat loop:
 During the pre-release gate, the chat also accepts `/approve` and
 `/abort` to resolve the decision and return to the main pipeline.
 
-### Local config & API keys (`scripts/with_env.sh`)
+### Local config and API keys (`scripts/with_env.sh`)
 
 The cloud-by-default planner/binder pair (see "Planner + tool binder" below)
 needs provider API keys in env. Harn does not auto-load `.env`, so the
@@ -114,7 +114,7 @@ locally; never commit secrets.
 
 By default the harnesses now route their planning calls through
 **OpenRouter DeepSeek V3.2** (planner) with **Cerebras GPT-OSS-120B** as
-a natural-language tool binder middleware — the empirical best cell from
+a natural-language tool binder middleware, the empirical best cell from
 [burin-labs/harn#1814](https://github.com/burin-labs/harn/pull/1814)
 (+18pp lift on the PEAR-style tool-call accuracy harness). When the
 required cloud API keys aren't present in env, the defaults fall back to
@@ -167,12 +167,12 @@ because they don't rebuild `harn` mid-run.
 
 ## Dependencies
 
-- `harn` v0.8.x.
-- `gh` CLI, authenticated — the script never embeds tokens, just shells out.
+- The Harn version pinned in `.harn-version`.
+- Authenticated `gh` CLI. The script never embeds tokens; it shells out.
 - A local Ollama model for the end-of-run summary and the post-run chat
-  loop; defaults to `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in
-  `ollama` provider. This matches `release_harn.harn` so both harnesses
-  share one tool-capable model. Override per-harness with
+  loop when no cloud planner key is configured. The shared default path is
+  OpenRouter DeepSeek V3.2 when `OPENROUTER_API_KEY` is set, otherwise local
+  Ollama `qwen3.6:35b-a3b-coding-nvfp4`. Override per harness with
   `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
   `HARN_RELEASE_MODEL` / `HARN_RELEASE_PROVIDER`.
 
@@ -271,7 +271,7 @@ A second invocation against an unchanged fleet is essentially a no-op:
 - `regex_captures`, `json_parse`/`json_stringify`, `mkdir`, `file_exists`,
   `read_file`/`write_file` from the stdlib.
 - `harn check`, `harn fmt`, `harn lint`, and focused `harn test` coverage as
-  pre-commit gates — the scripts are structured to pass all checks with no
+  pre-commit gates. The scripts are structured to pass all checks with no
   warnings.
 
 ## Output
@@ -286,7 +286,7 @@ A second invocation against an unchanged fleet is essentially a no-op:
 Plus Harn's own VM-managed run record under `.harn-runs/<run-id>/` from
 the host harn binary.
 
-## Release Harn Harness
+## Release Harn harness
 
 `release_harn.harn` is the matching Harn-native harness for the
 `~/projects/harn` `/release-harn` skill workflow. It does not publish
@@ -367,13 +367,13 @@ Options:
   the full audit + dry-run + bump, deletes the stale tag on origin, and
   re-pushes at the new pin. TOCTTOU re-checks the release/tag state one
   final time immediately before resetting the release branch.
-- `--agent` gives a local model a bounded read/search/run tool surface for
-  release readiness review. It defaults to `HARN_RELEASE_MODEL` or
-  `qwen3.6:35b-a3b-coding-nvfp4` via Harn's built-in `ollama` provider. Agent
-  runs persist the raw result, trace, and Harn `llm_transcript.jsonl` sidecar
-  under the run directory.
-- `--provider PROVIDER` can pin the LLM provider for `--agent`; default is
-  `HARN_RELEASE_PROVIDER` or `ollama`.
+- `--agent` gives the configured planner a bounded read/search/run tool
+  surface for release readiness review. Defaults come from
+  `HARN_RELEASE_*`, then shared planner env, then the cloud/local fallback in
+  `lib/llm_defaults`. Agent runs persist the raw result, trace, and Harn
+  `llm_transcript.jsonl` sidecar under the run directory.
+- `--provider PROVIDER` can pin the LLM provider for `--agent`; otherwise the
+  same default cascade is used.
 
 In `ship-pr`, the harness first scans only open PRs for an existing matching
 release/version-bump PR with auto-merge already enabled. If it finds one, it
@@ -391,7 +391,7 @@ If a live `--mode ship-pr` run starts and the harness detects:
 - an open `release/v<next_version>` PR on `<base>`,
 
 it switches into **post-publish fixup mode** automatically. The release
-artifact has already shipped from the originally-pushed tag — the open PR is
+artifact has already shipped from the originally-pushed tag; the open PR is
 paperwork that exists to land the Cargo.toml/CHANGELOG bump on `<base>`. In
 fixup mode the harness:
 
@@ -399,7 +399,7 @@ fixup mode the harness:
   re-runs the same gates).
 - Force-recreates the release branch on top of fresh `origin/<base>` so any
   conflicts caused by other PRs landing after the original publish are
-  dropped — the branch ends up with the version bump as its single new
+  dropped. The branch ends up with the version bump as its single new
   commit on top of current `<base>`.
 - Cherry-picks the original release branch's prepare commit(s) onto fresh
   `<base>` (`git cherry-pick --no-commit --strategy-option=ours <shas>`)
@@ -415,7 +415,7 @@ fixup mode the harness:
   `changelog_inject_existing_release_section`. **`## Unreleased` is
   preserved as-is.** Entries that landed in `## Unreleased` after the
   original publish describe behavior that isn't in the shipped binary
-  and belong in the NEXT release — folding them into v<next_version>
+  and belong in the NEXT release. Folding them into v<next_version>
   would mislabel the changelog. The harness leaves them where they
   are. (If a particular entry actually belongs in the shipped version,
   the operator must manually move it from Unreleased to v<next_version>
@@ -429,7 +429,7 @@ fixup mode the harness:
   "Post-publish fixup PR" callout that explains the artifact is already
   shipped and the tag will not move.
 - With `--agent`, runs a fixup-specific audit prompt instead of the
-  standard release prompt — the model is told the artifact has already
+  standard release prompt. The model is told the artifact has already
   shipped and asked to verify the inject (flag any `## Unreleased`
   entries that should actually be in the shipped version, or anything
   in v<next_version> that doesn't match the tag), not to author
@@ -445,7 +445,7 @@ corresponding shipped artifacts.
 
 To advance the pin on an open release PR that has NOT yet shipped (so the
 release is not yet immutable on crates.io), use `--repin-latest`
-instead — it is the opt-in inverse of fixup mode that folds post-pin
+instead. It is the opt-in inverse of fixup mode that folds post-pin
 commits into the same `v$next` rather than splitting them into a future
 release. See the flag description above. Side-effecting failures are preserved in
 the run report; with `--agent`, the failed command, stdout/stderr,
