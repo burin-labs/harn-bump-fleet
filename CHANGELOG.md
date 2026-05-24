@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Release and self-review agent loops now use Harn's transcript projection and
+  compaction policy APIs, preserving projection/compaction metadata in run
+  artifacts.
+- Harness self-review runs now emit Harn context-eval manifest and report
+  artifacts for raw, summary-projected, and clean-tool-repair context variants.
+
 ### Changed
 
 - Release and bump harness timings now use Harn `std/timing` spans and write

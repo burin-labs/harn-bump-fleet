@@ -1,0 +1,617 @@
+import { compaction_policy } from "std/agent/autocompact"
+import {
+  context_eval_manifest,
+  context_eval_mode,
+  context_eval_report_schema,
+  context_eval_task,
+} from "std/context/eval"
+import { truncate_text } from "text_util"
+
+let TOOL_REPAIR_PROJECTION = {policy: "clean_tool_repair"}
+
+/** Projection policy used for tool-using loops that may recover from rejected calls. */
+pub fn tool_repair_projection_policy() {
+  return TOOL_REPAIR_PROJECTION
+}
+
+/** Projection policy used for no-tool summary/finalization turns. */
+pub fn summary_projection_policy(keep_last) {
+  return {policy: "summary_prefix", keep_last: keep_last ?? 4}
+}
+
+fn __compaction_instructions(lines) {
+  return join(lines, "\n")
+}
+
+/** Compaction policy for release agent, validation-repair, and recovery loops. */
+pub fn release_compaction_policy(phase) {
+  let mode_suffix = phase ?? "agent"
+  return compaction_policy(
+    __compaction_instructions(
+      [
+        "Preserve release version decisions, bump type, target version, base branch, pin SHA, tag state, and release PR URL.",
+        "Preserve CI failures, markdownlint findings, command names, exit codes, artifact paths, publish/build gates, auto-merge state, and downstream Harn bump handoff state.",
+        "Preserve whether the run is normal, fixup, repin, post-publish paperwork, mock, prepare, audit, or ship-pr.",
+        "Drop repeated command output once the artifact path, status, and relevant failure lines are retained.",
+      ],
+    ),
+    {
+      mode: "harn_release_" + mode_suffix,
+      author: "harn-bump-fleet/release_harn",
+      preserve: [
+        "version decisions",
+        "pin SHA",
+        "CI failures",
+        "publish gates",
+        "release PR state",
+        "downstream bump state",
+      ],
+      drop: ["duplicate command output", "superseded tool repair chatter"],
+      extend_default_instructions: true,
+    },
+  )
+}
+
+/** Compaction policy for harness self-review tool and synthesis loops. */
+pub fn self_review_compaction_policy(phase) {
+  let mode_suffix = phase ?? "synthesis"
+  return compaction_policy(
+    __compaction_instructions(
+      [
+        "Preserve concrete source paths, run artifact paths, transcript symptoms, compared context variants, projection metadata, and rejected tool-call recovery evidence.",
+        "Preserve recommendations only when they cite deterministic facts or inspected source evidence.",
+        "Drop duplicate transcript excerpts and broad speculation that is not tied to a file, artifact, or run id.",
+      ],
+    ),
+    {
+      mode: "harn_bump_fleet_self_review_" + mode_suffix,
+      author: "harn-bump-fleet/harness_self_review",
+      preserve: [
+        "artifact paths",
+        "source paths",
+        "context variants",
+        "projection metadata",
+        "tool recovery evidence",
+      ],
+      drop: ["duplicate transcript excerpts", "uncited speculation"],
+      extend_default_instructions: true,
+    },
+  )
+}
+
+fn __event_kind(event) {
+  return event?.kind ?? event?.type ?? event?.event_type ?? event?.session_update ?? ""
+}
+
+fn __event_metadata(event) {
+  if type_of(event?.metadata) == "dict" {
+    return event.metadata
+  }
+  if type_of(event) == "dict" {
+    return event
+  }
+  return {}
+}
+
+fn __events_for(value, kind) {
+  if value == nil {
+    return []
+  }
+  if type_of(value) == "list" {
+    return value.filter({ event -> __event_kind(event) == kind })
+  }
+  return transcript_events_by_kind(value, kind)
+}
+
+/** Return normalized transcript.projection metadata from a transcript or event list. */
+pub fn transcript_projection_events(value) {
+  var out = []
+  for event in __events_for(value, "transcript.projection") {
+    let metadata = __event_metadata(event)
+    out = out
+      + [
+      {
+        id: event?.id ?? "",
+        policy: metadata?.policy ?? "",
+        reason: metadata?.reason ?? "",
+        prefix_hash: metadata?.prefix_hash ?? "",
+        kept_count: metadata?.kept_count ?? 0,
+        dropped_count: metadata?.dropped_count ?? 0,
+        kept_indices: metadata?.kept_indices ?? [],
+        dropped_indices: metadata?.dropped_indices ?? [],
+        provider_safety_blocked: metadata?.provider_safety_blocked ?? false,
+        respects_provider_signatures: metadata?.respects_provider_signatures ?? nil,
+        summary_keep_last: metadata?.summary_keep_last ?? nil,
+      },
+    ]
+  }
+  return out
+}
+
+/** Return normalized compaction metadata from a transcript or event list. */
+pub fn transcript_compaction_events(value) {
+  var out = []
+  for event in __events_for(value, "compaction") {
+    let metadata = __event_metadata(event)
+    out = out
+      + [
+      {
+        id: event?.id ?? "",
+        mode: metadata?.mode ?? "",
+        strategy: metadata?.strategy ?? "",
+        engine_strategy: metadata?.engine_strategy ?? "",
+        instruction_mode: metadata?.instruction_mode ?? "",
+        instruction_source: metadata?.instruction_source ?? "",
+        keep_last: metadata?.keep_last ?? nil,
+        archived_messages: metadata?.archived_messages ?? nil,
+        compaction_policy: metadata?.compaction_policy ?? nil,
+      },
+    ]
+  }
+  return out
+}
+
+/** Return projection and compaction metadata from an agent_loop result. */
+pub fn agent_transcript_context_metadata(result) {
+  let transcript = result?.transcript
+  let projections = transcript_projection_events(transcript)
+  let compactions = transcript_compaction_events(transcript)
+  return {
+    projection_event_count: len(projections),
+    compaction_event_count: len(compactions),
+    projection_events: projections,
+    compaction_events: compactions,
+  }
+}
+
+fn __context_eval_fact_summary(facts) {
+  let release_runs = facts?.release_runs ?? []
+  let bump_runs = facts?.bump_runs ?? []
+  let self_runs = facts?.self_review_runs ?? []
+  let source_refs = facts?.source_refs ?? []
+  var release_versions = []
+  for run in release_runs {
+    let next_version = run?.next_version ?? ""
+    if next_version != "" && !release_versions.contains(next_version) {
+      release_versions = release_versions + [next_version]
+    }
+  }
+  return {
+    schema_version: facts?.schema_version ?? "",
+    run_id: facts?.run_id ?? "",
+    release_run_count: len(release_runs),
+    bump_run_count: len(bump_runs),
+    self_review_run_count: len(self_runs),
+    source_ref_count: len(source_refs),
+    release_versions: release_versions.sort(),
+    validation_ladder_exists: facts?.validation_ladder?.exists ?? false,
+  }
+}
+
+/** Build the Harn context-eval manifest emitted by harness_self_review. */
+pub fn self_review_context_eval_manifest(facts) {
+  let summary = __context_eval_fact_summary(facts)
+  let summary_json = json_stringify(summary)
+  let run_id = facts?.run_id ?? "unknown"
+  let required_terms = ["release_run_count", "bump_run_count", "source_ref_count"]
+  let task = context_eval_task(
+    "self_review_context",
+    "Compare self-review context variants while preserving concrete release, bump, source, and projection evidence.",
+    {
+      artifacts: [
+        {
+          id: "self_review_facts_summary",
+          kind: "self_review_facts",
+          text: summary_json,
+          metadata: {source: "harness_self_review.facts"},
+        },
+        {
+          id: "self_review_source_refs",
+          kind: "source_refs",
+          text: truncate_text(json_stringify(facts?.source_refs ?? []), 6000),
+          metadata: {source: "harness_self_review.source_refs"},
+        },
+      ],
+      transcript: [
+        {role: "user", content: "Assess the harn-bump-fleet release and self-review context."},
+        {role: "assistant", content: "Available deterministic facts: " + summary_json},
+      ],
+      expected: {required_terms: required_terms, expected_artifact_ids: ["self_review_facts_summary"]},
+      metadata: {facts_schema_version: facts?.schema_version ?? ""},
+    },
+  )
+  let modes = [
+    context_eval_mode(
+      "raw_facts",
+      "raw",
+      {
+        description: "Full deterministic self-review facts without transcript projection.",
+        budget_tokens: 8000,
+        compaction_policy: self_review_compaction_policy("raw_facts"),
+      },
+    ),
+    context_eval_mode(
+      "projected_summary",
+      "projected",
+      {
+        description: "Summary-prefix projection for compact self-review resumption.",
+        projection_policy: "summary_prefix",
+        transcript_keep_last: 4,
+        budget_tokens: 3200,
+        compaction_policy: self_review_compaction_policy("projected_summary"),
+      },
+    ),
+    context_eval_mode(
+      "clean_tool_repair",
+      "projected",
+      {
+        description: "Tool-repair projection for recovered failed calls.",
+        projection_policy: "clean_tool_repair",
+        budget_tokens: 3200,
+        compaction_policy: self_review_compaction_policy("clean_tool_repair"),
+      },
+    ),
+  ]
+  return context_eval_manifest(
+    [task],
+    modes,
+    {
+      id: "harn-bump-fleet-self-review-" + run_id,
+      name: "harn-bump-fleet self-review context variants",
+      metadata: {
+        harness: "harness_self_review",
+        facts_schema_version: facts?.schema_version ?? "",
+        generated_at: facts?.generated_at ?? "",
+      },
+    },
+  )
+}
+
+fn __safe_list(value) {
+  if type_of(value) == "list" {
+    return value
+  }
+  return []
+}
+
+fn __safe_dict(value) {
+  if type_of(value) == "dict" {
+    return value
+  }
+  return {}
+}
+
+fn __mode_projection_policy(mode) {
+  let policy = mode?.projection_policy ?? ""
+  if policy != "" {
+    return policy
+  }
+  if mode?.kind ?? "" == "raw" {
+    return "none"
+  }
+  return "none"
+}
+
+fn __task_context_text(task, mode) {
+  return json_stringify(
+    {
+      objective: task?.objective ?? "",
+      mode: mode,
+      artifacts: task?.artifacts ?? [],
+      transcript: task?.transcript ?? [],
+      tools: task?.tools ?? [],
+    },
+  )
+}
+
+fn __rough_tokens(text) {
+  return (len(text ?? "") + 3) / 4
+}
+
+fn __artifact_ids(task) {
+  var out = []
+  for artifact in __safe_list(task?.artifacts) {
+    let id = artifact?.id ?? ""
+    if id != "" && !out.contains(id) {
+      out = out + [id]
+    }
+  }
+  return out.sort()
+}
+
+fn __required_terms(task) {
+  return __safe_list(task?.expected?.required_terms)
+}
+
+fn __expected_artifact_ids(task) {
+  return __safe_list(task?.expected?.expected_artifact_ids)
+}
+
+fn __expected_tools(task) {
+  return __safe_list(task?.expected?.expected_tools)
+}
+
+fn __context_eval_run(task, mode) {
+  let rendered = __task_context_text(task, mode)
+  let required_terms = __required_terms(task)
+  var present_terms = []
+  var missing_terms = []
+  for term in required_terms {
+    if contains(rendered, term) {
+      present_terms = present_terms + [term]
+    } else {
+      missing_terms = missing_terms + [term]
+    }
+  }
+  let artifact_ids = __artifact_ids(task)
+  var present_artifacts = []
+  var missing_artifacts = []
+  for id in __expected_artifact_ids(task) {
+    if artifact_ids.contains(id) {
+      present_artifacts = present_artifacts + [id]
+    } else {
+      missing_artifacts = missing_artifacts + [id]
+    }
+  }
+  let passed = len(missing_terms) == 0 && len(missing_artifacts) == 0
+  let score = if passed {
+    1.0
+  } else {
+    0.0
+  }
+  let policy = __mode_projection_policy(mode)
+  let transcript_messages = __safe_list(task?.transcript)
+  let expected_tools = __expected_tools(task)
+  let tool_score = if len(expected_tools) == 0 {
+    1.0
+  } else {
+    0.0
+  }
+  let retained_messages = if policy == "none" {
+    0
+  } else {
+    len(transcript_messages)
+  }
+  let stable_hash = sha256(rendered)
+  let task_id = task?.id ?? "task"
+  let mode_id = mode?.id ?? "mode"
+  return {
+    run_id: task_id + "__" + mode_id,
+    task_id: task?.id ?? "",
+    mode_id: mode?.id ?? "",
+    mode_kind: mode?.kind ?? "",
+    status: if passed {
+      "pass"
+    } else {
+      "fail"
+    },
+    passed: passed,
+    final_correctness: {
+      passed: passed,
+      score: score,
+      required_terms_present: present_terms,
+      required_terms_missing: missing_terms,
+      expected_artifact_ids_present: present_artifacts,
+      expected_artifact_ids_missing: missing_artifacts,
+      source: "context_projection",
+    },
+    reads_before_first_edit: 0,
+    tool_call_quality: {
+      score: tool_score,
+      expected_tools: expected_tools,
+      observed_tools: [],
+      matched_tools: [],
+      missing_tools: expected_tools,
+      unnecessary_tools: [],
+    },
+    latency_ms: 0,
+    input_tokens: __rough_tokens(rendered),
+    output_tokens: 0,
+    cost_usd: 0.0,
+    compaction_count: 0,
+    projection: {
+      policy: policy,
+      source_message_count: len(transcript_messages),
+      retained_message_count: retained_messages,
+      retained_tokens: if retained_messages == 0 {
+        0
+      } else {
+        __rough_tokens(json_stringify(transcript_messages))
+      },
+    },
+    context: {
+      projection_policy: policy,
+      tool_disclosure: mode?.tool_disclosure ?? "limited",
+      artifact_count: len(__safe_list(task?.artifacts)),
+      selected_artifact_ids: artifact_ids,
+      dropped_artifact_ids: [],
+      rendered_bytes: len(rendered),
+      rendered_tokens: __rough_tokens(rendered),
+      budget_tokens: mode?.budget_tokens ?? 8000,
+      assemble_strategy: mode?.assemble_strategy ?? "relevance",
+      dedup: mode?.dedup ?? "chunked",
+      exposed_tools: __safe_list(mode?.tool_allowlist),
+    },
+    cache: {
+      namespace: mode?.cache_namespace ?? "harn.context_eval",
+      key: "harn.context_eval:" + stable_hash[0:32],
+      stable_input_hash: stable_hash,
+      deterministic_order: true,
+      hit: mode?.expected_cache_hit ?? nil,
+    },
+    error_recovery_count: 0,
+    preprocessing: {mode: mode?.preprocessing ?? "deterministic", llm_enabled: false},
+    failures: if passed {
+      []
+    } else {
+      missing_terms.map({ term -> "missing required term: " + term })
+    },
+  }
+}
+
+fn __context_eval_report_modes(manifest) {
+  var out = []
+  for mode in __safe_list(manifest?.modes) {
+    out = out
+      + [
+      {
+        id: mode?.id ?? "",
+        kind: mode?.kind ?? "",
+        projection_policy: __mode_projection_policy(mode),
+        tool_disclosure: mode?.tool_disclosure ?? "limited",
+        preprocessing: {mode: mode?.preprocessing ?? "deterministic", llm_enabled: false},
+      },
+    ]
+  }
+  return out
+}
+
+fn __context_eval_report_tasks(manifest) {
+  var out = []
+  for task in __safe_list(manifest?.tasks) {
+    out = out
+      + [
+      {
+        id: task?.id ?? "",
+        name: task?.name ?? nil,
+        required_terms: __required_terms(task),
+        expected_artifact_ids: __expected_artifact_ids(task),
+        expected_tools: __expected_tools(task),
+      },
+    ]
+  }
+  return out
+}
+
+/** Build a deterministic context-eval report for self-review context variants. */
+pub fn self_review_context_eval_report(manifest) {
+  var runs = []
+  for task in __safe_list(manifest?.tasks) {
+    for mode in __safe_list(manifest?.modes) {
+      runs = runs + [__context_eval_run(task, mode)]
+    }
+  }
+  var passed_runs = 0
+  var correctness_total = 0.0
+  var tool_quality_total = 0.0
+  var input_tokens = 0
+  for run in runs {
+    if run.passed {
+      passed_runs = passed_runs + 1
+    }
+    let correctness_score = run.final_correctness?.score ?? 0.0
+    let tool_quality_score = run.tool_call_quality?.score ?? 0.0
+    let run_input_tokens = run.input_tokens ?? 0
+    correctness_total = correctness_total + correctness_score
+    tool_quality_total = tool_quality_total + tool_quality_score
+    input_tokens = input_tokens + run_input_tokens
+  }
+  let total_runs = len(runs)
+  let divisor = if total_runs == 0 {
+    1.0
+  } else {
+    to_float(total_runs) ?? 1.0
+  }
+  return {
+    _type: context_eval_report_schema(),
+    schema_version: 1,
+    manifest_id: manifest?.id ?? "",
+    manifest_name: manifest?.name ?? nil,
+    pass: passed_runs == total_runs,
+    total_runs: total_runs,
+    passed_runs: passed_runs,
+    failed_runs: total_runs - passed_runs,
+    total_tasks: len(__safe_list(manifest?.tasks)),
+    total_modes: len(__safe_list(manifest?.modes)),
+    aggregate: {
+      mean_final_correctness: correctness_total / divisor,
+      mean_tool_call_quality: tool_quality_total / divisor,
+      total_latency_ms: 0,
+      total_input_tokens: input_tokens,
+      total_output_tokens: 0,
+      total_cost_usd: 0.0,
+      total_compaction_count: 0,
+      total_error_recovery_count: 0,
+    },
+    modes: __context_eval_report_modes(manifest),
+    tasks: __context_eval_report_tasks(manifest),
+    runs: runs,
+    metadata: manifest?.metadata ?? {},
+  }
+}
+
+fn __format_float_4(value) {
+  let scaled = to_int(round((to_float(value) ?? 0.0) * 10000.0)) ?? 0
+  let whole = scaled / 10000
+  let frac = scaled - whole * 10000
+  var frac_str = to_string(frac)
+  while len(frac_str) < 4 {
+    frac_str = "0" + frac_str
+  }
+  return to_string(whole) + "." + frac_str
+}
+
+fn __format_float_6(value) {
+  let scaled = to_int(round((to_float(value) ?? 0.0) * 1000000.0)) ?? 0
+  let whole = scaled / 1000000
+  let frac = scaled - whole * 1000000
+  var frac_str = to_string(frac)
+  while len(frac_str) < 6 {
+    frac_str = "0" + frac_str
+  }
+  return to_string(whole) + "." + frac_str
+}
+
+/** Render the deterministic self-review context-eval report as Markdown. */
+pub fn self_review_context_eval_markdown(report) {
+  let aggregate = __safe_dict(report?.aggregate)
+  let title = report?.manifest_name ?? report?.manifest_id ?? ""
+  let status = if report?.pass ?? false {
+    "PASS"
+  } else {
+    "FAIL"
+  }
+  var out = "# Context Eval: " + title + "\n\n"
+  out = out + "- status: " + status + "\n"
+  out = out + "- runs: " + to_string(report?.passed_runs ?? 0)
+    + "/"
+    + to_string(report?.total_runs ?? 0)
+    + " passed\n"
+  out = out + "- mean correctness: " + __format_float_4(aggregate.mean_final_correctness ?? 0.0) + "\n"
+  out = out + "- mean tool quality: " + __format_float_4(aggregate.mean_tool_call_quality ?? 0.0) + "\n"
+  out = out + "- input tokens: " + to_string(aggregate.total_input_tokens ?? 0) + "\n"
+  out = out + "- output tokens: " + to_string(aggregate.total_output_tokens ?? 0) + "\n"
+  out = out + "- cost USD: " + __format_float_6(aggregate.total_cost_usd ?? 0.0) + "\n\n"
+  out = out
+    + "| task | mode | pass | correctness | tools | reads before edit | input tokens | compactions | cache key |\n"
+  out = out + "|---|---|---:|---:|---:|---:|---:|---:|---|\n"
+  for run in __safe_list(report?.runs) {
+    let task_id = run?.task_id ?? ""
+    let mode_id = run?.mode_id ?? ""
+    let passed = if run?.passed ?? false {
+      "yes"
+    } else {
+      "no"
+    }
+    let cache_key = run?.cache?.key ?? ""
+    out = out + "| " + task_id
+      + " | "
+      + mode_id
+      + " | "
+      + passed
+      + " | "
+      + __format_float_4(run?.final_correctness?.score ?? 0.0)
+      + " | "
+      + __format_float_4(run?.tool_call_quality?.score ?? 0.0)
+      + " | "
+      + to_string(run?.reads_before_first_edit ?? 0)
+      + " | "
+      + to_string(run?.input_tokens ?? 0)
+      + " | "
+      + to_string(run?.compaction_count ?? 0)
+      + " | `"
+      + cache_key
+      + "` |\n"
+  }
+  return out
+}
