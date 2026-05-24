@@ -9,10 +9,10 @@
 // never drives any side-effect.
 //
 // Usage:
-//   harn run bump_fleet.harn                      // bump to latest harn release
-//   harn run bump_fleet.harn -- v0.7.52           // pin to explicit tag
-//   harn run bump_fleet.harn -- --dry-run         // discover-only, no dispatch
-//   harn run bump_fleet.harn -- v0.7.52 --dry-run
+//   harn run --no-sandbox bump_fleet.harn                      // bump to latest harn release
+//   harn run --no-sandbox bump_fleet.harn -- v0.7.52           // pin to explicit tag
+//   harn run --no-sandbox bump_fleet.harn -- --dry-run         // discover-only, no dispatch
+//   harn run --no-sandbox bump_fleet.harn -- --dry-run v0.7.52
 import { agent_host_tools } from "std/agent/host_tools"
 import { summary_agent } from "std/agent/presets"
 import { parse_args } from "std/cli"
@@ -21,6 +21,7 @@ import { env_str } from "std/config"
 import { default_llm_caller, with_retry } from "std/llm/handlers"
 import { poll_until } from "std/poll"
 import { map_settled } from "std/settled"
+import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
 import {
   bump_summary_format_ok,
   bump_summary_problem_outcome,
@@ -47,6 +48,7 @@ import {
 import { planner_defaults } from "lib/llm_defaults"
 import { harn_release_readiness, release_readiness_detail } from "lib/release_readiness"
 import { is_v_semver, strip_v } from "lib/semver"
+import { timing_artifacts } from "lib/timing_report"
 
 let BUMP_BRANCH = "automation/bump-harn-runtime"
 
@@ -312,6 +314,38 @@ fn make_outcome(repo, local_pin, remote_pin) {
   return base_outcome_fields(repo, local_pin, remote_pin) + {status: "pending", detail: ""}
 }
 
+fn bump_span_status(outcome) {
+  return if bump_summary_problem_outcome(outcome) {
+    "error"
+  } else {
+    "ok"
+  }
+}
+
+fn timed_bump_phase(name, attrs, callback) {
+  let handle = start_timing(name, attrs)
+  try {
+    let outcome = callback()
+    end_timing(handle, {status: bump_span_status(outcome), outcome: outcome.status ?? ""})
+    return outcome
+  } catch (e) {
+    end_timing(handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
+fn timed_bump_outcome(name, attrs, callback) {
+  let handle = start_timing(name, attrs)
+  try {
+    let outcome = callback()
+    let timing = end_timing(handle, {status: bump_span_status(outcome), outcome: outcome.status ?? ""})
+    return outcome + {duration_ms: timing.duration_ms}
+  } catch (e) {
+    end_timing(handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
 /**
  * Whether an outcome status implies the script actually kicked a workflow
  * run for that repo (vs. resolving via probes only). Used to drive the
@@ -372,20 +406,18 @@ fn close_stale_pr(slug, pr, target, evidence) {
   }
 }
 
-fn finish_outcome(harness: Harness, base, started_ms, fields) {
-  return base + fields + {duration_ms: harness.clock.now_ms() - started_ms}
+fn finish_outcome(base, fields) {
+  return base + fields
 }
 
-fn dry_run_outcome(harness: Harness, base, target, started_ms) {
+fn dry_run_outcome(base, target) {
   return finish_outcome(
-    harness,
     base,
-    started_ms,
     {status: "dry_run", detail: "would dispatch bump-harn.yml with version=${target}"},
   )
 }
 
-fn already_current_outcome(harness: Harness, base, remote_pin, existing_pr, started_ms) {
+fn already_current_outcome(base, remote_pin, existing_pr) {
   let pr_n = if existing_pr == nil {
     nil
   } else {
@@ -397,9 +429,7 @@ fn already_current_outcome(harness: Harness, base, remote_pin, existing_pr, star
     existing_pr.url
   }
   return finish_outcome(
-    harness,
     base,
-    started_ms,
     {
       status: "already_current",
       detail: "remote main pin is ${remote_pin}; matches target" + local_pin_drift_detail(base, remote_pin),
@@ -421,7 +451,7 @@ fn local_pin_drift_detail(base, remote_pin) {
   return "; local checkout pin is ${local_no_v}, which differs from remote main"
 }
 
-fn targeted_pr_outcome(harness: Harness, base, slug, target, pr, started_ms) {
+fn targeted_pr_outcome(base, slug, target, pr) {
   let am = if pr.autoMergeRequest ?? nil != nil {
     "already_enabled"
   } else {
@@ -433,9 +463,7 @@ fn targeted_pr_outcome(harness: Harness, base, slug, target, pr, started_ms) {
     "pr_open_for_target"
   }
   return finish_outcome(
-    harness,
     base,
-    started_ms,
     {
       status: final_status,
       detail: "PR #${pr.number} already targets ${target}; auto-merge: ${am}",
@@ -446,7 +474,7 @@ fn targeted_pr_outcome(harness: Harness, base, slug, target, pr, started_ms) {
   )
 }
 
-fn predispatch_resolution(harness: Harness, repo, base, target, target_no_v, remote_pin, started_ms) {
+fn predispatch_resolution(repo, base, target, target_no_v, remote_pin) {
   let existing_pr = find_existing_pr(repo.slug)
   let existing_probe = if existing_pr == nil {
     nil
@@ -454,18 +482,10 @@ fn predispatch_resolution(harness: Harness, repo, base, target, target_no_v, rem
     pr_target_probe(repo.slug, existing_pr, target)
   }
   if remote_pin != nil && remote_pin == target_no_v {
-    return {
-      done: true,
-      outcome: already_current_outcome(harness, base, remote_pin, existing_pr, started_ms),
-      stale_note: "",
-    }
+    return {done: true, outcome: already_current_outcome(base, remote_pin, existing_pr), stale_note: ""}
   }
   if existing_pr != nil && existing_probe.matches {
-    return {
-      done: true,
-      outcome: targeted_pr_outcome(harness, base, repo.slug, target, existing_pr, started_ms),
-      stale_note: "",
-    }
+    return {done: true, outcome: targeted_pr_outcome(base, repo.slug, target, existing_pr), stale_note: ""}
   }
   if existing_pr != nil {
     let closed = close_stale_pr(repo.slug, existing_pr, target, existing_probe.evidence)
@@ -474,9 +494,7 @@ fn predispatch_resolution(harness: Harness, repo, base, target, target_no_v, rem
         done: true,
         stale_note: "",
         outcome: finish_outcome(
-          harness,
           base,
-          started_ms,
           {
             status: "stale_pr_close_failed",
             detail: closed,
@@ -491,16 +509,11 @@ fn predispatch_resolution(harness: Harness, repo, base, target, target_no_v, rem
   return {done: false, outcome: nil, stale_note: ""}
 }
 
-fn dispatch_bump_workflow(harness: Harness, repo, base, target, started_ms) {
+fn dispatch_bump_workflow(harness: Harness, repo, base, target) {
   let dispatch_ts = date_now_iso()
   let dispatch = gh_workflow_run(repo.slug, "bump-harn.yml", {version: target})
   if !dispatch.success {
-    return finish_outcome(
-      harness,
-      base,
-      started_ms,
-      {status: "dispatch_failed", detail: trim(dispatch.stderr)},
-    )
+    return finish_outcome(base, {status: "dispatch_failed", detail: trim(dispatch.stderr)})
   }
   harness.clock.sleep_ms(POST_DISPATCH_GRACE_MS)
   let polled = poll_for_completion(repo.slug, dispatch_ts)
@@ -579,22 +592,47 @@ fn with_auto_merge(slug, classified) {
 }
 
 fn bump_one(harness: Harness, repo, target, dry_run) {
-  let started_ms = harness.clock.now_ms()
-  let remote_pin = read_remote_pin(repo.slug)
-  let local_pin = read_pre_pin(harness, repo.dir)
-  let base = make_outcome(repo, local_pin, remote_pin)
-  if dry_run {
-    return dry_run_outcome(harness, base, target, started_ms)
-  }
-  let target_no_v = strip_v(target)
-  let pre = predispatch_resolution(harness, repo, base, target, target_no_v, remote_pin, started_ms)
-  if pre.done {
-    return pre.outcome
-  }
-  let run_outcome = dispatch_bump_workflow(harness, repo, base, target, started_ms)
-  let classified = classify_post_dispatch(repo.slug, target, target_no_v, run_outcome, pre.stale_note)
-  let final = with_auto_merge(repo.slug, classified)
-  return {...final, duration_ms: harness.clock.now_ms() - started_ms}
+  return timed_bump_outcome(
+    "bump.repo",
+    {repo: repo.slug, dry_run: dry_run, target: strip_v(target)},
+    { ->
+      let pins = timed(
+        "bump.repo.preflight",
+        {repo: repo.slug},
+        { -> return {remote_pin: read_remote_pin(repo.slug), local_pin: read_pre_pin(harness, repo.dir)} },
+      ).result
+      let remote_pin = pins.remote_pin
+      let local_pin = pins.local_pin
+      let base = make_outcome(repo, local_pin, remote_pin)
+      if dry_run {
+        return dry_run_outcome(base, target)
+      }
+      let target_no_v = strip_v(target)
+      let pre = timed(
+        "bump.repo.pre_dispatch_resolution",
+        {repo: repo.slug},
+        { -> return predispatch_resolution(repo, base, target, target_no_v, remote_pin) },
+      ).result
+      if pre.done {
+        return pre.outcome
+      }
+      let run_outcome = timed_bump_phase(
+        "bump.repo.dispatch_workflow",
+        {repo: repo.slug},
+        { -> return dispatch_bump_workflow(harness, repo, base, target) },
+      )
+      let classified = timed(
+        "bump.repo.post_dispatch_verification",
+        {repo: repo.slug},
+        { -> return classify_post_dispatch(repo.slug, target, target_no_v, run_outcome, pre.stale_note) },
+      ).result
+      return timed_bump_phase(
+        "bump.repo.auto_merge",
+        {repo: repo.slug},
+        { -> return with_auto_merge(repo.slug, classified) },
+      )
+    },
+  )
 }
 
 fn pr_target_probe(slug, pr, target) {
@@ -811,23 +849,23 @@ pipeline main() {
   if parsed.chat_only {
     return bump_chat_only(harness, parsed)
   }
-  let target = parsed.target ?? resolve_latest_release()
+  let target = parsed.target ?? timed("bump.resolve_target", {}, { -> return resolve_latest_release() }).result
   if !is_v_semver(target) {
     harness.stdio.eprintln("error: target must look like vX.Y.Z, got '${target}'")
     return 2
   }
   let run_id = uuid_v7()
-  let started_ms = harness.clock.now_ms()
   let started_iso = date_now_iso()
   let mode_label = if parsed.dry_run {
     "dry-run"
   } else {
     "live"
   }
+  let run_timing = start_timing("bump.run", {mode: mode_label, target: strip_v(target)})
   harness.stdio.println("== harn-bump-fleet run ${run_id}")
   harness.stdio.println("   target version : ${target}")
   harness.stdio.println("   mode           : ${mode_label}")
-  let all_repos = discover_repos(harness)
+  let all_repos = timed("bump.discovery", {}, { -> return discover_repos(harness) }).result
   let repos = if parsed.only != nil {
     all_repos.filter({ r -> r.slug == parsed.only })
   } else {
@@ -839,25 +877,35 @@ pipeline main() {
   }
   if len(repos) == 0 {
     harness.stdio.eprintln("no candidate repos matched (only=${parsed.only ?? \"\"})")
+    end_timing(run_timing, {status: "error", outcome: "no_matching_repos"})
     return 1
   }
   if !parsed.dry_run {
     harness.stdio.println("\n== waiting for target release readiness ...")
-    let readiness = wait_for_target_release_readiness(harness, target)
+    let readiness = timed(
+      "bump.release_readiness",
+      {target: strip_v(target)},
+      { -> return wait_for_target_release_readiness(harness, target) },
+    ).result
     if !readiness.ready {
       harness.stdio
         .eprintln(
         "error: target release ${target} was not ready after ${readiness.attempts} checks: "
           + release_readiness_detail(readiness),
       )
+      end_timing(run_timing, {status: "error", outcome: "release_not_ready"})
       return 1
     }
     harness.stdio.println("   ready: ${release_readiness_detail(readiness)}")
   }
   harness.stdio.println("\n== dispatching (max_concurrent=${PARALLEL_LIMIT}) ...")
-  let settled = parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
-    bump_one(harness, repo, target, parsed.dry_run)
-  }
+  let settled = timed(
+    "bump.dispatch_settle",
+    {repo_count: len(repos), max_concurrent: PARALLEL_LIMIT},
+    { -> return parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
+      bump_one(harness, repo, target, parsed.dry_run)
+    } },
+  ).result
   let outcomes = map_settled(
     settled.results,
     { value, _index -> value },
@@ -866,12 +914,11 @@ pipeline main() {
   for row in outcomes {
     harness.stdio.println("   ${row.slug}: ${row.status}")
   }
-  let finished_iso = date_now_iso()
   let core_payload = {
     run_id: run_id,
     started_iso: started_iso,
-    finished_iso: finished_iso,
-    duration_ms: harness.clock.now_ms() - started_ms,
+    finished_iso: date_now_iso(),
+    duration_ms: elapsed_ms(run_timing),
     operator: username(),
     host: hostname(),
     target_version: target,
@@ -883,25 +930,58 @@ pipeline main() {
     outcomes: outcomes,
   }
   harness.stdio.println("\n== summarizing with ${SUMMARY_MODEL} ...")
-  let summary_result = if parsed.dry_run {
-    bump_summary_skipped(core_payload, "(skipped on dry-run)")
-  } else {
-    summarize_with_local_llm(harness, {...core_payload, summary_text: ""})
-  }
+  let summary_result = timed(
+    "bump.summary",
+    {mode: mode_label, skipped: parsed.dry_run},
+    { -> return if parsed.dry_run {
+      bump_summary_skipped(core_payload, "(skipped on dry-run)")
+    } else {
+      summarize_with_local_llm(harness, {...core_payload, summary_text: ""})
+    } },
+  ).result
   let summary_text = summary_result.text
-  let cleanup = restore_local_checkout_to_main(parsed.dry_run)
+  let cleanup = timed(
+    "bump.checkout_cleanup",
+    {skipped: parsed.dry_run},
+    { -> return restore_local_checkout_to_main(parsed.dry_run) },
+  ).result
   if cleanup != nil {
     harness.stdio.println("\n== local checkout cleanup")
     harness.stdio.println("   ${cleanup.detail}")
   }
-  let payload = {...core_payload, summary_text: summary_text, summary: summary_result, cleanup: cleanup}
+  let any_error = outcomes
+    .any({ o -> bump_summary_problem_outcome(o) })
+  let run_report = end_timing(
+    run_timing,
+    {
+      status: if any_error {
+        "error"
+      } else {
+        "ok"
+      },
+      outcome: if any_error {
+        "failed"
+      } else {
+        "ok"
+      },
+    },
+  )
+  let timing = timing_artifacts()
+  let payload = {
+    ...core_payload,
+    finished_iso: date_now_iso(),
+    duration_ms: run_report.duration_ms,
+    summary_text: summary_text,
+    summary: summary_result,
+    cleanup: cleanup,
+    trace_spans: timing.trace_spans,
+    timing_summary: timing.timing_summary,
+  }
   let written = write_audit(harness, run_id, payload)
   harness.stdio.println("\n== audit written")
   harness.stdio.println("   json: ${written.json_path}")
   harness.stdio.println("   md  : ${written.md_path}")
   harness.stdio.println("\n${summary_text}")
-  let any_error = outcomes
-    .any({ o -> bump_summary_problem_outcome(o) })
   let exit_code = if any_error {
     1
   } else {

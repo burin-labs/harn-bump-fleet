@@ -19,8 +19,8 @@ set -euo pipefail
 #      original cannot AMFI-kill an in-flight run.
 #
 # Usage:
-#   scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
-#   scripts/harn_shielded.sh run release_harn.harn -- --mode ship-pr
+#   scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
+#   scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
 #   scripts/harn_shielded.sh --version
 
 self="$(/usr/bin/env -i PATH=/usr/bin:/bin readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
