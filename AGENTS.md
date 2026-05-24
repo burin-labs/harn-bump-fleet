@@ -36,16 +36,18 @@ Use `harn fmt $(git ls-files '*.harn')` for Harn formatting fixes.
 Common harness runs:
 
 ```sh
-harn run bump_fleet.harn -- --dry-run
-harn run bump_fleet.harn -- --only burin-labs/harn-cloud
-harn run release_harn.harn
-harn run release_harn.harn -- --mock --agent --mode ship-pr
-harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
+harn run --no-sandbox bump_fleet.harn -- --dry-run
+harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
+harn run --no-sandbox release_harn.harn
+harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
 are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
+The operation harnesses need `--no-sandbox` because they inspect sibling
+checkouts and invoke `git` / `gh`.
 
 ## Implementation rules
 
