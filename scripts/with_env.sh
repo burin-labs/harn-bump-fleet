@@ -18,8 +18,8 @@ set -euo pipefail
 # which files were sourced.
 #
 # Usage:
-#   scripts/with_env.sh harn run release_harn.harn -- --mode ship-pr
-#   scripts/with_env.sh scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
+#   scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr
+#   scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 verbose="${HARN_ENV_VERBOSE:-0}"
 

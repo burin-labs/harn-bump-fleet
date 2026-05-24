@@ -12,6 +12,7 @@ import { command_output_range, command_output_tail } from "std/command"
 import { env_bool, env_str } from "std/config"
 import { git_run } from "std/git"
 import { write_jsonl } from "std/jsonl"
+import { end_timing, start_timing, timed } from "std/timing"
 import {
   changelog_bullet_count,
   changelog_latest_version_section_from_text,
@@ -61,6 +62,7 @@ import { remote_tag_sha_from_ls_remote, repin_tocttou_decision } from "lib/relea
 import { next_semver, version_from_release_branch, version_from_tag } from "lib/semver"
 import { fail, ok, safe_shell_arg } from "lib/shell_util"
 import { markdown_multiline, truncate_text } from "lib/text_util"
+import { timing_artifacts } from "lib/timing_report"
 
 let DEFAULT_REPO = path_join(env_str("HOME") ?? "", "projects/harn")
 
@@ -79,6 +81,42 @@ let DEFAULT_PROVIDER = DEFAULT_PLANNER.provider
 let MOCK_AGENT_MODEL = "claude-sonnet-4-7"
 
 let RUN_ROOT = ".harn-runs/release-harn"
+
+fn timing_status(success) {
+  return if success {
+    "ok"
+  } else {
+    "error"
+  }
+}
+
+fn finish_release_run_timing(handle, outcome, success) {
+  return end_timing(handle, {status: timing_status(success), outcome: outcome})
+}
+
+fn timed_release_steps(name, attrs, callback) {
+  let handle = start_timing(name, attrs)
+  try {
+    let steps = callback()
+    let failed = execution_failed(steps)
+    end_timing(
+      handle,
+      {
+        status: timing_status(!failed),
+        outcome: if failed {
+          "failed"
+        } else {
+          "ok"
+        },
+        step_count: len(steps ?? []),
+      },
+    )
+    return steps
+  } catch (e) {
+    end_timing(handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
 
 // Mock-mode placeholder for the pinned base SHA. 40 hex chars so it
 // looks like a real commit SHA in audit reports, fixtures, and tests.
@@ -119,10 +157,10 @@ let RELEASE_RUN_ARGV_PREFIXES = [
 fn usage() {
   return """
 Usage:
-  harn run release_harn.harn
-  harn run release_harn.harn -- --agent
-  harn run release_harn.harn -- --mock --agent --mode ship-pr
-  harn run release_harn.harn -- --repo ~/projects/harn --mode prepare --yes-live-release
+  harn run --no-sandbox release_harn.harn
+  harn run --no-sandbox release_harn.harn -- --agent
+  harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+  harn run --no-sandbox release_harn.harn -- --repo ~/projects/harn --mode prepare --yes-live-release
 
 Modes:
   audit    Inspect release readiness and write an audit report. Default.
@@ -1726,14 +1764,17 @@ fn warm_local_model_for_recovery(harness: Harness, cfg) {
     return
   }
   harness.stdio.println("   → warming local model ${model} (long prepare may have cooled it)")
-  let warm_started = harness.clock.now_ms()
-  let result = try {
-    llm_healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
-  } catch (e) {
-    {valid: false, status: "error", message: "${e}"}
-  }
-  let elapsed_ms = harness.clock.now_ms() - warm_started
-  let elapsed_s = (elapsed_ms + 500) / 1000
+  let warm = timed(
+    "release.agent_warmup",
+    {provider: "ollama", model: model},
+    { -> return try {
+      llm_healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
+    } catch (e) {
+      {valid: false, status: "error", message: "${e}"}
+    } },
+  )
+  let result = warm.result
+  let elapsed_s = (warm.timing.duration_ms + 500) / 1000
   if result?.valid ?? false {
     harness.stdio.println("   ✓ warmed ${model} in ${elapsed_s}s")
   } else {
@@ -1965,7 +2006,7 @@ fn agent_review(harness: Harness, cfg, analysis, run_id) {
       },
     )
     let mock_final = {
-      text: "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
+      text: "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
     }
     llm_mock(mock_final)
     llm_mock(mock_final)
@@ -4520,12 +4561,24 @@ pipeline main() {
   }
   let run_id = uuid_v7()
   let started_iso = date_now_iso()
-  let started_ms = harness.clock.now_ms()
   let repo_label = if raw_cfg.mock {
     "(mock)"
   } else {
     raw_cfg.repo
   }
+  let run_timing = start_timing(
+    "release.run",
+    {
+      mode: raw_cfg.mode,
+      mock: raw_cfg.mock,
+      agent: raw_cfg.agent,
+      repo_kind: if raw_cfg.mock {
+        "mock"
+      } else {
+        "local"
+      },
+    },
+  )
   harness.stdio.println("== harn release harness ${run_id}")
   harness.stdio.println("   repo : ${repo_label}")
   harness.stdio.println("   mode : ${raw_cfg.mode}")
@@ -4535,7 +4588,14 @@ pipeline main() {
     "   ${planner_audit_line({provider: raw_cfg.provider, model: raw_cfg.model, source: DEFAULT_PLANNER.source})}",
   )
   harness.stdio.println("   ${binder_audit_line(install_binder({tools: []}).audit)}")
-  pre_release_sync_local_base(harness, raw_cfg, run_id)
+  timed(
+    "release.base_sync",
+    {base: raw_cfg.base, mock: raw_cfg.mock},
+    { ->
+      pre_release_sync_local_base(harness, raw_cfg, run_id)
+      return nil
+    },
+  )
   let cfg = {...raw_cfg, pin_sha: resolve_pin_sha(raw_cfg)}
   let run_events = release_log_event(
     harness,
@@ -4554,9 +4614,20 @@ pipeline main() {
   harness.stdio.println("   pin  : ${cfg.pin_sha}")
   harness.stdio.println("   events: ${run_events}")
   harness.stdio.println("   tail : tail -f ${run_events}")
-  normalize_release_analysis_checkout(harness, cfg, run_id)
+  timed(
+    "release.checkout_normalization",
+    {base: cfg.base, mock: cfg.mock},
+    { ->
+      normalize_release_analysis_checkout(harness, cfg, run_id)
+      return nil
+    },
+  )
   release_log_event(harness, run_id, "analysis_started", {})
-  let raw_analysis = analyze_release(harness, cfg)
+  let raw_analysis = timed(
+    "release.analysis",
+    {mode: cfg.mode, mock: cfg.mock},
+    { -> return analyze_release(harness, cfg) },
+  ).result
   let derived_cfg = with_derived_release_options(cfg, raw_analysis)
   // Repin and fixup are mutually exclusive: --repin-latest is the opt-in
   // inverse of fixup (advance the pin and fold drift in), so detect it
@@ -4595,9 +4666,16 @@ pipeline main() {
     if drift_state.kind == "paperwork_pr_open" {
       harness.stdio.println("== post-merge paperwork PR already open: ${drift_state.pr_url}")
       harness.stdio.println("   no changes needed (the open PR already fixes the drift)")
+      finish_release_run_timing(run_timing, "post_merge_paperwork_pr_open", true)
       return 0
     }
-    return run_post_merge_paperwork_pr(harness, derived_cfg, drift_state, run_id)
+    let drift_exit = timed(
+      "release.post_merge_paperwork",
+      {base: derived_cfg.base, mock: derived_cfg.mock},
+      { -> return run_post_merge_paperwork_pr(harness, derived_cfg, drift_state, run_id) },
+    ).result
+    finish_release_run_timing(run_timing, "post_merge_paperwork_pr", drift_exit == 0)
+    return drift_exit
   }
   let effective_cfg = with_repin_state(with_fixup_state(derived_cfg, fixup_state), repin_state)
   let analysis = analysis_with_repin_state(analysis_with_fixup_state(raw_analysis, fixup_state), repin_state)
@@ -4730,7 +4808,18 @@ pipeline main() {
       "agent_started",
       {model: model_label, llm_transcript_dir: agent_artifact_paths(run_id).llm_transcript_dir},
     )
-    agent_review_result = agent_review(harness, effective_cfg, analysis, run_id)
+    agent_review_result = timed(
+      "release.agent_review",
+      {
+        provider: if cfg.mock {
+          "mock"
+        } else {
+          cfg.provider
+        },
+        model: model_label,
+      },
+      { -> return agent_review(harness, effective_cfg, analysis, run_id) },
+    ).result
     release_log_event(
       harness,
       run_id,
@@ -4758,30 +4847,35 @@ pipeline main() {
     } catch (_e) {
       ""
     }
-    let gate = pre_release_gate(
-      harness,
-      {
-        provider: cfg.provider,
-        model: cfg.model,
-        mock: cfg.mock,
-        tools: release_repair_tools(harness, effective_cfg, run_id),
-        timeout_s: cfg.chat_timeout_s,
-      },
-      {changelog: changelog_text, pr_body: pr_body_preview, findings: analysis.deterministic_findings},
-      {
-        mode: cfg.mode,
-        next_version: analysis.next_version,
-        current_version: analysis.current_version,
-        repo: cfg.repo,
-        run_id: run_id,
-        base_branch: cfg.base,
-        latest_tag: analysis.latest_tag,
-        pin_sha: cfg.pin_sha,
-      },
-    )
+    let gate = timed(
+      "release.pre_release_gate",
+      {mode: cfg.mode, mock: cfg.mock},
+      { -> return pre_release_gate(
+        harness,
+        {
+          provider: cfg.provider,
+          model: cfg.model,
+          mock: cfg.mock,
+          tools: release_repair_tools(harness, effective_cfg, run_id),
+          timeout_s: cfg.chat_timeout_s,
+        },
+        {changelog: changelog_text, pr_body: pr_body_preview, findings: analysis.deterministic_findings},
+        {
+          mode: cfg.mode,
+          next_version: analysis.next_version,
+          current_version: analysis.current_version,
+          repo: cfg.repo,
+          run_id: run_id,
+          base_branch: cfg.base,
+          latest_tag: analysis.latest_tag,
+          pin_sha: cfg.pin_sha,
+        },
+      ) },
+    ).result
     if gate.decision == "abort" {
       release_log_event(harness, run_id, "pre_release_gate_aborted", {reason: gate.reason})
       harness.stdio.println("== chat: aborting before live release side effects (${gate.reason})")
+      finish_release_run_timing(run_timing, "pre_release_gate_aborted", false)
       return 2
     }
     release_log_event(harness, run_id, "pre_release_gate_approved", {reason: gate.reason})
@@ -4800,22 +4894,41 @@ pipeline main() {
   } else if cfg.mode == "prepare" {
     harness.stdio.println("== running prepare ...")
     release_log_event(harness, run_id, "mode_execution_started", {mode: "prepare"})
-    execution = execute_prepare(harness, effective_cfg, analysis, agent_review_result, run_id)
+    execution = timed_release_steps(
+      "release.mode_execution",
+      {mode: "prepare", mock: effective_cfg.mock},
+      { -> return execute_prepare(harness, effective_cfg, analysis, agent_review_result, run_id) },
+    )
   } else if cfg.mode == "ship-pr" {
     harness.stdio.println("== running prepare + PR handoff ...")
     release_log_event(harness, run_id, "mode_execution_started", {mode: "ship-pr"})
-    execution = execute_ship_pr(harness, effective_cfg, analysis, agent_review_result, run_id)
+    execution = timed_release_steps(
+      "release.mode_execution",
+      {mode: "ship-pr", mock: effective_cfg.mock},
+      { -> return execute_ship_pr(harness, effective_cfg, analysis, agent_review_result, run_id) },
+    )
   }
-  let cleanup = restore_release_checkout_to_base(harness, effective_cfg, execution, run_id)
+  let cleanup = timed(
+    "release.checkout_cleanup",
+    {mode: effective_cfg.mode, mock: effective_cfg.mock},
+    { -> return restore_release_checkout_to_base(harness, effective_cfg, execution, run_id) },
+  ).result
   if cleanup != nil {
     harness.stdio.println("== checkout cleanup")
     harness.stdio.println("   ${cleanup.detail}")
   }
+  let outcome = if execution_failed(execution) {
+    "FAILED"
+  } else {
+    "ok"
+  }
+  let run_report = finish_release_run_timing(run_timing, outcome, outcome == "ok")
+  let timing = timing_artifacts()
   let payload = {
     run_id: run_id,
     started_iso: started_iso,
     finished_iso: date_now_iso(),
-    duration_ms: harness.clock.now_ms() - started_ms,
+    duration_ms: run_report.duration_ms,
     operator: username(),
     host: hostname(),
     config: effective_cfg,
@@ -4824,6 +4937,8 @@ pipeline main() {
     agent_review_detail: agent_review_result,
     execution: execution,
     cleanup: cleanup,
+    trace_spans: timing.trace_spans,
+    timing_summary: timing.timing_summary,
   }
   let written = write_report(harness, run_id, payload)
   let fixture = write_crystallization_fixture(harness, run_id, payload, written)
@@ -4838,14 +4953,8 @@ pipeline main() {
       fixture_dir: fixture.out_dir,
     },
   )
-  let total_elapsed = harness.clock.now_ms() - started_ms
-  let outcome = if execution_failed(execution) {
-    "FAILED"
-  } else {
-    "ok"
-  }
   let pr_url = execution_pr_url(execution)
-  harness.stdio.println("== done (${outcome}, ${format_ms_human(total_elapsed)})")
+  harness.stdio.println("== done (${outcome}, ${format_ms_human(run_report.duration_ms)})")
   if pr_url != "" {
     harness.stdio.println("   pr      : ${pr_url}")
   }

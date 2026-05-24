@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Release and bump harness timings now use Harn `std/timing` spans and write
+  `trace_spans` plus a compact `timing_summary` into run artifacts.
+- Bumped the pinned Harn runtime to `v0.8.35` for first-class timing spans.
+
 ### Security
 
 - `scripts/install_harn.sh` now verifies the downloaded harn release tarball

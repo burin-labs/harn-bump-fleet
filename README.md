@@ -24,22 +24,25 @@ ignored under `.harn-runs/` and `.harn/`.
 
 ```sh
 # Bump every dependent repo to the latest harn release.
-harn run bump_fleet.harn
+harn run --no-sandbox bump_fleet.harn
 
 # Pin to an explicit tag.
-harn run bump_fleet.harn -- v0.7.52
+harn run --no-sandbox bump_fleet.harn -- v0.7.52
 
 # Discover-only: never dispatches anything, useful before a real run.
-harn run bump_fleet.harn -- --dry-run
+harn run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Run on one repo only.
-harn run bump_fleet.harn -- --only burin-labs/harn-cloud
+harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
 # Use a different local LLM for the summary.
 HARN_BUMP_FLEET_MODEL=gpt-oss:120b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
-  harn run bump_fleet.harn
+  harn run --no-sandbox bump_fleet.harn
 ```
+
+These operation harnesses inspect sibling checkouts under `~/projects` and
+shell out to `git` / `gh`, so Harn's default run sandbox must be disabled.
 
 ### Interactive chat (postmortem + pre-release review)
 
@@ -51,14 +54,14 @@ apply a fix to the harness or release artifacts mid-debrief if you ask.
 
 ```sh
 # Disable chat even when at a TTY.
-harn run release_harn.harn -- --no-chat        # or `HARN_CHAT=0`
+harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_CHAT=0`
 
 # Skip the pipeline; open the loop over a prior run.
-harn run release_harn.harn -- --chat-only                       # carousel
-harn run release_harn.harn -- --chat-only --chat-run <run-id>   # direct
+harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
+harn run --no-sandbox release_harn.harn -- --chat-only --chat-run <run-id>   # direct
 
 # Change the start-typing timeout (default 60s).
-harn run bump_fleet.harn -- --chat-timeout-s 120
+harn run --no-sandbox bump_fleet.harn -- --chat-timeout-s 120
 ```
 
 `release_harn.harn` also runs a **non-trivial classifier** before live
@@ -93,11 +96,11 @@ before exec'ing the rest of the command:
 ```sh
 # Sources ~/projects/burin-code/.env (override with HARN_BUMP_FLEET_ENV_FILE),
 # then ./.env and ./.env.local from the repo root, then runs the harness.
-scripts/with_env.sh harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
-scripts/with_env.sh scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Verbose mode prints which files were sourced.
-HARN_ENV_VERBOSE=1 scripts/with_env.sh harn run release_harn.harn
+HARN_ENV_VERBOSE=1 scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
 
 Discovery order (later entries override earlier ones):
@@ -145,8 +148,8 @@ Knobs (all `env_str`-style, all optional):
 | `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
 | `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
 
-`harn run release_harn.harn` prints a `planner` + `binder` line at the
-top of every run summarizing the resolved route.
+`harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
+at the top of every run summarizing the resolved route.
 
 ### AMFI-shielded launcher (macOS)
 
@@ -162,8 +165,8 @@ and execs that copy. Re-stages only when the source binary's size+mtime
 changes, so warm runs cost ~50ms.
 
 ```sh
-scripts/harn_shielded.sh run bump_fleet.harn -- --dry-run
-scripts/harn_shielded.sh run release_harn.harn -- --mode ship-pr
+scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
+scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
 ```
 
 Drop-in for any `harn ...` invocation. CI environments don't need it
@@ -237,7 +240,8 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
 6. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run
-   record.
+   record. The JSON includes raw `trace_spans` plus a compact
+   `timing_summary` for Harn Cloud ingestion and local replay inspection.
 7. **Summarize**: a read-only `summary_agent` against the local model produces a
    short bullet list of anomalies for the operator. The LLM is **never**
    allowed to drive a side-effect. If the local model returns anything other
@@ -264,6 +268,9 @@ A second invocation against an unchanged fleet is essentially a no-op:
 - `std/command` command steps for release command execution, retries, tails,
   and artifact references; `shell()` / `shell_at()` remain for small discovery
   probes and mocked fixtures.
+- `std/timing` spans for release, bump, command, verification, and agentic
+  phases. Human-readable durations are derived from those spans, and machine
+  artifacts keep the same trace data.
 - `render(...)` against a `.harn.prompt` template + `[asset_roots]` alias
   for audit markdown, PR bodies, recovery prompts, and fixture readmes.
 - `summary_agent` through Ollama for an on-machine summary. The default
@@ -283,7 +290,8 @@ A second invocation against an unchanged fleet is essentially a no-op:
 ```text
 ~/projects/harn-bump-fleet/.harn-runs/bump-fleet/<run-id>/
 ├── audit.json    # machine-readable: every per-repo outcome, with
-│                 # run/PR URLs, pre-pin, duration, auto-merge status
+│                 # run/PR URLs, pre-pin, duration, auto-merge status,
+│                 # trace_spans, and timing_summary
 └── audit.md      # human-readable rendered report including LLM summary
 ```
 
@@ -306,21 +314,21 @@ cannot leak into the published artifact.
 Default mode is read-only audit:
 
 ```sh
-harn run release_harn.harn
+harn run --no-sandbox release_harn.harn
 ```
 
 Useful rehearsals:
 
 ```sh
 # Fully mocked v0.7.52 -> v0.7.53 audit. No repo/GitHub writes.
-harn run release_harn.harn -- --mock
+harn run --no-sandbox release_harn.harn -- --mock
 
 # Mocked agent/tool loop using Harn's mock LLM provider.
-harn run release_harn.harn -- --mock --agent
+harn run --no-sandbox release_harn.harn -- --mock --agent
 
 # Mock the full command sequence: prepare, commit, rebase, push, PR,
 # and auto-merge. Still no repo/GitHub writes.
-harn run release_harn.harn -- --mock --agent --mode ship-pr
+harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 ```
 
 Live modes require the explicit guard flag. Before resolving the pin SHA, the
@@ -344,10 +352,10 @@ evidence instead of copied from commit titles.
 ```sh
 # Starts from main, an existing release branch, or another branch.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
-harn run release_harn.harn -- --mode prepare --yes-live-release
+harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
-harn run release_harn.harn -- --mode ship-pr --agent --yes-live-release
+harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
 Options:
@@ -485,6 +493,10 @@ Reports are written to:
     ├── tool-observations.jsonl
     └── README.md
 ```
+
+`release-audit.json` carries the same `trace_spans` and `timing_summary`
+fields as bump-fleet audits, so release command, verification, and agent spans
+can be inspected without scraping terminal output.
 
 The `crystallization-input/` directory is a self-contained fixture for the
 Harn crystallization importer tracked in
