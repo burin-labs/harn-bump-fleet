@@ -20,6 +20,11 @@ private-repo details, customer data, secrets, or anything too inside baseball
 from private Burin repositories. Generated run artifacts are intentionally
 ignored under `.harn-runs/` and `.harn/`.
 
+Harn 0.8.35 sandboxes `harn run` by default. These local ops harnesses inspect
+`~/projects` and authenticated GitHub CLI state, so use `harn run --no-sandbox`
+for real local release and bump runs. Mock release rehearsals can stay
+sandboxed.
+
 ## Usage
 
 ```sh

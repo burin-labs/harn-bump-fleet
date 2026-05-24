@@ -63,6 +63,12 @@ import { next_semver, version_from_release_branch, version_from_tag } from "lib/
 import { fail, ok, safe_shell_arg } from "lib/shell_util"
 import { markdown_multiline, truncate_text } from "lib/text_util"
 import { timing_artifacts } from "lib/timing_report"
+import {
+  agent_transcript_context_metadata,
+  release_compaction_policy,
+  summary_projection_policy,
+  tool_repair_projection_policy,
+} from "lib/transcript_context"
 
 let DEFAULT_REPO = path_join(env_str("HOME") ?? "", "projects/harn")
 
@@ -1268,6 +1274,7 @@ fn agent_artifact_paths(run_id) {
     out_dir: out_dir,
     raw_result_json: path_join(out_dir, "agent-result.json"),
     trace_json: path_join(out_dir, "agent-trace.json"),
+    transcript_context_json: path_join(out_dir, "agent-transcript-context.json"),
     llm_transcript_dir: path_join(out_dir, "agent-llm"),
     llm_transcript_jsonl: path_join(out_dir, "agent-llm/llm_transcript.jsonl"),
     draft_changelog_md: path_join(out_dir, "agent-draft-changelog.md"),
@@ -1518,6 +1525,16 @@ fn run_release_agent_loop(
   // still safe because the binder layer only fires when tools have
   // schemas and `_nl_intent` arrives in the call.
   let binder = install_binder(raw_tools)
+  let compaction_policy = if require_tool_evidence {
+    release_compaction_policy("audit")
+  } else {
+    release_compaction_policy("validation_repair")
+  }
+  let projection_policy = if require_tool_evidence {
+    tool_repair_projection_policy()
+  } else {
+    summary_projection_policy(4)
+  }
   var options = agent_preset(
     role,
     {
@@ -1553,7 +1570,8 @@ fn run_release_agent_loop(
       } else {
         nil
       },
-      compaction: {strategy: "hybrid", keep_last_n: 8},
+      compaction: {strategy: "hybrid", keep_last_n: 8, policy: compaction_policy},
+      transcript_projection: projection_policy,
       session_id: release_session_id(harness, cfg, analysis, run_id) + session_suffix,
       llm_transcript_dir: paths.llm_transcript_dir,
     },
@@ -1576,11 +1594,15 @@ fn persist_agent_artifacts(harness: Harness, run_id, result, attempts, validatio
     json_stringify({attempts: attempts, final_result: result}) + "\n",
   )
   harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  let transcript_context = agent_transcript_context_metadata(result)
+  harness.fs.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
   return {
     raw_result_json: paths.raw_result_json,
     trace_json: paths.trace_json,
+    transcript_context_json: paths.transcript_context_json,
     llm_transcript_jsonl: paths.llm_transcript_jsonl,
     draft_changelog_md: paths.draft_changelog_md,
+    transcript_context: transcript_context,
     validation_findings: validation_findings,
   }
 }
@@ -1592,6 +1614,7 @@ fn recovery_artifact_paths(run_id, step_name) {
     out_dir: out_dir,
     raw_result_json: path_join(out_dir, safe_step + "-agent-result.json"),
     trace_json: path_join(out_dir, safe_step + "-agent-trace.json"),
+    transcript_context_json: path_join(out_dir, safe_step + "-transcript-context.json"),
     advice_md: path_join(out_dir, safe_step + "-advice.md"),
     llm_transcript_dir: path_join(out_dir, safe_step + "-llm"),
     llm_transcript_jsonl: path_join(out_dir, safe_step + "-llm/llm_transcript.jsonl"),
@@ -1814,7 +1837,8 @@ fn run_recovery_agent_loop(harness: Harness, cfg, analysis, prompt, run_id, step
       max_nudges: 1,
       iteration_budget: {mode: "adaptive", initial: 4, max: 10, extend_by: 2},
       turn_policy: {allow_done_sentinel: false, max_prose_chars: 9000},
-      compaction: {strategy: "hybrid", keep_last_n: 6},
+      compaction: {strategy: "hybrid", keep_last_n: 6, policy: release_compaction_policy("recovery")},
+      transcript_projection: tool_repair_projection_policy(),
       session_id: recovery_session_id(harness, cfg, analysis, run_id, step_name),
       llm_transcript_dir: paths.llm_transcript_dir,
     },
@@ -1866,14 +1890,18 @@ fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, ru
   harness.fs.mkdir(paths.out_dir, true)
   harness.fs.write_text(paths.raw_result_json, json_stringify(result) + "\n")
   harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  let transcript_context = agent_transcript_context_metadata(result)
+  harness.fs.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
   harness.fs.write_text(paths.advice_md, text + "\n")
   return {
     text: text,
     artifacts: {
       raw_result_json: paths.raw_result_json,
       trace_json: paths.trace_json,
+      transcript_context_json: paths.transcript_context_json,
       advice_md: paths.advice_md,
       llm_transcript_jsonl: paths.llm_transcript_jsonl,
+      transcript_context: transcript_context,
     },
     llm: result.llm ?? {},
     tools: result.tools ?? {},
@@ -2047,16 +2075,7 @@ fn agent_review(harness: Harness, cfg, analysis, run_id) {
   var result = run_release_agent_loop(harness, cfg, analysis, system, prompt, run_id, true, "")
   var text = agent_result_text(result)
   var validation_findings = validate_agent_attempt(cfg, analysis, result, text)
-  var attempts = [
-    {
-      name: "initial-review",
-      text: text,
-      validation_findings: validation_findings,
-      llm: result.llm ?? {},
-      tools: result.tools ?? {},
-      status: result.status ?? "",
-    },
-  ]
+  var attempts = [agent_attempt_record("initial-review", text, validation_findings, result)]
   while len(validation_findings) > 0 && len(attempts) < 3 {
     let repair_prompt = agent_repair_prompt(validation_findings, text, analysis)
     result = run_release_agent_loop(
@@ -2072,16 +2091,7 @@ fn agent_review(harness: Harness, cfg, analysis, run_id) {
     text = agent_result_text(result)
     validation_findings = validate_agent_attempt(cfg, analysis, result, text)
     attempts = attempts
-      + [
-      {
-        name: "validation-repair-${len(attempts)}",
-        text: text,
-        validation_findings: validation_findings,
-        llm: result.llm ?? {},
-        tools: result.tools ?? {},
-        status: result.status ?? "",
-      },
-    ]
+      + [agent_attempt_record("validation-repair-${len(attempts)}", text, validation_findings, result)]
   }
   let draft_changelog = persist_agent_changelog(harness, run_id, text, analysis.next_version)
   let artifacts = persist_agent_artifacts(harness, run_id, result, attempts, validation_findings)
@@ -2091,6 +2101,18 @@ fn agent_review(harness: Harness, cfg, analysis, run_id) {
     validation_findings: validation_findings,
     draft_changelog: draft_changelog,
     artifacts: artifacts,
+  }
+}
+
+fn agent_attempt_record(name, text, validation_findings, result) {
+  return {
+    name: name,
+    text: text,
+    validation_findings: validation_findings,
+    llm: result.llm ?? {},
+    tools: result.tools ?? {},
+    status: result.status ?? "",
+    transcript_context: agent_transcript_context_metadata(result),
   }
 }
 
@@ -2273,7 +2295,8 @@ fn log_step_started(harness: Harness, run_id, name, command) {
 
 fn log_step_finished(harness: Harness, run_id, name, result, extra) {
   let base = {step: name, success: result.success, status: result.status}
-  release_log_event(harness, run_id, "step_finished", base + extra ?? {})
+  let extra_fields = extra ?? {}
+  release_log_event(harness, run_id, "step_finished", base + extra_fields)
 }
 
 fn release_command_runner(cfg) {

@@ -11,7 +11,7 @@ import { agent_preset } from "std/agent/presets"
 import { parse_args } from "std/cli"
 import { env_str } from "std/config"
 import { read_json } from "std/fs"
-import { read_jsonl } from "std/jsonl"
+import { read_jsonl, write_jsonl } from "std/jsonl"
 import {
   run_artifact_path,
   run_artifact_transcript_dir,
@@ -26,6 +26,17 @@ import { binder_audit_line, install_binder, planner_defaults } from "lib/llm_def
 import { agent_result_text } from "lib/release_audit"
 import { safe_shell_arg } from "lib/shell_util"
 import { truncate_text } from "lib/text_util"
+import {
+  agent_transcript_context_metadata,
+  self_review_compaction_policy,
+  self_review_context_eval_manifest,
+  self_review_context_eval_markdown,
+  self_review_context_eval_report,
+  summary_projection_policy,
+  tool_repair_projection_policy,
+  transcript_compaction_events,
+  transcript_projection_events,
+} from "lib/transcript_context"
 
 let RUN_ROOT = ".harn-runs"
 
@@ -137,6 +148,12 @@ fn review_artifact_paths(run_id) {
     report_md: run.paths.review,
     raw_result_json: run.paths.agent_result,
     trace_json: run.paths.agent_trace,
+    transcript_context_json: run_artifact_path(run, "agent-transcript-context.json"),
+    context_eval_manifest_json: run_artifact_path(run, "context-eval-manifest.json"),
+    context_eval_dir: run_artifact_path(run, "context-eval"),
+    context_eval_summary_json: run_artifact_path(run, "context-eval/summary.json"),
+    context_eval_summary_md: run_artifact_path(run, "context-eval/summary.md"),
+    context_eval_per_run_jsonl: run_artifact_path(run, "context-eval/per_run.jsonl"),
     llm_transcript_dir: run_artifact_transcript_dir(run),
     llm_transcript_jsonl: run_artifact_transcript_path(run),
   }
@@ -328,6 +345,8 @@ fn find_files(harness: Harness, root, glob_name) {
 fn transcript_summary(harness: Harness, path) {
   let events = read_jsonl(path)
   let raw = artifact_text(harness, path)
+  let projection_events = transcript_projection_events(events)
+  let compaction_events = transcript_compaction_events(events)
   var provider_requests = 0
   var provider_responses = 0
   var tool_schema_count = 0
@@ -400,6 +419,11 @@ fn transcript_summary(harness: Harness, path) {
     tool_choice_counts: tool_choice_counts,
     final_request: final_request,
     final_no_tools_request_seen: final_no_tools_request_seen,
+    projection_event_count: len(projection_events),
+    projection_events: projection_events,
+    projection_policies: projection_events.map({ event -> event.policy }),
+    compaction_event_count: len(compaction_events),
+    compaction_events: compaction_events,
     response_tool_counts: response_tool_counts,
     adjacent_repeated_tool_names: adjacent_repeats,
     response_protocol_leak_count: response_protocol_leaks,
@@ -574,6 +598,8 @@ fn self_review_run_summary(harness: Harness, dir) {
   let result_path = run.paths.agent_result
   let transcript_path = run_artifact_transcript_path(run)
   let synthesis_transcript_path = run_artifact_transcript_path(run, "synthesis-llm")
+  let agent_context_path = run_artifact_path(run, "agent-transcript-context.json")
+  let synthesis_context_path = run_artifact_path(run, "synthesis-transcript-context.json")
   let report_path = run.paths.review
   return {
     kind: "harness-self-review",
@@ -590,6 +616,16 @@ fn self_review_run_summary(harness: Harness, dir) {
     } else {
       nil
     },
+    agent_transcript_context: if harness.fs.exists(agent_context_path) {
+      read_json(agent_context_path)
+    } else {
+      nil
+    },
+    synthesis_transcript_context: if harness.fs.exists(synthesis_context_path) {
+      read_json(synthesis_context_path)
+    } else {
+      nil
+    },
     report_excerpt: truncate_text(artifact_text(harness, report_path), 1200),
   }
 }
@@ -600,6 +636,8 @@ fn transcript_digest(summary) {
   }
   return "requests=${summary.provider_requests}, responses=${summary.provider_responses}, tools="
     + json_stringify(summary.response_tool_counts)
+    + ", projections="
+    + json_stringify(summary.projection_policies ?? [])
     + ", final_no_tools="
     + to_string(summary.final_no_tools_request_seen)
     + ", required_tool_missing_mentions="
@@ -657,6 +695,10 @@ fn facts_digest(facts) {
       "- ${run.run_id}: status=${run.agent_result?.status ?? \"\"}, transcript=${transcript_digest(run.agent_transcript)}, report_excerpt=${single_line_report_excerpt(run.report_excerpt)}",
     ]
   }
+  lines = lines
+    + [
+    "Context eval: status=${facts.context_eval?.status ?? \"\"}, runs=${facts.context_eval?.passed_runs ?? \"?\"}/${facts.context_eval?.total_runs ?? \"?\"}, policies=${json_stringify(facts.context_eval?.projection_policies ?? [])}",
+  ]
   lines = lines + ["Source refs: " + json_stringify(facts.source_refs)]
   return lines.join("\n")
 }
@@ -665,8 +707,16 @@ fn single_line_report_excerpt(text) {
   return truncate_text(regex_replace_all("\\s+", " ", trim(text ?? "")), 500)
 }
 
+fn readonly_path_exists(path) {
+  let path_arg = safe_shell_arg(path)
+  if path_arg == nil {
+    return false
+  }
+  return shell("test -e " + path_arg).success
+}
+
 fn rg_excerpt(harness: Harness, label, path, pattern) {
-  if !harness.fs.exists(path) {
+  if !readonly_path_exists(path) {
     return "## ${label}\nmissing: ${path}"
   }
   let path_arg = safe_shell_arg(path)
@@ -689,7 +739,7 @@ fn source_evidence_digest(harness: Harness, cfg) {
     {
       label: "release harness agent/tool plumbing",
       path: path_join(cwd(), "release_harn.harn"),
-      pattern: "release_host_tools|release_review_post_turn|require_successful_tools|run_recovery_agent_loop|llm_transcript_dir|release_run_policy|release_replace_file|release_write_file|release_artifact",
+      pattern: "release_host_tools|release_review_post_turn|require_successful_tools|run_recovery_agent_loop|llm_transcript_dir|transcript_projection|compaction_policy|release_run_policy|release_replace_file|release_write_file|release_artifact",
     },
     {
       label: "fleet summary and cleanup behavior",
@@ -719,7 +769,7 @@ fn source_evidence_digest(harness: Harness, cfg) {
     {
       label: "Harn agent presets",
       path: path_join(cfg.harn_repo, "crates/harn-stdlib/src/stdlib/agent/presets.harn"),
-      pattern: "audit|repair|summary|iteration_budget|tool_format|done_judge|loop_until_done",
+      pattern: "audit|repair|summary|iteration_budget|tool_format|done_judge|loop_until_done|transcript_projection|compaction_policy",
     },
   ]
   var parts = []
@@ -734,7 +784,7 @@ fn source_file_refs(harness: Harness, cfg) {
     "release_harn.harn",
     "bump_fleet.harn",
     "prompts/release_agent_system.harn.prompt",
-    "prompts/release_agent_prompt.harn.prompt",
+    "prompts/release_agent_user.harn.prompt",
     "prompts/release_recovery_system.harn.prompt",
     "prompts/release_recovery_prompt.harn.prompt",
     "prompts/bump_summary_system.harn.prompt",
@@ -757,7 +807,7 @@ fn source_file_refs(harness: Harness, cfg) {
     harn_bump_fleet_files: local.map({ p -> {path: p, exists: harness.fs.exists(path_join(cwd(), p))} }),
     harn_source_areas: harn_candidates
       .map(
-      { p -> {path: path_join(cfg.harn_repo, p), exists: harness.fs.exists(path_join(cfg.harn_repo, p))} },
+      { p -> {path: path_join(cfg.harn_repo, p), exists: readonly_path_exists(path_join(cfg.harn_repo, p))} },
     ),
   }
 }
@@ -783,6 +833,28 @@ fn gather_facts(harness: Harness, cfg, run_id) {
     self_review_runs: self_dirs.map({ dir -> self_review_run_summary(harness, dir) }),
     validation_ladder: validation_ladder_summary(harness),
     source_refs: source_file_refs(harness, cfg),
+  }
+}
+
+fn write_context_eval_artifacts(harness: Harness, paths, facts) {
+  let manifest = self_review_context_eval_manifest(facts)
+  run_artifact_write_json(paths.run, "context-eval-manifest.json", manifest)
+  harness.fs.mkdir(paths.context_eval_dir, true)
+  let report = self_review_context_eval_report(manifest)
+  harness.fs.write_text(paths.context_eval_summary_json, json_stringify(report) + "\n")
+  harness.fs.write_text(paths.context_eval_summary_md, self_review_context_eval_markdown(report))
+  write_jsonl(paths.context_eval_per_run_jsonl, report.runs ?? [])
+  return {
+    status: "ok",
+    manifest_json: paths.context_eval_manifest_json,
+    output_dir: paths.context_eval_dir,
+    summary_json: paths.context_eval_summary_json,
+    summary_md: paths.context_eval_summary_md,
+    per_run_jsonl: paths.context_eval_per_run_jsonl,
+    report_schema: report?._type ?? "",
+    passed_runs: report?.passed_runs ?? nil,
+    total_runs: report?.total_runs ?? nil,
+    projection_policies: (report?.modes ?? []).map({ mode -> mode?.projection_policy ?? "" }),
   }
 }
 
@@ -852,7 +924,8 @@ fn run_review_agent(cfg, facts, paths, run_id) {
         iteration_budget: {mode: "adaptive", initial: 6, max: 12, extend_by: 2},
         require_successful_tools: ["audit_read"],
         turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
-        compaction: {strategy: "hybrid", keep_last_n: 10},
+        compaction: {strategy: "hybrid", keep_last_n: 10, policy: self_review_compaction_policy("tool_loop")},
+        transcript_projection: tool_repair_projection_policy(),
         session_id: "harn-bump-fleet-self-review-" + cfg.tool_format + "-" + run_id,
         llm_transcript_dir: paths.llm_transcript_dir,
       },
@@ -864,6 +937,7 @@ fn synthesis_artifact_paths(paths) {
   return {
     raw_result_json: run_artifact_path(paths.run, "synthesis-result.json"),
     trace_json: run_artifact_path(paths.run, "synthesis-trace.json"),
+    transcript_context_json: run_artifact_path(paths.run, "synthesis-transcript-context.json"),
     llm_transcript_dir: run_artifact_transcript_dir(paths.run, "synthesis-llm"),
     llm_transcript_jsonl: run_artifact_transcript_path(paths.run, "synthesis-llm"),
   }
@@ -900,6 +974,8 @@ fn run_synthesis_agent(harness: Harness, cfg, facts, paths, run_id, tool_attempt
         max_nudges: 0,
         timeout: 900,
         idle_timeout: 240,
+        compaction: {strategy: "hybrid", keep_last_n: 8, policy: self_review_compaction_policy("synthesis")},
+        transcript_projection: summary_projection_policy(4),
         session_id: "harn-bump-fleet-self-review-synthesis-" + run_id,
         llm_transcript_dir: synthesis_paths.llm_transcript_dir,
       },
@@ -907,6 +983,11 @@ fn run_synthesis_agent(harness: Harness, cfg, facts, paths, run_id, tool_attempt
   )
   run_artifact_write_json(paths.run, "synthesis-result.json", result)
   run_artifact_write_json(paths.run, "synthesis-trace.json", result.trace ?? {})
+  run_artifact_write_json(
+    paths.run,
+    "synthesis-transcript-context.json",
+    agent_transcript_context_metadata(result),
+  )
   return result
 }
 
@@ -930,9 +1011,13 @@ pipeline main() {
   harness.stdio.println("   tool format   : ${cfg.tool_format}")
   harness.stdio.println("   ${binder_audit_line(install_binder({tools: []}).audit)}")
   harness.stdio.println("   artifacts     : ${paths.out_dir}")
-  let facts = gather_facts(harness, cfg, run_id)
+  let base_facts = gather_facts(harness, cfg, run_id)
+  let context_eval = write_context_eval_artifacts(harness, paths, base_facts)
+  let facts = {...base_facts, context_eval: context_eval}
   run_artifact_write_json(paths.run, "facts.json", facts)
   harness.stdio.println("   facts         : ${paths.facts_json}")
+  harness.stdio
+    .println("   context eval  : ${context_eval.summary_md ?? paths.context_eval_summary_md}")
   if cfg.facts_only {
     return 0
   }
@@ -960,6 +1045,11 @@ pipeline main() {
     }
     run_artifact_write_json(paths.run, "agent-result.json", tool_result)
     run_artifact_write_json(paths.run, "agent-trace.json", tool_result?.trace ?? {})
+    run_artifact_write_json(
+      paths.run,
+      "agent-transcript-context.json",
+      agent_transcript_context_metadata(tool_result),
+    )
     if tool_result?.status ?? "" == "done" {
       let final_tool_text = agent_result_text(tool_result)
       run_artifact_write_text(paths.run, "review.md", final_tool_text)
