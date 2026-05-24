@@ -147,26 +147,82 @@ jobs:
           echo "Harn pin already matches ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      - name: Commit and push bump branch
+      - name: Commit bump via signed GraphQL mutation
         if: steps.update.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           BRANCH="automation/bump-harn-runtime"
-          git config user.name "harn-release-bot[bot]"
-          git config user.email "harn-release-bot[bot]@users.noreply.github.com"
-          git checkout -B "${BRANCH}"
-          git add .harn-version
-          if [ -f harn.lock ]; then
-            git add harn.lock
+          # Commits created via createCommitOnBranch using the App's installation
+          # token are signed by GitHub, satisfying the org-level required_signatures
+          # ruleset. A local `git commit` + `git push` would land unsigned and block
+          # the PR.
+          BASE_SHA="$(git rev-parse HEAD)"
+
+          # Reset (or create) the remote branch to BASE_SHA so the mutation can
+          # fast-forward from a known parent. Any prior bump branch is discarded —
+          # same blast radius as the previous `--force-with-lease` push.
+          if gh api "repos/${REPO}/git/refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/heads/${BRANCH}" \
+              -f sha="${BASE_SHA}" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" -f sha="${BASE_SHA}" >/dev/null
           fi
-          while IFS= read -r -d '' file; do
-            git add "$file"
-          done < <(git ls-files -z '*.harn')
-          git commit -m "chore: bump Harn runtime to ${VERSION}"
-          git push --force-with-lease origin HEAD:${BRANCH}
+
+          # Collect modified/added files from the working tree vs HEAD.
+          ADDITIONS_JSON='[]'
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            [ -f "${path}" ] || continue
+            CONTENT_B64="$(base64 -w0 < "${path}")"
+            ADDITIONS_JSON="$(jq --arg p "${path}" --arg c "${CONTENT_B64}" \
+              '. + [{path:$p, contents:$c}]' <<<"${ADDITIONS_JSON}")"
+          done < <(git diff --name-only --diff-filter=ACMRTUXB HEAD)
+
+          DELETIONS_JSON='[]'
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            DELETIONS_JSON="$(jq --arg p "${path}" '. + [{path:$p}]' <<<"${DELETIONS_JSON}")"
+          done < <(git diff --name-only --diff-filter=D HEAD)
+
+          if [ "${ADDITIONS_JSON}" = '[]' ] && [ "${DELETIONS_JSON}" = '[]' ]; then
+            echo "No file changes detected for bump commit; aborting." >&2
+            exit 1
+          fi
+
+          REQ_FILE="$(mktemp)"
+          jq -n \
+            --arg repo "${REPO}" \
+            --arg branch "${BRANCH}" \
+            --arg headline "chore: bump Harn runtime to ${VERSION}" \
+            --arg oid "${BASE_SHA}" \
+            --argjson additions "${ADDITIONS_JSON}" \
+            --argjson deletions "${DELETIONS_JSON}" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
+              variables: {
+                input: {
+                  branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                  message: {headline: $headline},
+                  fileChanges: {additions: $additions, deletions: $deletions},
+                  expectedHeadOid: $oid
+                }
+              }
+            }' > "${REQ_FILE}"
+
+          RESPONSE="$(gh api graphql --input "${REQ_FILE}")"
+          COMMIT_OID="$(jq -r '.data.createCommitOnBranch.commit.oid // empty' <<<"${RESPONSE}")"
+          if [ -z "${COMMIT_OID}" ]; then
+            echo "createCommitOnBranch failed:" >&2
+            echo "${RESPONSE}" >&2
+            exit 1
+          fi
+          echo "Created signed commit ${COMMIT_OID} on ${BRANCH}." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or refresh PR
         if: steps.update.outputs.changed == 'true'
