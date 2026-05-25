@@ -10,6 +10,13 @@
 - Harness self-review runs now emit Harn context-eval manifest and report
   artifacts for raw, summary-projected, and clean-tool-repair context variants.
 
+### Fixed
+
+- `bump_fleet.harn` and `release_harn.harn` now detect when they were invoked
+  without `harn run --no-sandbox` and exit with a single actionable line instead
+  of a cryptic `gh: operation not permitted` from the worktree sandbox blocking
+  `~/.config/gh/config.yml`.
+
 ### Changed
 
 - Release and bump harness timings now use Harn `std/timing` spans and write
