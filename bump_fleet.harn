@@ -13,6 +13,8 @@
 //   harn run --no-sandbox bump_fleet.harn -- v0.7.52           // pin to explicit tag
 //   harn run --no-sandbox bump_fleet.harn -- --dry-run         // discover-only, no dispatch
 //   harn run --no-sandbox bump_fleet.harn -- --dry-run v0.7.52
+//   harn run --no-sandbox bump_fleet.harn -- --retry-failed 3  // re-dispatch dispatch_failed/run_failure
+//                                                              // repos up to 3 more times each
 import { agent_host_tools } from "std/agent/host_tools"
 import { summary_agent } from "std/agent/presets"
 import { parse_args } from "std/cli"
@@ -91,7 +93,17 @@ let ARG_SPEC = [
   {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
   {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
   {kind: "option", name: "chat_timeout_s", flags: ["--chat-timeout-s"], default: "60"},
+  {kind: "option", name: "retry_failed", flags: ["--retry-failed"], default: "0"},
 ]
+
+// Outcome statuses that are transient enough to be worth retrying. Codeload
+// flakes, action-download HTTP 5xx, workflow_dispatch HTTP 500 during a
+// GitHub Actions incident, and per-run race conditions all surface as one of
+// these — none reflect a configuration problem the operator has to fix
+// first. `pr_open*`, `already_current`, `dry_run`, and the closed-stale
+// variants are intentionally absent: re-dispatching them either no-ops or
+// creates duplicate work.
+let RETRYABLE_STATUSES = ["dispatch_failed", "run_failure", "preflight_error", "run_in_progress"]
 
 fn parse_fleet_args(args) {
   let parsed = parse_args(args, ARG_SPEC)
@@ -102,6 +114,12 @@ fn parse_fleet_args(args) {
   if len(errors) > 0 {
     throw join(errors, "; ")
   }
+  let retry_raw = to_int(parsed.retry_failed) ?? 0
+  let retry_capped = if retry_raw < 0 {
+    0
+  } else {
+    retry_raw
+  }
   return {
     target: parsed.target,
     dry_run: parsed.dry_run,
@@ -110,6 +128,7 @@ fn parse_fleet_args(args) {
     chat_only: parsed.chat_only,
     chat_run: parsed.chat_run,
     chat_timeout_s: to_int(parsed.chat_timeout_s) ?? 60,
+    retry_failed: retry_capped,
   }
 }
 
@@ -833,6 +852,78 @@ fn wait_for_target_release_readiness(harness: Harness, target) {
   return last ?? harn_release_readiness(target) + {timed_out: true, attempts: attempt}
 }
 
+/**
+ * Re-dispatch every outcome whose status is in `RETRYABLE_STATUSES` up to
+ * `max_retries` more times. Each pass calls `bump_one` only on the
+ * still-failing slugs and stitches the fresh outcome back into the original
+ * list, preserving the original ordering so downstream summary/audit
+ * readers can diff status across passes by index. Returns the final
+ * outcomes list plus a per-slug `passes` map (1 = original try, 2+ =
+ * retry attempts) for the audit trail.
+ */
+fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max_retries) {
+  var current = outcomes
+  var passes_by_slug = {}
+  for o in current {
+    passes_by_slug = passes_by_slug + {[o.slug]: 1}
+  }
+  if max_retries <= 0 || dry_run {
+    return {outcomes: current, passes: passes_by_slug}
+  }
+  let repo_by_slug = {}
+  var idx_map = repo_by_slug
+  for r in repos {
+    idx_map = idx_map + {[r.slug]: r}
+  }
+  var attempt = 1
+  while attempt <= max_retries {
+    let failing = []
+    var pending = failing
+    for o in current {
+      if contains(RETRYABLE_STATUSES, o.status) {
+        pending = pending.push(o.slug)
+      }
+    }
+    if len(pending) == 0 {
+      return {outcomes: current, passes: passes_by_slug}
+    }
+    harness.stdio
+      .println(
+      "\n== retry pass ${attempt}/${max_retries} (re-dispatching ${len(pending)} repo(s) in retryable state) ...",
+    )
+    let retry_repos = pending.map({ slug -> idx_map[slug] })
+    let settled = parallel settle retry_repos with { max_concurrent: PARALLEL_LIMIT } { r ->
+      bump_one(harness, r, target, dry_run)
+    }
+    let retried = map_settled(
+      settled.results,
+      { value, _index -> value },
+      { msg, index -> error_outcome_for_repo(harness, retry_repos[index], msg) },
+    )
+    let by_slug = {}
+    var slug_map = by_slug
+    for o in retried {
+      slug_map = slug_map + {[o.slug]: o}
+      passes_by_slug = passes_by_slug + {[o.slug]: passes_by_slug[o.slug] ?? 1 + 1}
+    }
+    let next = []
+    var merged = next
+    for o in current {
+      if slug_map[o.slug] != nil {
+        merged = merged.push(slug_map[o.slug])
+      } else {
+        merged = merged.push(o)
+      }
+    }
+    current = merged
+    for o in retried {
+      harness.stdio.println("   ${o.slug}: ${o.status}")
+    }
+    attempt = attempt + 1
+  }
+  return {outcomes: current, passes: passes_by_slug}
+}
+
 fn restore_local_checkout_to_main(dry_run) {
   if dry_run {
     return nil
@@ -911,14 +1002,20 @@ pipeline main() {
       bump_one(harness, repo, target, parsed.dry_run)
     } },
   ).result
-  let outcomes = map_settled(
+  let initial_outcomes = map_settled(
     settled.results,
     { value, _index -> value },
     { msg, index -> error_outcome_for_repo(harness, repos[index], msg) },
   )
-  for row in outcomes {
+  for row in initial_outcomes {
     harness.stdio.println("   ${row.slug}: ${row.status}")
   }
+  let retry_result = timed(
+    "bump.retry_failed",
+    {max_retries: parsed.retry_failed, dry_run: parsed.dry_run},
+    { -> return retry_failed_outcomes(harness, repos, initial_outcomes, target, parsed.dry_run, parsed.retry_failed) },
+  ).result
+  let outcomes = retry_result.outcomes
   let core_payload = {
     run_id: run_id,
     started_iso: started_iso,
