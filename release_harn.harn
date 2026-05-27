@@ -14,13 +14,16 @@ import { git_run } from "std/git"
 import { write_jsonl } from "std/jsonl"
 import { end_timing, start_timing, timed } from "std/timing"
 import {
+  assemble_fragments_section,
   changelog_bullet_count,
   changelog_latest_version_section_from_text,
+  changelog_merge_fragments_into_unreleased,
   changelog_named_section_from_text,
   changelog_promote_pin_time_unreleased,
   changelog_release_section_update,
   changelog_repair_post_merge_drift,
   changelog_top_from_text,
+  parse_fragment_filename,
 } from "lib/changelog"
 import {
   chat_cfg_from_run_dir,
@@ -2849,14 +2852,86 @@ fn read_agent_notes(harness: Harness, notes_path) {
   return trim(harness.fs.read_text(notes_path))
 }
 
+/**
+ * Discover towncrier-style fragment files under `changelog.d/` in the
+ * target repo and assemble them into a Keep-a-Changelog section body.
+ * Returns `{section, paths}` where `section` is the rendered markdown
+ * (empty when there are no parseable fragments) and `paths` lists the
+ * absolute fragment paths consumed (so the caller can stage their
+ * deletion alongside the CHANGELOG.md update).
+ *
+ * Mock mode is a no-op so the v0.7.52→v0.7.53 rehearsal stays
+ * fragment-free without needing fixture files.
+ */
+fn assemble_repo_fragments(harness: Harness, cfg) {
+  if cfg.mock {
+    return {section: "", paths: []}
+  }
+  let dir = path_join(cfg.repo, "changelog.d")
+  if !harness.fs.exists(dir) {
+    return {section: "", paths: []}
+  }
+  let listing = shell_at(cfg.repo, "ls changelog.d/ 2>/dev/null")
+  if !listing.success {
+    return {section: "", paths: []}
+  }
+  var fragments = []
+  var paths = []
+  for name in listing.stdout.split("\n") {
+    let trimmed = trim(name)
+    if trimmed == "" {
+      continue
+    }
+    let parsed = parse_fragment_filename(trimmed)
+    if parsed == nil {
+      continue
+    }
+    let full = path_join(dir, trimmed)
+    if !harness.fs.exists(full) {
+      continue
+    }
+    let body = trim(harness.fs.read_text(full))
+    if body == "" {
+      continue
+    }
+    fragments = fragments.push({id: parsed.id, category: parsed.category, body: body})
+    paths = paths.push(full)
+  }
+  return {section: assemble_fragments_section(fragments), paths: paths}
+}
+
+/**
+ * Delete fragment files consumed in this release. `git add -u` (run later
+ * by scripts/release_ship.sh) picks the deletions up so they ride in the
+ * same release commit as the CHANGELOG.md update.
+ */
+fn delete_repo_fragments(cfg, paths) {
+  for p in paths {
+    let arg = safe_shell_arg(p)
+    if arg == nil {
+      continue
+    }
+    shell_at(cfg.repo, "rm -f " + arg)
+  }
+}
+
 fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path) {
   let changelog_path = path_join(cfg.repo, "CHANGELOG.md")
   if !cfg.mock && !harness.fs.exists(changelog_path) {
     return fail(1, "missing CHANGELOG.md")
   }
   let original = read_repo_file(harness, cfg, "CHANGELOG.md")
+  let fragments = assemble_repo_fragments(harness, cfg)
+  let after_fragments_merge = if fragments.section == "" {
+    {success: true, changed: false, text: original, message: "no changelog.d fragments"}
+  } else {
+    changelog_merge_fragments_into_unreleased(original, fragments.section)
+  }
+  if !after_fragments_merge.success {
+    return fail(1, after_fragments_merge.message)
+  }
   let update = changelog_release_section_update(
-    original,
+    after_fragments_merge.text,
     analysis.next_version,
     read_agent_notes(harness, notes_path),
   )
@@ -2866,7 +2941,15 @@ fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path) {
   if update.changed && !cfg.mock {
     harness.fs.write_text(changelog_path, update.text)
   }
-  return ok("ok: " + update.message + "\n")
+  if !cfg.mock && len(fragments.paths) > 0 {
+    delete_repo_fragments(cfg, fragments.paths)
+  }
+  let fragments_note = if len(fragments.paths) == 0 {
+    ""
+  } else {
+    "; folded ${len(fragments.paths)} changelog.d fragment(s)"
+  }
+  return ok("ok: " + update.message + fragments_note + "\n")
 }
 
 /**
