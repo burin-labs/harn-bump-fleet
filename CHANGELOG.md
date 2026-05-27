@@ -4,6 +4,14 @@
 
 ### Added
 
+- `lib/changelog.harn` gained towncrier-style fragment helpers
+  (`parse_fragment_filename`, `assemble_fragments_section`,
+  `changelog_merge_fragments_into_unreleased`) and a major-bump archive helper
+  (`changelog_archive_below_version`). `release_harn.harn::apply_draft_release_notes`
+  now folds any `changelog.d/<id>.<category>.md` fragments from the target repo
+  into `## Unreleased` before promotion, and stages the fragment files for
+  deletion in the same release commit. Falls back cleanly when `changelog.d/`
+  is absent or empty.
 - Release and self-review agent loops now use Harn's transcript projection and
   compaction policy APIs, preserving projection/compaction metadata in run
   artifacts.
