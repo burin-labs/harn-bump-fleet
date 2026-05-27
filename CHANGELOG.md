@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- Fleet dry-runs now apply the same remote-main idempotency pre-check as live
+  runs, so stale local checkouts no longer report redundant dispatches when
+  origin/main is already on the requested Harn version.
 - `bump_fleet.harn` and `release_harn.harn` now detect when they were invoked
   without `harn run --no-sandbox` and exit with a single actionable line instead
   of a cryptic `gh: operation not permitted` from the worktree sandbox blocking
