@@ -155,6 +155,8 @@ Knobs (all `env_str`-style, all optional):
 | `HARN_BINDER_MAX_TOKENS` | `1024` | Per [#1814 finding 3](https://github.com/burin-labs/harn/pull/1814) |
 | `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
 | `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
+| `HARN_RELEASE_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `release_harn` (`0` = uncapped) |
+| `HARN_BUMP_FLEET_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `bump_fleet` (`0` = uncapped) |
 
 `harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
 at the top of every run summarizing the resolved route.

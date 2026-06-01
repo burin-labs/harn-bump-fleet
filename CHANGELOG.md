@@ -4,6 +4,14 @@
 
 ### Added
 
+- Per-run LLM **cost ceiling** ($1.00 default) on `release_harn` and `bump_fleet`,
+  enforced by Harn's native `llm_budget` preflight: any agent call whose
+  projected session cost would cross the ceiling is refused before it reaches
+  the provider (surfaces as `budget_exhausted`). Override with
+  `HARN_RELEASE_COST_LIMIT_USD` / `HARN_BUMP_FLEET_COST_LIMIT_USD`; set to `0`
+  to disable. The resolved ceiling prints in the run header
+  (`cost limit : $1.00 per run`). New `lib/llm_defaults` exports
+  `install_cost_budget` + `cost_budget_audit_line`.
 - `lib/changelog.harn` gained towncrier-style fragment helpers
   (`parse_fragment_filename`, `assemble_fragments_section`,
   `changelog_merge_fragments_into_unreleased`) and a major-bump archive helper
