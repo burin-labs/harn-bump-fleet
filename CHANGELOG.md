@@ -38,6 +38,12 @@
 
 ### Changed
 
+- Release-failure output is now plain-language. Instead of
+  `failure : agent-review-validation (status 2)`, the run summary leads with a
+  jargon-free `✗ failed : <what broke>` headline plus a `next : <what to do>`
+  line, keeping the technical `(step …, status …)` as a secondary detail. New
+  `lib/release_execution::release_failure_explanation` maps the known failure
+  points (agent review, prepare, push, markdown lint, PR/auto-merge, commit).
 - `lib/llm_defaults` now defaults the planner **unconditionally** to the
   OpenRouter `qwen/qwen3.6-35b-a3b` cloud cell for `release_harn` and
   `bump_fleet`. Local Ollama is no longer the auto-fallback (it kept
