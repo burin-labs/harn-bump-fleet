@@ -36,6 +36,18 @@
   of a cryptic `gh: operation not permitted` from the worktree sandbox blocking
   `~/.config/gh/config.yml`.
 
+### Added
+
+- Interactive flag prompts on the release default path. When `--mode` / `--bump`
+  aren't passed **and** stdin is an interactive terminal, `release_harn` now
+  prompts for them (`audit`/`prepare`/`ship-pr`, `patch`/`minor`/`major`) with
+  the current defaults pre-selected. Gated by `chat_enabled`, so CI, piped/
+  redirected stdin, `--no-chat`, and `HARN_CHAT=0` keep today's silent
+  defaults untouched. A non-audit mode chosen interactively reminds the
+  operator that live side effects still require `--yes-live-release`. New pure
+  helpers `release_flag_passed` / `coerce_flag_choice` in
+  `lib/release_commands`.
+
 ### Changed
 
 - Release-failure output is now plain-language. Instead of
