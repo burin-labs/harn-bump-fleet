@@ -30,6 +30,13 @@
 
 ### Changed
 
+- `lib/llm_defaults` now defaults the planner **unconditionally** to the
+  OpenRouter `qwen/qwen3.6-35b-a3b` cloud cell for `release_harn` and
+  `bump_fleet`. Local Ollama is no longer the auto-fallback (it kept
+  returning HTTP 500s and was silently selected whenever
+  `OPENROUTER_API_KEY` was missing from the process env); reach it now only
+  by setting `HARN_PLANNER_PROVIDER=ollama` (or a per-role
+  `HARN_<ROLE>_PROVIDER`). Source provider keys via `scripts/with_env.sh`.
 - Release and bump harness timings now use Harn `std/timing` spans and write
   `trace_spans` plus a compact `timing_summary` into run artifacts.
 - Bumped the pinned Harn runtime to `v0.8.35` for first-class timing spans.

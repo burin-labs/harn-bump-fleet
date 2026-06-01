@@ -126,12 +126,15 @@ GPT-OSS-120B** as a natural-language tool binder middleware (the binder
 is the empirical best cell from
 [burin-labs/harn#1814](https://github.com/burin-labs/harn/pull/1814),
 +18pp lift on the PEAR-style tool-call accuracy harness). The cloud
-planner matches the local Ollama fallback's family
-(`qwen3.6:35b-a3b-coding-nvfp4`) so behavior stays consistent across the
-local/cloud boundary, and costs $0.15/$1.00 per Mtok. When the required
-cloud API keys aren't present in env, the defaults fall back to the
-local Ollama model so the local-only workflow keeps working without any
-setup.
+planner shares the Qwen 3.6 35B A3B family the repo previously ran
+locally (`qwen3.6:35b-a3b-coding-nvfp4`) so behavior stays consistent,
+and costs $0.15/$1.00 per Mtok. This cloud cell is now the
+**unconditional** default — local Ollama is *never* auto-selected
+(it kept returning HTTP 500s and silently became the fallback whenever
+`OPENROUTER_API_KEY` was missing from the process env). Source your keys
+via `scripts/with_env.sh` so the planner can authenticate; to run against
+local Ollama instead, opt in explicitly with `HARN_PLANNER_PROVIDER=ollama`
+(or the per-role `HARN_<ROLE>_PROVIDER`).
 
 The binder runs as a `compose_tool_callers` middleware layer on every
 tool-using agent loop in the repo (release agent, recovery loop, harness
@@ -144,7 +147,7 @@ Knobs (all `env_str`-style, all optional):
 
 | Env var | Default | Effect |
 |---|---|---|
-| `OPENROUTER_API_KEY` | (none) | Enables cloud planner default |
+| `OPENROUTER_API_KEY` | (none) | Authenticates the default OpenRouter cloud planner |
 | `CEREBRAS_API_KEY` | (none) | Auto-enables binder |
 | `HARN_BINDER` | `auto` | `0` to force off, `1` to force on |
 | `HARN_BINDER_PROVIDER` / `_MODEL` | `cerebras` / `gpt-oss-120b` | Override binder route |
@@ -181,21 +184,22 @@ because they don't rebuild `harn` mid-run.
 
 - The Harn version pinned in `.harn-version`.
 - Authenticated `gh` CLI. The script never embeds tokens; it shells out.
-- A local Ollama model for the end-of-run summary and the post-run chat
-  loop when no cloud planner key is configured. The shared default path is
-  OpenRouter `qwen/qwen3.6-35b-a3b` when `OPENROUTER_API_KEY` is set,
-  otherwise local Ollama `qwen3.6:35b-a3b-coding-nvfp4`. Override per
-  harness with `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
+- Cloud planner API keys from `~/projects/burin-code/.env`, sourced via
+  `scripts/with_env.sh`. The default route is OpenRouter
+  `qwen/qwen3.6-35b-a3b` (needs `OPENROUTER_API_KEY`); the Cerebras binder
+  auto-enables when `CEREBRAS_API_KEY` is present. This is the
+  unconditional default for the end-of-run summary, the post-run chat
+  loop, and every agent loop. Override per harness with
+  `HARN_BUMP_FLEET_MODEL` / `HARN_BUMP_FLEET_PROVIDER` or
   `HARN_RELEASE_MODEL` / `HARN_RELEASE_PROVIDER`.
 
-Recommended local Ollama model:
+To run against a local Ollama model instead (opt-in only — it is never
+auto-selected), set `HARN_PLANNER_PROVIDER=ollama` and pull the model:
 
 ```sh
 ollama pull qwen3.6:35b-a3b-coding-nvfp4
+HARN_PLANNER_PROVIDER=ollama harn run --no-sandbox release_harn.harn
 ```
-
-Normal invocations do not need LLM environment variables when Ollama is running
-on its default `http://localhost:11434` endpoint.
 
 ## CI
 
@@ -386,7 +390,7 @@ Options:
   final time immediately before resetting the release branch.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
-  `HARN_RELEASE_*`, then shared planner env, then the cloud/local fallback in
+  `HARN_RELEASE_*`, then shared planner env, then the OpenRouter cloud cell in
   `lib/llm_defaults`. Agent runs persist the raw result, trace, and Harn
   `llm_transcript.jsonl` sidecar under the run directory.
 - `--provider PROVIDER` can pin the LLM provider for `--agent`; otherwise the
