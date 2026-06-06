@@ -35,6 +35,15 @@
 
 ### Fixed
 
+- The **post-run chat agent now sees the failing step's live logs.** Its seed
+  context previously held only the run audit `.md`/`.json`, which record a step
+  as `failed (command_failed)` but never embed its stderr — so the agent could
+  not see *why* a step failed and guessed (e.g. reporting "LLM budget exhausted"
+  when the real cause was an sccache `Operation not permitted` in the prepare
+  warm-prebuild). `lib/chat_loop` now folds the error lines + bounded tail of
+  every `live-logs/*.log` that contains an error signature into the seed
+  context. New pure helpers `failing_step_logs_command` /
+  `format_failing_logs_section`.
 - `release_harn.harn` now runs an **sccache health preflight** before the
   build-heavy `prepare`/`ship-pr` steps. A shared `sccache` daemon that an
   earlier *sandboxed* build spawned inherits the `sandbox-exec` confinement
