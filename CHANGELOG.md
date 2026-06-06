@@ -4,6 +4,13 @@
 
 ### Added
 
+- **sccache keepalive LaunchAgent** (`scripts/sccache_keepalive.sh` +
+  `scripts/install_sccache_keepalive.sh`). Keeps a healthy, *unconfined* sccache
+  server owned by the login context so neither harn's `sandbox-exec` nor a
+  sandboxed agent shell is ever the first to spawn — and thereby permanently
+  confine — the shared daemon. Runs at login and every 2 minutes: restarts a
+  poisoned daemon and keeps one alive with idle-timeout disabled. This is the
+  machine-wide complement to the in-harness sccache preflight below.
 - Per-run LLM **cost ceiling** ($1.00 default) on `release_harn` and `bump_fleet`,
   enforced by Harn's native `llm_budget` preflight: any agent call whose
   projected session cost would cross the ceiling is refused before it reaches
