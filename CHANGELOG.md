@@ -28,6 +28,16 @@
 
 ### Fixed
 
+- `release_harn.harn` now runs an **sccache health preflight** before the
+  build-heavy `prepare`/`ship-pr` steps. A shared `sccache` daemon that an
+  earlier *sandboxed* build spawned inherits the `sandbox-exec` confinement
+  permanently, so it fails every later cargo build machine-wide with
+  `Operation not permitted` — which silently broke the v0.8.82 release's
+  warm-prebuild even though the run used `--no-sandbox`. The preflight detects
+  the poisoned daemon (via `sccache --show-stats` cache-error counters) and
+  restarts it so the prepare build spawns a fresh, unconfined server (on-disk
+  cache persists). New `lib/sccache_preflight` exports `ensure_healthy_sccache`
+  + `sccache_cache_error_count`.
 - Fleet dry-runs now apply the same remote-main idempotency pre-check as live
   runs, so stale local checkouts no longer report redundant dispatches when
   origin/main is already on the requested Harn version.
