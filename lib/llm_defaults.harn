@@ -180,6 +180,265 @@ pub fn planner_defaults(role_env_prefix) {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Planner preflight
+// -------------------------------------------------------------------------------------------------
+
+fn __candidate_key(candidate) {
+  let provider = candidate?.provider ?? ""
+  let model = candidate?.model ?? ""
+  return provider + "/" + model
+}
+
+fn __same_candidate(a, b) {
+  return __candidate_key(a) == __candidate_key(b)
+}
+
+fn __drop_keys(d, keys) {
+  var out = {}
+  for key in (d ?? {}).keys() {
+    if !(keys ?? []).contains(key) {
+      out = out + {[key]: d[key]}
+    }
+  }
+  return out
+}
+
+fn __redact_provider_text(text) {
+  var out = to_string(text ?? "")
+  out = regex_replace_all("sk-[A-Za-z0-9_./+=:-]+", "[redacted]", out)
+  out = regex_replace_all("csk-[A-Za-z0-9_./+=:-]+", "[redacted]", out)
+  out = regex_replace_all("Bearer[ ]+[^ ]+", "Bearer [redacted]", out)
+  return out
+}
+
+fn __append_unique_candidate(candidates, candidate) {
+  if trim(candidate?.provider ?? "") == "" || trim(candidate?.model ?? "") == "" {
+    return candidates
+  }
+  for existing in candidates ?? [] {
+    if __same_candidate(existing, candidate) {
+      return candidates
+    }
+  }
+  return candidates ?? [] + [candidate]
+}
+
+/** Return the ordered release-planner candidates: requested, cloud default, local fallback. */
+pub fn planner_preflight_candidates(requested) {
+  var candidates = []
+  candidates = __append_unique_candidate(
+    candidates,
+    {
+      provider: requested?.provider ?? CLOUD_PLANNER_PROVIDER,
+      model: requested?.model ?? CLOUD_PLANNER_MODEL,
+      source: requested?.source ?? "requested",
+      fallback_tier: "requested",
+    },
+  )
+  candidates = __append_unique_candidate(
+    candidates,
+    {
+      provider: CLOUD_PLANNER_PROVIDER,
+      model: CLOUD_PLANNER_MODEL,
+      source: "cloud_default",
+      fallback_tier: "configured_cloud",
+    },
+  )
+  candidates = __append_unique_candidate(
+    candidates,
+    {provider: "ollama", model: LOCAL_MODEL, source: "local_fallback", fallback_tier: "installed_local"},
+  )
+  return candidates
+}
+
+/**
+ * Strip provider-unsupported option fields from a planner preflight call.
+ *
+ * This keeps known-bad `reasoning_effort` shapes out of providers such as
+ * Cerebras GPT-OSS, while preserving the field for catalog rows that advertise
+ * `reasoning_effort_supported`.
+ */
+pub fn planner_provider_signature_options(provider, model, options = {}) {
+  let caps = try {
+    provider_capabilities(provider, model)
+  } catch (_e) {
+    {}
+  }
+  if provider == "cerebras" && (options ?? {}).keys().contains("reasoning_effort") {
+    return __drop_keys(options ?? {}, ["reasoning_effort"])
+  }
+  if (options ?? {}).keys().contains("reasoning_effort")
+    && !(caps?.reasoning_effort_supported ?? false) {
+    return __drop_keys(options ?? {}, ["reasoning_effort"])
+  }
+  return options ?? {}
+}
+
+/** Build the low-cost healthcheck options for a release planner candidate. */
+pub fn planner_healthcheck_options(provider, model) {
+  return planner_provider_signature_options(
+    provider,
+    model,
+    {model: model, temperature: 0.0, max_tokens: 1, reasoning_effort: "low"},
+  )
+}
+
+/** Classify an unhealthy planner healthcheck into a deterministic failure class. */
+pub fn planner_preflight_failure_class(provider, _model, health) {
+  if health?.valid ?? false {
+    return ""
+  }
+  let status = lowercase(to_string(health?.status ?? ""))
+  let message = lowercase(to_string(health?.message ?? health?.error ?? ""))
+  let combined = status + " " + message
+  if provider == "ollama" {
+    return "local_server_unavailable"
+  }
+  if contains(combined, "reasoning_effort") || contains(combined, "reasoning effort")
+    || contains(combined, "reasoning option") {
+    return "wrong_api_option_shape"
+  }
+  if provider == "together_ai" && (contains(combined, "dedicated") || contains(combined, "endpoint")) {
+    return "dedicated_endpoint_unavailable"
+  }
+  if contains(combined, "quota") || contains(combined, "unauthorized")
+    || contains(combined, "forbidden")
+    || contains(combined, "auth")
+    || contains(combined, "api key") {
+    return "auth_or_quota"
+  }
+  if provider == "minimax" || contains(combined, "unsupported") || contains(combined, "not supported")
+    || contains(combined, "plan does not support")
+    || contains(combined, "model not found") {
+    return "unsupported_model"
+  }
+  if contains(combined, "timeout") || contains(combined, "transport")
+    || contains(combined, "connection")
+    || contains(combined, "temporar")
+    || contains(combined, "rate limit") {
+    return "transient_transport"
+  }
+  return "provider_unhealthy"
+}
+
+fn __planner_preflight_attempt(candidate, health) {
+  let valid = health?.valid ?? false
+  return candidate
+    + {
+    valid: valid,
+    health_status: health?.status ?? "",
+    classification: planner_preflight_failure_class(candidate.provider, candidate.model, health),
+    message: __redact_provider_text(health?.message ?? health?.error ?? ""),
+  }
+}
+
+/** Pure selector used by tests and by the live preflight runner. */
+pub fn planner_preflight_select_from_results(candidates, health_by_key) {
+  var attempts = []
+  for candidate in candidates ?? [] {
+    let health = health_by_key[__candidate_key(candidate)]
+      ?? {valid: false, status: "not_checked", message: "provider was not checked"}
+    let attempt = __planner_preflight_attempt(candidate, health)
+    attempts = attempts + [attempt]
+    if attempt.valid {
+      let primary = if len(candidates ?? []) > 0 {
+        candidates[0]
+      } else {
+        candidate
+      }
+      return {
+        healthy: true,
+        selected: candidate,
+        attempts: attempts,
+        changed: !__same_candidate(primary, candidate),
+        disable_binder: false,
+      }
+    }
+  }
+  return {healthy: false, selected: nil, attempts: attempts, changed: false, disable_binder: false}
+}
+
+/**
+ * Return true when a healthy fallback would otherwise keep a known-bad binder provider in the loop.
+ */
+pub fn planner_preflight_should_disable_binder(decision, binder) {
+  if !(binder?.enabled ?? false) {
+    return false
+  }
+  for attempt in decision?.attempts ?? [] {
+    if attempt.provider == binder.provider && !(attempt.valid ?? false) {
+      return true
+    }
+  }
+  return false
+}
+
+/** Render one concise, redacted planner preflight audit line. */
+pub fn planner_preflight_audit_line(decision) {
+  let attempts = len(decision?.attempts ?? [])
+  if decision?.healthy ?? false {
+    let selected = decision.selected
+    let suffix = if decision.changed ?? false {
+      " after fallback"
+    } else {
+      ""
+    }
+    return "planner check : ${selected.provider}/${selected.model} healthy (${attempts} attempt(s)${suffix})"
+  }
+  return "planner check : no healthy provider (${attempts} attempt(s))"
+}
+
+/** Run the live release planner preflight, stopping at the first healthy candidate. */
+pub fn run_planner_preflight(requested) {
+  let candidates = planner_preflight_candidates(requested)
+  var attempts = []
+  for candidate in candidates {
+    let health = if candidate.provider == "mock" {
+      {valid: true, status: "ok", message: "mock provider"}
+    } else {
+      try {
+        llm_healthcheck(
+          candidate.provider,
+          planner_healthcheck_options(candidate.provider, candidate.model),
+        )
+      } catch (e) {
+        {valid: false, status: "exception", message: to_string(e)}
+      }
+    }
+    let attempt = __planner_preflight_attempt(candidate, health)
+    attempts = attempts + [attempt]
+    if attempt.valid {
+      let base = {
+        healthy: true,
+        selected: candidate,
+        attempts: attempts,
+        changed: !__same_candidate(candidates[0], candidate),
+      }
+      return base + {disable_binder: planner_preflight_should_disable_binder(base, binder_defaults())}
+    }
+  }
+  let failed = {healthy: false, selected: nil, attempts: attempts, changed: false}
+  return failed + {disable_binder: planner_preflight_should_disable_binder(failed, binder_defaults())}
+}
+
+/** install_binder variant that honors a release planner preflight decision. */
+pub fn install_binder_after_preflight(tools, preflight) {
+  if preflight?.disable_binder ?? false {
+    return {
+      tools: tools,
+      tool_caller: default_tool_caller(),
+      audit: {
+        enabled: false,
+        provider: CLOUD_BINDER_PROVIDER,
+        model: CLOUD_BINDER_MODEL,
+        reason: "disabled by release planner preflight after the binder provider failed healthcheck",
+      },
+    }
+  }
+  return install_binder(tools)
+}
+
+// -------------------------------------------------------------------------------------------------
 // Binder resolution
 // -------------------------------------------------------------------------------------------------
 
