@@ -45,11 +45,16 @@ import {
   gh_file_text_at_ref,
   gh_latest_release_tag,
   gh_pr_close,
+  gh_pr_comment,
   gh_workflow_run,
   gh_workflow_runs,
 } from "lib/github_cli"
 import { cost_budget_audit_line, install_cost_budget, planner_defaults } from "lib/llm_defaults"
 import { harn_release_readiness, release_readiness_detail } from "lib/release_readiness"
+import {
+  run_session_view_downstream_markdown,
+  run_session_view_fleet_gate,
+} from "lib/run_session_view_gate"
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { is_v_semver, strip_v } from "lib/semver"
 import { timing_artifacts } from "lib/timing_report"
@@ -57,6 +62,8 @@ import { timing_artifacts } from "lib/timing_report"
 let BUMP_BRANCH = "automation/bump-harn-runtime"
 
 let HARN_REPO = "burin-labs/harn"
+
+let DEFAULT_HARN_REPO_PATH = path_join(env_str("HOME") ?? "", "projects/harn")
 
 let POLL_INTERVAL_MS = 15000
 
@@ -95,6 +102,7 @@ let ARG_SPEC = [
   {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
   {kind: "option", name: "chat_timeout_s", flags: ["--chat-timeout-s"], default: "60"},
   {kind: "option", name: "retry_failed", flags: ["--retry-failed"], default: "0"},
+  {kind: "option", name: "harn_repo", flags: ["--harn-repo"], default: DEFAULT_HARN_REPO_PATH},
 ]
 
 // Outcome statuses that are transient enough to be worth retrying. Codeload
@@ -130,6 +138,7 @@ fn parse_fleet_args(args) {
     chat_run: parsed.chat_run,
     chat_timeout_s: to_int(parsed.chat_timeout_s) ?? 60,
     retry_failed: retry_capped,
+    harn_repo: parsed.harn_repo,
   }
 }
 
@@ -417,6 +426,16 @@ fn ensure_auto_merge(slug, pr_number) {
   }
 }
 
+fn annotate_bump_pr_with_view_metadata(slug, pr_number, target, view_gate) {
+  let body = run_session_view_downstream_markdown(target, view_gate)
+  let r = gh_pr_comment(slug, pr_number, body)
+  return if r.success {
+    {success: true, detail: "run/session view metadata comment posted"}
+  } else {
+    {success: false, detail: "run/session view metadata comment failed: " + trim(r.stderr ?? "")}
+  }
+}
+
 fn close_stale_pr(slug, pr, target, evidence) {
   let msg = "Closing stale Harn runtime bump PR: this fleet run targets ${target}, but ${evidence}."
   let r = gh_pr_close(slug, pr.number, msg)
@@ -453,7 +472,20 @@ fn already_current_outcome(base, remote_pin, existing_pr) {
   )
 }
 
-fn targeted_pr_outcome(base, slug, target, pr) {
+fn targeted_pr_outcome(base, slug, target, pr, view_gate) {
+  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate)
+  if !annotated.success {
+    return finish_outcome(
+      base,
+      {
+        status: "pr_open_for_target_schema_metadata_failed",
+        detail: "PR #${pr.number} already targets ${target}; " + annotated.detail,
+        pr_number: pr.number,
+        pr_url: pr.url,
+        auto_merge: nil,
+      },
+    )
+  }
   let am = if pr.autoMergeRequest ?? nil != nil {
     "already_enabled"
   } else {
@@ -468,7 +500,7 @@ fn targeted_pr_outcome(base, slug, target, pr) {
     base,
     {
       status: final_status,
-      detail: "PR #${pr.number} already targets ${target}; auto-merge: ${am}",
+      detail: "PR #${pr.number} already targets ${target}; " + annotated.detail + "; auto-merge: ${am}",
       pr_number: pr.number,
       pr_url: pr.url,
       auto_merge: am,
@@ -476,7 +508,7 @@ fn targeted_pr_outcome(base, slug, target, pr) {
   )
 }
 
-fn predispatch_resolution(repo, base, target, target_no_v, remote_pin) {
+fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate) {
   let existing_pr = find_existing_pr(repo.slug)
   let existing_probe = if existing_pr == nil {
     nil
@@ -487,7 +519,11 @@ fn predispatch_resolution(repo, base, target, target_no_v, remote_pin) {
     return {done: true, outcome: already_current_outcome(base, remote_pin, existing_pr), stale_note: ""}
   }
   if existing_pr != nil && existing_probe.matches {
-    return {done: true, outcome: targeted_pr_outcome(base, repo.slug, target, existing_pr), stale_note: ""}
+    return {
+      done: true,
+      outcome: targeted_pr_outcome(base, repo.slug, target, existing_pr, view_gate),
+      stale_note: "",
+    }
   }
   if existing_pr != nil {
     let closed = close_stale_pr(repo.slug, existing_pr, target, existing_probe.evidence)
@@ -574,11 +610,20 @@ fn classify_post_dispatch(slug, target, target_no_v, run_outcome, stale_note) {
   return {outcome: outcome, pr: pr}
 }
 
-fn with_auto_merge(slug, classified) {
+fn with_auto_merge(slug, classified, target, view_gate) {
   let with_pr = classified.outcome
   let pr = classified.pr
   if pr == nil || with_pr.status == "stale_pr_after_run" {
     return with_pr
+  }
+  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate)
+  if !annotated.success {
+    return {
+      ...with_pr,
+      status: "pr_open_schema_metadata_failed",
+      detail: "${with_pr.detail}; " + annotated.detail,
+      auto_merge: nil,
+    }
   }
   let am = if pr.autoMergeRequest ?? nil != nil {
     "already_enabled"
@@ -593,7 +638,7 @@ fn with_auto_merge(slug, classified) {
   return {...with_pr, auto_merge: am, detail: detail}
 }
 
-fn bump_one(harness: Harness, repo, target, dry_run) {
+fn bump_one(harness: Harness, repo, target, dry_run, view_gate) {
   return timed_bump_outcome(
     "bump.repo",
     {repo: repo.slug, dry_run: dry_run, target: strip_v(target)},
@@ -619,7 +664,7 @@ fn bump_one(harness: Harness, repo, target, dry_run) {
       let pre = timed(
         "bump.repo.pre_dispatch_resolution",
         {repo: repo.slug},
-        { -> return predispatch_resolution(repo, base, target, target_no_v, remote_pin) },
+        { -> return predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate) },
       ).result
       if pre.done {
         return pre.outcome
@@ -637,7 +682,7 @@ fn bump_one(harness: Harness, repo, target, dry_run) {
       return timed_bump_phase(
         "bump.repo.auto_merge",
         {repo: repo.slug},
-        { -> return with_auto_merge(repo.slug, classified) },
+        { -> return with_auto_merge(repo.slug, classified, target, view_gate) },
       )
     },
   )
@@ -849,7 +894,7 @@ fn wait_for_target_release_readiness(harness: Harness, target) {
  * outcomes list plus a per-slug `passes` map (1 = original try, 2+ =
  * retry attempts) for the audit trail.
  */
-fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max_retries) {
+fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max_retries, view_gate) {
   var current = outcomes
   var passes_by_slug = {}
   for o in current {
@@ -881,7 +926,7 @@ fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max
     )
     let retry_repos = pending.map({ slug -> idx_map[slug] })
     let settled = parallel settle retry_repos with { max_concurrent: PARALLEL_LIMIT } { r ->
-      bump_one(harness, r, target, dry_run)
+      bump_one(harness, r, target, dry_run, view_gate)
     }
     let retried = map_settled(
       settled.results,
@@ -985,12 +1030,51 @@ pipeline main() {
     }
     harness.stdio.println("   ready: ${release_readiness_detail(readiness)}")
   }
+  harness.stdio.println("\n== run/session view compatibility gate ...")
+  let view_gate = timed(
+    "bump.run_session_view_gate",
+    {target: strip_v(target), harn_repo: parsed.harn_repo},
+    { -> return run_session_view_fleet_gate(harness, parsed.harn_repo, target) },
+  ).result
+  harness.stdio.println("   schemas: ${view_gate.summary_line}")
+  harness.stdio.println("   check  : ${view_gate.check.command} -> ${view_gate.check.status}")
+  harness.stdio.println("   change : ${view_gate.target_change.detail}")
+  if !view_gate.ok {
+    harness.stdio
+      .eprintln(
+      "error: run/session view compatibility gate failed: " + trim(view_gate.check.stderr ?? ""),
+    )
+    let failed_report = end_timing(run_timing, {status: "error", outcome: "run_session_view_gate_failed"})
+    let timing = timing_artifacts()
+    let payload = {
+      run_id: run_id,
+      started_iso: started_iso,
+      finished_iso: date_now_iso(),
+      duration_ms: failed_report.duration_ms,
+      operator: username(),
+      host: hostname(),
+      target_version: target,
+      mode: mode_label,
+      repos_total: len(repos),
+      repos_dispatched: 0,
+      summary_model: SUMMARY_MODEL,
+      summary_text: "- run/session view compatibility gate failed before dispatch",
+      summary: {source: "deterministic_gate", text: "- run/session view compatibility gate failed before dispatch"},
+      outcomes: [],
+      run_session_view: view_gate,
+      trace_spans: timing.trace_spans,
+      timing_summary: timing.timing_summary,
+    }
+    let written = write_audit(harness, run_id, payload)
+    harness.stdio.println("   audit : ${written.md_path}")
+    return 1
+  }
   harness.stdio.println("\n== dispatching (max_concurrent=${PARALLEL_LIMIT}) ...")
   let settled = timed(
     "bump.dispatch_settle",
     {repo_count: len(repos), max_concurrent: PARALLEL_LIMIT},
     { -> return parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
-      bump_one(harness, repo, target, parsed.dry_run)
+      bump_one(harness, repo, target, parsed.dry_run, view_gate)
     } },
   ).result
   let initial_outcomes = map_settled(
@@ -1004,7 +1088,15 @@ pipeline main() {
   let retry_result = timed(
     "bump.retry_failed",
     {max_retries: parsed.retry_failed, dry_run: parsed.dry_run},
-    { -> return retry_failed_outcomes(harness, repos, initial_outcomes, target, parsed.dry_run, parsed.retry_failed) },
+    { -> return retry_failed_outcomes(
+      harness,
+      repos,
+      initial_outcomes,
+      target,
+      parsed.dry_run,
+      parsed.retry_failed,
+      view_gate,
+    ) },
   ).result
   let outcomes = retry_result.outcomes
   let core_payload = {
@@ -1020,6 +1112,7 @@ pipeline main() {
     repos_dispatched: len(outcomes.filter({ o -> dispatched_status(o.status) })),
     summary_model: SUMMARY_MODEL,
     summary_text: "",
+    run_session_view: view_gate,
     outcomes: outcomes,
   }
   harness.stdio.println("\n== summarizing with ${SUMMARY_MODEL} ...")
