@@ -75,6 +75,12 @@ import {
 } from "lib/release_execution"
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import { remote_tag_sha_from_ls_remote, repin_tocttou_decision } from "lib/release_repin"
+import {
+  run_session_view_command_env,
+  run_session_view_gate,
+  run_session_view_mock_gate,
+  run_session_view_release_note_status,
+} from "lib/run_session_view_gate"
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { ensure_healthy_sccache } from "lib/sccache_preflight"
 import {
@@ -3709,6 +3715,59 @@ fn live_release_notes_blocker(cfg, analysis) {
   )
 }
 
+fn release_run_session_view_gate(harness: Harness, cfg, analysis) {
+  let gate = if cfg.mock {
+    run_session_view_mock_gate()
+  } else {
+    run_session_view_gate(harness, cfg.repo, nil, run_session_view_command_env(harness, cfg.repo))
+  }
+  let note_status = if cfg.mock {
+    {changed: false, paths: [], required: false, present: false, ok: true}
+  } else {
+    run_session_view_release_note_status(harness, cfg.repo, analysis)
+  }
+  var findings = []
+  if !gate.ok {
+    findings = findings
+      + ["run/session view fixture gate failed: ${trim(gate.check.stderr ?? gate.check.stdout ?? "")}"]
+  }
+  if note_status.required && !note_status.present {
+    findings = findings
+      + [
+      "run/session view contract files changed without a CHANGELOG.md or changelog.d note: "
+        + join(note_status.paths, ", "),
+    ]
+  }
+  return {...gate, release_note: note_status, findings: findings}
+}
+
+fn run_session_view_release_blocker(cfg, view_gate) {
+  if cfg.mode == "audit" {
+    return nil
+  }
+  if view_gate.ok && view_gate.release_note.ok {
+    return nil
+  }
+  let check_msg = if view_gate.ok {
+    ""
+  } else {
+    "fixture check failed (`${view_gate.check.command}` status ${view_gate.check.status}): "
+      + trim(view_gate.check.stderr ?? view_gate.check.stdout ?? "")
+  }
+  let note_msg = if view_gate.release_note.required && !view_gate.release_note.present {
+    "run/session view contract files changed without a human-readable CHANGELOG.md or changelog.d note: "
+      + join(view_gate.release_note.paths, ", ")
+  } else {
+    ""
+  }
+  let message = trim(join([check_msg, note_msg].filter({ line -> trim(line) != "" }), "\n"))
+  return recorded_step(
+    "run-session-view-fixture-gate",
+    "make check-run-view-fixtures and require release notes for run/session view schema changes",
+    fail(2, message),
+  )
+}
+
 fn ensure_release_notes_with_run_id(harness: Harness, cfg, analysis, agent_review_result, run_id) {
   let current_top = changelog_top(harness, cfg)
   if current_top == analysis.next_version {
@@ -3771,6 +3830,7 @@ fn prepared_release_analysis(raw, original) {
     operator_focus: original.operator_focus ?? "",
     pin_sha: original.pin_sha ?? raw.pin_sha ?? "",
     deterministic_findings: prepared_release_findings(raw, original),
+    run_session_view: original.run_session_view ?? raw.run_session_view ?? nil,
     fixup_mode: original.fixup_mode ?? raw.fixup_mode ?? false,
     fixup_tag: original.fixup_tag ?? raw.fixup_tag ?? "",
     fixup_pr_url: original.fixup_pr_url ?? raw.fixup_pr_url ?? "",
@@ -3868,6 +3928,24 @@ fn pr_body_text(analysis, agent_review_result, execution, run_id) {
   } else {
     standard_changelog_block(analysis)
   }
+  let run_session_view = analysis.run_session_view ?? {}
+  let view_check = run_session_view.check ?? {}
+  let view_note = run_session_view.release_note ?? {}
+  let view_summary = run_session_view.summary_line ?? "unknown"
+  let view_fixture_status = if view_check.success ?? false {
+    "passed"
+  } else {
+    "failed"
+  }
+  let view_release_note = if view_note.required ?? false {
+    if view_note.present ?? false {
+      "contract files changed; release note present"
+    } else {
+      "contract files changed; release note missing"
+    }
+  } else {
+    "no contract-file change detected"
+  }
   return render(
     "@prompts/release_pr_body.harn.prompt",
     {
@@ -3882,6 +3960,9 @@ fn pr_body_text(analysis, agent_review_result, execution, run_id) {
       pin_sha_note: pin_sha_note,
       latest_tag: analysis.latest_tag,
       changelog_block: changelog_block,
+      run_session_view_summary: view_summary,
+      run_session_view_fixture_status: view_fixture_status,
+      run_session_view_release_note: view_release_note,
       commits_since_latest_tag: analysis.commits_since_latest_tag,
       execution_summary: execution_summary,
       execution_step_count: execution_step_count(execution),
@@ -5062,7 +5143,17 @@ pipeline main() {
     return drift_exit
   }
   let effective_cfg = with_repin_state(with_fixup_state(derived_cfg, fixup_state), repin_state)
-  let analysis = analysis_with_repin_state(analysis_with_fixup_state(raw_analysis, fixup_state), repin_state)
+  let base_analysis = analysis_with_repin_state(analysis_with_fixup_state(raw_analysis, fixup_state), repin_state)
+  let view_gate = timed(
+    "release.run_session_view_gate",
+    {mode: effective_cfg.mode, mock: effective_cfg.mock},
+    { -> return release_run_session_view_gate(harness, effective_cfg, base_analysis) },
+  ).result
+  let analysis = {
+    ...base_analysis,
+    run_session_view: view_gate,
+    deterministic_findings: base_analysis.deterministic_findings + view_gate.findings,
+  }
   release_log_event(
     harness,
     run_id,
@@ -5081,6 +5172,9 @@ pipeline main() {
     .println("   current -> next : ${analysis.current_version} -> ${analysis.next_version}")
   harness.stdio.println("   changelog top   : v${analysis.changelog_top}")
   harness.stdio.println("   dirty files     : ${analysis.dirty_files}")
+  harness.stdio.println("   view schemas    : ${view_gate.summary_line}")
+  harness.stdio
+    .println("   view fixture    : ${view_gate.check.command} -> ${view_gate.check.status}")
   if effective_cfg.bootstrap_new_crates ?? false && !(cfg.bootstrap_new_crates ?? false) {
     harness.stdio.println("   bootstrap new crates: auto-enabled from release delta")
     release_log_event(harness, run_id, "option_derived", {bootstrap_new_crates: true})
@@ -5267,7 +5361,10 @@ pipeline main() {
     release_log_event(harness, run_id, "pre_release_gate_approved", {reason: gate.reason})
   }
   var execution = nil
-  if cfg.agent && cfg.mode != "audit" && len(agent_review_result.validation_findings) > 0 {
+  let view_blocker = run_session_view_release_blocker(effective_cfg, view_gate)
+  if view_blocker != nil {
+    execution = [view_blocker]
+  } else if cfg.agent && cfg.mode != "audit" && len(agent_review_result.validation_findings) > 0 {
     execution = [
       recorded_step(
         "agent-review-validation",

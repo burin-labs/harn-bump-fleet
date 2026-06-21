@@ -4,6 +4,10 @@
 
 ### Added
 
+- `release_harn` and `bump_fleet` now run Harn's run/session view fixture gate
+  before shipping or adopting a release, record the tested view schemas, require
+  a release note for run/session view contract changes, and annotate downstream
+  bump PRs with compatibility metadata before auto-merge.
 - **sccache keepalive LaunchAgent** (`scripts/sccache_keepalive.sh` +
   `scripts/install_sccache_keepalive.sh`). Keeps a healthy, *unconfined* sccache
   server owned by the login context so neither harn's `sandbox-exec` nor a
