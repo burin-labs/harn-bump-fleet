@@ -489,6 +489,12 @@ deprecated `llm_retries` option. The release audit handoff likewise avoids the
 deprecated `post_turn_callback.llm_options` patch and carries next-turn tool
 changes through `next_options`.
 
+Release commits created by live `ship-pr` use `git commit --no-verify` after
+`release_ship.sh --prepare`, generated-content checks, and markdown lint have
+already passed. This avoids re-running target-repo pre-commit hooks that
+duplicate the just-recorded release evidence, while the pushed branch and tag
+still run the normal GitHub release, CI, and merge-queue gates.
+
 Reports are written to:
 
 ```text
