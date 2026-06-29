@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Pre-tag base-drift guard.** `release_harn` ship-pr now re-probes
+  `origin/<base>` HEAD immediately before the irreversible tag push and refuses
+  to tag a pin that fell behind the base while the run was in flight — the
+  v0.8.153 "started before the PR merged, never advanced the pin" failure mode,
+  where the tag shipped a tree missing commits already on the base. Override
+  with `--repin-latest` (fold the new commits in) or `--allow-base-drift` (ship
+  the frozen pin on purpose); `--at-sha` and mock mode skip the probe. New pure
+  `lib/release_repin::pre_tag_drift_decision`.
+- **Opt-in post-tag publish watch** (`--watch-publish` /
+  `HARN_RELEASE_WATCH_PUBLISH=1`). Because publishing is tag-first, the heavy
+  build/publish workflows only run after the tag exists; this polls those
+  tag-triggered runs and, on a confirmed red conclusion, fails loudly with a
+  yank path (delete the tag, `cargo yank` immutable crates, re-run). Fail-open:
+  a never-confirmed or unobservable publish is an informational note, never a
+  release failure. Default flow is unchanged. New `lib/release_health` exports
+  `publish_watch_decision` + `publish_failure_yank_lines`.
 - `release_harn` and `bump_fleet` now run Harn's run/session view fixture gate
   before shipping or adopting a release, record the tested view schemas, require
   a release note for run/session view contract changes, and annotate downstream

@@ -37,7 +37,7 @@ import {
 } from "lib/chat_loop"
 import { checkout_cleanup, sync_base_branch } from "lib/checkout_cleanup"
 import { release_log_range_arg, release_log_range_args } from "lib/git"
-import { gh_argv } from "lib/github_cli"
+import { gh_argv, gh_workflow_runs } from "lib/github_cli"
 import {
   binder_audit_line,
   cost_budget_audit_line,
@@ -74,8 +74,13 @@ import {
   recovery_step_refs,
   release_failure_explanation,
 } from "lib/release_execution"
+import { publish_failure_yank_lines, publish_watch_decision } from "lib/release_health"
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
-import { remote_tag_sha_from_ls_remote, repin_tocttou_decision } from "lib/release_repin"
+import {
+  pre_tag_drift_decision,
+  remote_tag_sha_from_ls_remote,
+  repin_tocttou_decision,
+} from "lib/release_repin"
 import {
   run_session_view_command_env,
   run_session_view_gate,
@@ -225,6 +230,16 @@ Flags:
                           `--mode ship-pr --yes-live-release`; refuses if the
                           v$next release already shipped (crates.io is immutable).
                           Re-runs audit + dry-run + bump and re-tags at the new pin.
+  --allow-base-drift      Ship the frozen pin even if `origin/<base>` advanced past it
+                          while the run was in flight. By default ship-pr aborts before
+                          the tag push when the pin is behind base HEAD, so a release can
+                          never silently tag a tree that excludes commits already on the
+                          base. Use --repin-latest to fold the new commits in instead.
+  --watch-publish         After pushing the tag, poll the tag-triggered publish/build
+                          workflows and fail loudly with a yank path if they go red.
+                          Opt-in (also HARN_RELEASE_WATCH_PUBLISH=1); the default flow is
+                          unchanged. The publish is tag-first, so this is a post-tag
+                          health watch, not a pre-tag gate.
   --agent                 Ask the configured planner to review release evidence with read/search/run tools.
                           Live prepare/ship-pr requires --agent unless CHANGELOG.md
                           already starts with the target version.
@@ -269,6 +284,8 @@ let RELEASE_ARG_SPEC = [
   {kind: "flag", name: "yes_live_release", flags: ["--yes-live-release"]},
   {kind: "option", name: "pin_sha_input", flags: ["--at-sha"], default: ""},
   {kind: "flag", name: "repin_latest", flags: ["--repin-latest"]},
+  {kind: "flag", name: "allow_base_drift", flags: ["--allow-base-drift"]},
+  {kind: "flag", name: "watch_publish", flags: ["--watch-publish"]},
   {kind: "flag", name: "no_chat", flags: ["--no-chat"]},
   {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
   {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
@@ -318,6 +335,8 @@ fn parse_release_args(harness: Harness, args) {
     fixup_pin_unreleased: "",
     fixup_release_body_source: "",
     repin_latest: parsed.repin_latest,
+    allow_base_drift: parsed.allow_base_drift,
+    watch_publish: parsed.watch_publish || env_bool("HARN_RELEASE_WATCH_PUBLISH", false),
     repin_mode: false,
     repin_tag: "",
     repin_pr_url: "",
@@ -2499,6 +2518,163 @@ fn release_branch_push_argv(cfg, branch, no_verify) {
  * artifact. Short-circuit with an idempotent step so the fixup flow can
  * proceed straight to the PR body refresh.
  */
+fn release_repo_slug(cfg) {
+  let remote = run_git(cfg, ["remote", "get-url", "origin"])
+  if !remote.success {
+    return ""
+  }
+  return github_slug_from_remote_url(remote.stdout)
+}
+
+/**
+ * Refuse to tag a pin that has fallen behind `origin/<base>` while the run was
+ * in flight. The pin was frozen at startup; the only meaningful place to detect
+ * base drift is here, immediately before the irreversible tag push, because
+ * drift accrues during the run, not at startup. Returns `{steps, proceed}`;
+ * `proceed=false` means a step was recorded and the caller must stop before
+ * `ensure_release_tag_pushed`.
+ *
+ * The pure `pre_tag_drift_decision` owns the policy; this only gathers the fresh
+ * probe. Repin mode, explicit `--at-sha`, and `--allow-base-drift` short-circuit
+ * (their drift is intended or already gated); mock skips the live probe.
+ */
+fn pre_tag_drift_gate(harness: Harness, cfg, version, steps, run_id) {
+  let tag = "v${version}"
+  let explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
+  if cfg.mock || (cfg.repin_mode ?? false) || explicit_pin || (cfg.allow_base_drift ?? false) {
+    return {steps: steps, proceed: true}
+  }
+  release_log_event(harness, run_id, "step_started", {step: "pre-tag-drift-check"})
+  let fetch = run_git(cfg, ["fetch", "origin", "--quiet", cfg.base])
+  if !fetch.success {
+    let fetch_stderr = trim(fetch.stderr ?? "")
+    let recorded = recorded_step(
+      "pre-tag-drift-check",
+      "git fetch origin ${cfg.base}",
+      fail(
+        2,
+        "pre-tag drift check could not fetch origin/${cfg.base} before tagging ${tag}: ${fetch_stderr}",
+      ),
+    )
+    release_log_event(harness, run_id, "step_finished", {step: "pre-tag-drift-check", success: false})
+    return {steps: steps + [recorded], proceed: false}
+  }
+  let head = run_git(cfg, ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"])
+  let base_head = if head.success {
+    trim(head.stdout ?? "")
+  } else {
+    ""
+  }
+  let decision = pre_tag_drift_decision(
+    {
+      pin_sha: cfg.pin_sha,
+      base_head_sha: base_head,
+      base: cfg.base,
+      tag: tag,
+      repin_latest: false,
+      explicit_pin: false,
+      allow_drift: false,
+    },
+  )
+  if decision.action == "abort" {
+    let recorded = recorded_step(
+      "pre-tag-drift-check",
+      "compare release pin to origin/${cfg.base} HEAD",
+      fail(2, decision.reason),
+    )
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "pre-tag-drift-check", success: false, reason: decision.reason},
+    )
+    return {steps: steps + [recorded], proceed: false}
+  }
+  let recorded = recorded_step(
+    "pre-tag-drift-check",
+    "compare release pin to origin/${cfg.base} HEAD",
+    ok("pin ${cfg.pin_sha} matches origin/${cfg.base} HEAD; safe to tag ${tag}\n"),
+  )
+  release_log_event(harness, run_id, "step_finished", {step: "pre-tag-drift-check", success: true})
+  return {steps: steps + [recorded], proceed: true}
+}
+
+/**
+ * Opt-in post-tag publish-health watch. The fleet is tag-first, so the
+ * publish/build workflows only run after the tag exists and cannot gate it.
+ * When `--watch-publish` is set, poll those tag-triggered runs and, on a
+ * confirmed red conclusion, record a loud failed step carrying the yank path.
+ * Fail-open: any trouble observing the runs (poll error, never-confirmed) is an
+ * informational note, never a release failure — only a definitively red publish
+ * fails. Returns the (possibly appended) steps unchanged in shape.
+ */
+fn watch_publish_health(harness: Harness, cfg, version, steps, run_id) {
+  if !(cfg.watch_publish ?? false) || cfg.mock {
+    return steps
+  }
+  let tag = "v${version}"
+  let slug = release_repo_slug(cfg)
+  if slug == "" {
+    return steps
+      + [
+      recorded_step(
+        "watch-publish",
+        "resolve repo slug for publish watch",
+        ok("publish watch skipped: could not resolve a github slug for ${cfg.repo}\n"),
+      ),
+    ]
+  }
+  let required = ["publish-release.yml", "build-release-binaries.yml"]
+  let attempts = to_int(env_str("HARN_RELEASE_PUBLISH_WATCH_ATTEMPTS") ?? "") ?? 20
+  let interval_ms = (to_int(env_str("HARN_RELEASE_PUBLISH_WATCH_INTERVAL_S") ?? "") ?? 15) * 1000
+  release_log_event(
+    harness,
+    run_id,
+    "step_started",
+    {step: "watch-publish", tag: tag, attempts: attempts},
+  )
+  var decision = {state: "pending", message: "publish for ${tag} not yet observed"}
+  var attempt = 0
+  while attempt < attempts {
+    var runs = []
+    for workflow in required {
+      for run in gh_workflow_runs(slug, workflow, nil, 10) {
+        runs = runs + [{...run, workflow: workflow}]
+      }
+    }
+    decision = publish_watch_decision({runs: runs, required_workflows: required, tag: tag})
+    if decision.state == "failed" || decision.state == "healthy" {
+      break
+    }
+    attempt = attempt + 1
+    if attempt < attempts {
+      harness.clock.sleep_ms(interval_ms)
+    }
+  }
+  if decision.state == "failed" {
+    let body = ([decision.message] + publish_failure_yank_lines(tag, slug)).join("\n")
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "watch-publish", success: false, state: "failed"},
+    )
+    return steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", fail(2, body))]
+  }
+  let note = if decision.state == "healthy" {
+    "publish for ${tag} confirmed green by tag-triggered workflows\n"
+  } else {
+    "publish watch for ${tag} did not confirm green within ${attempts} polls (state: ${decision.state}); check the workflows manually — this is not treated as a release failure\n"
+  }
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {step: "watch-publish", success: true, state: decision.state},
+  )
+  return steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", ok(note))]
+}
+
 fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
   let tag = "v${version}"
   if cfg.skip_tag ?? false {
@@ -4710,6 +4886,15 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   if !delete_outcome.success {
     return steps
   }
+  // Refuse to publish a pin that fell behind origin/<base> while the run was
+  // in flight: the tag below fires publish-release.yml, and a behind-base pin
+  // would ship a tree missing commits already on the base. --repin-latest,
+  // --at-sha, and --allow-base-drift opt out of this guard.
+  let drift_gate = pre_tag_drift_gate(harness, cfg, version, steps, run_id)
+  steps = drift_gate.steps
+  if !drift_gate.proceed {
+    return steps
+  }
   // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
   // fires on this tag push and ships crates.io + the GitHub release
   // from the pinned commit; the PR that follows is paperwork (lands the
@@ -4778,7 +4963,13 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   let final_body_path = write_pr_body(harness, run_id, post_prepare_analysis, agent_review_result, steps)
   let final_edit_argv = ["gh", "pr", "edit", pr_url, "--title", "Release v${version}", "--body-file", final_body_path]
   let final_edit = logged_github_command_step(harness, cfg, steps, "refresh-pr-body-final", final_edit_argv, run_id)
-  return final_edit.steps
+  steps = final_edit.steps
+  if !final_edit.success {
+    return steps
+  }
+  // Tag + PR handoff is complete. Optionally watch the tag-triggered publish so
+  // a red publish surfaces loudly with a yank path instead of going unnoticed.
+  return watch_publish_health(harness, cfg, version, steps, run_id)
 }
 
 fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
