@@ -40,6 +40,12 @@ harn run --no-sandbox bump_fleet.harn -- --dry-run
 # Run on one repo only.
 harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
+# Inspect unsigned bot dependency PRs that are blocked by required signatures.
+harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
+
+# Rewrite one selected in-repo bot PR head as a signed commit and re-check auto-merge.
+harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --pr 3704 --live
+
 # Use a different local LLM for the summary.
 HARN_BUMP_FLEET_MODEL=gpt-oss:120b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
@@ -48,6 +54,35 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
 
 These operation harnesses inspect sibling checkouts under `~/projects` and
 shell out to `git` / `gh`, so Harn's default run sandbox must be disabled.
+
+### Signed bot PRs
+
+`sign_bot_prs.harn` fixes a narrow merge-queue failure mode: an organization
+ruleset requires signed commits, but a bot-authored dependency branch contains
+unsigned commits. GitHub can show the PR as green while merge-queue admission
+stays blocked by policy.
+
+The helper is dry-run by default. It reads PR commit signatures and the merge
+queue via GraphQL, then prints whether each selected PR can be rewritten. Live
+mode refuses forks, queued PRs, non-bot authors, missing head branches/OIDs, and
+already-signed PRs unless the corresponding override is passed. A live rewrite
+uses a fsmonitor-disabled temp worktree, soft-resets the PR tree to
+`origin/main`, creates one signed commit with the configured trailer, pushes
+with an exact `--force-with-lease=refs/heads/<branch>:<oldHeadOid>`, then
+re-checks auto-merge. It does not bypass CI.
+
+Common flags:
+
+| Flag | Effect |
+|---|---|
+| `--repo owner/name` | Repository to inspect |
+| `--pr N` / `--prs N,N` | Selected PR numbers |
+| `--live` | Perform the rewrite; omitted means dry-run |
+| `--checkout <path>` | Local checkout to use; defaults to `~/projects/<repo>` |
+| `--allow-queued` | Permit rewriting a PR that is already in the merge queue |
+| `--allow-non-bot` | Permit a non-bot author |
+| `--allow-fork` | Permit a cross-repository PR |
+| `--no-auto-merge` | Skip the final auto-merge check |
 
 ### Interactive chat (postmortem + pre-release review)
 

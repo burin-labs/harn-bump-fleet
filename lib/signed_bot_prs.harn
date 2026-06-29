@@ -1,0 +1,340 @@
+import { command_json, command_run } from "std/command"
+import { gh_enable_auto_merge } from "./github_cli"
+
+let DEFAULT_BASE = "main"
+
+let DEFAULT_TRAILER = "Co-Authored-By: Codex <codex@openai.com>"
+
+fn slug_parts(slug) {
+  let parts = split(to_string(slug ?? ""), "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    return nil
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+fn compact_slug(slug) {
+  return replace(replace(to_string(slug), "/", "-"), ".", "-")
+}
+
+fn first_line(text) {
+  return split(trim(to_string(text ?? "")), "\n")[0] ?? ""
+}
+
+fn bool_option(options, name) {
+  return (options ?? {})[name] ?? false
+}
+
+fn text_option(options, name, fallback) {
+  let value = (options ?? {})[name]
+  if value == nil || trim(to_string(value)) == "" {
+    return fallback
+  }
+  return to_string(value)
+}
+
+/** Parse a comma-separated PR list, rejecting empty or non-positive entries. */
+pub fn parse_pr_numbers(raw) {
+  var out = []
+  for part in split(to_string(raw ?? ""), ",") {
+    let trimmed = trim(part)
+    if trimmed == "" {
+      continue
+    }
+    let n = to_int(trimmed)
+    if n == nil || n <= 0 {
+      throw "invalid pull request number: " + trimmed
+    }
+    out = out + [n]
+  }
+  return out
+}
+
+/** Build the GraphQL argv for PR metadata, including per-commit signature state. */
+pub fn pr_signature_query_args(slug, pr_number) {
+  let parts = slug_parts(slug)
+  if parts == nil {
+    throw "repo must be owner/name, got: " + to_string(slug)
+  }
+  let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number title url state isCrossRepository mergeStateStatus baseRefName headRefName headRefOid author{login __typename} headRepositoryOwner{login} headRepository{nameWithOwner} autoMergeRequest{enabledAt} commits(first:100){nodes{commit{oid messageHeadline signature{state signer{login}}}}}}}}"
+  return [
+    "api",
+    "graphql",
+    "-f",
+    "owner=" + parts.owner,
+    "-f",
+    "name=" + parts.repo,
+    "-F",
+    "number=" + to_string(pr_number),
+    "-f",
+    "query=" + query,
+  ]
+}
+
+/** Build the GraphQL argv for reading the merge queue attached to a base branch. */
+pub fn merge_queue_query_args(slug, base = DEFAULT_BASE) {
+  let parts = slug_parts(slug)
+  if parts == nil {
+    throw "repo must be owner/name, got: " + to_string(slug)
+  }
+  let query = "query($owner:String!,$name:String!,$base:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$base){entries(first:100){nodes{state pullRequest{number title headRefName}}}}}}"
+  return [
+    "api",
+    "graphql",
+    "-f",
+    "owner=" + parts.owner,
+    "-f",
+    "name=" + parts.repo,
+    "-f",
+    "base=" + base,
+    "-f",
+    "query=" + query,
+  ]
+}
+
+pub fn load_pr_signature_metadata(slug, pr_number) {
+  return normalize_pr_signature_payload(
+    slug,
+    command_json(["gh", ...pr_signature_query_args(slug, pr_number)]),
+  )
+}
+
+pub fn load_queued_pr_numbers(slug, base = DEFAULT_BASE) {
+  return queued_pr_numbers(command_json(["gh", ...merge_queue_query_args(slug, base)]))
+}
+
+pub fn normalize_pr_signature_payload(slug, payload) {
+  let pr = payload?.data?.repository?.pullRequest
+  if pr == nil {
+    return nil
+  }
+  let commits = (pr?.commits?.nodes ?? [])
+    .map(
+    { node ->
+      let commit = node?.commit ?? {}
+      return {
+        oid: commit?.oid ?? "",
+        message: commit?.messageHeadline ?? "",
+        signature_state: commit?.signature?.state ?? nil,
+        signer_login: commit?.signature?.signer?.login ?? nil,
+      }
+    },
+  )
+  let head_repo = pr?.headRepository?.nameWithOwner ?? ""
+  return {
+    slug: slug,
+    number: pr.number,
+    title: pr.title ?? "",
+    url: pr.url ?? "",
+    state: pr.state ?? "",
+    base_ref_name: pr.baseRefName ?? DEFAULT_BASE,
+    head_ref_name: pr.headRefName ?? "",
+    head_oid: pr.headRefOid ?? "",
+    head_repo: head_repo,
+    head_owner: pr?.headRepositoryOwner?.login ?? "",
+    author_login: pr?.author?.login ?? "",
+    author_type: pr?.author?.__typename ?? "",
+    merge_state_status: pr?.mergeStateStatus ?? "",
+    auto_merge_enabled: pr?.autoMergeRequest != nil,
+    cross_repository: (pr?.isCrossRepository ?? false) || (head_repo != "" && head_repo != slug),
+    commits: commits,
+  }
+}
+
+pub fn queued_pr_numbers(payload) {
+  return (payload?.data?.repository?.mergeQueue?.entries?.nodes ?? [])
+    .map({ node -> node?.pullRequest?.number })
+    .filter({ n -> n != nil })
+}
+
+pub fn is_bot_pr_author(pr) {
+  let login = lowercase(pr?.author_login ?? "")
+  let typ = pr?.author_type ?? ""
+  return typ == "Bot"
+    || contains(login, "[bot]")
+    || login == "dependabot"
+    || login == "github-actions"
+    || login == "renovate"
+}
+
+pub fn unsigned_commits(pr) {
+  return (pr?.commits ?? []).filter({ commit -> commit?.signature_state != "VALID" })
+}
+
+pub fn signed_bot_pr_decision(pr, queued_numbers = [], options = {}) {
+  if pr == nil {
+    return {
+      eligible: false,
+      action: "refuse",
+      errors: ["pull request metadata was not found"],
+      unsigned_count: 0,
+      detail: "pull request metadata was not found",
+    }
+  }
+  var errors = []
+  if trim(pr.head_ref_name ?? "") == "" {
+    errors = errors + ["missing head branch"]
+  }
+  if trim(pr.head_oid ?? "") == "" {
+    errors = errors + ["missing head oid"]
+  }
+  if pr.cross_repository && !bool_option(options, "allow_fork") {
+    errors = errors + ["cross-repository or fork PR"]
+  }
+  if contains(queued_numbers, pr.number) && !bool_option(options, "allow_queued") {
+    errors = errors + ["PR is already in the merge queue"]
+  }
+  if !is_bot_pr_author(pr) && !bool_option(options, "allow_non_bot") {
+    errors = errors + ["author is not recognized as a bot: " + (pr.author_login ?? "")]
+  }
+  let unsigned = unsigned_commits(pr)
+  if len(unsigned) == 0 {
+    return {
+      eligible: false,
+      action: "already_signed",
+      errors: [],
+      unsigned_count: 0,
+      detail: "all commits already have VALID signatures; no rewrite needed",
+    }
+  }
+  if len(errors) > 0 {
+    return {
+      eligible: false,
+      action: "refuse",
+      errors: errors,
+      unsigned_count: len(unsigned),
+      detail: join(errors, "; "),
+    }
+  }
+  return {
+    eligible: true,
+    action: "rewrite",
+    errors: [],
+    unsigned_count: len(unsigned),
+    detail: "rewrite " + to_string(len(unsigned)) + " unsigned commit(s) as one signed commit",
+  }
+}
+
+pub fn default_checkout_path(slug, home) {
+  let parts = slug_parts(slug)
+  if parts == nil {
+    return ""
+  }
+  return path_join(home, "projects/" + parts.repo)
+}
+
+pub fn default_temp_path(slug, pr_number, head_oid, temp_root = "/tmp/harn-signed-bot-prs") {
+  let suffix = if trim(head_oid ?? "") == "" {
+    to_string(pr_number)
+  } else {
+    substring(head_oid, 0, 12)
+  }
+  return path_join(temp_root, compact_slug(slug) + "-pr-" + to_string(pr_number) + "-" + suffix)
+}
+
+pub fn rewrite_command_plan(slug, pr, options = {}) {
+  let base = text_option(options, "base", pr?.base_ref_name ?? DEFAULT_BASE)
+  let home = text_option(options, "home", "")
+  let checkout = text_option(options, "checkout", default_checkout_path(slug, home))
+  let temp_root = text_option(options, "temp_root", "/tmp/harn-signed-bot-prs")
+  let temp_path = text_option(options, "temp_path", default_temp_path(slug, pr.number, pr.head_oid, temp_root))
+  let trailer = text_option(options, "trailer", DEFAULT_TRAILER)
+  let title = first_line(pr.title)
+  let branch = pr.head_ref_name
+  let old_head = pr.head_oid
+  return {
+    checkout: checkout,
+    temp_path: temp_path,
+    branch: branch,
+    old_head: old_head,
+    commands: [
+      {
+        name: "fetch-pr-head",
+        argv: [
+          "git",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "-C",
+          checkout,
+          "fetch",
+          "origin",
+          base,
+          branch,
+          "--prune",
+        ],
+      },
+      {name: "mkdir-temp-root", argv: ["mkdir", "-p", temp_root]},
+      {
+        name: "add-temp-worktree",
+        argv: ["git", "-C", checkout, "worktree", "add", "--detach", temp_path, old_head],
+      },
+      {
+        name: "disable-temp-fsmonitor",
+        argv: ["git", "-C", temp_path, "config", "core.fsmonitor", "false"],
+      },
+      {
+        name: "soft-reset-to-base",
+        argv: [
+          "git",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "-C",
+          temp_path,
+          "reset",
+          "--soft",
+          "origin/" + base,
+        ],
+      },
+      {
+        name: "create-signed-commit",
+        argv: ["git", "-C", temp_path, "commit", "-S", "-m", title, "-m", trailer],
+      },
+      {
+        name: "push-signed-head",
+        argv: [
+          "git",
+          "-C",
+          temp_path,
+          "push",
+          "origin",
+          "HEAD:" + branch,
+          "--force-with-lease=refs/heads/" + branch + ":" + old_head,
+        ],
+      },
+      {
+        name: "remove-temp-worktree",
+        argv: ["git", "-C", checkout, "worktree", "remove", "--force", temp_path],
+      },
+    ],
+  }
+}
+
+fn command_label(argv) {
+  return join(argv.map({ a -> to_string(a) }), " ")
+}
+
+pub fn run_rewrite_commands(plan) {
+  var steps = []
+  for command in plan.commands {
+    let result = command_run(command.argv)
+    steps = steps + [{name: command.name, command: command_label(command.argv), result: result}]
+    if !result.success {
+      if command.name != "remove-temp-worktree" {
+        command_run(["git", "-C", plan.checkout, "worktree", "remove", "--force", plan.temp_path])
+      }
+      return {success: false, failed_step: command.name, steps: steps}
+    }
+  }
+  return {success: true, failed_step: "", steps: steps}
+}
+
+pub fn maybe_enable_auto_merge(slug, pr_number, enabled = true) {
+  if !enabled {
+    return {success: true, status: "skipped", stderr: "", strategy: "disabled"}
+  }
+  return gh_enable_auto_merge(slug, pr_number, "squash")
+}

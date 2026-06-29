@@ -1,0 +1,176 @@
+#!/usr/bin/env harn
+//
+// sign_bot_prs.harn - rewrite selected in-repo bot PR heads as signed commits
+// when required-signatures rulesets block merge-queue admission.
+//
+// Default mode is dry-run. Live mode requires --live and never bypasses CI.
+import { parse_args } from "std/cli"
+import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
+import {
+  load_pr_signature_metadata,
+  load_queued_pr_numbers,
+  maybe_enable_auto_merge,
+  parse_pr_numbers,
+  rewrite_command_plan,
+  run_rewrite_commands,
+  signed_bot_pr_decision,
+  unsigned_commits,
+} from "lib/signed_bot_prs"
+
+let ARG_SPEC = [
+  {kind: "option", name: "repo", flags: ["--repo"]},
+  {kind: "option", name: "prs", flags: ["--prs"]},
+  {kind: "option", name: "pr", flags: ["--pr"]},
+  {kind: "option", name: "checkout", flags: ["--checkout"], default: ""},
+  {kind: "option", name: "base", flags: ["--base"], default: "main"},
+  {kind: "option", name: "temp_root", flags: ["--temp-root"], default: "/tmp/harn-signed-bot-prs"},
+  {
+    kind: "option",
+    name: "trailer",
+    flags: ["--trailer"],
+    default: "Co-Authored-By: Codex <codex@openai.com>",
+  },
+  {kind: "flag", name: "live", flags: ["--live"]},
+  {kind: "flag", name: "allow_non_bot", flags: ["--allow-non-bot"]},
+  {kind: "flag", name: "allow_fork", flags: ["--allow-fork"]},
+  {kind: "flag", name: "allow_queued", flags: ["--allow-queued"]},
+  {kind: "flag", name: "no_auto_merge", flags: ["--no-auto-merge"]},
+]
+
+fn parse_sign_args(args) {
+  let parsed = parse_args(args, ARG_SPEC)
+  let errors = parsed._errors ?? []
+  if len(parsed._extras) > 0 {
+    throw "unknown flag: " + parsed._extras[0]
+  }
+  if len(errors) > 0 {
+    throw join(errors, "; ")
+  }
+  if trim(parsed.repo ?? "") == "" {
+    throw "--repo owner/name is required"
+  }
+  let combined = join([parsed.pr ?? "", parsed.prs ?? ""].filter({ v -> trim(v) != "" }), ",")
+  let prs = parse_pr_numbers(combined)
+  if len(prs) == 0 {
+    throw "--pr N or --prs N,N is required"
+  }
+  return {
+    repo: parsed.repo,
+    prs: prs,
+    checkout: parsed.checkout,
+    base: parsed.base,
+    temp_root: parsed.temp_root,
+    trailer: parsed.trailer,
+    live: parsed.live,
+    allow_non_bot: parsed.allow_non_bot,
+    allow_fork: parsed.allow_fork,
+    allow_queued: parsed.allow_queued,
+    auto_merge: !parsed.no_auto_merge,
+  }
+}
+
+fn options_from_cfg(cfg) {
+  var out = {
+    base: cfg.base,
+    home: harness.env.get_or("HOME", ""),
+    temp_root: cfg.temp_root,
+    trailer: cfg.trailer,
+    allow_non_bot: cfg.allow_non_bot,
+    allow_fork: cfg.allow_fork,
+    allow_queued: cfg.allow_queued,
+  }
+  if trim(cfg.checkout ?? "") != "" {
+    out["checkout"] = cfg.checkout
+  }
+  return out
+}
+
+fn print_plan(pr, decision, plan) {
+  if pr == nil {
+    harness.stdio.println("PR: metadata unavailable")
+    harness.stdio.println("  decision    : ${decision.action} - ${decision.detail}")
+    return
+  }
+  harness.stdio.println("PR #${pr.number}: ${pr.title}")
+  harness.stdio.println("  branch      : ${pr.head_ref_name}")
+  harness.stdio.println("  head        : ${substring(pr.head_oid, 0, 12)}")
+  harness.stdio.println("  author      : ${pr.author_login} (${pr.author_type})")
+  harness.stdio.println("  unsigned    : ${decision.unsigned_count}")
+  harness.stdio.println("  decision    : ${decision.action} - ${decision.detail}")
+  if plan != nil {
+    harness.stdio.println("  checkout    : ${plan.checkout}")
+    harness.stdio.println("  temp        : ${plan.temp_path}")
+    harness.stdio.println("  push guard  : refs/heads/${plan.branch}:${plan.old_head}")
+  }
+}
+
+fn run_one(cfg, queued, pr_number) {
+  let pr = load_pr_signature_metadata(cfg.repo, pr_number)
+  let decision = signed_bot_pr_decision(pr, queued, options_from_cfg(cfg))
+  let plan = if decision.eligible {
+    rewrite_command_plan(cfg.repo, pr, options_from_cfg(cfg))
+  } else {
+    nil
+  }
+  print_plan(pr, decision, plan)
+  if !decision.eligible {
+    return {
+      ok: decision.action == "already_signed",
+      action: decision.action,
+      pr: pr_number,
+      detail: decision.detail,
+    }
+  }
+  if !cfg.live {
+    harness.stdio.println("  dry-run     : no branch rewrite performed")
+    return {ok: true, action: "dry_run", pr: pr_number, detail: decision.detail}
+  }
+  let unsigned_before = unsigned_commits(pr).map({ c -> c.oid })
+  harness.stdio.println("  live        : rewriting ${len(unsigned_before)} commit(s)")
+  let result = run_rewrite_commands(plan)
+  if !result.success {
+    harness.stdio.eprintln("  failed      : " + result.failed_step)
+    return {ok: false, action: "rewrite_failed", pr: pr_number, detail: result.failed_step}
+  }
+  let auto_merge = maybe_enable_auto_merge(cfg.repo, pr_number, cfg.auto_merge)
+  if !auto_merge.success {
+    harness.stdio.eprintln("  auto-merge  : failed: " + trim(auto_merge.stderr ?? ""))
+    return {ok: false, action: "auto_merge_failed", pr: pr_number, detail: trim(auto_merge.stderr ?? "")}
+  }
+  harness.stdio.println("  auto-merge  : " + (auto_merge.status ?? "ok"))
+  return {ok: true, action: "rewritten", pr: pr_number, detail: "rewritten and auto-merge checked"}
+}
+
+pipeline main() {
+  let preflight = ensure_unrestricted_sandbox(harness, "sign_bot_prs.harn")
+  if preflight != nil {
+    return preflight
+  }
+  let cfg = parse_sign_args(argv)
+  let mode = if cfg.live {
+    "live"
+  } else {
+    "dry-run"
+  }
+  harness.stdio.println("== signed bot PR rewrite")
+  harness.stdio.println("   repo : ${cfg.repo}")
+  harness.stdio.println("   base : ${cfg.base}")
+  harness.stdio.println("   mode : ${mode}")
+  let queued = load_queued_pr_numbers(cfg.repo, cfg.base)
+  if len(queued) > 0 {
+    harness.stdio.println("   queued PRs: " + join(queued.map({ n -> "#" + to_string(n) }), ", "))
+  }
+  var results = []
+  for pr_number in cfg.prs {
+    results = results + [run_one(cfg, queued, pr_number)]
+  }
+  let failures = results.filter({ r -> !r.ok })
+  if len(failures) > 0 {
+    harness.stdio
+      .eprintln(
+      "failed: " + join(failures.map({ r -> "#" + to_string(r.pr) + " " + r.action }), ", "),
+    )
+    return 1
+  }
+  return 0
+}
