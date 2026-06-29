@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Release branch push no-verify by default.** `release_harn --mode ship-pr`
+  now bypasses the target repo's pre-push hook for the canonical release-branch
+  push after the full release audit, generated-content checks, and markdown lint
+  have passed. This prevents duplicate local hooks from hanging a live release;
+  GitHub CI, merge queue, and tag-triggered publish/build workflows remain the
+  authoritative gates.
 - **Optional remote audit offload (tornadough), fail-open.** `--offload-audit`
   (or `HARN_RELEASE_OFFLOAD_AUDIT=1`) runs the ~548s `release_gate.sh audit` —
   the long pole that duplicates merge-queue CI — on a remote builder

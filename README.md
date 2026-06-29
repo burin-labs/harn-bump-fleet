@@ -473,13 +473,15 @@ To advance the pin on an open release PR that has NOT yet shipped (so the
 release is not yet immutable on crates.io), use `--repin-latest`
 instead. It is the opt-in inverse of fixup mode that folds post-pin
 commits into the same `v$next` rather than splitting them into a future
-release. See the flag description above. Side-effecting failures are preserved in
-the run report; with `--agent`, the failed command, stdout/stderr,
+release. See the flag description above. Side-effecting failures are preserved
+in the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
-`agent_loop` sidecar with its own JSONL transcript under `recovery/`. The only
-automatic bypass is the documented pre-push case where the hook output reports
-green tests and a wall-clock budget timeout; that retry uses
-`git push --no-verify` and records both attempts.
+`agent_loop` sidecar with its own JSONL transcript under `recovery/`. After the
+full release audit and generated-content checks pass, the canonical release
+branch push uses `git push --no-verify`; GitHub CI, the merge queue, and the
+tag-triggered publish/build workflows remain the authoritative gates. The older
+pre-push timeout classifier is kept for recovery reports and manual push
+failures.
 
 After a successful live `ship-pr`, the harness performs the same conservative
 `std/git` checkout cleanup in the target Harn repo: if the release checkout is
