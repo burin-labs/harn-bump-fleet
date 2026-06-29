@@ -228,7 +228,10 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
    the fleet waits for `harn-cli@X.Y.Z` to be visible on crates.io and for all
    expected macOS, Linux, and Windows release binary assets to exist on the
    GitHub release. Dry runs skip this wait.
-4. **Idempotency pre-check** per repo:
+4. **Run the run/session view compatibility gate** on live runs. Dry runs record
+   this metadata as skipped so discovery stays cheap and cannot start a local
+   Cargo build.
+5. **Idempotency pre-check** per repo:
    - Read origin/main directly from GitHub. Local worktrees are only used for
      discovery and as an audit signal.
    - If origin/main's `.harn-version` (or `harn-vm = "..."` in `Cargo.toml`)
