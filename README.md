@@ -49,6 +49,34 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
 These operation harnesses inspect sibling checkouts under `~/projects` and
 shell out to `git` / `gh`, so Harn's default run sandbox must be disabled.
 
+### Signed bot-PR rewrites
+
+Some repositories require signed commits before a PR can enter the merge
+queue. When Dependabot or another bot opens an in-repository dependency PR with
+an unsigned head commit, GitHub can report the PR as generically `BLOCKED`
+even after checks are green, review is complete, and auto-merge is enabled.
+
+`bot_pr_rewrite.harn` detects those PRs and defaults to a dry-run plan:
+
+```sh
+# Scan recent open PRs in one repository.
+harn run --no-sandbox bot_pr_rewrite.harn -- --repo burin-labs/harn --dry-run
+
+# Inspect selected PRs.
+harn run --no-sandbox bot_pr_rewrite.harn -- --targets burin-labs/harn#3711,burin-labs/harn#3712
+
+# Live rewrite one selected PR. The helper refuses fork PRs, queued PRs, and
+# human-authored PRs by default, then pushes with an exact force-with-lease.
+harn run --no-sandbox bot_pr_rewrite.harn -- --pr burin-labs/harn#3711 --live
+```
+
+Live mode creates a temporary worktree from the local checkout for that repo
+(`~/projects/<repo>` by default, or `--checkout <path>`), disables Git
+fsmonitor inside the temp worktree, reads the PR tree onto current
+`origin/main`, signs one tree-preserving commit, and pushes only if the remote
+branch still matches the observed head SHA. It then re-enables squash
+auto-merge. It never bypasses CI or branch protection.
+
 ### Interactive chat (postmortem + pre-release review)
 
 Both harnesses drop into a TTY-aware chat loop after their pipeline

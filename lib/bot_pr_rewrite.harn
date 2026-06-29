@@ -1,0 +1,281 @@
+import { remote_url_to_slug } from "./git"
+import { gh_enable_auto_merge } from "./github_cli"
+
+let PR_FIELDS = "number title author{login} headRefName headRefOid headRepositoryOwner{login} headRepository{nameWithOwner} baseRefName isInMergeQueue mergeQueueEntry{position state} autoMergeRequest{enabledAt} commits(last:20){ nodes{ commit{ oid signature{ isValid state signer{login} } authors(first:10){nodes{user{login}}} } } }"
+
+let PR_QUERY = "query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ "
+  + PR_FIELDS
+  + " } } }"
+
+let OPEN_PRS_QUERY = "query($owner:String!,$name:String!,$first:Int!){ repository(owner:$owner,name:$name){ pullRequests(states:OPEN, first:$first, orderBy:{field:UPDATED_AT,direction:DESC}){ nodes{ "
+  + PR_FIELDS
+  + " } } } }"
+
+pub fn github_slug_parts(slug) {
+  let parts = split(to_string(slug), "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    return nil
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+pub fn parse_pr_selector(raw, default_repo = nil) {
+  let text = trim(to_string(raw ?? ""))
+  if text == "" {
+    return nil
+  }
+  let direct = regex_captures("^([^#]+)#([0-9]+)$", text)
+  if direct != nil && len(direct) > 0 {
+    return {slug: direct[0].groups[0], number: to_int(direct[0].groups[1]) ?? 0}
+  }
+  if default_repo != nil && regex_match("^[0-9]+$", text) != nil {
+    return {slug: default_repo, number: to_int(text) ?? 0}
+  }
+  return nil
+}
+
+pub fn parse_pr_selector_list(raw, default_repo = nil) {
+  var out = []
+  for item in split(to_string(raw ?? ""), ",") {
+    let selector = parse_pr_selector(item, default_repo)
+    if selector != nil {
+      out = out + [selector]
+    }
+  }
+  return out
+}
+
+pub fn is_bot_login(login) {
+  let l = lowercase(trim(to_string(login ?? "")))
+  return l == "dependabot" || l == "dependabot[bot]" || l == "github-actions[bot]"
+    || l == "renovate[bot]"
+    || l == "snyk-bot"
+    || ends_with(l, "[bot]")
+}
+
+pub fn gh_pr_query_args(slug, number) {
+  let parts = github_slug_parts(slug)
+  if parts == nil {
+    throw "invalid GitHub repo slug: ${slug}"
+  }
+  return [
+    "api",
+    "graphql",
+    "-f",
+    "owner=${parts.owner}",
+    "-f",
+    "name=${parts.repo}",
+    "-F",
+    "number=${number}",
+    "-f",
+    "query=${PR_QUERY}",
+  ]
+}
+
+pub fn gh_open_prs_query_args(slug, limit = 50) {
+  let parts = github_slug_parts(slug)
+  if parts == nil {
+    throw "invalid GitHub repo slug: ${slug}"
+  }
+  return [
+    "api",
+    "graphql",
+    "-f",
+    "owner=${parts.owner}",
+    "-f",
+    "name=${parts.repo}",
+    "-F",
+    "first=${limit}",
+    "-f",
+    "query=${OPEN_PRS_QUERY}",
+  ]
+}
+
+pub fn pr_commits(pr) {
+  return (pr?.commits?.nodes ?? []).map({ node -> node.commit })
+}
+
+pub fn commit_is_signed(commit) {
+  let sig = commit?.signature ?? nil
+  if sig == nil {
+    return false
+  }
+  return (sig.isValid ?? false) && lowercase(sig.state ?? "") == "valid"
+}
+
+pub fn unsigned_commit_oids(pr) {
+  return pr_commits(pr).filter({ commit -> !commit_is_signed(commit) }).map({ commit -> commit.oid })
+}
+
+pub fn commit_author_logins(commit) {
+  var out = []
+  for author in commit?.authors?.nodes ?? [] {
+    let login = trim(to_string(author?.user?.login ?? ""))
+    if login != "" {
+      out = out + [login]
+    }
+  }
+  return out
+}
+
+fn unique_strings(values) {
+  var seen = {}
+  var out = []
+  for value in values ?? [] {
+    let key = to_string(value)
+    if !(seen[key] ?? false) {
+      seen[key] = true
+      out = out + [key]
+    }
+  }
+  return out
+}
+
+pub fn non_bot_commit_author_logins(pr) {
+  var authors = []
+  for commit in pr_commits(pr) {
+    for login in commit_author_logins(commit) {
+      if !is_bot_login(login) {
+        authors = authors + [login]
+      }
+    }
+  }
+  return unique_strings(authors)
+}
+
+pub fn bot_pr_rewrite_plan(slug, pr, opts = nil) {
+  let base = opts?.base ?? "main"
+  let allow_human = opts?.allow_human_authors ?? false
+  let unsigned = unsigned_commit_oids(pr)
+  let signed_count = len(pr_commits(pr)) - len(unsigned)
+  if len(unsigned) == 0 {
+    return {
+      status: "already_signed",
+      eligible: false,
+      needs_rewrite: false,
+      blockers: [],
+      unsigned_commit_oids: unsigned,
+      signed_commit_count: signed_count,
+      detail: "all checked commits already have valid signatures",
+    }
+  }
+  var blockers = []
+  if pr == nil {
+    blockers = blockers + ["PR metadata is missing"]
+  }
+  if (pr?.headRepository?.nameWithOwner ?? "") != slug {
+    blockers = blockers + ["PR head is not an in-repository branch"]
+  }
+  let parts = github_slug_parts(slug)
+  if parts == nil {
+    blockers = blockers + ["invalid GitHub repo slug: ${slug}"]
+  } else if (pr?.headRepositoryOwner?.login ?? "") != parts.owner {
+    blockers = blockers + ["PR head owner does not match repository owner"]
+  }
+  if (pr?.baseRefName ?? "") != base {
+    blockers = blockers + ["PR base is ${pr?.baseRefName ?? "unknown"}, expected ${base}"]
+  }
+  if pr?.isInMergeQueue ?? false {
+    blockers = blockers + ["PR is already in the merge queue"]
+  }
+  let author = pr?.author?.login ?? ""
+  if !allow_human && !is_bot_login(author) {
+    blockers = blockers + ["PR author ${author} is not a recognized bot"]
+  }
+  let human_commit_authors = non_bot_commit_author_logins(pr)
+  if !allow_human && len(human_commit_authors) > 0 {
+    blockers = blockers
+      + ["unsigned PR includes non-bot commit authors: ${join(human_commit_authors, ", ")}"]
+  }
+  let status = if len(blockers) == 0 {
+    "rewrite"
+  } else {
+    "refused"
+  }
+  return {
+    status: status,
+    eligible: len(blockers) == 0,
+    needs_rewrite: true,
+    blockers: blockers,
+    unsigned_commit_oids: unsigned,
+    signed_commit_count: signed_count,
+    detail: if len(blockers) == 0 {
+      "will rewrite ${len(unsigned)} unsigned commit(s) into one signed tree-preserving commit"
+    } else {
+      join(blockers, "; ")
+    },
+  }
+}
+
+pub fn rewrite_commit_body(pr, operator = "harn-bump-fleet") {
+  return "Tree-preserving signed rewrite for required-signatures merge queues.\n\n"
+    + "Original-Head: ${pr.headRefOid}\n"
+    + "Original-Branch: ${pr.headRefName}\n"
+    + "Bot-PR-Rewrite: ${operator}\n"
+}
+
+pub fn bot_pr_rewrite_command_plan(local_repo, scratch, pr, base = "main", remote = "origin") {
+  let branch = pr.headRefName
+  let temp_branch = "bot-pr-rewrite-${pr.number}"
+  return [
+    {
+      name: "fetch-base-and-head",
+      argv: [
+        "git",
+        "-C",
+        local_repo,
+        "fetch",
+        remote,
+        base,
+        "refs/heads/${branch}:refs/remotes/${remote}/${branch}",
+        "--quiet",
+      ],
+    },
+    {
+      name: "add-temp-worktree",
+      argv: ["git", "-C", local_repo, "worktree", "add", "--detach", scratch, "${remote}/${base}"],
+    },
+    {name: "disable-fsmonitor", argv: ["git", "-C", scratch, "config", "core.fsmonitor", "false"]},
+    {
+      name: "checkout-base-parent",
+      argv: ["git", "-C", scratch, "checkout", "-B", temp_branch, "${remote}/${base}"],
+    },
+    {
+      name: "read-pr-tree",
+      argv: ["git", "-C", scratch, "read-tree", "--reset", "-u", "${remote}/${branch}"],
+    },
+    {name: "verify-tree-diff", argv: ["git", "-C", scratch, "diff", "--stat", "--cached", "HEAD"]},
+    {
+      name: "commit-signed-tree",
+      argv: ["git", "-C", scratch, "commit", "-S", "-m", pr.title, "-m", rewrite_commit_body(pr)],
+    },
+    {
+      name: "push-with-lease",
+      argv: [
+        "git",
+        "-C",
+        scratch,
+        "push",
+        remote,
+        "HEAD:refs/heads/${branch}",
+        "--force-with-lease=refs/heads/${branch}:${pr.headRefOid}",
+      ],
+    },
+  ]
+}
+
+pub fn validate_checkout_slug(local_repo, expected_slug, runner) {
+  let r = runner(["git", "-C", local_repo, "remote", "get-url", "origin"])
+  if !(r.success ?? false) {
+    return {ok: false, detail: trim(r.stderr ?? "could not read origin remote")}
+  }
+  let actual = remote_url_to_slug(trim(r.stdout ?? ""))
+  if actual != expected_slug {
+    return {ok: false, detail: "checkout origin is ${actual ?? "unknown"}, expected ${expected_slug}"}
+  }
+  return {ok: true, detail: "checkout origin matches ${expected_slug}"}
+}
+
+pub fn enable_pr_auto_merge(slug, number) {
+  return gh_enable_auto_merge(slug, number, "squash")
+}

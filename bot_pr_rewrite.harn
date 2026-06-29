@@ -1,0 +1,249 @@
+#!/usr/bin/env harn
+//
+// bot_pr_rewrite.harn — dry-run-first helper for required-signatures merge
+// queues that reject unsigned bot-authored dependency PR heads.
+import { parse_args } from "std/cli"
+import { command_json, command_run } from "std/command"
+import {
+  bot_pr_rewrite_command_plan,
+  bot_pr_rewrite_plan,
+  enable_pr_auto_merge,
+  gh_open_prs_query_args,
+  gh_pr_query_args,
+  github_slug_parts,
+  parse_pr_selector,
+  parse_pr_selector_list,
+  validate_checkout_slug,
+} from "lib/bot_pr_rewrite"
+import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
+
+let ARG_SPEC = [
+  {kind: "option", name: "repo", flags: ["--repo"], default: ""},
+  {kind: "option", name: "pr", flags: ["--pr"], default: ""},
+  {kind: "option", name: "targets", flags: ["--targets"], default: ""},
+  {kind: "option", name: "base", flags: ["--base"], default: "main"},
+  {kind: "option", name: "checkout", flags: ["--checkout"], default: ""},
+  {kind: "option", name: "limit", flags: ["--limit"], default: "50"},
+  {kind: "flag", name: "live", flags: ["--live"]},
+  {kind: "flag", name: "dry_run", flags: ["--dry-run"]},
+  {kind: "flag", name: "allow_human_authors", flags: ["--allow-human-authors"]},
+]
+
+fn parse_bot_rewrite_args(args) {
+  let parsed = parse_args(args, ARG_SPEC)
+  if len(parsed._extras ?? []) > 0 {
+    throw "unknown flag: " + parsed._extras[0]
+  }
+  if len(parsed._errors ?? []) > 0 {
+    throw join(parsed._errors, "; ")
+  }
+  if parsed.live && parsed.dry_run {
+    throw "--live and --dry-run cannot both be set"
+  }
+  return parsed + {
+    mode: if parsed.live {
+      "live"
+    } else {
+      "dry-run"
+    },
+  }
+}
+
+fn selector_targets(parsed) {
+  var targets = []
+  if trim(parsed.targets ?? "") != "" {
+    targets = targets + parse_pr_selector_list(parsed.targets, parsed.repo)
+  }
+  if trim(parsed.pr ?? "") != "" {
+    let selector = parse_pr_selector(parsed.pr, parsed.repo)
+    if selector == nil {
+      throw "--pr must be a number with --repo or an owner/repo#number selector"
+    }
+    targets = targets + [selector]
+  }
+  return targets
+}
+
+fn repo_from_selection(parsed, targets) {
+  if trim(parsed.repo ?? "") != "" {
+    return parsed.repo
+  }
+  if len(targets) == 1 {
+    return targets[0].slug
+  }
+  return ""
+}
+
+fn fetch_pr(selector) {
+  let payload = command_json(["gh", ...gh_pr_query_args(selector.slug, selector.number)])
+  return payload?.data?.repository?.pullRequest ?? nil
+}
+
+fn fetch_open_prs(slug, limit) {
+  let payload = command_json(["gh", ...gh_open_prs_query_args(slug, limit)])
+  return payload?.data?.repository?.pullRequests?.nodes ?? []
+}
+
+fn default_checkout_for(slug) {
+  let parts = github_slug_parts(slug)
+  if parts == nil {
+    return ""
+  }
+  let candidate = path_join(harness.env.get_or("HOME", ""), "projects", parts.repo)
+  return if harness.fs.exists(path_join(candidate, ".git")) {
+    candidate
+  } else {
+    ""
+  }
+}
+
+fn command_label(argv) {
+  return join(argv.map({ arg -> to_string(arg) }), " ")
+}
+
+fn run_live_step(step) {
+  harness.stdio.println("   -> ${step.name}: ${command_label(step.argv)}")
+  let r = command_run({argv: step.argv, capture: {max_inline_bytes: 12000}})
+  if !(r.success ?? false) {
+    throw "${step.name} failed: " + trim((r.stdout ?? "") + "\n" + (r.stderr ?? ""))
+  }
+  return r
+}
+
+fn live_rewrite(slug, pr, parsed) {
+  let checkout = if trim(parsed.checkout ?? "") != "" {
+    parsed.checkout
+  } else {
+    default_checkout_for(slug)
+  }
+  if checkout == "" {
+    throw "live mode needs --checkout <local repo path>; could not infer ~/projects/${github_slug_parts(slug).repo}"
+  }
+  let checkout_ok = validate_checkout_slug(
+    checkout,
+    slug,
+    { argv -> command_run({argv: argv, capture: {max_inline_bytes: 12000}}) },
+  )
+  if !checkout_ok.ok {
+    throw checkout_ok.detail
+  }
+  let scratch = path_join(harness.fs.temp_dir(), "bot-pr-rewrite-${pr.number}-${uuid_v7()}")
+  let steps = bot_pr_rewrite_command_plan(checkout, scratch, pr, parsed.base)
+  var created = false
+  try {
+    for step in steps {
+      let r = run_live_step(step)
+      if step.name == "add-temp-worktree" {
+        created = true
+      }
+      if step.name == "verify-tree-diff" {
+        let stat = trim(r.stdout ?? "")
+        harness.stdio
+          .println(
+          "      tree diff: "
+            + if stat == "" {
+            "(empty)"
+          } else {
+            stat
+          },
+        )
+      }
+    }
+  } catch (e) {
+    if created {
+      command_run(
+        {
+          argv: ["git", "-C", checkout, "worktree", "remove", "--force", scratch],
+          capture: {max_inline_bytes: 12000},
+        },
+      )
+    }
+    throw e
+  }
+  command_run(
+    {
+      argv: ["git", "-C", checkout, "worktree", "remove", "--force", scratch],
+      capture: {max_inline_bytes: 12000},
+    },
+  )
+  let auto_merge = enable_pr_auto_merge(slug, pr.number)
+  let after = fetch_pr({slug: slug, number: pr.number})
+  return {auto_merge: auto_merge, after: after}
+}
+
+fn print_plan(slug, pr, plan, parsed) {
+  harness.stdio.println("#${pr.number} ${slug}: ${plan.status}")
+  harness.stdio.println("   title     : ${pr.title}")
+  harness.stdio.println("   author    : ${pr.author?.login ?? "unknown"}")
+  harness.stdio.println("   head      : ${pr.headRefName} @ ${pr.headRefOid}")
+  harness.stdio.println("   unsigned  : ${len(plan.unsigned_commit_oids)}")
+  harness.stdio.println("   detail    : ${plan.detail}")
+  if parsed.mode == "dry-run" && plan.eligible {
+    let checkout = if trim(parsed.checkout ?? "") != "" {
+      parsed.checkout
+    } else {
+      default_checkout_for(slug)
+    }
+    let scratch = "/tmp/bot-pr-rewrite-${pr.number}-<run-id>"
+    for step in bot_pr_rewrite_command_plan(checkout, scratch, pr, parsed.base) {
+      harness.stdio.println("   dry-run ${step.name}: ${command_label(step.argv)}")
+    }
+  }
+}
+
+fn process_pr(slug, pr, parsed) {
+  let plan = bot_pr_rewrite_plan(slug, pr, {base: parsed.base, allow_human_authors: parsed.allow_human_authors})
+  print_plan(slug, pr, plan, parsed)
+  if !plan.eligible || parsed.mode == "dry-run" {
+    return {number: pr.number, status: plan.status, detail: plan.detail}
+  }
+  let live = live_rewrite(slug, pr, parsed)
+  let after = live.after
+  if after == nil {
+    throw "could not read PR metadata after push"
+  }
+  let after_plan = bot_pr_rewrite_plan(slug, after, {base: parsed.base, allow_human_authors: true})
+  harness.stdio.println("   pushed    : ${after.headRefOid}")
+  harness.stdio.println("   signature : ${after_plan.detail}")
+  harness.stdio.println("   autoMerge : ${live.auto_merge.status ?? "unknown"}")
+  return {number: pr.number, status: "rewritten", detail: after.headRefOid}
+}
+
+pipeline main() {
+  let preflight = ensure_unrestricted_sandbox(harness, "bot_pr_rewrite.harn")
+  if preflight != nil {
+    return preflight
+  }
+  let parsed = parse_bot_rewrite_args(argv)
+  let targets = selector_targets(parsed)
+  let repo = repo_from_selection(parsed, targets)
+  if repo == "" {
+    harness.stdio.eprintln("error: pass --repo owner/name to scan open bot PRs, or --pr owner/name#123")
+    return 2
+  }
+  harness.stdio.println("== bot PR signed-rewrite helper")
+  harness.stdio.println("   repo : ${repo}")
+  harness.stdio.println("   mode : ${parsed.mode}")
+  harness.stdio.println("   base : ${parsed.base}")
+  if parsed.mode == "dry-run" {
+    harness.stdio.println("   note : dry-run is default; pass --live to push with force-with-lease")
+  }
+  let prs = if len(targets) > 0 {
+    targets.map({ target -> fetch_pr(target) }).filter({ pr -> pr != nil })
+  } else {
+    fetch_open_prs(repo, to_int(parsed.limit) ?? 50)
+  }
+  if len(prs) == 0 {
+    harness.stdio.println("(no open PRs matched)")
+    return 0
+  }
+  var outcomes = []
+  for pr in prs {
+    outcomes = outcomes + [process_pr(repo, pr, parsed)]
+  }
+  let failures = outcomes.filter({ row -> row.status == "refused" })
+  if parsed.mode == "live" && len(failures) > 0 {
+    return 1
+  }
+  return 0
+}

@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Signed bot-PR rewrite helper.** `bot_pr_rewrite.harn` detects unsigned
+  bot-authored in-repository PR heads that cannot enter required-signatures
+  merge queues, defaults to a dry-run command plan, and only with `--live`
+  rewrites the selected PR tree as one signed commit pushed with an exact
+  `--force-with-lease`. The helper refuses fork PRs, queued PRs, and
+  human-authored PRs by default, disables Git fsmonitor in its temporary
+  worktree, and re-enables squash auto-merge after a successful push.
 - **Release branch push no-verify by default.** `release_harn --mode ship-pr`
   now bypasses the target repo's pre-push hook for the canonical release-branch
   push after the full release audit, generated-content checks, and markdown lint

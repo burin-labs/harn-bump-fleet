@@ -13,6 +13,10 @@ The entry points are:
 - `release_harn.harn`: mirrors the human `/release-harn` flow for
   `~/projects/harn`. Default mode is read-only audit. Live prepare/ship-pr
   requires `--yes-live-release`.
+- `bot_pr_rewrite.harn`: dry-run-first operations helper for GitHub rulesets
+  that require signed commits. It detects unsigned bot-authored in-repo PR
+  heads and, only with `--live`, rewrites the selected PR tree as one signed
+  commit pushed with an exact `--force-with-lease`.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
 
@@ -41,6 +45,8 @@ harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 harn run --no-sandbox release_harn.harn
 harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+harn run --no-sandbox bot_pr_rewrite.harn -- --repo burin-labs/harn --dry-run
+harn run --no-sandbox bot_pr_rewrite.harn -- --pr burin-labs/harn#3711 --live
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
