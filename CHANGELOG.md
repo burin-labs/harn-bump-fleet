@@ -4,6 +4,35 @@
 
 ### Added
 
+- **Optional remote audit offload (tornadough), fail-open.** `--offload-audit`
+  (or `HARN_RELEASE_OFFLOAD_AUDIT=1`) runs the ~548s `release_gate.sh audit` —
+  the long pole that duplicates merge-queue CI — on a remote builder
+  (`--offload-host`, default tornadough) and passes the existing
+  `release_ship.sh --skip-audit` to the local prepare only when the remote run
+  is definitively green. Every other outcome (host unreachable, ssh/transport
+  failure, setup failure, or a red remote audit) falls back to the full local
+  audit, which stays the correctness backstop — so the path is fail-open by
+  construction: a down builder degrades to today's behavior, never an outage.
+  Opt-in; the default release path is unchanged. New `lib/remote_offload` with
+  `audit_offload_decision`, `remote_audit_skip_decision`, and the ssh/probe
+  command builders. Remote scratch dir is `HARN_RELEASE_OFFLOAD_DIR` (default
+  `~/harn-release-audit`).
+- **Pre-tag base-drift guard.** `release_harn` ship-pr now re-probes
+  `origin/<base>` HEAD immediately before the irreversible tag push and refuses
+  to tag a pin that fell behind the base while the run was in flight — the
+  v0.8.153 "started before the PR merged, never advanced the pin" failure mode,
+  where the tag shipped a tree missing commits already on the base. Override
+  with `--repin-latest` (fold the new commits in) or `--allow-base-drift` (ship
+  the frozen pin on purpose); `--at-sha` and mock mode skip the probe. New pure
+  `lib/release_repin::pre_tag_drift_decision`.
+- **Opt-in post-tag publish watch** (`--watch-publish` /
+  `HARN_RELEASE_WATCH_PUBLISH=1`). Because publishing is tag-first, the heavy
+  build/publish workflows only run after the tag exists; this polls those
+  tag-triggered runs and, on a confirmed red conclusion, fails loudly with a
+  yank path (delete the tag, `cargo yank` immutable crates, re-run). Fail-open:
+  a never-confirmed or unobservable publish is an informational note, never a
+  release failure. Default flow is unchanged. New `lib/release_health` exports
+  `publish_watch_decision` + `publish_failure_yank_lines`.
 - `release_harn` and `bump_fleet` now run Harn's run/session view fixture gate
   before shipping or adopting a release, record the tested view schemas, require
   a release note for run/session view contract changes, and annotate downstream
