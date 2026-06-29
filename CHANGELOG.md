@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Optional remote audit offload (tornadough), fail-open.** `--offload-audit`
+  (or `HARN_RELEASE_OFFLOAD_AUDIT=1`) runs the ~548s `release_gate.sh audit` —
+  the long pole that duplicates merge-queue CI — on a remote builder
+  (`--offload-host`, default tornadough) and passes the existing
+  `release_ship.sh --skip-audit` to the local prepare only when the remote run
+  is definitively green. Every other outcome (host unreachable, ssh/transport
+  failure, setup failure, or a red remote audit) falls back to the full local
+  audit, which stays the correctness backstop — so the path is fail-open by
+  construction: a down builder degrades to today's behavior, never an outage.
+  Opt-in; the default release path is unchanged. New `lib/remote_offload` with
+  `audit_offload_decision`, `remote_audit_skip_decision`, and the ssh/probe
+  command builders. Remote scratch dir is `HARN_RELEASE_OFFLOAD_DIR` (default
+  `~/harn-release-audit`).
 - **Pre-tag base-drift guard.** `release_harn` ship-pr now re-probes
   `origin/<base>` HEAD immediately before the irreversible tag push and refuses
   to tag a pin that fell behind the base while the run was in flight — the

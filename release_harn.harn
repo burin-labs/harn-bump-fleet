@@ -82,6 +82,14 @@ import {
   repin_tocttou_decision,
 } from "lib/release_repin"
 import {
+  audit_offload_decision,
+  offload_probe_command,
+  remote_audit_run_command,
+  remote_audit_setup_command,
+  remote_audit_skip_decision,
+  resolve_offload_host,
+} from "lib/remote_offload"
+import {
   run_session_view_command_env,
   run_session_view_gate,
   run_session_view_mock_gate,
@@ -240,6 +248,15 @@ Flags:
                           Opt-in (also HARN_RELEASE_WATCH_PUBLISH=1); the default flow is
                           unchanged. The publish is tag-first, so this is a post-tag
                           health watch, not a pre-tag gate.
+  --offload-audit         Run the ~548s release_gate.sh audit on a remote builder
+                          (default host tornadough) and skip the duplicate local audit
+                          only when the remote run is definitively green. Opt-in (also
+                          HARN_RELEASE_OFFLOAD_AUDIT=1). Fail-open: if the host is
+                          unreachable or the remote step fails for any reason, the full
+                          local audit runs unchanged. The remote scratch dir is
+                          HARN_RELEASE_OFFLOAD_DIR (default ~/harn-release-audit).
+  --offload-host HOST     SSH host for --offload-audit. Also HARN_RELEASE_OFFLOAD_HOST;
+                          defaults to tornadough.
   --agent                 Ask the configured planner to review release evidence with read/search/run tools.
                           Live prepare/ship-pr requires --agent unless CHANGELOG.md
                           already starts with the target version.
@@ -286,6 +303,8 @@ let RELEASE_ARG_SPEC = [
   {kind: "flag", name: "repin_latest", flags: ["--repin-latest"]},
   {kind: "flag", name: "allow_base_drift", flags: ["--allow-base-drift"]},
   {kind: "flag", name: "watch_publish", flags: ["--watch-publish"]},
+  {kind: "flag", name: "offload_audit", flags: ["--offload-audit"]},
+  {kind: "option", name: "offload_host", flags: ["--offload-host"], default: ""},
   {kind: "flag", name: "no_chat", flags: ["--no-chat"]},
   {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
   {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
@@ -337,6 +356,12 @@ fn parse_release_args(harness: Harness, args) {
     repin_latest: parsed.repin_latest,
     allow_base_drift: parsed.allow_base_drift,
     watch_publish: parsed.watch_publish || env_bool("HARN_RELEASE_WATCH_PUBLISH", false),
+    offload_audit: parsed.offload_audit || env_bool("HARN_RELEASE_OFFLOAD_AUDIT", false),
+    offload_host: if trim(parsed.offload_host) != "" {
+      parsed.offload_host
+    } else {
+      env_str("HARN_RELEASE_OFFLOAD_HOST") ?? ""
+    },
     repin_mode: false,
     repin_tag: "",
     repin_pr_url: "",
@@ -2243,7 +2268,7 @@ fn agent_attempt_record(name, text, validation_findings, result) {
   }
 }
 
-fn prepare_command(cfg) {
+fn prepare_command(cfg, skip_local_audit = false) {
   // Keep the bootstrap Harn used to run this harness out of the target repo's
   // release gate. release_gate.sh intentionally exports HARN_BIN to its Harn
   // audit lanes, but it must resolve that binary from the release worktree.
@@ -2251,8 +2276,73 @@ fn prepare_command(cfg) {
   // Also override any inherited CARGO_TARGET_DIR. Release sessions are often
   // launched from agent shells that carry repo-specific Cargo target dirs; using
   // one of those here can block Harn package/audit steps behind unrelated builds.
+  //
+  // When a remote offload already proved the audit green, pass the existing
+  // release_ship.sh `--skip-audit` flag so the heavy gate is not re-run locally.
+  let skip = if skip_local_audit {
+    " --skip-audit"
+  } else {
+    ""
+  }
   return release_prepare_env(cfg.repo, cfg.bootstrap_new_crates)
-    + " ./scripts/release_ship.sh --prepare --bump ${cfg.bump}"
+    + " ./scripts/release_ship.sh --prepare --bump ${cfg.bump}${skip}"
+}
+
+/**
+ * Optionally offload the heavy `release_gate.sh audit` to a remote builder.
+ * Returns `{steps, skip_local_audit}`. `skip_local_audit` is true ONLY when a
+ * remote run was definitively green; every other path (disabled, unreachable,
+ * transport failure, red remote audit) leaves it false so the full local audit
+ * still runs as the correctness backstop. Fail-open by construction: a down
+ * builder degrades to today's local behavior, never an outage.
+ */
+fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
+  if !(cfg.offload_audit ?? false) || cfg.mock {
+    return {steps: steps, skip_local_audit: false}
+  }
+  let host = resolve_offload_host(cfg.offload_host)
+  release_log_event(harness, run_id, "step_started", {step: "remote-audit-offload", host: host})
+  let probe = run_cmd(cfg, offload_probe_command(host))
+  let plan = audit_offload_decision({enabled: true, host: host, probe_ok: probe.success})
+  if plan.target == "local" {
+    let recorded = recorded_step("remote-audit-offload", offload_probe_command(host), ok("${plan.reason}\n"))
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "remote-audit-offload", success: true, target: "local", reason: plan.reason},
+    )
+    return {steps: steps + [recorded], skip_local_audit: false}
+  }
+  let remote_dir = env_str("HARN_RELEASE_OFFLOAD_DIR") ?? ""
+  let repo_url = trim(run_git(cfg, ["remote", "get-url", "origin"]).stdout ?? "")
+  let setup_cmd = remote_audit_setup_command(
+    {host: host, remote_dir: remote_dir, repo_url: repo_url, pin_sha: cfg.pin_sha},
+  )
+  harness.stdio.println("   → offloading release audit to ${host} (${cfg.pin_sha[0:12]})")
+  let setup = run_cmd(cfg, setup_cmd)
+  var audit_status = -1
+  if setup.success {
+    let audit = run_cmd(cfg, remote_audit_run_command({host: host, remote_dir: remote_dir}))
+    audit_status = audit.status ?? -1
+  }
+  let skip = remote_audit_skip_decision({setup_ok: setup.success, audit_status: audit_status, host: host})
+  // Always recorded as ok: a non-green remote audit is not a release failure —
+  // the local audit runs next and is authoritative.
+  let recorded = recorded_step("remote-audit-offload", setup_cmd, ok("${skip.reason}\n"))
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {
+      step: "remote-audit-offload",
+      success: true,
+      target: "remote",
+      skip_local_audit: skip.skip_local_audit,
+      reason: skip.reason,
+    },
+  )
+  return {steps: steps + [recorded], skip_local_audit: skip.skip_local_audit}
 }
 
 /**
@@ -4692,7 +4782,9 @@ fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run_id)
     )
     return steps
   }
-  let cmd = prepare_command(cfg)
+  let offload = resolve_audit_offload(harness, cfg, steps, run_id)
+  steps = offload.steps
+  let cmd = prepare_command(cfg, offload.skip_local_audit)
   let prepare = logged_live_shell_command_step(harness, cfg, steps, "prepare", cmd, run_id)
   steps = prepare.steps
   if execution_failed(steps) {
