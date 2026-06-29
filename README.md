@@ -64,12 +64,14 @@ stays blocked by policy.
 
 The helper is dry-run by default. It reads PR commit signatures and the merge
 queue via GraphQL, then prints whether each selected PR can be rewritten. Live
-mode refuses forks, queued PRs, non-bot authors, missing head branches/OIDs, and
-already-signed PRs unless the corresponding override is passed. A live rewrite
+mode refuses queued PRs, missing head branches/OIDs, and already-signed PRs.
+It also refuses forks and non-bot authors unless the corresponding override is
+passed. A live rewrite verifies the local checkout's origin matches `--repo`,
 uses a fsmonitor-disabled temp worktree, soft-resets the PR tree to
 `origin/main`, creates one signed commit with the configured trailer, pushes
-with an exact `--force-with-lease=refs/heads/<branch>:<oldHeadOid>`, then
-re-checks auto-merge. It does not bypass CI.
+with an exact `--force-with-lease=refs/heads/<branch>:<oldHeadOid>`, verifies
+the pushed head no longer has unsigned commits, then re-checks auto-merge. It
+does not bypass CI.
 
 Common flags:
 
@@ -79,7 +81,6 @@ Common flags:
 | `--pr N` / `--prs N,N` | Selected PR numbers |
 | `--live` | Perform the rewrite; omitted means dry-run |
 | `--checkout <path>` | Local checkout to use; defaults to `~/projects/<repo>` |
-| `--allow-queued` | Permit rewriting a PR that is already in the merge queue |
 | `--allow-non-bot` | Permit a non-bot author |
 | `--allow-fork` | Permit a cross-repository PR |
 | `--no-auto-merge` | Skip the final auto-merge check |

@@ -79,6 +79,10 @@
 
 ### Fixed
 
+- **Signed bot-PR rewrite guardrails.** Live rewrites now verify the selected
+  local checkout's `origin` matches `--repo`, keep queued PRs as a hard refusal,
+  and re-read the pushed PR head to confirm no unsigned commits remain before
+  re-checking auto-merge.
 - The **post-run chat agent now sees the failing step's live logs.** Its seed
   context previously held only the run audit `.md`/`.json`, which record a step
   as `failed (command_failed)` but never embed its stderr — so the agent could
