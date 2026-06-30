@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- `release_harn --watch-publish` now scopes publish/build workflow health to
+  the pushed release tag, so older cancelled or failed workflow runs cannot
+  falsely mark a fresh tag red.
+- Live `release_harn` prepare can reuse an explicit
+  `HARN_RELEASE_CARGO_TARGET_DIR` cache while still defaulting to an isolated
+  `<repo>/target/release-harn` target.
+
 ### Added
 
 - **Live release audit offload by default.** `release_harn --mode prepare` and
