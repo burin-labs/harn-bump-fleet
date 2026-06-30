@@ -84,6 +84,9 @@
 
 ### Fixed
 
+- **Changelog fragment assembly.** Plain prose fragments are now normalized into
+  top-level bullets before release assembly, preventing generated Harn release
+  notes from gluing unbulleted fragment text onto the previous entry.
 - **Signed bot-PR rewrite guardrails.** Live rewrites now verify the selected
   local checkout's `origin` matches `--repo`, keep queued PRs as a hard refusal,
   and re-read the pushed PR head to confirm no unsigned commits remain before
