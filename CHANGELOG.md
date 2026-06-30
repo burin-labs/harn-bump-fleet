@@ -84,6 +84,9 @@
 
 ### Fixed
 
+- **Remote release audit hygiene.** The offload path now checks release-gate
+  tool prerequisites before running the remote audit and cleans stale untracked
+  remote checkout state while preserving Cargo build cache.
 - **Changelog fragment assembly.** Plain prose fragments are now normalized into
   top-level bullets before release assembly, preventing generated Harn release
   notes from gluing unbulleted fragment text onto the previous entry.
