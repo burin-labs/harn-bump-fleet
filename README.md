@@ -408,6 +408,12 @@ harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 ```
 
+Live `prepare` and `ship-pr` runs auto-attempt the fail-open remote audit
+offload before the local prepare step. A green remote audit passes
+`--skip-audit` to `scripts/release_ship.sh`; every other outcome runs the full
+local audit as the correctness backstop. Use `--local-audit` or
+`HARN_RELEASE_OFFLOAD_AUDIT=0` when the remote probe should be skipped.
+
 Options:
 
 - `--repo PATH` points at a different Harn checkout; default is

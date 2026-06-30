@@ -4,6 +4,11 @@
 
 ### Added
 
+- **Live release audit offload by default.** `release_harn --mode prepare` and
+  `--mode ship-pr` now auto-attempt the fail-open remote audit offload for live
+  releases, using the existing local-audit fallback for every remote failure.
+  `--local-audit`, `HARN_RELEASE_LOCAL_AUDIT=1`, or
+  `HARN_RELEASE_OFFLOAD_AUDIT=0` keep the entire audit local.
 - **Signed bot-PR rewrite helper.** `sign_bot_prs.harn` inspects selected
   in-repo bot PRs for unsigned commits, refuses risky cases by default
   (forks, queued PRs, non-bot authors, missing heads), and can rewrite the PR
