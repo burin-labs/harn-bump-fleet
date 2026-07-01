@@ -13,6 +13,12 @@
 
 ### Added
 
+- `release_harn` remote audit offload now preflights remote scratch-disk free
+  space before starting the heavy audit and supports `--require-remote-audit`
+  / `HARN_RELEASE_REQUIRE_REMOTE_AUDIT=1` for fail-closed release lanes that
+  must abort instead of falling back to a local Mac audit. The free-space floor
+  defaults to 120 GiB and can be changed with `--offload-min-free-gb` or
+  `HARN_RELEASE_OFFLOAD_MIN_FREE_GB`.
 - **Live release audit offload by default.** `release_harn --mode prepare` and
   `--mode ship-pr` now auto-attempt the fail-open remote audit offload for live
   releases, using the existing local-audit fallback for every remote failure.
