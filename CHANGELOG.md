@@ -41,7 +41,7 @@
   Opt-in; the default release path is unchanged. New `lib/remote_offload` with
   `audit_offload_decision`, `remote_audit_skip_decision`, and the ssh/probe
   command builders. Remote scratch dir is `HARN_RELEASE_OFFLOAD_DIR` (default
-  `~/harn-release-audit`).
+  `harn-release-audit` under the SSH user's home).
 - **Pre-tag base-drift guard.** `release_harn` ship-pr now re-probes
   `origin/<base>` HEAD immediately before the irreversible tag push and refuses
   to tag a pin that fell behind the base while the run was in flight — the
