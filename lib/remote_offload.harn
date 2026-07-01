@@ -4,12 +4,13 @@
  * what merge-queue CI already proved; `release_ship.sh --prepare` exposes
  * `--skip-audit` precisely so a caller that has independent proof can skip it.
  *
- * The offload runs that audit on the remote box. It is purely an optimization:
- * the ONLY outcome that skips the local audit is a definitively green remote
- * run. Every other outcome — host unreachable, ssh/rsync transport failure,
- * setup failure, or a red remote audit — falls back to the full local audit,
- * which is the correctness backstop. That makes the path fail-open by
- * construction: a down builder degrades to today's behavior, never an outage.
+ * The offload runs that audit on the remote box. By default, it is an
+ * optimization: the ONLY outcome that skips the local audit is a definitively
+ * green remote run. Every other outcome — host unreachable, ssh/rsync transport
+ * failure, setup failure, or a red remote audit — falls back to the full local
+ * audit, which is the correctness backstop. Operators can opt into fail-closed
+ * behavior for dedicated release lanes where preserving the local machine is
+ * more important than automatic fallback.
  *
  * The decisions and command builders are pure so the fallback can be exercised
  * without a reachable host.
@@ -19,6 +20,17 @@ import { shell_heredoc_command, shell_join } from "./shell_util"
 let DEFAULT_OFFLOAD_HOST = "tornadough"
 
 let DEFAULT_REMOTE_DIR = "harn-release-audit"
+
+let DEFAULT_MIN_FREE_GB = 120
+
+/** Resolve the remote audit free-space floor. Invalid input keeps the default. */
+pub fn resolve_remote_audit_min_free_gb(configured) {
+  let parsed = to_int(trim(configured ?? ""))
+  if parsed == nil || parsed <= 0 {
+    return DEFAULT_MIN_FREE_GB
+  }
+  return parsed
+}
 
 /** ssh reachability probe: short connect timeout, no prompts, no-op remote. */
 pub fn offload_probe_command(host) {
@@ -48,6 +60,56 @@ pub fn remote_audit_prereq_command(host) {
     "\n",
   )
   return ssh_bash_stdin_command(h, [], script)
+}
+
+/**
+ * Remote disk preflight. The release audit can materialize a large Cargo target
+ * tree, so check the filesystem that backs the scratch dir before spending
+ * minutes in Rust builds that are doomed to ENOSPC.
+ */
+pub fn remote_audit_disk_command(inputs) {
+  let host = trim(inputs.host ?? "")
+  let remote_dir = trim(inputs.remote_dir ?? "")
+  let min_free_gb = inputs.min_free_gb ?? DEFAULT_MIN_FREE_GB
+  let dir = if remote_dir == "" {
+    DEFAULT_REMOTE_DIR
+  } else {
+    remote_dir
+  }
+  let script = join(
+    [
+      "set -e",
+      "dir=$1",
+      "min_gib=$2",
+      "if [ \"$dir\" = \"~\" ]; then",
+      "  dir=\"$HOME\"",
+      "fi",
+      "case \"$dir\" in",
+      "  \"~/\"*) dir=\"$HOME/$(printf '%s' \"$dir\" | sed 's#^~/##')\" ;;",
+      "esac",
+      "case \"$min_gib\" in ''|*[!0-9]*) min_gib=" + to_string(DEFAULT_MIN_FREE_GB) + " ;; esac",
+      "mkdir -p \"$dir\"",
+      "avail_kib=$(df -Pk \"$dir\" | awk 'NR==2 {print $4}')",
+      "if [ -z \"$avail_kib\" ]; then",
+      "  echo \"remote audit disk preflight could not read df output for $dir\"",
+      "  exit 3",
+      "fi",
+      "min_kib=$((min_gib * 1024 * 1024))",
+      "target_kib=0",
+      "if [ -d \"$dir/target\" ]; then",
+      "  target_kib=$(du -sk \"$dir/target\" | awk '{print $1}')",
+      "fi",
+      "avail_gib=$((avail_kib / 1024 / 1024))",
+      "target_gib=$((target_kib / 1024 / 1024))",
+      "printf 'remote audit disk: dir=%s avail_gib=%s min_gib=%s target_gib=%s\\n' \"$dir\" \"$avail_gib\" \"$min_gib\" \"$target_gib\"",
+      "if [ \"$avail_kib\" -lt \"$min_kib\" ]; then",
+      "  echo \"remote audit disk below minimum free space\"",
+      "  exit 3",
+      "fi",
+    ],
+    "\n",
+  )
+  return ssh_bash_stdin_command(host, [dir, to_string(min_free_gb)], script)
 }
 
 /**
@@ -104,23 +166,52 @@ pub fn remote_audit_skip_decision(inputs) {
   let setup_ok = inputs.setup_ok ?? false
   let audit_status = inputs.audit_status ?? -1
   let host = trim(inputs.host ?? "remote")
+  let require_remote = inputs.require_remote ?? false
   if !setup_ok {
+    if require_remote {
+      return {
+        skip_local_audit: false,
+        abort_release: true,
+        reason: "${host} audit setup (clone/fetch/checkout) failed; remote audit is required, aborting instead of running the local fallback",
+      }
+    }
     return {
       skip_local_audit: false,
+      abort_release: false,
       reason: "${host} audit setup (clone/fetch/checkout) failed; running the full audit locally",
     }
   }
   if audit_status == 0 {
-    return {skip_local_audit: true, reason: "${host} audit passed; skipping the duplicate local audit"}
+    return {
+      skip_local_audit: true,
+      abort_release: false,
+      reason: "${host} audit passed; skipping the duplicate local audit",
+    }
   }
   if audit_status == 255 {
+    if require_remote {
+      return {
+        skip_local_audit: false,
+        abort_release: true,
+        reason: "${host} audit connection dropped (ssh 255); remote audit is required, aborting instead of running the local fallback",
+      }
+    }
     return {
       skip_local_audit: false,
+      abort_release: false,
       reason: "${host} audit connection dropped (ssh 255); running the full audit locally",
+    }
+  }
+  if require_remote {
+    return {
+      skip_local_audit: false,
+      abort_release: true,
+      reason: "${host} audit reported failure (exit ${audit_status}); remote audit is required, aborting instead of running the local fallback",
     }
   }
   return {
     skip_local_audit: false,
+    abort_release: false,
     reason: "${host} audit reported failure (exit ${audit_status}); running the full audit locally to confirm",
   }
 }
