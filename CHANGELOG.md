@@ -7,6 +7,9 @@
 - `release_harn` now treats a rerun as successful when the remote release tag
   already targets the intended release commit, while still refusing to move a
   remote tag that targets any other commit.
+- `release_harn --watch-publish` now evaluates the newest observed run for
+  each required release workflow, so a successful manual rerun clears an older
+  failed publish/build attempt for the same tag.
 - Live `release_harn --mode ship-pr --yes-live-release` now watches the
   tag-triggered publish/build workflows by default, so a release run does not
   finish cleanly while its crates or binary assets are red, cancelled, or
