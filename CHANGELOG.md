@@ -15,6 +15,9 @@
 - `bump_fleet` now reports observed queued or in-progress downstream
   `bump-harn.yml` workflow runs as `run_in_progress` with the run URL instead
   of timing out as `run_not_found`.
+- Harn release-readiness polling now checks crates.io through its HTTP API
+  instead of repeatedly invoking `cargo info`, avoiding Cargo registry/cache
+  lock contention during release and bump workflows.
 - Remote release-audit offload now prepends standard user tool directories to
   every SSH script, so non-login shells can find `~/.cargo/bin/cargo`,
   user-installed `rg`, and Homebrew tools before deciding to fall back to the

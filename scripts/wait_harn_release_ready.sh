@@ -61,7 +61,10 @@ write_output() {
 
 for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
   crate_ready=0
-  if cargo info "harn-cli@${version_no_v}" >/dev/null 2>&1; then
+  if curl -fsSL \
+    -A "burin-labs/harn-bump-fleet release-readiness" \
+    -H "Accept: application/json" \
+    "https://crates.io/api/v1/crates/harn-cli/${version_no_v}" >/dev/null; then
     crate_ready=1
   fi
 
