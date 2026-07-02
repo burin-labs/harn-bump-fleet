@@ -12,6 +12,9 @@
   include observed workflow run status/URLs while waiting, so long binary
   builds are reported as in progress instead of timing out after the old
   five-minute watch window.
+- `bump_fleet` now reports observed queued or in-progress downstream
+  `bump-harn.yml` workflow runs as `run_in_progress` with the run URL instead
+  of timing out as `run_not_found`.
 - Remote release-audit offload now prepends standard user tool directories to
   every SSH script, so non-login shells can find `~/.cargo/bin/cargo`,
   user-installed `rg`, and Homebrew tools before deciding to fall back to the
