@@ -34,9 +34,9 @@
 - `release_harn --watch-publish` now scopes publish/build workflow health to
   the pushed release tag, so older cancelled or failed workflow runs cannot
   falsely mark a fresh tag red.
-- Live `release_harn` prepare can reuse an explicit
-  `HARN_RELEASE_CARGO_TARGET_DIR` cache while still defaulting to an isolated
-  `<repo>/target/release-harn` target.
+- Live `release_harn` prepare now defaults to a stable user-cache Cargo target
+  dir, so clean release worktrees reuse the warmed Harn CLI build across
+  releases instead of cold-compiling it every time.
 
 ### Added
 

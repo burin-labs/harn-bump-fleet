@@ -192,8 +192,13 @@ Knobs (all `env_str`-style, all optional):
 | `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
 | `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
 | `HARN_RELEASE_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `release_harn` (`0` = uncapped) |
-| `HARN_RELEASE_CARGO_TARGET_DIR` | `<repo>/target/release-harn` | Cargo target cache for live `release_harn` prepare/audit |
+| `HARN_RELEASE_CARGO_TARGET_DIR` | user cache dir | Cargo target cache for live `release_harn` prepare/audit |
 | `HARN_BUMP_FLEET_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `bump_fleet` (`0` = uncapped) |
+
+The default release Cargo target is
+`$XDG_CACHE_HOME/harn-bump-fleet/release-harn-target`, or
+`$HOME/.cache/harn-bump-fleet/release-harn-target` when `XDG_CACHE_HOME` is
+unset. Override it only when a release lane needs an isolated cache.
 
 `harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
 at the top of every run summarizing the resolved route.
