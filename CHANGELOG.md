@@ -40,6 +40,9 @@
 - `release_harn` planner preflight now requires a tiny generation probe after
   provider reachability, so exhausted keys and quota/auth failures are caught
   before the release audit and before any branch/tag mutation.
+- Remote release-audit disk preflight now prunes the managed offload `target/`
+  cache when it is the reason free space fell below the floor, then re-checks
+  disk before falling back to the local audit.
 
 ### Added
 
