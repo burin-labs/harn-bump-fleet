@@ -5,7 +5,7 @@ import { newest_workflow_run_after } from "./workflow_runs"
  * `publish-release.yml` and `build-release-binaries.yml` fire on the tag push,
  * so the heavy release-build checks only run AFTER the tag exists and cannot
  * gate it. This module classifies the tag-triggered workflow runs the fleet
- * polls after tagging, and renders the operator-facing yank path when a
+ * polls after tagging, and renders operator-facing recovery guidance when a
  * published release lands red.
  *
  * Logic stays pure so the poll loop can be exercised with synthetic run rows.
@@ -70,6 +70,38 @@ fn newest_run_for_workflow(runs, workflow) {
   return matches[0]
 }
 
+fn workflow_names(values) {
+  var names = []
+  for value in values ?? [] {
+    let name = trim(to_string(value ?? ""))
+    if name != "" {
+      names = names + [name]
+    }
+  }
+  return names
+}
+
+fn workflow_name_in(names, needle) {
+  for name in names {
+    if name == needle {
+      return true
+    }
+  }
+  return false
+}
+
+fn has_unclassified_workflow(names) {
+  if len(names) == 0 {
+    return true
+  }
+  for name in names {
+    if name != "publish-release.yml" && name != "build-release-binaries.yml" {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * Classify publish health from observed tag-triggered workflow runs.
  *
@@ -78,7 +110,7 @@ fn newest_run_for_workflow(runs, workflow) {
  * `required_workflows` is the set of workflow identifiers that must each show
  * a completed+success run for the publish to count as healthy.
  *
- * Returns `{state, message}` with state:
+ * Returns `{state, message, failed_workflows}` with state:
  *   "failed"  — at least one observed run concluded in a bad state.
  *   "healthy" — every required workflow has a completed+success run.
  *   "pending" — required runs are still queued/in_progress (or unobserved).
@@ -103,7 +135,11 @@ pub fn publish_watch_decision(inputs) {
   }
   if len(failed_workflows) > 0 {
     let failed_list = failed_workflows.join(", ")
-    return {state: "failed", message: "publish for ${tag} is red: ${failed_list} concluded in a failed state"}
+    return {
+      state: "failed",
+      message: "publish for ${tag} is red: ${failed_list} concluded in a failed state",
+      failed_workflows: failed_workflows,
+    }
   }
   var unsatisfied = []
   for workflow in required {
@@ -114,39 +150,98 @@ pub fn publish_watch_decision(inputs) {
     }
   }
   if len(unsatisfied) == 0 && len(required) > 0 {
-    return {state: "healthy", message: "publish for ${tag} is green: all required workflows succeeded"}
+    return {
+      state: "healthy",
+      message: "publish for ${tag} is green: all required workflows succeeded",
+      failed_workflows: [],
+    }
   }
   let waiting_list = unsatisfied.map({ workflow -> pending_workflow_detail(workflow, scoped_runs) })
     .join(", ")
   return {
     state: "pending",
     message: "publish for ${tag} not yet confirmed green: still waiting on ${waiting_list}",
+    failed_workflows: [],
   }
 }
 
-/**
- * Operator-facing yank path for a red publish. The tag is already pushed and
- * the publish workflows ran from it, so recovery is a deliberate yank, not an
- * in-flight abort. Returned as lines so the caller can fold them into a step's
- * stderr without committing to a single rendering.
- */
-pub fn publish_failure_yank_lines(tag, slug) {
-  let repo = if trim(slug ?? "") == "" {
-    "<owner/repo>"
-  } else {
-    trim(slug)
+fn release_repo_label(slug) {
+  if trim(slug ?? "") == "" {
+    return "<owner/repo>"
   }
+  return trim(slug)
+}
+
+fn inspect_failed_runs_lines(repo, include_publish, include_binaries) {
+  var lines = ["1. inspect the failed run(s):"]
+  if include_publish {
+    lines = lines + ["     gh run list --repo ${repo} --workflow=publish-release.yml --limit 5"]
+  }
+  if include_binaries {
+    lines = lines + ["     gh run list --repo ${repo} --workflow=build-release-binaries.yml --limit 5"]
+  }
+  return lines
+}
+
+fn publish_yank_recovery_lines(tag, first_step, final_step) {
   return [
-    "release publish for ${tag} is RED — the published artifact may be broken or incomplete.",
-    "1. inspect the failed runs:",
-    "     gh run list --repo ${repo} --workflow=publish-release.yml --limit 5",
-    "     gh run list --repo ${repo} --workflow=build-release-binaries.yml --limit 5",
-    "2. if nothing usable shipped, yank the git tag before anyone repins to it:",
+    "${first_step}. if nothing usable shipped, yank the git tag before anyone repins to it:",
     "     git push origin --delete ${tag} && git tag -d ${tag}",
     "3. crates.io is immutable: if a crate already published, yank that version instead:",
     "     cargo yank --version <X.Y.Z> <crate>",
-    "4. fix the cause on the base branch, then re-run release_harn to re-tag and re-publish.",
+    "${final_step}. fix the cause on the base branch, then re-run release_harn to re-tag and re-publish.",
   ]
+}
+
+fn binary_asset_recovery_lines(tag, repo, first_step, final_step) {
+  return [
+    "${first_step}. recover missing release assets from the existing tag; do not delete the tag solely for a binary-build failure:",
+    "     gh workflow run build-release-binaries.yml --repo ${repo} -f tag=${tag}",
+    "     scripts/wait_harn_release_ready.sh ${tag}",
+    "${final_step}. after the rerun is green, verify the release asset set before repinning downstream.",
+  ]
+}
+
+/**
+ * Operator-facing recovery path for a red post-tag release. The tag is already
+ * pushed, and the failing workflow determines whether recovery is a crates/tag
+ * rollback or an idempotent binary-asset rebuild from the existing tag.
+ * Returned as lines so callers can fold them into a step's stderr.
+ */
+pub fn publish_failure_recovery_lines(tag, slug, failed_workflows) {
+  let repo = release_repo_label(slug)
+  let failed = workflow_names(failed_workflows)
+  let publish_failed = workflow_name_in(failed, "publish-release.yml")
+  let binaries_failed = workflow_name_in(failed, "build-release-binaries.yml")
+  let unknown_failed = has_unclassified_workflow(failed)
+  if binaries_failed && !publish_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: binary release assets may be missing, but the crates/tag can still be valid.",
+    ]
+      + inspect_failed_runs_lines(repo, false, true)
+      + binary_asset_recovery_lines(tag, repo, "2", "3")
+  }
+  if publish_failed && !binaries_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: publish-release.yml failed, so crates.io/tag state may be partial.",
+    ]
+      + inspect_failed_runs_lines(repo, true, false)
+      + publish_yank_recovery_lines(tag, "2", "4")
+  }
+  if publish_failed && binaries_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: inspect publish-release.yml first because crates.io/tag state may be partial.",
+    ]
+      + inspect_failed_runs_lines(repo, true, true)
+      + publish_yank_recovery_lines(tag, "2", "4")
+      + binary_asset_recovery_lines(tag, repo, "5", "6")
+  }
+  return [
+    "release publish for ${tag} is RED: an unclassified publish workflow failed, so inspect before choosing recovery.",
+  ]
+    + inspect_failed_runs_lines(repo, true, true)
+    + publish_yank_recovery_lines(tag, "2", "4")
+    + binary_asset_recovery_lines(tag, repo, "5", "6")
 }
 
 /** Return whether a release_harn run should watch post-tag publish health. */
