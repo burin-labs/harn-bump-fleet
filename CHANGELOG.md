@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Remote release-audit offload now prepends standard user tool directories to
+  every SSH script, so non-login shells can find `~/.cargo/bin/cargo`,
+  user-installed `rg`, and Homebrew tools before deciding to fall back to the
+  local audit.
 - `release_harn --watch-publish` now scopes publish/build workflow health to
   the pushed release tag, so older cancelled or failed workflow runs cannot
   falsely mark a fresh tag red.
