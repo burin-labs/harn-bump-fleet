@@ -8,6 +8,9 @@
   every SSH script, so non-login shells can find `~/.cargo/bin/cargo`,
   user-installed `rg`, and Homebrew tools before deciding to fall back to the
   local audit.
+- Remote release-audit offload now requires `cargo-nextest` during the
+  prerequisite probe, so audit builders do not silently take Harn's slower
+  plain `cargo test --workspace` fallback.
 - `release_harn --watch-publish` now scopes publish/build workflow health to
   the pushed release tag, so older cancelled or failed workflow runs cannot
   falsely mark a fresh tag red.
