@@ -84,6 +84,7 @@ import {
 } from "lib/release_health"
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import {
+  local_release_tag_decision,
   pre_tag_drift_decision,
   remote_release_tag_decision,
   remote_tag_sha_from_ls_remote,
@@ -113,7 +114,7 @@ import {
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { ensure_healthy_sccache } from "lib/sccache_preflight"
 import {
-  latest_semver_tag_from_git_tag_list,
+  latest_semver_tag_from_remote_refs,
   next_semver,
   version_from_release_branch,
   version_from_tag,
@@ -649,6 +650,7 @@ version = "0.7.52"
 
 @complexity(allow)
 fn fake_command(command, cfg) {
+  let mock_stale_local_tag = env_str("HARN_RELEASE_MOCK_STALE_LOCAL_TAG") == "1"
   if contains(command, "git branch --show-current") {
     return ok("release/v0.7.53\n")
   }
@@ -665,6 +667,11 @@ fn fake_command(command, cfg) {
   }
   if contains(command, "git tag --list") && contains(command, "--sort=-v:refname") {
     return ok("v0.7.52\n")
+  }
+  if contains(command, "git ls-remote --tags --refs origin refs/tags/v") {
+    return ok(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.7.51\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v0.7.52\n",
+    )
   }
   if contains(command, "git describe --tags") {
     return ok("v0.7.51\n")
@@ -717,6 +724,9 @@ fn fake_command(command, cfg) {
     return ok(MOCK_PIN_SHA + "\n")
   }
   if contains(command, "git rev-parse -q --verify refs/tags/") {
+    if mock_stale_local_tag {
+      return ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
     return fail(1, "")
   }
   if contains(command, "git ls-remote origin refs/tags/v") {
@@ -726,7 +736,13 @@ fn fake_command(command, cfg) {
     return ok(MOCK_PIN_SHA + "\n")
   }
   if contains(command, "git rev-list -n 1") {
+    if mock_stale_local_tag {
+      return ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
     return ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git tag -d") {
+    return ok("Deleted tag 'v0.7.53' (was eeeeeee)\n")
   }
   if contains(command, "git tag -a") {
     return ok("")
@@ -1493,11 +1509,12 @@ fn release_session_id(harness: Harness, cfg, analysis, run_id) {
 }
 
 fn latest_release_tag(cfg) {
-  let listed = run_git(cfg, ["tag", "--list", "v[0-9]*", "--sort=-v:refname"])
-  if listed.success {
-    return latest_semver_tag_from_git_tag_list(listed.stdout)
+  let remote = run_git(cfg, ["ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"])
+  if !remote.success {
+    throw "could not list origin release tags; refusing to derive release history from local-only tags:\n"
+      + trim(remote.stderr ?? "")
   }
-  return trim(run_git(cfg, ["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"]).stdout)
+  return latest_semver_tag_from_remote_refs(remote.stdout)
 }
 
 fn agent_artifact_paths(run_id) {
@@ -3070,32 +3087,50 @@ fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
     ]
   }
   let local_tag_probe = run_git(cfg, ["rev-parse", "-q", "--verify", "refs/tags/" + tag])
+  let local_exists = local_tag_probe.success
+  var local_target = ""
   if local_tag_probe.success {
     let tag_commit_probe = run_git(cfg, ["rev-list", "-n", "1", tag])
-    let tag_commit = if tag_commit_probe.success {
+    local_target = if tag_commit_probe.success {
       trim(tag_commit_probe.stdout)
     } else {
       ""
     }
-    if tag_commit != head {
+  }
+  let local_decision = local_release_tag_decision(
+    {
+      tag: tag,
+      head_sha: head,
+      local_exists: local_exists,
+      local_target_sha: local_target,
+      remote_target_sha: remote_target,
+    },
+  )
+  if local_decision.action == "abort" {
+    return pre_steps
+      + [recorded_step("create-release-tag", "git rev-list -n 1 " + tag, fail(2, local_decision.reason))]
+  }
+  if local_decision.action == "refresh" {
+    let delete = logged_command_step(
+      harness,
+      cfg,
+      pre_steps,
+      "refresh-local-release-tag",
+      ["git", "tag", "-d", tag],
+      run_id,
+    )
+    pre_steps = delete.steps
+    if !delete.success {
       return pre_steps
-        + [
-        recorded_step(
-          "create-release-tag",
-          "git rev-list -n 1 " + tag,
-          fail(
-            2,
-            "tag ${tag} already exists locally at ${tag_commit}, but release HEAD is ${head}; delete the stale tag (`git tag -d ${tag}`) before re-running",
-          ),
-        ),
-      ]
     }
+  }
+  if local_decision.action == "reuse" {
     pre_steps = pre_steps
       + [
       recorded_step(
         "create-release-tag",
         "tag ${tag} already pinned at HEAD",
-        ok("idempotent reuse of existing tag ${tag} at ${head}\n"),
+        ok("idempotent reuse: ${local_decision.reason}\n"),
       ),
     ]
   } else {
