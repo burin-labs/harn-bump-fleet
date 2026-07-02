@@ -37,6 +37,9 @@
 - Live `release_harn` prepare now defaults to a stable user-cache Cargo target
   dir, so clean release worktrees reuse the warmed Harn CLI build across
   releases instead of cold-compiling it every time.
+- `release_harn` planner preflight now requires a tiny generation probe after
+  provider reachability, so exhausted keys and quota/auth failures are caught
+  before the release audit and before any branch/tag mutation.
 
 ### Added
 
