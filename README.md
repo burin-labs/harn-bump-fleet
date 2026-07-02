@@ -414,6 +414,9 @@ offload before the local prepare step. A green remote audit passes
 `--skip-audit` to `scripts/release_ship.sh`; every other outcome runs the full
 local audit as the correctness backstop. Use `--local-audit` or
 `HARN_RELEASE_OFFLOAD_AUDIT=0` when the remote probe should be skipped.
+Remote builders must have Harn's release-gate toolchain on `PATH`, including
+`cargo-nextest`; otherwise `make test` would silently use the slower plain
+`cargo test --workspace` fallback and erase the offload win.
 
 Options:
 
