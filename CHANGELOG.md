@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Live `release_harn --mode ship-pr --yes-live-release` now watches the
+  tag-triggered publish/build workflows by default, so a release run does not
+  finish cleanly while its crates or binary assets are red, cancelled, or
+  still only partially uploaded.
 - Remote release-audit offload now prepends standard user tool directories to
   every SSH script, so non-login shells can find `~/.cargo/bin/cargo`,
   user-installed `rg`, and Homebrew tools before deciding to fall back to the
