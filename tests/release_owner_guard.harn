@@ -1,0 +1,163 @@
+import {
+  release_owner_guard_acquire,
+  release_owner_guard_decision,
+  release_owner_guard_finish,
+  release_owner_guard_required,
+  release_owner_guard_update,
+} from "../lib/release_owner_guard"
+
+pipeline test_release_owner_guard_required_only_for_live_mutations(task) {
+  assert_eq(release_owner_guard_required({mode: "audit", yes_live_release: true}), false)
+  assert_eq(release_owner_guard_required({mode: "prepare", yes_live_release: false}), false)
+  assert_eq(
+    release_owner_guard_required({mode: "ship-pr", yes_live_release: true, mock: true}),
+    false,
+  )
+  assert_eq(release_owner_guard_required({mode: "prepare", yes_live_release: true}), true)
+  assert_eq(release_owner_guard_required({mode: "ship-pr", yes_live_release: true}), true)
+}
+
+pipeline test_release_owner_guard_decision_blocks_active_owner(task) {
+  let existing = {
+    status: "active",
+    run_id: "run-a",
+    operator: "codex",
+    host: "workstation",
+    repo: "/tmp/harn",
+    mode: "ship-pr",
+    next_version: "0.9.0",
+    tag: "v0.9.0",
+    pin_sha: "abc123",
+    started_iso: "2026-07-03T00:00:00Z",
+    started_ms: 1000,
+    updated_ms: 5000,
+    ttl_ms: 60000,
+  }
+  let requested = {...existing, run_id: "run-b", next_version: "0.9.1", tag: "v0.9.1"}
+  let decision = release_owner_guard_decision(existing, requested, 10000, 60000, false)
+  assert_eq(decision.action, "block")
+  assert(contains(decision.reason, "another live Harn release appears active"))
+  assert(contains(decision.reason, "run-a"))
+  assert(contains(decision.reason, "run-b"))
+  assert(contains(decision.reason, "HARN_RELEASE_OWNER_TAKEOVER=1"))
+}
+
+pipeline test_release_owner_guard_decision_replaces_stale_or_taken_over_owner(task) {
+  let active = {status: "active", run_id: "run-a", updated_ms: 1000, ttl_ms: 1000}
+  let requested = {status: "active", run_id: "run-b", updated_ms: 3000, ttl_ms: 1000}
+  assert_eq(
+    release_owner_guard_decision(active, requested, 3000, 1000, false).action,
+    "replace_stale",
+  )
+  assert_eq(release_owner_guard_decision(active, requested, 1500, 1000, true).action, "replace")
+  assert_eq(
+    release_owner_guard_decision({...active, status: "finished"}, requested, 1500, 1000, false).action,
+    "acquire",
+  )
+  assert_eq(
+    release_owner_guard_decision(active, {...requested, run_id: "run-a"}, 1500, 1000, false).action,
+    "refresh",
+  )
+}
+
+pipeline test_release_owner_guard_file_roundtrip(task) {
+  mock_time(1700000000000)
+  let root = path_join(harness.fs.temp_dir(), "release-owner-guard-" + uuid_v7())
+  let path = path_join(root, "owner.json")
+  let cfg = {
+    repo: "/tmp/harn",
+    base: "main",
+    mode: "ship-pr",
+    bump: "minor",
+    yes_live_release: true,
+    mock: false,
+    pin_sha: "abc123",
+    owner_guard_path: path,
+    owner_guard_ttl_ms: 60000,
+  }
+  let analysis = {current_version: "0.8.169", next_version: "0.9.0"}
+  let first = release_owner_guard_acquire(harness, cfg, analysis, "run-a")
+  assert_eq(first.enabled, true)
+  assert_eq(harness.fs.exists(path), true)
+  let blocked = try {
+    release_owner_guard_acquire(harness, cfg, analysis, "run-b")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(blocked, "another live Harn release appears active"))
+  assert(contains(blocked, "Guard file: " + path))
+  let finished = release_owner_guard_finish(harness, first, "ok", true)
+  assert_eq(finished.status, "finished")
+  assert_eq(finished.success, true)
+  let second = release_owner_guard_acquire(harness, cfg, analysis, "run-b")
+  assert_eq(second.enabled, true)
+  assert_eq(second.decision.action, "acquire")
+  unmock_time()
+}
+
+pipeline test_release_owner_guard_update_enriches_active_record(task) {
+  mock_time(1700000000000)
+  let root = path_join(harness.fs.temp_dir(), "release-owner-guard-" + uuid_v7())
+  let path = path_join(root, "owner.json")
+  let cfg = {
+    repo: "/tmp/harn",
+    base: "main",
+    mode: "prepare",
+    bump: "patch",
+    yes_live_release: true,
+    mock: false,
+    pin_sha: "pin-before-analysis",
+    owner_guard_path: path,
+    owner_guard_ttl_ms: 60000,
+  }
+  let owner = release_owner_guard_acquire(harness, cfg, {}, "run-a")
+  let before = json_parse(harness.fs.read_text(path))
+  assert_eq(before.next_version, "")
+  mock_time(1700000001000)
+  let updated = release_owner_guard_update(
+    harness,
+    owner,
+    {...cfg, pin_sha: "pin-after-analysis"},
+    {current_version: "0.9.0", next_version: "0.9.1"},
+  )
+  assert_eq(updated.record.next_version, "0.9.1")
+  assert_eq(updated.record.tag, "v0.9.1")
+  assert_eq(updated.record.pin_sha, "pin-after-analysis")
+  let persisted = json_parse(harness.fs.read_text(path))
+  assert_eq(persisted.next_version, "0.9.1")
+  assert_eq(persisted.updated_ms, 1700000001000)
+  unmock_time()
+}
+
+pipeline test_release_owner_guard_malformed_file_requires_takeover(task) {
+  let root = path_join(harness.fs.temp_dir(), "release-owner-guard-" + uuid_v7())
+  let path = path_join(root, "owner.json")
+  harness.fs.mkdir(root, true)
+  harness.fs.write_text(path, "{not json}\n")
+  let cfg = {
+    repo: "/tmp/harn",
+    base: "main",
+    mode: "prepare",
+    bump: "patch",
+    yes_live_release: true,
+    mock: false,
+    pin_sha: "abc123",
+    owner_guard_path: path,
+  }
+  let blocked = try {
+    release_owner_guard_acquire(harness, cfg, {next_version: "0.9.1"}, "run-a")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(blocked, "release owner guard file is malformed"))
+  let acquired = release_owner_guard_acquire(
+    harness,
+    {...cfg, owner_guard_takeover: true},
+    {next_version: "0.9.1"},
+    "run-a",
+  )
+  assert_eq(acquired.enabled, true)
+  assert_eq(acquired.decision.action, "replace_malformed")
+}
