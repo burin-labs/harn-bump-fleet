@@ -8,7 +8,8 @@ set -euo pipefail
 #
 # Behavior:
 #   1. Resolve the "source" harn binary: first $HARN_BIN, else the first `harn`
-#      on PATH that is NOT this launcher.
+#      installed in this repo's `.harn/bin`, else the first `harn` on PATH
+#      that is NOT this launcher.
 #   2. Stage a copy at $XDG_CACHE_HOME/harn-shielded/harn (default
 #      ~/Library/Caches/harn-shielded/harn on macOS, ~/.cache/harn-shielded/harn
 #      elsewhere). The launcher only re-stages when the source binary's
@@ -24,6 +25,8 @@ set -euo pipefail
 #   scripts/harn_shielded.sh --version
 
 self="$(/usr/bin/env -i PATH=/usr/bin:/bin readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+script_dir="$(cd -- "$(dirname -- "$self")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
 find_source_harn() {
   if [ -n "${HARN_BIN:-}" ]; then
@@ -33,6 +36,11 @@ find_source_harn() {
     fi
     echo "harn_shielded: HARN_BIN=${HARN_BIN} is not executable" >&2
     return 1
+  fi
+  local repo_harn="${repo_root}/.harn/bin/harn"
+  if [ -x "$repo_harn" ]; then
+    printf '%s\n' "$repo_harn"
+    return 0
   fi
   local IFS=:
   for dir in $PATH; do

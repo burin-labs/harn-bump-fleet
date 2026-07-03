@@ -10,13 +10,15 @@ set -euo pipefail
 # path entirely (debugging / reproducing source builds).
 
 version="${1:-}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
 if [ -z "${version}" ]; then
-  if [ ! -f .harn-version ]; then
+  if [ ! -f "${repo_root}/.harn-version" ]; then
     echo "Usage: $0 vX.Y.Z" >&2
     echo "or run from a repo with .harn-version" >&2
     exit 2
   fi
-  version="$(tr -d '[:space:]' < .harn-version)"
+  version="$(tr -d '[:space:]' < "${repo_root}/.harn-version")"
 fi
 
 if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -26,7 +28,7 @@ fi
 
 version_no_v="${version#v}"
 tag="v${version_no_v}"
-install_root="${HARN_INSTALL_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/harn-${version_no_v}}"
+install_root="${HARN_INSTALL_ROOT:-${repo_root}/.harn}"
 bin_dir="${install_root}/bin"
 mkdir -p "${bin_dir}"
 
