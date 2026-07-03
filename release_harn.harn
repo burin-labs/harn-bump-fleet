@@ -108,7 +108,7 @@ import {
   remote_audit_run_command,
   remote_audit_setup_command,
   remote_audit_skip_decision,
-  resolve_offload_host,
+  resolve_offload_hosts,
   resolve_remote_audit_min_free_gb,
 } from "lib/remote_offload"
 import {
@@ -272,7 +272,7 @@ Flags:
                           non-live review runs. The publish is tag-first, so this is
                           a post-tag health watch, not a pre-tag gate.
   --offload-audit         Force the ~548s release_gate.sh audit onto a remote builder
-                          (default host tornadough) and skip the duplicate local audit
+                          (default host order tornadough,cattrick) and skip the duplicate local audit
                           only when the remote run is definitively green. Live
                           prepare/ship-pr runs try this fail-open path by default; set
                           HARN_RELEASE_OFFLOAD_AUDIT=0 or pass --local-audit to keep
@@ -289,8 +289,8 @@ Flags:
   --offload-min-free-gb N Require at least N GiB free on the remote scratch filesystem
                           before starting the audit (default 120). Also
                           HARN_RELEASE_OFFLOAD_MIN_FREE_GB.
-  --offload-host HOST     SSH host for --offload-audit. Also HARN_RELEASE_OFFLOAD_HOST;
-                          defaults to tornadough.
+  --offload-host HOSTS    SSH host or comma/space separated host order for --offload-audit.
+                          Also HARN_RELEASE_OFFLOAD_HOST; defaults to tornadough,cattrick.
   --agent                 Ask the configured planner to review release evidence with read/search/run tools.
                           Live prepare/ship-pr requires --agent unless CHANGELOG.md
                           already starts with the target version.
@@ -2420,8 +2420,97 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
   if !(cfg.offload_audit ?? false) || cfg.mock {
     return {steps: steps, skip_local_audit: false}
   }
-  let host = resolve_offload_host(cfg.offload_host)
   let remote_dir = env_str("HARN_RELEASE_OFFLOAD_DIR") ?? ""
+  let hosts = resolve_offload_hosts(cfg.offload_host)
+  var current_steps = steps
+  for {index, value} in hosts.enumerate() {
+    let host = trim(value ?? "")
+    if host == "" {
+      continue
+    }
+    let result = resolve_audit_offload_host(
+      harness,
+      cfg,
+      current_steps,
+      run_id,
+      host,
+      remote_dir,
+      index >= len(hosts) - 1,
+    )
+    current_steps = result.steps
+    if result.skip_local_audit ?? false {
+      return {steps: current_steps, skip_local_audit: true}
+    }
+    if !(result.try_next_host ?? false) {
+      return {steps: current_steps, skip_local_audit: false}
+    }
+  }
+  if cfg.require_remote_audit ?? false {
+    throw "all configured remote audit hosts failed; remote audit is required, aborting instead of running the local fallback"
+  }
+  return {steps: current_steps, skip_local_audit: false}
+}
+
+fn audit_offload_fallback_action(cfg, is_last_host) {
+  if !is_last_host {
+    return "trying the next remote audit host"
+  }
+  if cfg.require_remote_audit ?? false {
+    return "remote audit is required, aborting instead of running the local fallback"
+  }
+  return "running the full audit locally"
+}
+
+fn audit_offload_fallback_target(is_last_host) {
+  if is_last_host {
+    return "local"
+  }
+  return "next-remote"
+}
+
+fn record_remote_audit_preflight_failure(
+  harness: Harness,
+  cfg,
+  steps,
+  run_id,
+  command,
+  host,
+  remote_dir,
+  reason,
+  output,
+  status_fields,
+  is_last_host,
+) {
+  let diagnostic_output = trim(output ?? "")
+  let recorded_stdout = if diagnostic_output == "" {
+    "${reason}\n"
+  } else {
+    "${reason}\n\n${diagnostic_output}\n"
+  }
+  let failure_context = remote_audit_context(
+    {host: host, remote_dir: remote_dir, output: truncate_text(diagnostic_output, 12000)},
+  )
+    + (status_fields ?? {})
+  let recorded = {...recorded_step("remote-audit-offload", command, ok(recorded_stdout)), ...failure_context}
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {
+      step: "remote-audit-offload",
+      success: !((cfg.require_remote_audit ?? false) && is_last_host),
+      target: audit_offload_fallback_target(is_last_host),
+      reason: reason,
+    }
+      + failure_context,
+  )
+  if (cfg.require_remote_audit ?? false) && is_last_host {
+    throw recorded_stdout
+  }
+  return {steps: steps + [recorded], skip_local_audit: false, try_next_host: !is_last_host}
+}
+
+fn resolve_audit_offload_host(harness: Harness, cfg, steps, run_id, host, remote_dir, is_last_host) {
   let initial_remote_context = remote_audit_context({host: host, remote_dir: remote_dir})
   release_log_event(
     harness,
@@ -2432,7 +2521,12 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
   let probe = run_cmd(cfg, offload_probe_command(host))
   let plan = audit_offload_decision({enabled: true, host: host, probe_ok: probe.success})
   if plan.target == "local" {
-    if cfg.require_remote_audit ?? false {
+    let reason = if is_last_host {
+      plan.reason
+    } else {
+      "${host} unreachable; " + audit_offload_fallback_action(cfg, false)
+    }
+    if (cfg.require_remote_audit ?? false) && is_last_host {
       release_log_event(
         harness,
         run_id,
@@ -2441,15 +2535,15 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
           step: "remote-audit-offload",
           success: false,
           target: "local",
-          reason: plan.reason,
+          reason: reason,
           probe_status: probe.status,
         }
           + initial_remote_context,
       )
-      throw "${plan.reason}; remote audit is required, aborting instead of running the local fallback"
+      throw "${reason}; remote audit is required, aborting instead of running the local fallback"
     }
     let recorded = {
-      ...recorded_step("remote-audit-offload", offload_probe_command(host), ok("${plan.reason}\n")),
+      ...recorded_step("remote-audit-offload", offload_probe_command(host), ok("${reason}\n")),
       ...initial_remote_context,
       probe_status: probe.status,
     }
@@ -2460,135 +2554,69 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
       {
         step: "remote-audit-offload",
         success: true,
-        target: "local",
-        reason: plan.reason,
+        target: audit_offload_fallback_target(is_last_host),
+        reason: reason,
         probe_status: probe.status,
       }
         + initial_remote_context,
     )
-    return {steps: steps + [recorded], skip_local_audit: false}
+    return {steps: steps + [recorded], skip_local_audit: false, try_next_host: !is_last_host}
   }
   let prereq_cmd = remote_audit_prereq_command(host)
   let prereq = run_cmd(cfg, prereq_cmd)
   if !prereq.success {
-    let reason = if cfg.require_remote_audit ?? false {
-      "${host} audit prerequisites failed; remote audit is required, aborting instead of running the local fallback"
-    } else {
-      "${host} audit prerequisites failed; running the full audit locally"
-    }
-    let diagnostic_output = trim(command_output(prereq))
-    let recorded_stdout = if diagnostic_output == "" {
-      "${reason}\n"
-    } else {
-      "${reason}\n\n${diagnostic_output}\n"
-    }
-    let failure_context = remote_audit_context(
-      {host: host, remote_dir: remote_dir, output: truncate_text(diagnostic_output, 12000)},
-    )
-    let recorded = {
-      ...recorded_step("remote-audit-offload", prereq_cmd, ok(recorded_stdout)),
-      ...failure_context,
-      prereq_status: prereq.status,
-    }
-    release_log_event(
+    let reason = "${host} audit prerequisites failed; " + audit_offload_fallback_action(cfg, is_last_host)
+    return record_remote_audit_preflight_failure(
       harness,
+      cfg,
+      steps,
       run_id,
-      "step_finished",
-      {
-        step: "remote-audit-offload",
-        success: !(cfg.require_remote_audit ?? false),
-        target: "local",
-        reason: reason,
-        prereq_status: prereq.status,
-      }
-        + failure_context,
+      prereq_cmd,
+      host,
+      remote_dir,
+      reason,
+      command_output(prereq),
+      {prereq_status: prereq.status},
+      is_last_host,
     )
-    if cfg.require_remote_audit ?? false {
-      throw recorded_stdout
-    }
-    return {steps: steps + [recorded], skip_local_audit: false}
   }
   let disk_cmd = remote_audit_disk_command(
     {host: host, remote_dir: remote_dir, min_free_gb: cfg.offload_min_free_gb},
   )
   let disk = run_cmd(cfg, disk_cmd)
   if !disk.success {
-    let reason = if cfg.require_remote_audit ?? false {
-      "${host} audit disk preflight failed; remote audit is required, aborting instead of running the local fallback"
-    } else {
-      "${host} audit disk preflight failed; running the full audit locally"
-    }
-    let diagnostic_output = trim(command_output(disk))
-    let recorded_stdout = if diagnostic_output == "" {
-      "${reason}\n"
-    } else {
-      "${reason}\n\n${diagnostic_output}\n"
-    }
-    let failure_context = remote_audit_context(
-      {host: host, remote_dir: remote_dir, output: truncate_text(diagnostic_output, 12000)},
-    )
-    let recorded = {
-      ...recorded_step("remote-audit-offload", disk_cmd, ok(recorded_stdout)),
-      ...failure_context,
-      disk_status: disk.status,
-    }
-    release_log_event(
+    let reason = "${host} audit disk preflight failed; " + audit_offload_fallback_action(cfg, is_last_host)
+    return record_remote_audit_preflight_failure(
       harness,
+      cfg,
+      steps,
       run_id,
-      "step_finished",
-      {
-        step: "remote-audit-offload",
-        success: !(cfg.require_remote_audit ?? false),
-        target: "local",
-        reason: reason,
-        disk_status: disk.status,
-      }
-        + failure_context,
+      disk_cmd,
+      host,
+      remote_dir,
+      reason,
+      command_output(disk),
+      {disk_status: disk.status},
+      is_last_host,
     )
-    if cfg.require_remote_audit ?? false {
-      throw recorded_stdout
-    }
-    return {steps: steps + [recorded], skip_local_audit: false}
   }
   let resource_cmd = remote_audit_resource_command({host: host, remote_dir: remote_dir})
   let resource = run_cmd(cfg, resource_cmd)
   if !resource.success {
-    let reason = if cfg.require_remote_audit ?? false {
-      "${host} audit resource preflight failed; remote audit is required, aborting instead of running the local fallback"
-    } else {
-      "${host} audit resource preflight failed; running the full audit locally"
-    }
-    let diagnostic_output = trim(command_output(resource))
-    let recorded_stdout = if diagnostic_output == "" {
-      "${reason}\n"
-    } else {
-      "${reason}\n\n${diagnostic_output}\n"
-    }
-    let failure_context = remote_audit_context(
-      {host: host, remote_dir: remote_dir, output: truncate_text(diagnostic_output, 12000)},
-    )
-    let recorded = {
-      ...recorded_step("remote-audit-offload", resource_cmd, ok(recorded_stdout)),
-      ...failure_context,
-      resource_status: resource.status,
-    }
-    release_log_event(
+    let reason = "${host} audit resource preflight failed; " + audit_offload_fallback_action(cfg, is_last_host)
+    return record_remote_audit_preflight_failure(
       harness,
+      cfg,
+      steps,
       run_id,
-      "step_finished",
-      {
-        step: "remote-audit-offload",
-        success: !(cfg.require_remote_audit ?? false),
-        target: "local",
-        reason: reason,
-        resource_status: resource.status,
-      }
-        + failure_context,
+      resource_cmd,
+      host,
+      remote_dir,
+      reason,
+      command_output(resource),
+      {resource_status: resource.status},
+      is_last_host,
     )
-    if cfg.require_remote_audit ?? false {
-      throw recorded_stdout
-    }
-    return {steps: steps + [recorded], skip_local_audit: false}
   }
   let repo_url = trim(run_git(cfg, ["remote", "get-url", "origin"]).stdout ?? "")
   let setup_cmd = remote_audit_setup_command(
@@ -2616,7 +2644,8 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
       setup_ok: setup.success,
       audit_status: audit_status,
       host: host,
-      require_remote: cfg.require_remote_audit ?? false,
+      require_remote: (cfg.require_remote_audit ?? false) && is_last_host,
+      fallback_action: audit_offload_fallback_action(cfg, is_last_host),
     },
   )
   // Always recorded as ok: a non-green remote audit is not a release failure —
@@ -2647,8 +2676,15 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
     {
       step: "remote-audit-offload",
       success: true,
-      target: "remote",
+      target: if skip.skip_local_audit {
+        "remote"
+      } else if is_last_host {
+        "local"
+      } else {
+        "next-remote"
+      },
       skip_local_audit: skip.skip_local_audit,
+      try_next_host: !skip.skip_local_audit && !is_last_host,
       reason: skip.reason,
       setup_status: setup_status,
       audit_status: audit_status,
@@ -2658,7 +2694,11 @@ fn resolve_audit_offload(harness: Harness, cfg, steps, run_id) {
   if skip.abort_release ?? false {
     throw recorded_stdout
   }
-  return {steps: steps + [recorded], skip_local_audit: skip.skip_local_audit}
+  return {
+    steps: steps + [recorded],
+    skip_local_audit: skip.skip_local_audit,
+    try_next_host: !skip.skip_local_audit && !is_last_host,
+  }
 }
 
 /**
