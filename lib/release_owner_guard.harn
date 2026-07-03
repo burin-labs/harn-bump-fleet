@@ -1,4 +1,13 @@
+import {
+  coord_acquire_dir_lock,
+  coord_dir_lock_path,
+  coord_release_dir_lock,
+} from "std/coordination"
+import { read_json_result, write_json } from "std/fs"
+
 let DEFAULT_OWNER_TTL_MS = 12 * 60 * 60 * 1000
+
+let DEFAULT_OWNER_LOCK_TTL_MS = 10 * 60 * 1000
 
 fn owner_env_bool(harness: Harness, name) {
   let raw = lowercase(trim(harness.env.get_or(name, "")))
@@ -23,6 +32,18 @@ fn owner_ttl_ms(harness: Harness, cfg) {
     return seconds * 1000
   }
   return DEFAULT_OWNER_TTL_MS
+}
+
+fn owner_lock_ttl_ms(harness: Harness, cfg) {
+  let configured = positive_int(cfg?.owner_guard_lock_ttl_ms ?? "", 0)
+  if configured > 0 {
+    return configured
+  }
+  let seconds = positive_int(harness.env.get_or("HARN_RELEASE_OWNER_LOCK_TTL_SECONDS", ""), 0)
+  if seconds > 0 {
+    return seconds * 1000
+  }
+  return DEFAULT_OWNER_LOCK_TTL_MS
 }
 
 fn owner_takeover_requested(harness: Harness, cfg) {
@@ -92,6 +113,120 @@ fn compact_owner_lines(record, now_ms) {
     "- last update age: " + release_owner_elapsed_seconds(now_ms, updated),
     "- stale after: " + to_string(ttl / 1000) + "s",
   ].filter({ line -> trim(line) != "" })
+}
+
+/** Atomic lock directory path used to serialize owner read/decision/write. */
+pub fn release_owner_lock_path(owner_path) {
+  return coord_dir_lock_path(trim(owner_path ?? ""))
+}
+
+fn release_owner_lock_owner(cfg, owner_path, run_id) {
+  return {
+    id: run_id,
+    run_id: run_id,
+    owner_path: owner_path,
+    repo: cfg?.repo ?? "",
+    mode: cfg?.mode ?? "",
+    operator: username(),
+    host: hostname(),
+  }
+}
+
+fn release_owner_lock_message(lock_path, conflict, now_ms, takeover_hint = true) {
+  let hint = if takeover_hint {
+    "\nIf this lock is genuinely stale, rerun with HARN_RELEASE_OWNER_TAKEOVER=1 after checking the coordination log."
+  } else {
+    ""
+  }
+  if conflict.holder != nil {
+    let holder = conflict.holder
+    let owner = holder?.owner ?? {}
+    let display_record = {
+      ...owner,
+      status: holder?.status ?? conflict?.reason ?? "active",
+      updated_ms: holder?.updated_at_ms ?? holder?.acquired_at_ms ?? now_ms,
+      ttl_ms: holder?.ttl_ms ?? DEFAULT_OWNER_LOCK_TTL_MS,
+    }
+    return "error: release owner guard lock is held: ${lock_path}\n"
+      + join(compact_owner_lines(display_record, now_ms), "\n")
+      + hint
+  }
+  if conflict.reason == "malformed" {
+    return "error: release owner guard lock metadata is malformed: ${conflict.record_path}\n"
+      + "Refusing to remove the lock automatically."
+      + hint
+  }
+  return "error: release owner guard lock is held without metadata: ${lock_path}" + hint
+}
+
+fn release_owner_lock_acquire(harness: Harness, cfg, owner_path, run_id, now_ms) {
+  let lock_path = release_owner_lock_path(owner_path)
+  let ttl_ms = owner_lock_ttl_ms(harness, cfg)
+  let takeover = owner_takeover_requested(harness, cfg)
+  let owner = release_owner_lock_owner(cfg, owner_path, run_id)
+  let lock = coord_acquire_dir_lock(
+    owner_path,
+    owner,
+    {
+      lock_path: lock_path,
+      ttl_ms: ttl_ms,
+      reason: "release_owner_guard",
+      throw_on_conflict: false,
+      take_stale: true,
+    },
+  )
+  if lock.acquired {
+    return {acquired: true, path: lock_path, record: lock.record, lease: lock}
+  }
+  if takeover {
+    let released = try {
+      coord_release_dir_lock(lock_path, {strict: false})
+    } catch (_e) {
+      nil
+    }
+    if released == nil {
+      throw "error: could not remove release owner lock during takeover: ${lock_path}"
+    }
+    let reacquired = coord_acquire_dir_lock(
+      owner_path,
+      owner,
+      {
+        lock_path: lock_path,
+        ttl_ms: ttl_ms,
+        reason: "release_owner_guard",
+        throw_on_conflict: false,
+        take_stale: true,
+      },
+    )
+    if reacquired.acquired {
+      return {acquired: true, path: lock_path, record: reacquired.record, lease: reacquired}
+    }
+    throw release_owner_lock_message(lock_path, reacquired, now_ms, false)
+  }
+  throw release_owner_lock_message(lock_path, lock, now_ms)
+}
+
+fn release_owner_lock_release(lock) {
+  if !(lock?.acquired ?? false) {
+    return nil
+  }
+  let path = trim(lock?.path ?? "")
+  if path == "" {
+    return nil
+  }
+  return coord_release_dir_lock(lock.lease ?? lock)
+}
+
+fn with_release_owner_lock(harness: Harness, cfg, owner_path, run_id, body) {
+  let lock = release_owner_lock_acquire(harness, cfg, owner_path, run_id, harness.clock.now_ms())
+  return try {
+    let value = body()
+    release_owner_lock_release(lock)
+    value
+  } catch (e) {
+    release_owner_lock_release(lock)
+    throw e
+  }
 }
 
 /** True when release_harn should acquire the cross-process live-release owner guard. */
@@ -193,16 +328,11 @@ fn read_owner_record(harness: Harness, path) {
   if path == "" || !harness.fs.exists(path) {
     return {record: nil, malformed: ""}
   }
-  let text = harness.fs.read_text(path)
-  let parsed = try {
-    json_parse(text)
-  } catch (e) {
-    nil
+  let parsed = read_json_result(path)
+  if parsed.ok {
+    return {record: parsed.value, malformed: ""}
   }
-  if parsed == nil {
-    return {record: nil, malformed: trim(text)}
-  }
-  return {record: parsed, malformed: ""}
+  return {record: nil, malformed: trim(harness.fs.read_text(path))}
 }
 
 /** Acquire the live-release owner guard, or throw a collision/malformed-owner error. */
@@ -214,25 +344,38 @@ pub fn release_owner_guard_acquire(harness: Harness, cfg, analysis, run_id) {
   let now_ms = harness.clock.now_ms()
   let ttl_ms = owner_ttl_ms(harness, cfg)
   let requested = release_owner_requested_record(cfg, analysis, run_id, path, now_ms, ttl_ms)
-  let existing = read_owner_record(harness, path)
-  let takeover = owner_takeover_requested(harness, cfg)
-  if existing.malformed != "" && !takeover {
-    throw "error: release owner guard file is malformed: ${path}\n"
-      + "Refusing live release until the stale owner record is inspected. "
-      + "Rerun with HARN_RELEASE_OWNER_TAKEOVER=1 only after confirming no live release is active."
-  }
-  let decision = if existing.malformed != "" && takeover {
-    {action: "replace_malformed", reason: "takeover of malformed owner record requested"}
-  } else {
-    release_owner_guard_decision(existing.record, requested, now_ms, ttl_ms, takeover)
-  }
-  if decision.action == "block" {
-    throw decision.reason + "\nGuard file: " + path
-  }
-  let record = {...requested, acquire_action: decision.action, acquire_reason: decision.reason}
-  harness.fs.mkdir(dirname(path), true)
-  harness.fs.write_text(path, json_stringify(record) + "\n")
-  return {enabled: true, path: path, record: record, decision: decision}
+  return with_release_owner_lock(
+    harness,
+    cfg,
+    path,
+    run_id,
+    { ->
+      let existing = read_owner_record(harness, path)
+      let takeover = owner_takeover_requested(harness, cfg)
+      var error = nil
+      if existing.malformed != "" && !takeover {
+        error = "error: release owner guard file is malformed: ${path}\n"
+          + "Refusing live release until the stale owner record is inspected. "
+          + "Rerun with HARN_RELEASE_OWNER_TAKEOVER=1 only after confirming no live release is active."
+      }
+      let decision = if error != nil {
+        {action: "error", reason: error}
+      } else if existing.malformed != "" && takeover {
+        {action: "replace_malformed", reason: "takeover of malformed owner record requested"}
+      } else {
+        release_owner_guard_decision(existing.record, requested, now_ms, ttl_ms, takeover)
+      }
+      if decision.action == "block" {
+        error = decision.reason + "\nGuard file: " + path
+      }
+      if error != nil {
+        throw error
+      }
+      let record = {...requested, acquire_action: decision.action, acquire_reason: decision.reason}
+      write_json(path, record)
+      return {enabled: true, path: path, record: record, decision: decision}
+    },
+  )
 }
 
 /** Refresh the current run's owner record with analysis-derived version context. */
@@ -241,62 +384,85 @@ pub fn release_owner_guard_update(harness: Harness, owner, cfg, analysis) {
     return owner
   }
   let path = trim(owner?.path ?? "")
-  if path == "" || !harness.fs.exists(path) {
+  if path == "" {
     return owner
   }
-  let current = read_owner_record(harness, path)
   let run_id = trim(owner?.record?.run_id ?? "")
-  if current.record == nil || trim(current.record?.run_id ?? "") != run_id {
-    return owner
-  }
-  let now_ms = harness.clock.now_ms()
-  let ttl_ms = positive_int(current.record?.ttl_ms ?? "", owner_ttl_ms(harness, cfg))
-  let context = release_owner_requested_record(cfg, analysis, run_id, path, now_ms, ttl_ms)
-  let updated = {
-    ...current.record,
-    repo: context.repo,
-    base: context.base,
-    mode: context.mode,
-    bump: context.bump,
-    current_version: context.current_version,
-    next_version: context.next_version,
-    tag: context.tag,
-    pin_sha: context.pin_sha,
-    updated_iso: date_now_iso(),
-    updated_ms: now_ms,
-    ttl_ms: ttl_ms,
-  }
-  harness.fs.write_text(path, json_stringify(updated) + "\n")
-  return {...owner, record: updated}
+  return with_release_owner_lock(
+    harness,
+    cfg,
+    path,
+    run_id,
+    { ->
+      if !harness.fs.exists(path) {
+        return owner
+      }
+      let current = read_owner_record(harness, path)
+      if current.record == nil || trim(current.record?.run_id ?? "") != run_id {
+        return owner
+      }
+      let now_ms = harness.clock.now_ms()
+      let ttl_ms = positive_int(current.record?.ttl_ms ?? "", owner_ttl_ms(harness, cfg))
+      let context = release_owner_requested_record(cfg, analysis, run_id, path, now_ms, ttl_ms)
+      let updated = {
+        ...current.record,
+        repo: context.repo,
+        base: context.base,
+        mode: context.mode,
+        bump: context.bump,
+        current_version: context.current_version,
+        next_version: context.next_version,
+        tag: context.tag,
+        pin_sha: context.pin_sha,
+        updated_iso: date_now_iso(),
+        updated_ms: now_ms,
+        ttl_ms: ttl_ms,
+      }
+      write_json(path, updated)
+      return {...owner, record: updated}
+    },
+  )
 }
 
 /** Mark the owner record complete iff it still belongs to this run. */
-pub fn release_owner_guard_finish(harness: Harness, owner, outcome, success) {
+pub fn release_owner_guard_finish(harness: Harness, owner, outcome, success, cfg = nil) {
   if !(owner?.enabled ?? false) {
     return nil
   }
   let path = trim(owner?.path ?? "")
-  if path == "" || !harness.fs.exists(path) {
+  if path == "" {
     return nil
   }
-  let current = read_owner_record(harness, path)
-  if current.record == nil || trim(current.record?.run_id ?? "") != trim(owner?.record?.run_id ?? "") {
-    return nil
-  }
-  let now_ms = harness.clock.now_ms()
-  let finished = {
-    ...current.record,
-    status: if success {
-      "finished"
-    } else {
-      "failed"
+  let run_id = trim(owner?.record?.run_id ?? "")
+  return with_release_owner_lock(
+    harness,
+    cfg,
+    path,
+    run_id,
+    { ->
+      if !harness.fs.exists(path) {
+        return nil
+      }
+      let current = read_owner_record(harness, path)
+      if current.record == nil || trim(current.record?.run_id ?? "") != run_id {
+        return nil
+      }
+      let now_ms = harness.clock.now_ms()
+      let finished = {
+        ...current.record,
+        status: if success {
+          "finished"
+        } else {
+          "failed"
+        },
+        outcome: outcome,
+        success: success,
+        finished_iso: date_now_iso(),
+        finished_ms: now_ms,
+        updated_ms: now_ms,
+      }
+      write_json(path, finished)
+      return finished
     },
-    outcome: outcome,
-    success: success,
-    finished_iso: date_now_iso(),
-    finished_ms: now_ms,
-    updated_ms: now_ms,
-  }
-  harness.fs.write_text(path, json_stringify(finished) + "\n")
-  return finished
+  )
 }
