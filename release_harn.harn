@@ -2967,11 +2967,10 @@ fn release_repo_slug(cfg) {
 
 /**
  * Refuse to tag a pin that has fallen behind `origin/<base>` while the run was
- * in flight. The pin was frozen at startup; the only meaningful place to detect
- * base drift is here, immediately before the irreversible tag push, because
- * drift accrues during the run, not at startup. Returns `{steps, proceed}`;
- * `proceed=false` means a step was recorded and the caller must stop before
- * `ensure_release_tag_pushed`.
+ * in flight. The pin was frozen at startup; this final gate runs immediately
+ * before the irreversible tag push because drift can accrue after every earlier
+ * check. Returns `{steps, proceed}`; `proceed=false` means a step was recorded
+ * and the caller must stop before `ensure_release_tag_pushed`.
  *
  * The pure `pre_tag_drift_decision` owns the policy; this only gathers the fresh
  * probe. Repin mode, explicit `--at-sha`, and `--allow-base-drift` short-circuit
@@ -3035,6 +3034,92 @@ fn pre_tag_drift_gate(harness: Harness, cfg, version, steps, run_id) {
     ok("pin ${cfg.pin_sha} matches origin/${cfg.base} HEAD; safe to tag ${tag}\n"),
   )
   release_log_event(harness, run_id, "step_finished", {step: "pre-tag-drift-check", success: true})
+  return {steps: steps + [recorded], proceed: true}
+}
+
+/**
+ * Fast-fail a normal live release before branch mutation when the frozen pin is
+ * already behind `origin/<base>`. The final pre-tag gate above still owns the
+ * irreversible safety boundary; this earlier gate avoids spending prepare time
+ * and pushing a stale release branch when drift is already observable.
+ */
+fn pre_prepare_drift_gate(harness: Harness, cfg, analysis, steps, run_id) {
+  let explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
+  if cfg.mock || (cfg.repin_mode ?? false) || explicit_pin || (cfg.allow_base_drift ?? false) {
+    return {steps: steps, proceed: true}
+  }
+  let version = trim(analysis.next_version ?? "")
+  let tag = if version == "" {
+    "v<unknown>"
+  } else {
+    "v${version}"
+  }
+  release_log_event(harness, run_id, "step_started", {step: "pre-prepare-drift-check"})
+  let fetch = run_git(cfg, ["fetch", "origin", "--quiet", cfg.base])
+  if !fetch.success {
+    let fetch_stderr = trim(fetch.stderr ?? "")
+    let recorded = recorded_step(
+      "pre-prepare-drift-check",
+      "git fetch origin ${cfg.base}",
+      fail(
+        2,
+        "pre-prepare drift check could not fetch origin/${cfg.base} before preparing ${tag}: ${fetch_stderr}",
+      ),
+    )
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "pre-prepare-drift-check", success: false},
+    )
+    return {steps: steps + [recorded], proceed: false}
+  }
+  let head = run_git(cfg, ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"])
+  let base_head = if head.success {
+    trim(head.stdout ?? "")
+  } else {
+    ""
+  }
+  let decision = pre_tag_drift_decision(
+    {
+      pin_sha: cfg.pin_sha,
+      base_head_sha: base_head,
+      base: cfg.base,
+      tag: tag,
+      repin_latest: false,
+      explicit_pin: false,
+      allow_drift: false,
+    },
+  )
+  if decision.action == "abort" {
+    let recorded = recorded_step(
+      "pre-prepare-drift-check",
+      "compare release pin to origin/${cfg.base} HEAD",
+      fail(
+        2,
+        decision.reason
+          + " Re-run before prepare so release notes and branch content are regenerated from the fresh base.",
+      ),
+    )
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "pre-prepare-drift-check", success: false, reason: decision.reason},
+    )
+    return {steps: steps + [recorded], proceed: false}
+  }
+  let recorded = recorded_step(
+    "pre-prepare-drift-check",
+    "compare release pin to origin/${cfg.base} HEAD",
+    ok("pin ${cfg.pin_sha} matches origin/${cfg.base} HEAD before prepare; safe to mutate ${tag}\n"),
+  )
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {step: "pre-prepare-drift-check", success: true},
+  )
   return {steps: steps + [recorded], proceed: true}
 }
 
@@ -5276,7 +5361,13 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   }
   let cfg = pre.cfg
   let analysis = pre.analysis
-  var steps = pre.steps + execute_prepare(harness, cfg, analysis, agent_review_result, run_id)
+  var steps = pre.steps
+  let pre_prepare_gate = pre_prepare_drift_gate(harness, cfg, analysis, steps, run_id)
+  steps = pre_prepare_gate.steps
+  if !pre_prepare_gate.proceed {
+    return steps
+  }
+  steps = steps + execute_prepare(harness, cfg, analysis, agent_review_result, run_id)
   if execution_failed(steps) {
     return steps
   }
