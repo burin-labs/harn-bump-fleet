@@ -67,6 +67,58 @@ source_if_present "$(pwd)/.env"
 source_if_present "$(pwd)/.env.local"
 
 repo_harn_bin="${repo_root}/.harn/bin"
+repo_harn="${repo_harn_bin}/harn"
+repo_pin_file="${repo_root}/.harn-version"
+install_harn="${repo_root}/scripts/install_harn.sh"
+
+normalize_harn_version() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="${value#harn }"
+  value="${value#v}"
+  if [ -z "$value" ]; then
+    printf ''
+  else
+    printf 'v%s' "$value"
+  fi
+}
+
+ensure_repo_harn_matches_pin() {
+  if [ "${HARN_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL:-0}" = "1" ]; then
+    note "skip harn auto-install (HARN_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL=1)"
+    return 0
+  fi
+  if [ ! -f "$repo_pin_file" ] || [ ! -x "$install_harn" ]; then
+    return 0
+  fi
+
+  local expected
+  expected="$(normalize_harn_version "$(cat "$repo_pin_file")")"
+  if [ -z "$expected" ]; then
+    return 0
+  fi
+
+  local actual=""
+  if [ -x "$repo_harn" ]; then
+    actual="$(normalize_harn_version "$("$repo_harn" --version 2>/dev/null || true)")"
+  fi
+
+  if [ "$actual" = "$expected" ]; then
+    note "repo harn matches pin: $expected"
+    return 0
+  fi
+
+  if [ -z "$actual" ]; then
+    echo "with_env.sh: installing pinned Harn ${expected} into ${repo_harn_bin}" >&2
+  else
+    echo "with_env.sh: repo Harn binary ${actual} does not match ${expected}; reinstalling" >&2
+  fi
+  "$install_harn" "$expected" >&2
+}
+
+ensure_repo_harn_matches_pin
+
 if [ -x "${repo_harn_bin}/harn" ]; then
   export PATH="${repo_harn_bin}:${PATH}"
   if [ -z "${HARN_BIN:-}" ]; then
