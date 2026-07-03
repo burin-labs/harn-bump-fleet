@@ -49,6 +49,11 @@ another session may replace the `harn` binary while the process is running.
 The operation harnesses need `--no-sandbox` because they inspect sibling
 checkouts and invoke `git` / `gh`.
 
+Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
+installs the pinned CLI into this repo's ignored `.harn/bin`, and
+`scripts/with_env.sh` / `scripts/harn_shielded.sh` prefer that binary over a
+stale global `harn` on `PATH`.
+
 ## Implementation rules
 
 Keep GitHub side effects deterministic. GitHub writes go through `gh` or the

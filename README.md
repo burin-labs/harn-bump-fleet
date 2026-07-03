@@ -132,11 +132,15 @@ During the pre-release gate, the chat also accepts `/approve` and
 The cloud-by-default planner/binder pair (see "Planner + tool binder" below)
 needs provider API keys in env. Harn does not auto-load `.env`, so the
 launcher script `scripts/with_env.sh` sources one or more local env files
-before exec'ing the rest of the command:
+before exec'ing the rest of the command. It also prepends the repo-local
+`.harn/bin` directory when present, so `scripts/install_harn.sh` keeps the
+harness on the version pinned in `.harn-version` instead of whatever `harn`
+appears first on the ambient `PATH`:
 
 ```sh
 # Sources ~/projects/burin-code/.env (override with HARN_BUMP_FLEET_ENV_FILE),
 # then ./.env and ./.env.local from the repo root, then runs the harness.
+scripts/install_harn.sh
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
@@ -210,8 +214,8 @@ on disk is replaced (a fresh `cargo install harn-cli` mid-run is enough).
 Long fleet runs would otherwise need the manual
 `cp ~/.cargo/bin/harn ~/.cargo/bin/harn2` workaround.
 
-`scripts/harn_shielded.sh` resolves the source `harn` on `PATH` (or
-`$HARN_BIN`), stages a copy under
+`scripts/harn_shielded.sh` resolves the source `harn` from `$HARN_BIN`, then
+the repo-local `.harn/bin/harn`, then `PATH`, stages a copy under
 `$XDG_CACHE_HOME/harn-shielded/harn` (default `~/Library/Caches/...`),
 and execs that copy. Re-stages only when the source binary's size+mtime
 changes, so warm runs cost ~50ms.

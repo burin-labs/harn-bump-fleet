@@ -22,6 +22,8 @@ set -euo pipefail
 #   scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 verbose="${HARN_ENV_VERBOSE:-0}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
 note() {
   if [ "$verbose" = "1" ]; then
@@ -63,6 +65,15 @@ fi
 
 source_if_present "$(pwd)/.env"
 source_if_present "$(pwd)/.env.local"
+
+repo_harn_bin="${repo_root}/.harn/bin"
+if [ -x "${repo_harn_bin}/harn" ]; then
+  export PATH="${repo_harn_bin}:${PATH}"
+  if [ -z "${HARN_BIN:-}" ]; then
+    export HARN_BIN="${repo_harn_bin}/harn"
+  fi
+  note "prepend harn bin: ${repo_harn_bin}"
+fi
 
 if [ "$#" -eq 0 ]; then
   echo "with_env.sh: nothing to exec (pass a command after the script path)" >&2
