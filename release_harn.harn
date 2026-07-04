@@ -87,6 +87,10 @@ import {
   release_owner_guard_finish,
   release_owner_guard_update,
 } from "lib/release_owner_guard"
+import {
+  release_pr_watchdog_decision,
+  release_pr_watchdog_query_args,
+} from "lib/release_pr_watchdog"
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import {
   local_release_tag_decision,
@@ -3124,7 +3128,76 @@ fn pre_prepare_drift_gate(harness: Harness, cfg, analysis, steps, run_id) {
  * informational note, never a release failure — only a definitively red publish
  * fails. Returns the (possibly appended) steps unchanged in shape.
  */
-fn watch_publish_health(harness: Harness, cfg, version, steps, run_id) {
+fn release_pr_watchdog_rearm_if_needed(harness: Harness, cfg, steps, pr_url, run_id) {
+  if pr_url == "" || cfg.mock || (cfg.fixup_mode ?? false) {
+    return steps
+  }
+  let slug = release_repo_slug(cfg)
+  let query_args = release_pr_watchdog_query_args(slug, pr_url)
+  if query_args == nil {
+    release_log_event(
+      harness,
+      run_id,
+      "release_pr_watchdog_skipped",
+      {pr_url: pr_url, reason: "could_not_build_query"},
+    )
+    return steps
+  }
+  release_log_event(
+    harness,
+    run_id,
+    "release_pr_watchdog_probe_started",
+    {pr_url: pr_url, command: "gh " + join(query_args, " ")},
+  )
+  let probe = gh_argv(query_args)
+  if !probe.success {
+    release_log_event(
+      harness,
+      run_id,
+      "release_pr_watchdog_probe_finished",
+      {pr_url: pr_url, success: false, status: probe.status, stderr: trim(probe.stderr ?? "")},
+    )
+    return steps
+  }
+  let payload = try {
+    json_parse(probe.stdout)
+  } catch (e) {
+    nil
+  }
+  let decision = release_pr_watchdog_decision(payload ?? {})
+  release_log_event(
+    harness,
+    run_id,
+    "release_pr_watchdog_probe_finished",
+    {pr_url: pr_url, success: true, decision: decision},
+  )
+  if decision.action != "rearm" {
+    return steps
+  }
+  let attempts = gh_auto_merge_cli_attempts(slug, pr_url, "squash")
+  let auto_merge = logged_github_command_step(
+    harness,
+    cfg,
+    steps,
+    "release-pr-watchdog-auto-merge",
+    ["gh", ...attempts[0]],
+    run_id,
+  )
+  if auto_merge.success || len(attempts) < 2 {
+    return auto_merge.steps
+  }
+  let fallback = logged_github_command_step(
+    harness,
+    cfg,
+    auto_merge.steps,
+    "release-pr-watchdog-auto-merge-squash-fallback",
+    ["gh", ...attempts[1]],
+    run_id,
+  )
+  return fallback.steps
+}
+
+fn watch_publish_health(harness: Harness, cfg, version, steps, run_id, pr_url = "") {
   if !(cfg.watch_publish ?? false) || cfg.mock {
     return steps
   }
@@ -3155,9 +3228,11 @@ fn watch_publish_health(harness: Harness, cfg, version, steps, run_id) {
     "step_started",
     {step: "watch-publish", tag: tag, attempts: attempts, interval_seconds: interval_s},
   )
+  var watched_steps = steps
   var decision = {state: "pending", message: "publish for ${tag} not yet observed"}
   var attempt = 0
   while attempt < attempts {
+    watched_steps = release_pr_watchdog_rearm_if_needed(harness, cfg, watched_steps, pr_url, run_id)
     var runs = []
     for workflow in required {
       for run in gh_workflow_runs(slug, workflow, nil, 10) {
@@ -3182,7 +3257,8 @@ fn watch_publish_health(harness: Harness, cfg, version, steps, run_id) {
       "step_finished",
       {step: "watch-publish", success: false, state: "failed"},
     )
-    return steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", fail(2, body))]
+    return watched_steps
+      + [recorded_step("watch-publish", "watch ${tag} publish workflows", fail(2, body))]
   }
   let note = if decision.state == "healthy" {
     "publish for ${tag} confirmed green by tag-triggered workflows\n"
@@ -3198,7 +3274,7 @@ fn watch_publish_health(harness: Harness, cfg, version, steps, run_id) {
     "step_finished",
     {step: "watch-publish", success: true, state: decision.state},
   )
-  return steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", ok(note))]
+  return watched_steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", ok(note))]
 }
 
 fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
@@ -5559,7 +5635,7 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   }
   // Tag + PR handoff is complete. Optionally watch the tag-triggered publish so
   // a red publish surfaces loudly with a yank path instead of going unnoticed.
-  return watch_publish_health(harness, cfg, version, steps, run_id)
+  return watch_publish_health(harness, cfg, version, steps, run_id, pr_url)
 }
 
 fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
