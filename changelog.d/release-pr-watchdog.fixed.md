@@ -1,0 +1,1 @@
+`release_harn --watch-publish` now keeps the release PR merge-queue handoff alive while tag-triggered publish/build workflows run, re-arming auto-merge if GitHub drops the PR out of the queue without an active auto-merge request.
