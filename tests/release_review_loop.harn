@@ -1,0 +1,154 @@
+import { agent_review_attempt_name, agent_review_execute } from "../lib/release_review_loop"
+import { agent_review_attempt_selection } from "../release_harn.harn"
+
+/**
+ * Regression tests for the release audit run -> validate -> repair loop after it
+ * moved onto harn's `workflow_run_repair` primitive (inline executor + retry
+ * context feedback). The parity contract these guard:
+ *   - the loop runs at most 3 attempts and stops on the first clean attempt;
+ *   - each attempt is named initial-review / validation-repair-1 / ...;
+ *   - a failing attempt's findings thread into the next attempt (so the repair
+ *     prompt for attempt N contains attempt N-1's findings) — a findings-LESS
+ *     repair prompt would be a silent correctness regression.
+ */
+fn fake_record(name, text, findings) {
+  return {name: name, text: text, validation_findings: findings, llm: {}, tools: {}, status: "completed"}
+}
+
+pipeline test_attempt_names(task) {
+  assert_eq(agent_review_attempt_name(1), "initial-review")
+  assert_eq(agent_review_attempt_name(2), "validation-repair-1")
+  assert_eq(agent_review_attempt_name(3), "validation-repair-2")
+}
+
+pipeline test_three_attempt_scenario_threads_prior_findings(task) {
+  let review = agent_review_execute(
+    {
+      task: "BASE-PROMPT",
+      max_attempts: 3,
+      // Emulate production selection: attempt 1 runs the base prompt; every
+      // repair attempt rebuilds its prompt from the prior attempt's findings.
+      run_attempt: { ctx ->
+        let prompt = if ctx.attempt <= 1 {
+          "INITIAL-PROMPT"
+        } else {
+          "REPAIR prior_findings=[" + join(ctx.prior_findings, ", ") + "] prior_text="
+            + ctx.prior_text
+        }
+        let findings_to_report = if ctx.attempt <= 2 {
+          ["finding-from-attempt-" + to_string(ctx.attempt)]
+        } else {
+          []
+        }
+        {visible_text: prompt, findings_to_report: findings_to_report}
+      },
+      validate: { result, _text -> result.findings_to_report },
+      make_record: { name, text, findings, _result -> fake_record(name, text, findings) },
+    },
+  )
+  // (a) exactly three attempt records with the canonical names.
+  assert_eq(len(review.attempts), 3)
+  assert_eq(review.attempts[0].name, "initial-review")
+  assert_eq(review.attempts[1].name, "validation-repair-1")
+  assert_eq(review.attempts[2].name, "validation-repair-2")
+  // (b) the repair prompt for attempt 2 contains attempt-1's findings text, and
+  // attempt 3 threads attempt-2's findings — proving feedback is not dropped.
+  assert_eq(contains(review.attempts[1].text, "finding-from-attempt-1"), true)
+  assert_eq(contains(review.attempts[2].text, "finding-from-attempt-2"), true)
+  // Per-attempt findings are recorded on each attempt.
+  assert_eq(review.attempts[0].validation_findings, ["finding-from-attempt-1"])
+  assert_eq(review.attempts[1].validation_findings, ["finding-from-attempt-2"])
+  assert_eq(review.attempts[2].validation_findings, [])
+  // The loop stops on the first clean attempt; final values come from it.
+  assert_eq(review.validation_findings, [])
+  assert_eq(review.text, review.attempts[2].text)
+  assert_eq(review.final_result.visible_text, review.attempts[2].text)
+}
+
+pipeline test_stops_when_first_attempt_passes(task) {
+  let review = agent_review_execute(
+    {
+      task: "BASE",
+      max_attempts: 3,
+      run_attempt: { _ctx -> {visible_text: "clean audit"} },
+      validate: { _result, _text -> [] },
+      make_record: { name, text, findings, _result -> fake_record(name, text, findings) },
+    },
+  )
+  assert_eq(len(review.attempts), 1)
+  assert_eq(review.attempts[0].name, "initial-review")
+  assert_eq(review.validation_findings, [])
+}
+
+pipeline test_caps_at_max_attempts_when_findings_persist(task) {
+  let review = agent_review_execute(
+    {
+      task: "BASE",
+      max_attempts: 3,
+      run_attempt: { ctx -> {visible_text: "t" + to_string(ctx.attempt), fnd: ["always-" + to_string(ctx.attempt)]} },
+      validate: { result, _text -> result.fnd },
+      make_record: { name, text, findings, _result -> fake_record(name, text, findings) },
+    },
+  )
+  // Never exceeds max_attempts even though every attempt still has findings.
+  assert_eq(len(review.attempts), 3)
+  assert_eq(review.attempts[2].name, "validation-repair-2")
+  assert_eq(review.validation_findings, ["always-3"])
+}
+
+fn selection_analysis() {
+  return {
+    fixup_mode: false,
+    repo: "/tmp/harn",
+    mode: "ship-pr",
+    current_version: "1.2.2",
+    next_version: "1.2.3",
+    bump: "patch",
+    pin_sha: "deadbeefcafe",
+    base_branch: "main",
+    latest_tag: "v1.2.2",
+    operator_focus: "",
+    changelog_top: "1.2.3",
+    changelog_section: "## v1.2.3\n\n### Changed\n\n- Something.",
+    changelog_unreleased_section: "",
+    deterministic_findings: [],
+    commits_since_latest_tag: "abc1234 release: important change",
+    post_tag_pr_numbers: [42],
+  }
+}
+
+pipeline test_attempt_selection_initial_uses_base_prompt(task) {
+  let selection = agent_review_attempt_selection(
+    {attempt: 1, prior_findings: [], prior_text: ""},
+    selection_analysis(),
+    "BASE-SYSTEM",
+    "BASE-USER-PROMPT",
+  )
+  assert_eq(selection.system, "BASE-SYSTEM")
+  assert_eq(selection.prompt, "BASE-USER-PROMPT")
+  assert_eq(selection.require_tool_evidence, true)
+  assert_eq(selection.session_suffix, "")
+}
+
+pipeline test_attempt_selection_repair_prompt_threads_prior_findings(task) {
+  let marker = "MARKER-UNIQUE-FINDING-9f3a2b"
+  let selection = agent_review_attempt_selection(
+    {attempt: 2, prior_findings: [marker], prior_text: "prior audit text"},
+    selection_analysis(),
+    "BASE-SYSTEM",
+    "BASE-USER-PROMPT",
+  )
+  // Repair attempts drop tool evidence and carry the -repair-N session suffix.
+  assert_eq(selection.require_tool_evidence, false)
+  assert_eq(selection.session_suffix, "-repair-1")
+  // The real repair prompt must embed the prior attempt's findings.
+  assert_eq(contains(selection.prompt, marker), true)
+  let selection3 = agent_review_attempt_selection(
+    {attempt: 3, prior_findings: [marker], prior_text: "x"},
+    selection_analysis(),
+    "S",
+    "P",
+  )
+  assert_eq(selection3.session_suffix, "-repair-2")
+  assert_eq(contains(selection3.prompt, marker), true)
+}
