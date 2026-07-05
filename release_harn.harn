@@ -108,6 +108,7 @@ import {
   repin_tocttou_decision,
 } from "lib/release_repin"
 import { require_release_repo_path } from "lib/release_repo_guard"
+import { agent_review_execute } from "lib/release_review_loop"
 import {
   audit_offload_decision,
   offload_probe_command,
@@ -1508,6 +1509,29 @@ fn agent_repair_system() {
   return render("@prompts/release_repair_system.harn.prompt", {})
 }
 
+/**
+ * Pick the system prompt, user prompt, tool-evidence flag, and session suffix
+ * for the Nth release-review attempt. Attempt 1 is the tool-driven initial
+ * audit (`system`/`prompt`, tool evidence required, no suffix); every later
+ * attempt is a findings-driven repair pass that re-prompts with
+ * `agent_repair_prompt` off the prior attempt's findings and text
+ * (`ctx.prior_findings` / `ctx.prior_text`) under the repair system prompt.
+ * This is the per-attempt branch the `workflow_run_repair` executor runs; it is
+ * `pub` so the release-review loop test can prove the repair prompt threads the
+ * prior findings.
+ */
+pub fn agent_review_attempt_selection(ctx, analysis, base_system, base_prompt) {
+  if ctx.attempt <= 1 {
+    return {system: base_system, prompt: base_prompt, require_tool_evidence: true, session_suffix: ""}
+  }
+  return {
+    system: agent_repair_system(),
+    prompt: agent_repair_prompt(ctx.prior_findings, ctx.prior_text, analysis),
+    require_tool_evidence: false,
+    session_suffix: "-repair-" + to_string(ctx.attempt - 1),
+  }
+}
+
 fn persist_agent_changelog(harness: Harness, run_id, text, next_version) {
   let section = agent_changelog_section(text, next_version)
   if section == "" {
@@ -2354,31 +2378,38 @@ fn agent_review(harness: Harness, cfg, analysis, run_id) {
       {analysis_json: json_stringify(compact_agent_analysis(analysis))},
     )
   }
-  var result = run_release_agent_loop(harness, cfg, analysis, system, prompt, run_id, true, "")
-  var text = agent_result_text(result)
-  var validation_findings = validate_agent_attempt(cfg, analysis, result, text)
-  var attempts = [agent_attempt_record("initial-review", text, validation_findings, result)]
-  // TODO(rearch-I2): replace this hand-rolled validate->repair-with-feedback
-  // loop with the workflow stage retry-with-feedback primitive
-  // (WorkflowRetryPolicy `repair_prompt_builder` / `feedback`) once the stage
-  // retry-loop inversion ships in a harn release.
-  while len(validation_findings) > 0 && len(attempts) < 3 {
-    let repair_prompt = agent_repair_prompt(validation_findings, text, analysis)
-    result = run_release_agent_loop(
-      harness,
-      cfg,
-      analysis,
-      agent_repair_system(),
-      repair_prompt,
-      run_id,
-      false,
-      "-repair-${len(attempts)}",
-    )
-    text = agent_result_text(result)
-    validation_findings = validate_agent_attempt(cfg, analysis, result, text)
-    attempts = attempts
-      + [agent_attempt_record("validation-repair-${len(attempts)}", text, validation_findings, result)]
-  }
+  // Run the validate->repair-with-feedback loop on harn's canonical
+  // `workflow_run_repair` primitive (inline executor + retry-context feedback)
+  // instead of a hand-rolled while loop. The executor owns each attempt: it
+  // selects the initial vs. repair system/prompt off `ctx.attempt` (threading
+  // the prior attempt's findings via `ctx.prior_findings`/`ctx.prior_text`),
+  // runs the agent, validates, and returns a "failed" branch while findings
+  // remain — which is what drives the primitive's retry up to 3 attempts.
+  let review = agent_review_execute(
+    {
+      task: prompt,
+      max_attempts: 3,
+      run_attempt: { ctx ->
+        let selection = agent_review_attempt_selection(ctx, analysis, system, prompt)
+        run_release_agent_loop(
+          harness,
+          cfg,
+          analysis,
+          selection.system,
+          selection.prompt,
+          run_id,
+          selection.require_tool_evidence,
+          selection.session_suffix,
+        )
+      },
+      validate: { attempt_result, attempt_text -> validate_agent_attempt(cfg, analysis, attempt_result, attempt_text) },
+      make_record: { name, attempt_text, findings, attempt_result -> agent_attempt_record(name, attempt_text, findings, attempt_result) },
+    },
+  )
+  let result = review.final_result
+  let text = review.text
+  let validation_findings = review.validation_findings
+  let attempts = review.attempts
   let draft_changelog = persist_agent_changelog(harness, run_id, text, analysis.next_version)
   let artifacts = persist_agent_artifacts(harness, run_id, result, attempts, validation_findings)
   return {

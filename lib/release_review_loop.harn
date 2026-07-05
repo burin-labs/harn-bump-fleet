@@ -1,0 +1,92 @@
+import { workflow_run_repair } from "std/workflow/repair"
+import { agent_result_text } from "./release_audit"
+
+/**
+ * Canonical name for the Nth release-review attempt. Attempt 1 is the initial
+ * audit; every later attempt is a findings-driven repair pass. The names are a
+ * public contract: `agent_fixture_events` emits them as `agent_review_attempt`
+ * event identifiers and `persist_agent_artifacts` serializes them into
+ * `raw_result.json`, so they must stay `initial-review`,
+ * `validation-repair-1`, `validation-repair-2`, ...
+ */
+pub fn agent_review_attempt_name(attempt) {
+  if attempt <= 1 {
+    return "initial-review"
+  }
+  return "validation-repair-" + to_string(attempt - 1)
+}
+
+/**
+ * Drive the release audit run -> validate -> repair-with-feedback loop on harn's
+ * canonical `workflow_run_repair` primitive instead of a hand-rolled while loop.
+ *
+ * The whole attempt is owned by a caller-supplied inline executor (harn #4086):
+ * for each attempt `workflow_run_repair` invokes our executor, which runs the
+ * agent, validates the output, and returns a settled payload whose `branch` is
+ * `"failed"` while findings remain — that is what drives the primitive's retry.
+ * The retry context threads the prior attempt's findings/text back in
+ * (`ctx.prior_findings` / `ctx.prior_text`), so `run_attempt` can rebuild the
+ * repair prompt exactly as the old loop did. The primitive caps the loop at
+ * `max_attempts`, stopping the moment an attempt validates clean.
+ *
+ * Because the primitive's own attempt records do not carry bump-fleet's richer
+ * per-attempt shape (text / llm / tools / transcript_context / raw result), the
+ * executor stashes the full `make_record(...)` record and the raw agent result
+ * inside each attempt's `verification`, which survives on
+ * `run.stages[i].attempts[i].verification`. We reconstruct the byte-identical
+ * `attempts` list from there.
+ *
+ * Callbacks:
+ * - `run_attempt(ctx) -> agent_loop_result` — runs one attempt. `ctx` is the
+ *   retry context `{task, attempt, prior_findings, prior_verification,
+ *   prior_text, artifacts}`; `attempt` is 1-based. The caller branches on
+ *   `ctx.attempt` to pick the initial vs. repair system/prompt.
+ * - `validate(result, text) -> list` — machine-checked findings for the attempt.
+ *   Empty findings means the attempt passed.
+ * - `make_record(name, text, findings, result) -> dict` — builds the per-attempt
+ *   record surfaced downstream.
+ *
+ * Returns `{text, validation_findings, attempts, final_result}` where `text`,
+ * `validation_findings`, and `final_result` are the last attempt's values.
+ */
+pub fn agent_review_execute(config) {
+  let base_prompt = config.task
+  let max_attempts = config.max_attempts
+  let run_attempt = config.run_attempt
+  let validate = config.validate
+  let make_record = config.make_record
+  let executor = { ctx ->
+    let result = run_attempt(ctx)
+    let text = agent_result_text(result)
+    let findings = validate(result, text)
+    let record = make_record(agent_review_attempt_name(ctx.attempt), text, findings, result)
+    return {
+      result: result,
+      verification: {ok: len(findings) == 0, findings: findings, record: record, raw_result: result},
+      // A non-"failed" branch settles the attempt as a success and stops the
+      // primitive's retry loop; "failed" keeps retrying (up to max_attempts)
+      // and threads these findings into the next attempt's context.
+      branch: if len(findings) == 0 {
+        nil
+      } else {
+        "failed"
+      },
+      outcome: "completed",
+    }
+  }
+  let out = workflow_run_repair({task: base_prompt, executor: executor, max_attempts: max_attempts})
+  var records = []
+  var raw_results = []
+  for {index: _index, value} in (out.run?.stages[0]?.attempts ?? []).enumerate() {
+    let verification = value?.verification
+    records = records + [verification?.record]
+    raw_results = raw_results + [verification?.raw_result]
+  }
+  let last = len(records) - 1
+  return {
+    text: records[last].text,
+    validation_findings: records[last].validation_findings,
+    attempts: records,
+    final_result: raw_results[last],
+  }
+}
