@@ -1,0 +1,206 @@
+/**
+ * Deterministic preflight auto-remediation for the known-safe release blockers.
+ *
+ * Two recurring blockers stall a live release with a hard failure that a human
+ * then heals by hand:
+ *   (a) a stale local `release/vX.Y.Z` branch left by an earlier aborted run,
+ *   (b) a local base branch that is behind origin.
+ *
+ * Both are safe to heal automatically ONLY when there is nothing to lose:
+ *   - stale release branch: no open PR AND no unique un-pushed commits AND a
+ *     clean tree -> delete and let the normal flow recreate it at the pin.
+ *   - base behind origin: clean tree -> `git pull --ff-only`.
+ *
+ * Anything else (open PR, unique un-pushed work, or a dirty tree) is NOT
+ * known-safe: the step fails loud with guidance and never destroys work.
+ *
+ * The classification is a pure function so every safe/unsafe branch is
+ * unit-testable; the effect wrapper probes state through injected runners,
+ * applies the remediation, and re-verifies once before failing loud.
+ */
+/**
+ * Classify a single preflight case. Inputs:
+ *   - kind: "stale_release_branch" | "base_behind".
+ *   - label: human token for messages (version or base name).
+ *   - branch_exists / has_open_pr / unique_unpushed / dirty_tree (stale branch).
+ *   - base_behind / dirty_tree (base behind).
+ * Returns `{action, safe, reason}` with action "noop" | "remediate" | "fail".
+ */
+pub fn preflight_remediation_decision(inputs) {
+  let kind = trim(inputs.kind ?? "")
+  let label = trim(inputs.label ?? "")
+  if kind == "stale_release_branch" {
+    if !(inputs.branch_exists ?? false) {
+      return {action: "noop", safe: true, reason: "no stale release/${label} branch present"}
+    }
+    if inputs.dirty_tree ?? false {
+      return {
+        action: "fail",
+        safe: false,
+        reason: "release/${label} branch present but the working tree is dirty; commit or stash before recreating the release branch",
+      }
+    }
+    if inputs.has_open_pr ?? false {
+      return {
+        action: "fail",
+        safe: false,
+        reason: "release/${label} has an open PR; recreating the branch would clobber it — rerun in fixup/repin mode instead",
+      }
+    }
+    if inputs.unique_unpushed ?? false {
+      return {
+        action: "fail",
+        safe: false,
+        reason: "release/${label} has commits not present on origin; refusing to delete it to avoid losing un-pushed work",
+      }
+    }
+    return {
+      action: "remediate",
+      safe: true,
+      reason: "stale release/${label} branch has no open PR and no unique commits; deleting so it is recreated at the pin",
+    }
+  }
+  if kind == "base_behind" {
+    if !(inputs.base_behind ?? false) {
+      return {action: "noop", safe: true, reason: "base ${label} already up to date with origin"}
+    }
+    if inputs.dirty_tree ?? false {
+      return {
+        action: "fail",
+        safe: false,
+        reason: "base ${label} is behind origin but the working tree is dirty; commit or stash before fast-forwarding",
+      }
+    }
+    return {
+      action: "remediate",
+      safe: true,
+      reason: "base ${label} is behind origin with a clean tree; fast-forwarding via git pull --ff-only",
+    }
+  }
+  return {action: "noop", safe: true, reason: "unknown preflight case `${kind}`; no remediation"}
+}
+
+fn tree_is_dirty(git) {
+  let status = git(["status", "--porcelain", "--untracked-files=normal"])
+  return trim(status.stdout ?? "") != ""
+}
+
+fn local_branch_present(git, branch) {
+  return git(["rev-parse", "--verify", "--quiet", "refs/heads/${branch}"]).success ?? false
+}
+
+fn count_or_zero(result) {
+  if !(result.success ?? false) {
+    return 0
+  }
+  return to_int(trim(result.stdout ?? "")) ?? 0
+}
+
+/**
+ * Un-pushed commits on `branch` that origin does not already have. When origin
+ * has the branch, that is `origin/branch..branch`; otherwise any commit beyond
+ * `origin/base` counts as un-pushed work worth protecting.
+ */
+fn unique_unpushed_count(git, branch, base) {
+  if git(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/${branch}"]).success ?? false {
+    return count_or_zero(git(["rev-list", "--count", "origin/${branch}..${branch}"]))
+  }
+  return count_or_zero(git(["rev-list", "--count", "origin/${base}..${branch}"]))
+}
+
+/**
+ * Heal a stale `release/<version>` branch when known-safe. `git` is a runner
+ * closure `argv -> {success, stdout, stderr}`; `open_pr_count` is
+ * `branch -> int`. Returns `{action, safe, reason, remediated, verified,
+ * decision}`. Deletes the branch only on the safe path; re-verifies once that
+ * the branch is gone before reporting success, else fails loud.
+ */
+pub fn preflight_remediate_stale_release_branch(git, open_pr_count, config) {
+  let version = trim(config.version ?? "")
+  let base = trim(config.base ?? "main")
+  let branch = "release/${version}"
+  let branch_exists = local_branch_present(git, branch)
+  let decision = preflight_remediation_decision(
+    {
+      kind: "stale_release_branch",
+      label: version,
+      branch_exists: branch_exists,
+      dirty_tree: if branch_exists {
+        tree_is_dirty(git)
+      } else {
+        false
+      },
+      has_open_pr: if branch_exists {
+        open_pr_count(branch) > 0
+      } else {
+        false
+      },
+      unique_unpushed: if branch_exists {
+        unique_unpushed_count(git, branch, base) > 0
+      } else {
+        false
+      },
+    },
+  )
+  if decision.action != "remediate" {
+    return {...decision, remediated: false, verified: decision.action == "noop", decision: decision}
+  }
+  // Only delete when we are not standing on the branch we are about to remove.
+  let current = trim(git(["branch", "--show-current"]).stdout ?? "")
+  if current == branch {
+    git(["switch", base])
+  }
+  let deleted = git(["branch", "-D", branch])
+  let still_present = local_branch_present(git, branch)
+  if !(deleted.success ?? false) || still_present {
+    return {
+      action: "fail",
+      safe: false,
+      reason: "failed to delete stale release/${version} branch: ${trim(deleted.stderr ?? "")}",
+      remediated: false,
+      verified: false,
+      decision: decision,
+    }
+  }
+  return {...decision, remediated: true, verified: true, decision: decision}
+}
+
+/**
+ * Fast-forward a base branch that is behind origin when the tree is clean.
+ * `git` is a runner closure scoped to the checkout. Returns `{action, safe,
+ * reason, remediated, verified, decision}`. Fetches first, decides, then
+ * `git pull --ff-only` and re-verifies the branch is caught up.
+ */
+pub fn preflight_remediate_base_behind(git, config) {
+  let base = trim(config.base ?? "main")
+  git(["fetch", "origin", "--prune", "--quiet"])
+  let behind_before = count_or_zero(git(["rev-list", "--count", "${base}..origin/${base}"]))
+  let decision = preflight_remediation_decision(
+    {
+      kind: "base_behind",
+      label: base,
+      base_behind: behind_before > 0,
+      dirty_tree: if behind_before > 0 {
+        tree_is_dirty(git)
+      } else {
+        false
+      },
+    },
+  )
+  if decision.action != "remediate" {
+    return {...decision, remediated: false, verified: decision.action == "noop", decision: decision}
+  }
+  let pulled = git(["pull", "--ff-only", "origin", base, "--quiet"])
+  let behind_after = count_or_zero(git(["rev-list", "--count", "${base}..origin/${base}"]))
+  if !(pulled.success ?? false) || behind_after > 0 {
+    return {
+      action: "fail",
+      safe: false,
+      reason: "failed to fast-forward base ${base}: ${trim(pulled.stderr ?? "")}",
+      remediated: false,
+      verified: false,
+      decision: decision,
+    }
+  }
+  return {...decision, remediated: true, verified: true, decision: decision}
+}

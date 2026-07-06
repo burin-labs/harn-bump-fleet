@@ -1,0 +1,184 @@
+/**
+ * Guard the bump-fleet checkout against running its own stale release code.
+ *
+ * `release_harn.harn` carefully pins and freshness-checks the TARGET repo it
+ * releases (`~/projects/harn`), but nothing checks whether the bump-fleet
+ * checkout that release_harn.harn itself lives in is up to date with its own
+ * origin. A stale bump-fleet runs old release logic and can crash mid-cut.
+ *
+ * The decision is a pure function of the local/remote HEAD relationship so the
+ * behind/ahead/diverged/opt-in matrix is unit-testable without git or the
+ * network. The effect wrapper resolves the fleet root, fetches, compares, and
+ * either fails loud with an exact `git -C <root> pull --ff-only` remediation or
+ * (only under an explicit `--self-update` / `FLEET_SELF_UPDATE=1` opt-in)
+ * fast-forwards. It never silently proceeds while behind.
+ */
+/**
+ * Decide what to do about bump-fleet self-staleness. Inputs:
+ *   - mode: release mode; only mutating modes (prepare/ship-pr) gate.
+ *   - fetch_ok: whether `git fetch origin` succeeded.
+ *   - equal: local HEAD equals the remote default-branch tip.
+ *   - behind: remote has commits the local checkout lacks.
+ *   - ahead: local checkout has commits the remote lacks.
+ *   - opt_in: operator asked to auto fast-forward (`--self-update`).
+ *   - fleet_root / remote_ref: for actionable message text.
+ * Returns `{action, reason, remediation?}` with action one of
+ * "skip" | "proceed" | "warn" | "fail" | "autoff".
+ */
+pub fn fleet_self_update_decision(inputs) {
+  let mode = trim(inputs.mode ?? "")
+  let fleet_root = trim(inputs.fleet_root ?? "<fleet>")
+  let remote_ref = trim(inputs.remote_ref ?? "origin/main")
+  // Pure audit is read-only; there is no stale-code hazard worth gating on.
+  if mode == "" || mode == "audit" {
+    return {action: "skip", reason: "mode `${mode}` is read-only; skipping bump-fleet self-check"}
+  }
+  if !(inputs.fetch_ok ?? false) {
+    return {
+      action: "warn",
+      reason: "could not fetch bump-fleet ${remote_ref}; proceeding without a freshness guarantee",
+    }
+  }
+  if inputs.equal ?? false {
+    return {action: "proceed", reason: "bump-fleet checkout is up to date with ${remote_ref}"}
+  }
+  let behind = inputs.behind ?? false
+  let ahead = inputs.ahead ?? false
+  let remediation = "git -C ${fleet_root} pull --ff-only"
+  if behind && ahead {
+    return {
+      action: "fail",
+      reason: "bump-fleet checkout has diverged from ${remote_ref} (local commits AND missing remote commits); a stale release harness can run old code",
+      remediation: "git -C ${fleet_root} pull --rebase   # resolve the divergence, then rerun",
+    }
+  }
+  if behind {
+    if inputs.opt_in ?? false {
+      return {
+        action: "autoff",
+        reason: "bump-fleet checkout is behind ${remote_ref}; fast-forwarding (self-update opt-in)",
+        remediation: remediation,
+      }
+    }
+    return {
+      action: "fail",
+      reason: "bump-fleet checkout is behind ${remote_ref}; a stale release harness can run old code",
+      remediation: remediation,
+    }
+  }
+  if ahead {
+    return {
+      action: "proceed",
+      reason: "bump-fleet checkout is ahead of ${remote_ref} (local unpushed commits); proceeding on newer code",
+    }
+  }
+  // HEADs differ but neither ahead nor behind: unexpected (e.g. detached or
+  // reflog rewrite). Don't block the release; surface it.
+  return {
+    action: "warn",
+    reason: "bump-fleet HEAD differs from ${remote_ref} but is neither ahead nor behind; proceeding",
+  }
+}
+
+fn rev_count(result) {
+  if !(result.success ?? false) {
+    return nil
+  }
+  return to_int(trim(result.stdout ?? ""))
+}
+
+/**
+ * Effect wrapper around `fleet_self_update_decision`. `git` is a runner closure
+ * `argv -> {success, stdout, stderr, status}` scoped to the bump-fleet checkout
+ * (process cwd); `exists` is `path -> bool`. Config:
+ *   - mode: release mode.
+ *   - opt_in: `--self-update` / `FLEET_SELF_UPDATE=1`.
+ *   - default_branch: fleet default branch (usually "main").
+ *   - marker_file: file that must exist at the resolved root to confirm it is
+ *     the bump-fleet checkout (defaults to "release_harn.harn").
+ *
+ * Returns the decision record plus `{fleet_root, remote_ref, local_sha,
+ * remote_sha, ff?}`. Fast-forwards in place only when the decision is "autoff".
+ * Never mutates for any other action.
+ */
+pub fn fleet_self_check(git, exists, config) {
+  let mode = trim(config.mode ?? "")
+  let opt_in = config.opt_in ?? false
+  let default_branch = trim(config.default_branch ?? "main")
+  let marker_file = trim(config.marker_file ?? "release_harn.harn")
+  if mode == "" || mode == "audit" {
+    return {
+      action: "skip",
+      reason: "mode `${mode}` is read-only; skipping bump-fleet self-check",
+      fleet_root: "",
+      remote_ref: "origin/${default_branch}",
+    }
+  }
+  let top = git(["rev-parse", "--show-toplevel"])
+  if !(top.success ?? false) {
+    return {
+      action: "warn",
+      reason: "could not resolve bump-fleet checkout root; skipping self-check",
+      fleet_root: "",
+      remote_ref: "origin/${default_branch}",
+    }
+  }
+  let fleet_root = trim(top.stdout ?? "")
+  let remote_ref = "origin/${default_branch}"
+  if fleet_root == "" || !exists(path_join(fleet_root, marker_file)) {
+    return {
+      action: "warn",
+      reason: "resolved root `${fleet_root}` is not a bump-fleet checkout (no ${marker_file}); skipping self-check",
+      fleet_root: fleet_root,
+      remote_ref: remote_ref,
+    }
+  }
+  let fetch = git(["fetch", "origin", "--quiet"])
+  let fetch_ok = fetch.success ?? false
+  let local = git(["rev-parse", "HEAD"])
+  let remote = git(["rev-parse", remote_ref])
+  let local_sha = trim(local.stdout ?? "")
+  let remote_sha = trim(remote.stdout ?? "")
+  if !fetch_ok || !(local.success ?? false) || !(remote.success ?? false) {
+    let decision = fleet_self_update_decision(
+      {mode: mode, fetch_ok: false, fleet_root: fleet_root, remote_ref: remote_ref},
+    )
+    return {
+      ...decision,
+      fleet_root: fleet_root,
+      remote_ref: remote_ref,
+      local_sha: local_sha,
+      remote_sha: remote_sha,
+    }
+  }
+  let equal = local_sha != "" && local_sha == remote_sha
+  let behind_count = rev_count(git(["rev-list", "--count", "HEAD..${remote_ref}"]))
+  let ahead_count = rev_count(git(["rev-list", "--count", "${remote_ref}..HEAD"]))
+  let decision = fleet_self_update_decision(
+    {
+      mode: mode,
+      fetch_ok: true,
+      opt_in: opt_in,
+      equal: equal,
+      behind: (behind_count ?? 0) > 0,
+      ahead: (ahead_count ?? 0) > 0,
+      fleet_root: fleet_root,
+      remote_ref: remote_ref,
+    },
+  )
+  var out = {
+    ...decision,
+    fleet_root: fleet_root,
+    remote_ref: remote_ref,
+    local_sha: local_sha,
+    remote_sha: remote_sha,
+  }
+  if decision.action == "autoff" {
+    let ff = git(["merge", "--ff-only", remote_ref])
+    out = {
+      ...out,
+      ff: {success: ff.success ?? false, stdout: trim(ff.stdout ?? ""), stderr: trim(ff.stderr ?? "")},
+    }
+  }
+  return out
+}
