@@ -24,6 +24,7 @@ import { strip_think_blocks } from "std/llm/safe"
 import { poll_until } from "std/poll"
 import { map_settled } from "std/settled"
 import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
+import { workflow_run_repair } from "std/workflow/repair"
 import { dry_run_predispatch_outcome, local_pin_drift_detail } from "lib/bump_decision"
 import { cargo_harn_pin_probe, harn_version_pin_probe } from "lib/bump_pins"
 import {
@@ -869,19 +870,44 @@ fn write_audit(harness: Harness, run_id, payload) {
 }
 
 fn summarize_with_local_llm(harness: Harness, payload) {
+  // Single-node validate -> repair on harn's canonical `workflow_run_repair`
+  // primitive instead of a hand-rolled two-attempt loop. The inline executor
+  // owns each attempt: attempt 1 asks for bullets straight off the audit JSON;
+  // any later attempt (fired only when `bump_summary_format_ok` rejected the
+  // prior text) re-prompts through the `bump_summary_retry` template. Returning
+  // a `"failed"` branch while the format check fails is what drives the
+  // primitive's retry, capped at `max_attempts: 2` — byte-identical to the old
+  // first/second ceiling. Each attempt stashes its text on the attempt record's
+  // `verification`, so we rebuild the exact `[first]` / `[first, second]` list
+  // `bump_summary_result` expects (it selects the first valid attempt, else the
+  // deterministic fallback, so a bad final attempt still fails open).
   let system = render_local_prompt(harness, "bump_summary_system.harn.prompt", {})
-  let prompt = "Audit JSON:\n```json\n" + json_stringify(payload) + "\n```\nBullets:\n"
-  let first = llm_summary_once(prompt, system)
-  if bump_summary_format_ok(first) {
-    return bump_summary_result(payload, [first])
+  let audit_json = json_stringify(payload)
+  let executor = { ctx ->
+    let attempt_prompt = if ctx.attempt <= 1 {
+      "Audit JSON:\n```json\n" + audit_json + "\n```\nBullets:\n"
+    } else {
+      render_local_prompt(harness, "bump_summary_retry.harn.prompt", {audit_json: audit_json})
+    }
+    let text = llm_summary_once(attempt_prompt, system)
+    let ok = bump_summary_format_ok(text)
+    return {
+      text: text,
+      verification: {ok: ok, text: text},
+      branch: if ok {
+        nil
+      } else {
+        "failed"
+      },
+      outcome: "completed",
+    }
   }
-  let retry_prompt = render_local_prompt(
-    harness,
-    "bump_summary_retry.harn.prompt",
-    {audit_json: json_stringify(payload)},
-  )
-  let second = llm_summary_once(retry_prompt, system)
-  return bump_summary_result(payload, [first, second])
+  let out = workflow_run_repair({task: "bump-fleet-summary", executor: executor, max_attempts: 2})
+  var texts = []
+  for {index: _index, value} in (out.run?.stages[0]?.attempts ?? []).enumerate() {
+    texts = texts + [value?.verification?.text]
+  }
+  return bump_summary_result(payload, texts)
 }
 
 fn llm_summary_once(prompt, system) {
