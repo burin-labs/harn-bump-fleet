@@ -1,0 +1,223 @@
+import {
+  preflight_remediate_base_behind,
+  preflight_remediate_stale_release_branch,
+  preflight_remediation_decision,
+} from "../lib/preflight_remediation"
+import { fail, ok } from "../lib/shell_util"
+
+fn scripted_git(entries) {
+  return { args ->
+    let key = join(args, " ")
+    for entry in entries {
+      if entry.cmd == key {
+        return entry.result
+      }
+    }
+    throw "unexpected git: " + key
+  }
+}
+
+fn entry(cmd, result) {
+  return {cmd: cmd, result: result}
+}
+
+pipeline test_preflight_remediation_decision(task) {
+  // Stale release branch: absent -> noop.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: false},
+    ).action,
+    "noop",
+  )
+  // Present + clean + no PR + no unique -> remediate (delete/recreate).
+  let safe = preflight_remediation_decision(
+    {
+      kind: "stale_release_branch",
+      label: "v1.2.3",
+      branch_exists: true,
+      dirty_tree: false,
+      has_open_pr: false,
+      unique_unpushed: false,
+    },
+  )
+  assert_eq(safe.action, "remediate")
+  assert_eq(safe.safe, true)
+  // Dirty tree -> fail.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, dirty_tree: true},
+    ).action,
+    "fail",
+  )
+  // Open PR -> fail (would clobber).
+  let open_pr = preflight_remediation_decision(
+    {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, has_open_pr: true},
+  )
+  assert_eq(open_pr.action, "fail")
+  assert_eq(contains(open_pr.reason, "open PR"), true)
+  // Unique un-pushed commits -> fail (don't lose work).
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, unique_unpushed: true},
+    ).action,
+    "fail",
+  )
+  // Base behind: up to date -> noop.
+  assert_eq(
+    preflight_remediation_decision({kind: "base_behind", label: "main", base_behind: false}).action,
+    "noop",
+  )
+  // Behind + clean -> remediate.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "base_behind", label: "main", base_behind: true, dirty_tree: false},
+    ).action,
+    "remediate",
+  )
+  // Behind + dirty -> fail.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "base_behind", label: "main", base_behind: true, dirty_tree: true},
+    ).action,
+    "fail",
+  )
+}
+
+pipeline test_stale_release_branch_wrapper_unsafe(task) {
+  // Unsafe: an open PR blocks deletion (no state transition needed).
+  let open_git = scripted_git(
+    [
+      entry("rev-parse --verify --quiet refs/heads/release/v1.2.3", ok("abc\n")),
+      entry("status --porcelain --untracked-files=normal", ok("")),
+      entry("rev-parse --verify --quiet refs/remotes/origin/release/v1.2.3", fail(1, "")),
+      entry("rev-list --count origin/main..release/v1.2.3", ok("0\n")),
+    ],
+  )
+  let blocked = preflight_remediate_stale_release_branch(open_git, { _b -> 1 }, {version: "v1.2.3", base: "main"})
+  assert_eq(blocked.action, "fail")
+  assert_eq(blocked.remediated, false)
+  // Unsafe: unique un-pushed commits block deletion.
+  let unique_git = scripted_git(
+    [
+      entry("rev-parse --verify --quiet refs/heads/release/v1.2.3", ok("abc\n")),
+      entry("status --porcelain --untracked-files=normal", ok("")),
+      entry("rev-parse --verify --quiet refs/remotes/origin/release/v1.2.3", fail(1, "")),
+      entry("rev-list --count origin/main..release/v1.2.3", ok("2\n")),
+    ],
+  )
+  assert_eq(
+    preflight_remediate_stale_release_branch(unique_git, { _b -> 0 }, {version: "v1.2.3", base: "main"}).action,
+    "fail",
+  )
+  // Absent branch -> noop, no delete attempted.
+  let absent = preflight_remediate_stale_release_branch(
+    scripted_git([entry("rev-parse --verify --quiet refs/heads/release/v9.9.9", fail(1, ""))]),
+    { _b -> 0 },
+    {version: "v9.9.9", base: "main"},
+  )
+  assert_eq(absent.action, "noop")
+}
+
+pipeline test_base_behind_wrapper_unsafe(task) {
+  // Up to date -> noop.
+  let uptodate = scripted_git(
+    [
+      entry("fetch origin --prune --quiet", ok("")),
+      entry("rev-list --count main..origin/main", ok("0\n")),
+    ],
+  )
+  assert_eq(preflight_remediate_base_behind(uptodate, {base: "main"}).action, "noop")
+  // Behind but dirty tree -> fail (never destructive).
+  let dirty = scripted_git(
+    [
+      entry("fetch origin --prune --quiet", ok("")),
+      entry("rev-list --count main..origin/main", ok("2\n")),
+      entry("status --porcelain --untracked-files=normal", ok(" M file.rs\n")),
+    ],
+  )
+  assert_eq(preflight_remediate_base_behind(dirty, {base: "main"}).action, "fail")
+}
+
+// -------------------------------------------------------------------------------------------------
+// Dogfood: exercise the safe remediation end-to-end against real git fixtures.
+// -------------------------------------------------------------------------------------------------
+
+fn sh(cmd) {
+  let r = shell(cmd)
+  if !(r.success ?? false) {
+    throw "fixture command failed: ${cmd}\n${r.stderr ?? ""}"
+  }
+  return r
+}
+
+fn git_runner_for(repo) {
+  return { args -> shell("git -C '" + repo + "' " + join(args.map({ a -> "'" + a + "'" }), " ")) }
+}
+
+fn setup_repo_with_origin() {
+  let root = trim(sh("mktemp -d").stdout)
+  let origin = root + "/origin.git"
+  let work = root + "/work"
+  sh("git init --bare -q '" + origin + "'")
+  sh("git init -q '" + work + "'")
+  sh("git -C '" + work + "' config user.email t@example.com")
+  sh("git -C '" + work + "' config user.name test")
+  sh("git -C '" + work + "' config commit.gpgsign false")
+  sh("git -C '" + work + "' checkout -q -b main")
+  sh("printf 'a\\n' > '" + work + "/f.txt'")
+  sh("git -C '" + work + "' add -A")
+  sh("git -C '" + work + "' commit -q -m init")
+  sh("git -C '" + work + "' remote add origin '" + origin + "'")
+  sh("git -C '" + work + "' push -q -u origin main")
+  return {root: root, origin: origin, work: work}
+}
+
+pipeline test_stale_release_branch_dogfood(task) {
+  let repo = setup_repo_with_origin()
+  // Create a stale release branch at main with no extra commits, not pushed.
+  sh("git -C '" + repo.work + "' branch release/v1.2.3 main")
+  sh("git -C '" + repo.work + "' checkout -q main")
+  let git = git_runner_for(repo.work)
+  let result = preflight_remediate_stale_release_branch(git, { _b -> 0 }, {version: "v1.2.3", base: "main"})
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  // Branch is really gone.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  sh("rm -rf '" + repo.root + "'")
+}
+
+pipeline test_stale_release_branch_dogfood_unique(task) {
+  let repo = setup_repo_with_origin()
+  // Release branch has a unique un-pushed commit -> refuse to delete.
+  sh("git -C '" + repo.work + "' checkout -q -b release/v1.2.3 main")
+  sh("printf 'b\\n' > '" + repo.work + "/g.txt'")
+  sh("git -C '" + repo.work + "' add -A")
+  sh("git -C '" + repo.work + "' commit -q -m unique")
+  sh("git -C '" + repo.work + "' checkout -q main")
+  let git = git_runner_for(repo.work)
+  let result = preflight_remediate_stale_release_branch(git, { _b -> 0 }, {version: "v1.2.3", base: "main"})
+  assert_eq(result.action, "fail")
+  // Branch is preserved.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, true)
+  sh("rm -rf '" + repo.root + "'")
+}
+
+pipeline test_base_behind_dogfood(task) {
+  let repo = setup_repo_with_origin()
+  // Advance origin by two commits, then rewind local main behind it.
+  sh("printf 'b\\n' >> '" + repo.work + "/f.txt'")
+  sh("git -C '" + repo.work + "' commit -q -am second")
+  sh("printf 'c\\n' >> '" + repo.work + "/f.txt'")
+  sh("git -C '" + repo.work + "' commit -q -am third")
+  sh("git -C '" + repo.work + "' push -q origin main")
+  sh("git -C '" + repo.work + "' reset -q --hard HEAD~2")
+  let git = git_runner_for(repo.work)
+  let result = preflight_remediate_base_behind(git, {base: "main"})
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  // Local main really caught up.
+  assert_eq(trim(git(["rev-list", "--count", "main..origin/main"]).stdout), "0")
+  sh("rm -rf '" + repo.root + "'")
+}

@@ -1,0 +1,182 @@
+import { fleet_self_check, fleet_self_update_decision } from "../lib/fleet_selfcheck"
+import { fail, ok } from "../lib/shell_util"
+
+fn scripted_git(entries) {
+  return { args ->
+    let key = join(args, " ")
+    for entry in entries {
+      if entry.cmd == key {
+        return entry.result
+      }
+    }
+    throw "unexpected git: " + key
+  }
+}
+
+fn entry(cmd, result) {
+  return {cmd: cmd, result: result}
+}
+
+pipeline test_fleet_self_update_decision(task) {
+  // Read-only audit never gates.
+  assert_eq(fleet_self_update_decision({mode: "audit", fetch_ok: true, behind: true}).action, "skip")
+  // Unknown fetch state -> warn, proceed without a freshness guarantee.
+  let no_fetch = fleet_self_update_decision({mode: "prepare", fetch_ok: false})
+  assert_eq(no_fetch.action, "warn")
+  // Up to date -> proceed.
+  assert_eq(
+    fleet_self_update_decision({mode: "prepare", fetch_ok: true, equal: true}).action,
+    "proceed",
+  )
+  // Behind without opt-in -> fail loud with ff remediation.
+  let behind = fleet_self_update_decision(
+    {mode: "prepare", fetch_ok: true, equal: false, behind: true, ahead: false, fleet_root: "/x"},
+  )
+  assert_eq(behind.action, "fail")
+  assert_eq(contains(behind.remediation, "git -C /x pull --ff-only"), true)
+  // Behind with opt-in -> auto fast-forward.
+  let behind_opt = fleet_self_update_decision(
+    {mode: "ship-pr", fetch_ok: true, equal: false, behind: true, ahead: false, opt_in: true},
+  )
+  assert_eq(behind_opt.action, "autoff")
+  // Ahead only (local unpushed) -> proceed on newer code.
+  assert_eq(
+    fleet_self_update_decision(
+      {mode: "prepare", fetch_ok: true, equal: false, behind: false, ahead: true},
+    ).action,
+    "proceed",
+  )
+  // Diverged -> fail with a rebase remediation.
+  let diverged = fleet_self_update_decision(
+    {mode: "prepare", fetch_ok: true, equal: false, behind: true, ahead: true, fleet_root: "/x"},
+  )
+  assert_eq(diverged.action, "fail")
+  assert_eq(contains(diverged.remediation, "pull --rebase"), true)
+}
+
+fn sh(cmd) {
+  let r = shell(cmd)
+  if !(r.success ?? false) {
+    throw "fixture command failed: ${cmd}\n${r.stderr ?? ""}"
+  }
+  return r
+}
+
+fn git_runner_for(repo) {
+  return { args -> shell("git -C '" + repo + "' " + join(args.map({ a -> "'" + a + "'" }), " ")) }
+}
+
+fn setup_behind_fleet() {
+  let root = trim(sh("mktemp -d").stdout)
+  let origin = root + "/origin.git"
+  let work = root + "/work"
+  sh("git init --bare -q '" + origin + "'")
+  sh("git init -q '" + work + "'")
+  sh("git -C '" + work + "' config user.email t@example.com")
+  sh("git -C '" + work + "' config user.name test")
+  sh("git -C '" + work + "' config commit.gpgsign false")
+  sh("git -C '" + work + "' checkout -q -b main")
+  // Marker file so the self-check confirms this is the bump-fleet checkout.
+  sh("printf 'x\\n' > '" + work + "/release_harn.harn'")
+  sh("git -C '" + work + "' add -A")
+  sh("git -C '" + work + "' commit -q -m init")
+  sh("git -C '" + work + "' remote add origin '" + origin + "'")
+  sh("git -C '" + work + "' push -q -u origin main")
+  // Advance origin by two commits, then rewind the local checkout behind it.
+  sh("printf 'a\\n' >> '" + work + "/release_harn.harn'")
+  sh("git -C '" + work + "' commit -q -am second")
+  sh("printf 'b\\n' >> '" + work + "/release_harn.harn'")
+  sh("git -C '" + work + "' commit -q -am third")
+  sh("git -C '" + work + "' push -q origin main")
+  sh("git -C '" + work + "' reset -q --hard HEAD~2")
+  return {root: root, work: work}
+}
+
+pipeline test_fleet_self_check_dogfood_behind(task) {
+  let fleet = setup_behind_fleet()
+  let git = git_runner_for(fleet.work)
+  let exists = { p -> shell("test -e '" + p + "'").success }
+  // A stale (behind) fleet fails loud without opt-in.
+  let stale = fleet_self_check(git, exists, {mode: "prepare", default_branch: "main"})
+  assert_eq(stale.action, "fail")
+  assert_eq(contains(stale.remediation, "pull --ff-only"), true)
+  sh("rm -rf '" + fleet.root + "'")
+}
+
+pipeline test_fleet_self_check_dogfood_autoff(task) {
+  let fleet = setup_behind_fleet()
+  let git = git_runner_for(fleet.work)
+  let exists = { p -> shell("test -e '" + p + "'").success }
+  // With opt-in, the behind fleet fast-forwards and really catches up.
+  let ff = fleet_self_check(git, exists, {mode: "ship-pr", opt_in: true, default_branch: "main"})
+  assert_eq(ff.action, "autoff")
+  assert_eq(ff.ff.success, true)
+  assert_eq(trim(git(["rev-list", "--count", "HEAD..origin/main"]).stdout), "0")
+  sh("rm -rf '" + fleet.root + "'")
+}
+
+pipeline test_fleet_self_check_wrapper(task) {
+  let always_exists = { _p -> true }
+  // Audit short-circuits before touching git.
+  let skip = fleet_self_check({ _a -> ok("") }, always_exists, {mode: "audit"})
+  assert_eq(skip.action, "skip")
+  // Behind -> fail (no opt-in). Two remote commits, zero local.
+  let behind_git = scripted_git(
+    [
+      entry("rev-parse --show-toplevel", ok("/fleet\n")),
+      entry("fetch origin --quiet", ok("")),
+      entry("rev-parse HEAD", ok("aaaa\n")),
+      entry("rev-parse origin/main", ok("bbbb\n")),
+      entry("rev-list --count HEAD..origin/main", ok("2\n")),
+      entry("rev-list --count origin/main..HEAD", ok("0\n")),
+    ],
+  )
+  let behind = fleet_self_check(behind_git, always_exists, {mode: "prepare", default_branch: "main"})
+  assert_eq(behind.action, "fail")
+  assert_eq(behind.fleet_root, "/fleet")
+  assert_eq(behind.local_sha, "aaaa")
+  // Behind + opt-in -> autoff, merge --ff-only invoked and succeeds.
+  let ff_git = scripted_git(
+    [
+      entry("rev-parse --show-toplevel", ok("/fleet\n")),
+      entry("fetch origin --quiet", ok("")),
+      entry("rev-parse HEAD", ok("aaaa\n")),
+      entry("rev-parse origin/main", ok("bbbb\n")),
+      entry("rev-list --count HEAD..origin/main", ok("2\n")),
+      entry("rev-list --count origin/main..HEAD", ok("0\n")),
+      entry("merge --ff-only origin/main", ok("Updated\n")),
+    ],
+  )
+  let ff = fleet_self_check(ff_git, always_exists, {mode: "prepare", opt_in: true})
+  assert_eq(ff.action, "autoff")
+  assert_eq(ff.ff.success, true)
+  // Equal HEADs -> proceed.
+  let equal_git = scripted_git(
+    [
+      entry("rev-parse --show-toplevel", ok("/fleet\n")),
+      entry("fetch origin --quiet", ok("")),
+      entry("rev-parse HEAD", ok("cccc\n")),
+      entry("rev-parse origin/main", ok("cccc\n")),
+      entry("rev-list --count HEAD..origin/main", ok("0\n")),
+      entry("rev-list --count origin/main..HEAD", ok("0\n")),
+    ],
+  )
+  assert_eq(fleet_self_check(equal_git, always_exists, {mode: "prepare"}).action, "proceed")
+  // Resolved root is not the fleet checkout (marker missing) -> warn, no gating.
+  let wrong = fleet_self_check(
+    scripted_git([entry("rev-parse --show-toplevel", ok("/elsewhere\n"))]),
+    { _p -> false },
+    {mode: "prepare"},
+  )
+  assert_eq(wrong.action, "warn")
+  // Fetch failure -> warn (cannot verify freshness).
+  let no_fetch_git = scripted_git(
+    [
+      entry("rev-parse --show-toplevel", ok("/fleet\n")),
+      entry("fetch origin --quiet", fail(1, "network down")),
+      entry("rev-parse HEAD", ok("aaaa\n")),
+      entry("rev-parse origin/main", fail(1, "unknown revision")),
+    ],
+  )
+  assert_eq(fleet_self_check(no_fetch_git, always_exists, {mode: "ship-pr"}).action, "warn")
+}

@@ -1,0 +1,180 @@
+/**
+ * Advisory local build mutex for the heavy release build/audit phase.
+ *
+ * Two release or build runs sharing the machine's Cargo build dir contend for
+ * ~20+ minutes of compile time and can poison each other's incremental cache.
+ * This is a cooperative, cross-platform (macOS has no `flock`) advisory lock
+ * built on an atomic `mkdir` — the same primitive the remote audit lease uses.
+ *
+ * The lock directory records the owning `harn` process id. A second acquirer
+ * that finds the lock held checks whether that pid is still alive: a dead owner
+ * (crashed/killed release) yields a stale lock that is safe to steal; a live
+ * owner means a real concurrent build, so the caller fails fast unless it opted
+ * into `--wait`. The acquire never blocks unboundedly and the lock is released
+ * on exit.
+ *
+ * The decision is pure so acquired/steal/wait/fail is unit-testable without the
+ * filesystem; the effect wrapper drives it through a shell runner closure.
+ */
+import { safe_shell_arg } from "./shell_util"
+
+let DEFAULT_POLL_SECONDS = 5
+
+let DEFAULT_MAX_WAIT_POLLS = 240
+
+let DEFAULT_STEAL_CAP = 3
+
+/**
+ * Decide what to do when a `mkdir` lock attempt did not immediately win.
+ * Inputs: `{acquired, owner_alive, wait}`. Returns `{action, reason}` with
+ * action "acquired" | "steal" | "wait" | "fail".
+ */
+pub fn build_lock_decision(inputs) {
+  if inputs.acquired ?? false {
+    return {action: "acquired", reason: "acquired the build lock"}
+  }
+  if !(inputs.owner_alive ?? false) {
+    return {action: "steal", reason: "build lock is held by a dead process; reclaiming the stale lock"}
+  }
+  if inputs.wait ?? false {
+    return {action: "wait", reason: "build lock is held by a live process; waiting (--wait)"}
+  }
+  return {
+    action: "fail",
+    reason: "another release/build holds the build lock; rerun with --wait to queue behind it or clear the stale lock",
+  }
+}
+
+fn quote(value) {
+  let arg = safe_shell_arg(value)
+  if arg == nil {
+    throw "build lock path/note contains unsupported shell characters: ${value}"
+  }
+  return arg
+}
+
+fn build_lock_mkdir_command(lock_path, pid, note) {
+  let q = quote(lock_path)
+  // The owner-file write is grouped so a printf failure never masks the mkdir
+  // result: only the atomic `mkdir` decides whether we won the lock.
+  return "mkdir ${q} 2>/dev/null && { printf 'pid=%s\\nstarted_at=%s\\nnote=%s\\n' "
+    + quote(to_string(pid))
+    + " \"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)\" "
+    + quote(note)
+    + " > ${q}/owner 2>/dev/null || true; }"
+}
+
+fn owner_pid_from_text(text) {
+  for line in split(text ?? "", "\n") {
+    let t = trim(line)
+    if starts_with(t, "pid=") {
+      return to_int(trim(t[4:len(t)]))
+    }
+  }
+  return nil
+}
+
+fn read_lock_owner(run, lock_path) {
+  let q = quote(lock_path)
+  let out = run("cat ${q}/owner 2>/dev/null || true")
+  return {pid: owner_pid_from_text(out.stdout ?? ""), raw: trim(out.stdout ?? "")}
+}
+
+fn owner_pid_alive(run, pid) {
+  if pid == nil {
+    // No recorded owner pid: treat as a live hold so we never blindly steal a
+    // lock we cannot attribute. Age/wait handling still applies to real holds.
+    return true
+  }
+  let out = run("kill -0 ${to_string(pid)} 2>/dev/null && echo alive || echo dead")
+  return trim(out.stdout ?? "") == "alive"
+}
+
+/**
+ * Acquire the advisory build lock. `run` is a shell runner closure
+ * `cmd -> {success, stdout, stderr}`. Config:
+ *   - lock_path (required): the lock directory, e.g. `$TMPDIR/harn-release-build.lock`.
+ *   - pid: the current process id to record as owner (live caller passes `pid()`).
+ *   - wait: queue behind a live owner instead of failing fast.
+ *   - note: diagnostic purpose string written into the owner file.
+ *   - poll_seconds / max_wait_polls / steal_cap: bounds (defaults keep it from
+ *     ever blocking unboundedly).
+ * Returns `{acquired, action, lock_path, reason, owner?, waited_polls}`.
+ */
+pub fn acquire_build_lock(run, config) {
+  let lock_path = trim(config.lock_path ?? "")
+  if lock_path == "" {
+    throw "acquire_build_lock: lock_path is required"
+  }
+  let pid = config.pid ?? 0
+  let wait = config.wait ?? false
+  let poll_seconds = config.poll_seconds ?? DEFAULT_POLL_SECONDS
+  let max_polls = config.max_wait_polls ?? DEFAULT_MAX_WAIT_POLLS
+  let steal_cap = config.steal_cap ?? DEFAULT_STEAL_CAP
+  let note = trim(config.note ?? "harn release build")
+  var polls = 0
+  var steals = 0
+  while true {
+    let made = run(build_lock_mkdir_command(lock_path, pid, note))
+    if made.success ?? false {
+      return {
+        acquired: true,
+        action: "acquired",
+        lock_path: lock_path,
+        reason: "acquired build lock ${lock_path}",
+        waited_polls: polls,
+      }
+    }
+    let owner = read_lock_owner(run, lock_path)
+    let alive = owner_pid_alive(run, owner.pid)
+    let decision = build_lock_decision({acquired: false, owner_alive: alive, wait: wait})
+    if decision.action == "steal" {
+      if steals >= steal_cap {
+        return {
+          acquired: false,
+          action: "fail",
+          lock_path: lock_path,
+          reason: "build lock ${lock_path} kept reappearing after ${steal_cap} steal attempts; refusing to spin",
+          owner: owner,
+          waited_polls: polls,
+        }
+      }
+      run("rm -rf " + quote(lock_path))
+      steals = steals + 1
+      continue
+    }
+    if decision.action == "wait" {
+      if polls >= max_polls {
+        return {
+          acquired: false,
+          action: "fail",
+          lock_path: lock_path,
+          reason: "timed out after ${to_string(polls)} polls waiting for build lock ${lock_path} (owner pid ${to_string(owner.pid)})",
+          owner: owner,
+          waited_polls: polls,
+        }
+      }
+      run("sleep ${to_string(poll_seconds)}")
+      polls = polls + 1
+      continue
+    }
+    return {
+      acquired: false,
+      action: "fail",
+      lock_path: lock_path,
+      reason: decision.reason + " (owner pid ${to_string(owner.pid)})",
+      owner: owner,
+      waited_polls: polls,
+    }
+  }
+}
+
+/** Release the advisory build lock. Idempotent; safe to call even if unheld. */
+pub fn release_build_lock(run, lock_path) {
+  let path = trim(lock_path ?? "")
+  if path == "" {
+    return {released: false}
+  }
+  run("rm -rf " + quote(path))
+  return {released: true}
+}
