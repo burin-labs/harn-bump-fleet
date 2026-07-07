@@ -85,9 +85,19 @@ for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
     fi
   done
 
-  if [ "${crate_ready}" -eq 1 ] && [ "${#missing_assets[@]}" -eq 0 ]; then
+  release_prerelease="unknown"
+  if release_prerelease_probe="$(gh release view "${version}" --repo "${repo}" --json isPrerelease --jq '.isPrerelease' 2>/dev/null)"; then
+    release_prerelease="$(printf '%s\n' "${release_prerelease_probe}" | head -n 1 | tr -d '\r')"
+  fi
+
+  release_final=0
+  if [ "${release_prerelease}" = "false" ]; then
+    release_final=1
+  fi
+
+  if [ "${crate_ready}" -eq 1 ] && [ "${#missing_assets[@]}" -eq 0 ] && [ "${release_final}" -eq 1 ]; then
     write_output "ready" "true"
-    echo "harn-cli ${version_no_v} is published and required release assets are present."
+    echo "harn-cli ${version_no_v} is published, required release assets are present, and the GitHub release is finalized."
     exit 0
   fi
 
@@ -101,7 +111,14 @@ for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
   else
     asset_detail="missing release assets: $(join_by_comma "${missing_assets[@]}")"
   fi
-  echo "attempt ${attempt}/${max_attempts}: ${crate_detail}; ${asset_detail}"
+  if [ "${release_final}" -eq 1 ]; then
+    release_detail="GitHub release finalized"
+  elif [ "${release_prerelease}" = "true" ]; then
+    release_detail="GitHub release still marked prerelease"
+  else
+    release_detail="GitHub release finalization unknown"
+  fi
+  echo "attempt ${attempt}/${max_attempts}: ${crate_detail}; ${asset_detail}; ${release_detail}"
 
   if [ "${attempt}" -lt "${max_attempts}" ]; then
     sleep "${poll_seconds}"
