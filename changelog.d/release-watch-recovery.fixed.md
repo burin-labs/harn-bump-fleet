@@ -1,0 +1,1 @@
+`release_harn --watch-publish` now keeps polling for release assets after an automatic binary recovery run fails, so a valid release can still finish after a later rerun or manual recovery instead of exiting on stale recovery state.
