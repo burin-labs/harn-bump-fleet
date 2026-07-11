@@ -533,10 +533,11 @@ in the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
 `agent_loop` sidecar with its own JSONL transcript under `recovery/`. After the
 full release audit and generated-content checks pass, the canonical release
-branch push uses `git push --no-verify`; GitHub CI, the merge queue, and the
-tag-triggered publish/build workflows remain the authoritative gates. The older
-pre-push timeout classifier is kept for recovery reports and manual push
-failures.
+branch push keeps hooks enabled and sets `HARN_HOOKS_NO_LOCAL_BUILD=1` so
+harn-side hooks do not re-run the expensive local build evidence the harness
+just recorded. GitHub CI, the merge queue, and the tag-triggered publish/build
+workflows remain the authoritative gates. The older pre-push timeout classifier
+is kept for recovery reports and manual push failures.
 
 After a successful live `ship-pr`, the harness performs the same conservative
 `std/git` checkout cleanup in the target Harn repo: if the release checkout is
@@ -549,11 +550,11 @@ deprecated `llm_retries` option. The release audit handoff likewise avoids the
 deprecated `post_turn_callback.llm_options` patch and carries next-turn tool
 changes through `next_options`.
 
-Release commits created by live `ship-pr` use `git commit --no-verify` after
-`release_ship.sh --prepare`, generated-content checks, and markdown lint have
-already passed. This avoids re-running target-repo pre-commit hooks that
-duplicate the just-recorded release evidence, while the pushed branch and tag
-still run the normal GitHub release, CI, and merge-queue gates.
+Release commits created by live `ship-pr` keep hooks enabled and set
+`HARN_HOOKS_NO_LOCAL_BUILD=1` after `release_ship.sh --prepare`,
+generated-content checks, and markdown lint have already passed. This avoids
+re-running duplicated harn-side local builds while still preserving normal hook,
+GitHub release, CI, and merge-queue gates.
 
 Reports are written to:
 
