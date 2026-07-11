@@ -81,6 +81,7 @@ import {
 } from "lib/release_commands"
 import {
   execution_failed,
+  hook_light_env,
   last_failed_step,
   markdownlint_source_context,
   markdownlint_violations_from_text,
@@ -715,7 +716,7 @@ version = "0.7.52"
 }
 
 @complexity(allow)
-fn fake_command(command, cfg) {
+fn fake_command(command, cfg, env = nil) {
   let mock_stale_local_tag = env_str("HARN_RELEASE_MOCK_STALE_LOCAL_TAG") == "1"
   if contains(command, "git branch --show-current") {
     return ok("release/v0.7.53\n")
@@ -777,7 +778,7 @@ fn fake_command(command, cfg) {
       "=== Release audit ===\n=== Publish dry run ===\n=== Stage release content ===\nRelease content staged on release/v0.7.53:\n  Previous version: 0.7.52\n  Next version:     0.7.53\n",
     )
   }
-  if contains(command, "git commit --no-verify -m") {
+  if contains(command, "git commit -m") {
     return ok("[release/v0.7.53 9999999] Release v0.7.53\n")
   }
   if contains(command, "git add -u") {
@@ -816,7 +817,7 @@ fn fake_command(command, cfg) {
   if contains(command, "git tag -a") {
     return ok("")
   }
-  if contains(command, "git push --no-verify origin v") {
+  if contains(command, "git push origin v") {
     return ok("To github.com:burin-labs/harn.git\n * [new tag]         v0.7.53 -> v0.7.53\n")
   }
   if contains(command, "git reset --hard") {
@@ -826,7 +827,7 @@ fn fake_command(command, cfg) {
     || contains(command, "npx markdownlint-cli2") {
     return ok("markdownlint-cli2 v0.22.1\nSummary: 0 error(s)\n")
   }
-  if contains(command, "git push --no-verify -u origin") {
+  if contains(command, "git push -u origin") && (env?.HARN_HOOKS_NO_LOCAL_BUILD ?? "") == "1" {
     return ok("branch 'release/v0.7.53' set up to track 'origin/release/v0.7.53'.\n")
   }
   if contains(command, "git push -u origin") {
@@ -2178,7 +2179,7 @@ fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, ru
     )
     llm_mock(
       {
-        text: "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry with `git push --no-verify -u origin ${analysis.expected_branch}` and keep both attempts in the run artifacts.",
+        text: "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry the normal push with `HARN_HOOKS_NO_LOCAL_BUILD=1` and keep both attempts in the run artifacts.",
       },
     )
   }
@@ -2253,9 +2254,14 @@ fn maybe_recovery_advice_step(harness: Harness, cfg, analysis, steps, failed_ste
 
 fn retry_commands_after_agent_repair(step) {
   if step.name == "commit" {
+    let commit_retry = if starts_with(step.command, "git commit -m ") {
+      {command: step.command, env: hook_light_env()}
+    } else {
+      step.command
+    }
     return [
       {name: "stage-after-agent-repair-commit", command: "git add -u"},
-      {name: "commit-after-agent-repair", command: step.command},
+      {name: "commit-after-agent-repair", command: commit_retry},
     ]
   }
   return []
@@ -2939,6 +2945,12 @@ fn release_log_event(harness: Harness, run_id, event_type, data) {
 }
 
 fn command_label(command) {
+  if command?.argv != nil {
+    return argv_label(command.argv)
+  }
+  if command?.command != nil {
+    return command.command
+  }
   if type_of(command) == "list" {
     return argv_label(command)
   }
@@ -2971,7 +2983,7 @@ fn release_command_runner(cfg) {
     } else {
       spec?.command ?? ""
     }
-    fake_command(label, cfg)
+    fake_command(label, cfg, spec?.env)
   }
 }
 
@@ -3004,8 +3016,8 @@ fn target_release_checkout_state(harness: Harness, cfg, analysis) {
   }
 }
 
-fn release_branch_push_argv(cfg, branch, no_verify) {
-  return release_branch_push_args(branch, remote_branch_exists(cfg, branch), no_verify)
+fn release_branch_push_argv(cfg, branch) {
+  return release_branch_push_args(branch, remote_branch_exists(cfg, branch))
 }
 
 /**
@@ -3625,7 +3637,7 @@ fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
     cfg,
     pre_steps,
     "push-release-tag",
-    release_tag_push_args(tag, true),
+    {argv: release_tag_push_args(tag), env: hook_light_env()},
     run_id,
   )
   return push_tag.steps
@@ -5847,10 +5859,10 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   let version = post_prepare_analysis.next_version
   let branch = "release/v${version}"
   // The release gate, generated-content checks, and markdown lint have already
-  // produced stronger evidence than the target repo's pre-push hook. Bypass
-  // the local hook for the canonical release-branch push so a hook that
-  // duplicates those checks cannot hang the live release after a clean audit.
-  let push_argv = release_branch_push_argv(cfg, branch, true)
+  // produced stronger evidence than the target repo's expensive local-build
+  // hook path. Keep hooks enabled, but ask harn-side hooks to skip duplicated
+  // local builds for the canonical generated release push.
+  let push_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
   let commands = []
   let committed_release_content = false
   if trim(post_prepare_analysis.status ?? "") == ""
@@ -5870,10 +5882,15 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   } else {
     commands = commands + [{name: "stage-tracked-release-content", argv: ["git", "add", "-u"]}]
     // The release gate has already run the expensive audit, generated-content
-    // checks, and markdown lint before this canonical generated commit. Avoid
-    // re-paying target-repo pre-commit hooks that duplicate that evidence.
+    // checks, and markdown lint before this canonical generated commit. Keep
+    // hooks enabled, but skip duplicated harn-side local builds.
     commands = commands
-      + [{name: "commit", argv: ["git", "commit", "--no-verify", "-m", "Release v${version}"]}]
+      + [
+      {
+        name: "commit",
+        argv: {argv: ["git", "commit", "-m", "Release v${version}"], env: hook_light_env()},
+      },
+    ]
   }
   commands = commands
     + [
@@ -5935,8 +5952,8 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
       if step.name == "push" {
         steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
         if push_hook_budget_exceeded(failed_step.command, failed_step) {
-          let retry_argv = release_branch_push_argv(cfg, branch, true)
-          let push_retry = append_command_step(harness, cfg, steps, "push-no-verify-after-green-hook-budget", retry_argv)
+          let retry_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
+          let push_retry = append_command_step(harness, cfg, steps, "push-hook-light-after-green-hook-budget", retry_argv)
           steps = push_retry.steps
           if push_retry.success {
             continue
