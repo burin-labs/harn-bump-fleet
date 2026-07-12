@@ -32,7 +32,7 @@ sandboxed.
 harn run --no-sandbox bump_fleet.harn
 
 # Pin to an explicit tag.
-harn run --no-sandbox bump_fleet.harn -- v0.7.52
+harn run --no-sandbox bump_fleet.harn -- vX.Y.Z
 
 # Discover-only: never dispatches anything, useful before a real run.
 harn run --no-sandbox bump_fleet.harn -- --dry-run
@@ -363,9 +363,9 @@ the host harn binary.
 `release_harn.harn` is the matching Harn-native harness for the
 `~/projects/harn` `/release-harn` skill workflow. It does not publish
 directly. The live flow mirrors the skill: prepare one `Release vX.Y.Z` PR,
-push `vX.Y.Z` at the pinned commit, enable auto-merge, then let the
-`publish-release` and `build-release-binaries` workflows ship from the
-tag. **Pin model:** the release branch is parented at `origin/<base>`
+push `vX.Y.Z` at the pinned commit before auto-merge, then let the
+tag-triggered `publish-release` and `build-release-binaries` workflows ship
+from that tag. **Pin model:** the release branch is parented at `origin/<base>`
 HEAD captured at run start (or whatever `--at-sha` resolves to), and is
 NOT rebased before push. The pushed tag is the source of truth for what
 ships, so any commits that land on `<base>` between PR-open and merge
@@ -380,7 +380,7 @@ harn run --no-sandbox release_harn.harn
 Useful rehearsals:
 
 ```sh
-# Fully mocked v0.7.52 -> v0.7.53 audit. No repo/GitHub writes.
+# Fully mocked vX.Y.Z -> vX.Y.(Z+1) audit. No repo/GitHub writes.
 harn run --no-sandbox release_harn.harn -- --mock
 
 # Mocked agent/tool loop using Harn's mock LLM provider.
