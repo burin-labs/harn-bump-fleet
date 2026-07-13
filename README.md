@@ -371,6 +371,10 @@ NOT rebased before push. The pushed tag is the source of truth for what
 ships, so any commits that land on `<base>` between PR-open and merge
 cannot leak into the published artifact.
 
+The harness creates the release tag with Git's configured signing key and
+verifies its signature locally before pushing. A signing or verification
+failure stops publication before the tag reaches the remote.
+
 Default mode is read-only audit:
 
 ```sh
