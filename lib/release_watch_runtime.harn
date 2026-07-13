@@ -1,0 +1,214 @@
+import { env_bool } from "std/config"
+import {
+  gh_argv,
+  gh_auto_merge_cli_attempts,
+  gh_workflow_run,
+  gh_workflow_runs,
+} from "./github_cli"
+import { post_publish_warm_cache_dispatch_decision } from "./release_health"
+import { release_pr_watchdog_decision, release_pr_watchdog_query_args } from "./release_pr_watchdog"
+import { harn_release_readiness } from "./release_readiness"
+import {
+  ReleaseWatchObservation,
+  ReleaseWatchReceipt,
+  release_watch_receipt_write,
+  release_watch_record_recovery_dispatch,
+  release_watch_record_warm_cache_dispatch,
+  release_watch_transition,
+} from "./release_watch_state"
+
+pub type ReleaseWatchRuntimeOptions = {
+  max_polls?: int,
+  interval_ms?: int,
+  dispatch_recovery?: bool,
+  dispatch_warm_cache?: bool,
+}
+
+fn default_watch_adapter() {
+  return {
+    workflow_runs: fn(slug, workflow) { return gh_workflow_runs(slug, workflow, nil, 20) },
+    readiness: fn(tag) { return harn_release_readiness(tag) },
+    dispatch: fn(slug, workflow, fields) { return gh_workflow_run(slug, workflow, fields) },
+    pr_probe: fn(slug, pr_url) {
+      const args = release_pr_watchdog_query_args(slug, pr_url)
+      if args == nil {
+        return {success: false, status: 2, stdout: "", stderr: "invalid release PR reference"}
+      }
+      return gh_argv(args)
+    },
+    enable_auto_merge: fn(slug, pr_url) {
+      const attempts = gh_auto_merge_cli_attempts(slug, pr_url, "squash")
+      const first = gh_argv(attempts[0])
+      if first.success || len(attempts) < 2 {
+        return first
+      }
+      return gh_argv(attempts[1])
+    },
+  }
+}
+
+fn collect_runs(adapter, receipt: ReleaseWatchReceipt) -> list<dict> {
+  let runs: list<dict> = []
+  for workflow in receipt.required_workflows {
+    for run in adapter.workflow_runs(receipt.slug, workflow) {
+      runs = runs + [{...run, workflow: workflow}]
+    }
+  }
+  return runs
+}
+
+fn keep_release_pr_armed(adapter, receipt: ReleaseWatchReceipt) {
+  if receipt.pr_url == "" {
+    return {action: "skip", reason: "missing_pull_request"}
+  }
+  const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if !probe.success {
+    return {action: "skip", reason: "pull_request_probe_failed", status: probe.status}
+  }
+  const payload = try {
+    json_parse(probe.stdout)
+  } catch (_e) {
+    nil
+  }
+  const decision = release_pr_watchdog_decision(payload ?? {})
+  if decision.action != "rearm" {
+    return decision
+  }
+  const armed = adapter.enable_auto_merge(receipt.slug, receipt.pr_url)
+  if !armed.success {
+    return {action: "failed", reason: "auto_merge_rearm_failed", status: armed.status}
+  }
+  return {action: "rearmed", reason: "auto_merge_rearmed"}
+}
+
+fn readiness_observation(readiness, runs, observed_at) -> ReleaseWatchObservation {
+  return {
+    runs: runs,
+    assets_ready: readiness.ready ?? false,
+    missing_assets: readiness.missing_assets ?? [],
+    observed_at: observed_at,
+  }
+}
+
+fn maybe_dispatch_warm_cache(adapter, receipt: ReleaseWatchReceipt, enabled: bool) {
+  if receipt.warm_cache.dispatched {
+    return {
+      receipt: receipt,
+      result: {attempted: false, success: true, reason: "warm-cache dispatch already persisted"},
+    }
+  }
+  const decision = post_publish_warm_cache_dispatch_decision(
+    {enabled: enabled, publish_state: receipt.state, slug: receipt.slug},
+  )
+  if !(decision.should_dispatch ?? false) {
+    return {receipt: receipt, result: {attempted: false, success: true, reason: decision.reason ?? ""}}
+  }
+  const result = adapter.dispatch(receipt.slug, decision.workflow, decision.fields ?? {})
+  return {
+    receipt: release_watch_record_warm_cache_dispatch(receipt, date_now_iso(), result.success),
+    result: {
+      attempted: true,
+      success: result.success,
+      workflow: decision.workflow,
+      status: result.status,
+      stderr: trim(result.stderr ?? ""),
+    },
+  }
+}
+
+/**
+ * Monitor a durable release receipt. Tests inject an adapter and zero interval;
+ * production supplies GitHub/process adapters and performs the only real wait.
+ */
+pub fn run_release_watch(
+  harness: Harness,
+  initial_receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  options: ReleaseWatchRuntimeOptions = {},
+  injected_adapter = nil,
+) {
+  const opts = options ?? {}
+  const max_polls = opts.max_polls ?? 240
+  const interval_ms = opts.interval_ms ?? 30000
+  const dispatch_recovery = opts.dispatch_recovery ?? true
+  const dispatch_warm = opts.dispatch_warm_cache
+    ?? !env_bool("HARN_RELEASE_DISABLE_POST_PUBLISH_WARM_CACHE", false)
+  const adapter = injected_adapter ?? default_watch_adapter()
+  let receipt = initial_receipt
+  let poll = 0
+  while poll < max_polls {
+    const watchdog = keep_release_pr_armed(adapter, receipt)
+    const runs = collect_runs(adapter, receipt)
+    const readiness = adapter.readiness(receipt.tag)
+    const transition = release_watch_transition(receipt, readiness_observation(readiness, runs, date_now_iso()))
+    receipt = transition.receipt
+    release_watch_receipt_write(receipt_path, receipt)
+    if transition.action == "complete" {
+      const warm = maybe_dispatch_warm_cache(adapter, receipt, dispatch_warm)
+      receipt = warm.receipt
+      release_watch_receipt_write(receipt_path, receipt)
+      return {
+        status: 0,
+        state: receipt.state,
+        receipt: receipt,
+        receipt_path: receipt_path,
+        polls: poll + 1,
+        watchdog: watchdog,
+        warm_cache: warm.result,
+      }
+    }
+    if transition.action == "fail" {
+      return {
+        status: 2,
+        state: receipt.state,
+        receipt: receipt,
+        receipt_path: receipt_path,
+        polls: poll + 1,
+        watchdog: watchdog,
+        reason: receipt.message,
+      }
+    }
+    if transition.action == "dispatch_binary_recovery" {
+      if !dispatch_recovery {
+        return {
+          status: 2,
+          state: "failed",
+          receipt: receipt,
+          receipt_path: receipt_path,
+          polls: poll + 1,
+          reason: "binary recovery required but dispatch is disabled",
+        }
+      }
+      const dispatched = adapter
+        .dispatch(
+        receipt.slug,
+        transition.recovery_workflow,
+        transition.recovery_fields ?? {tag: receipt.tag},
+      )
+      receipt = release_watch_record_recovery_dispatch(receipt, date_now_iso(), dispatched.success)
+      release_watch_receipt_write(receipt_path, receipt)
+      if !dispatched.success {
+        return {
+          status: 2,
+          state: receipt.state,
+          receipt: receipt,
+          receipt_path: receipt_path,
+          polls: poll + 1,
+          reason: trim(dispatched.stderr ?? "binary recovery dispatch failed"),
+        }
+      }
+    }
+    poll = poll + 1
+    if poll < max_polls && interval_ms > 0 {
+      harness.clock.sleep_ms(interval_ms)
+    }
+  }
+  return {
+    status: 3,
+    state: receipt.state,
+    receipt: receipt,
+    receipt_path: receipt_path,
+    polls: poll,
+    reason: "release remains incomplete after ${max_polls} polls",
+  }
+}

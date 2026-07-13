@@ -41,12 +41,7 @@ import {
 import { checkout_cleanup, sync_base_branch } from "lib/checkout_cleanup"
 import { fleet_self_check } from "lib/fleet_selfcheck"
 import { release_log_range_arg, release_log_range_args } from "lib/git"
-import {
-  gh_argv,
-  gh_auto_merge_cli_attempts,
-  gh_workflow_run,
-  gh_workflow_runs,
-} from "lib/github_cli"
+import { gh_argv, gh_auto_merge_cli_attempts } from "lib/github_cli"
 import {
   binder_audit_line,
   cost_budget_audit_line,
@@ -97,23 +92,10 @@ import {
   release_tag_verify_args,
 } from "lib/release_execution"
 import {
-  post_publish_warm_cache_dispatch_decision,
-  publish_binary_recovery_decision,
-  publish_binary_recovery_status,
-  publish_failure_recovery_lines,
-  publish_watch_decision,
-  release_publish_watch_enabled,
-  release_publish_watch_polling_defaults,
-} from "lib/release_health"
-import {
   release_owner_guard_acquire,
   release_owner_guard_finish,
   release_owner_guard_update,
 } from "lib/release_owner_guard"
-import {
-  release_pr_watchdog_decision,
-  release_pr_watchdog_query_args,
-} from "lib/release_pr_watchdog"
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import {
   local_release_tag_decision,
@@ -125,6 +107,11 @@ import {
 } from "lib/release_repin"
 import { require_release_repo_path } from "lib/release_repo_guard"
 import { agent_review_execute } from "lib/release_review_loop"
+import {
+  release_watch_receipt,
+  release_watch_receipt_path,
+  release_watch_receipt_write,
+} from "lib/release_watch_state"
 import {
   audit_offload_decision,
   coordination_hw_post_command,
@@ -325,12 +312,6 @@ Flags:
                           the tag push when the pin is behind base HEAD, so a release can
                           never silently tag a tree that excludes commits already on the
                           base. Use --repin-latest to fold the new commits in instead.
-  --watch-publish         After pushing the tag, poll the tag-triggered publish/build
-                          workflows and fail loudly with a yank path if they go red.
-                          Live ship-pr runs watch by default; this flag, or
-                          HARN_RELEASE_WATCH_PUBLISH=1, also enables the watch for
-                          non-live review runs. The publish is tag-first, so this is
-                          a post-tag health watch, not a pre-tag gate.
   --offload-audit         Force the ~548s release_gate.sh audit onto a configured
                           remote builder and skip the duplicate local audit only
                           when the remote run is definitively green. Live
@@ -410,7 +391,6 @@ let RELEASE_ARG_SPEC = [
   {kind: "option", name: "pin_sha_input", flags: ["--at-sha"], default: ""},
   {kind: "flag", name: "repin_latest", flags: ["--repin-latest"]},
   {kind: "flag", name: "allow_base_drift", flags: ["--allow-base-drift"]},
-  {kind: "flag", name: "watch_publish", flags: ["--watch-publish"]},
   {kind: "flag", name: "offload_audit", flags: ["--offload-audit"]},
   {kind: "flag", name: "local_audit", flags: ["--local-audit"]},
   {kind: "flag", name: "require_remote_audit", flags: ["--require-remote-audit"]},
@@ -516,15 +496,6 @@ fn parse_release_args(harness: Harness, args) {
     fixup_release_body_source: "",
     repin_latest: parsed.repin_latest,
     allow_base_drift: parsed.allow_base_drift,
-    watch_publish: release_publish_watch_enabled(
-      {
-        mode: parsed.mode,
-        yes_live_release: parsed.yes_live_release,
-        mock: parsed.mock,
-        explicit_watch: parsed.watch_publish,
-        env_watch: env_bool("HARN_RELEASE_WATCH_PUBLISH", false),
-      },
-    ),
     offload_audit: remote_audit.offload_audit,
     local_audit: remote_audit.local_audit,
     require_remote_audit: remote_audit.require_remote_audit,
@@ -3278,319 +3249,33 @@ fn pre_prepare_drift_gate(harness: Harness, cfg, analysis, steps, run_id) {
   return {steps: steps + [recorded], proceed: true}
 }
 
-/**
- * Opt-in post-tag publish-health watch. The fleet is tag-first, so the
- * publish/build workflows only run after the tag exists and cannot gate it.
- * When `--watch-publish` is set, poll those tag-triggered runs and, on a
- * confirmed red conclusion, record a loud failed step carrying the yank path.
- * Fail-open: any trouble observing the runs (poll error, never-confirmed) is an
- * informational note, never a release failure — only a definitively red publish
- * fails. Returns the (possibly appended) steps unchanged in shape.
- */
-fn release_pr_watchdog_rearm_if_needed(harness: Harness, cfg, steps, pr_url, run_id) {
-  if pr_url == "" || cfg.mock || (cfg.fixup_mode ?? false) {
+/** Persist the handoff that lets post-tag monitoring resume in another process. */
+fn persist_release_watch_receipt(harness: Harness, cfg, version, steps, run_id, pr_url) {
+  if cfg.mock {
     return steps
   }
-  let slug = release_repo_slug(cfg)
-  let query_args = release_pr_watchdog_query_args(slug, pr_url)
-  if query_args == nil {
-    release_log_event(
-      harness,
-      run_id,
-      "release_pr_watchdog_skipped",
-      {pr_url: pr_url, reason: "could_not_build_query"},
-    )
-    return steps
-  }
-  release_log_event(
-    harness,
-    run_id,
-    "release_pr_watchdog_probe_started",
-    {pr_url: pr_url, command: "gh " + join(query_args, " ")},
+  const tag = "v${version}"
+  const slug = release_repo_slug(cfg)
+  const path = release_watch_receipt_path(release_run_root(), tag)
+  const receipt = release_watch_receipt(
+    {tag: tag, slug: slug, pin_sha: cfg.pin_sha, pr_url: pr_url, created_at: date_now_iso()},
   )
-  let probe = gh_argv(query_args)
-  if !probe.success {
-    release_log_event(
-      harness,
-      run_id,
-      "release_pr_watchdog_probe_finished",
-      {pr_url: pr_url, success: false, status: probe.status, stderr: trim(probe.stderr ?? "")},
-    )
-    return steps
+  const written = try {
+    release_watch_receipt_write(path, receipt)
   }
-  let payload = try {
-    json_parse(probe.stdout)
-  } catch (e) {
-    nil
-  }
-  let decision = release_pr_watchdog_decision(payload ?? {})
-  release_log_event(
-    harness,
-    run_id,
-    "release_pr_watchdog_probe_finished",
-    {pr_url: pr_url, success: true, decision: decision},
-  )
-  if decision.action != "rearm" {
-    return steps
-  }
-  let attempts = gh_auto_merge_cli_attempts(slug, pr_url, "squash")
-  let auto_merge = logged_github_command_step(
-    harness,
-    cfg,
-    steps,
-    "release-pr-watchdog-auto-merge",
-    ["gh", ...attempts[0]],
-    run_id,
-  )
-  if auto_merge.success || len(attempts) < 2 {
-    return auto_merge.steps
-  }
-  let fallback = logged_github_command_step(
-    harness,
-    cfg,
-    auto_merge.steps,
-    "release-pr-watchdog-auto-merge-squash-fallback",
-    ["gh", ...attempts[1]],
-    run_id,
-  )
-  return fallback.steps
-}
-
-fn watch_publish_health(harness: Harness, cfg, version, steps, run_id, pr_url = "") {
-  if !(cfg.watch_publish ?? false) || cfg.mock {
-    return steps
-  }
-  let tag = "v${version}"
-  let slug = release_repo_slug(cfg)
-  if slug == "" {
-    return steps
-      + [
-      recorded_step(
-        "watch-publish",
-        "resolve repo slug for publish watch",
-        ok("publish watch skipped: could not resolve a github slug for ${cfg.repo}\n"),
-      ),
-    ]
-  }
-  let required = ["publish-release.yml", "build-release-binaries.yml"]
-  let polling_defaults = release_publish_watch_polling_defaults(
-    {mode: cfg.mode, yes_live_release: cfg.yes_live_release, mock: cfg.mock},
-  )
-  let attempts = to_int(env_str("HARN_RELEASE_PUBLISH_WATCH_ATTEMPTS") ?? "")
-    ?? polling_defaults.attempts
-  let interval_s = to_int(env_str("HARN_RELEASE_PUBLISH_WATCH_INTERVAL_S") ?? "")
-    ?? polling_defaults.interval_seconds
-  let interval_ms = interval_s * 1000
-  release_log_event(
-    harness,
-    run_id,
-    "step_started",
-    {step: "watch-publish", tag: tag, attempts: attempts, interval_seconds: interval_s},
-  )
-  let watched_steps = steps
-  let decision = {state: "pending", message: "publish for ${tag} not yet observed"}
-  let binary_recovery_dispatched = false
-  let binary_recovery_started_iso = ""
-  let attempt = 0
-  while attempt < attempts {
-    watched_steps = release_pr_watchdog_rearm_if_needed(harness, cfg, watched_steps, pr_url, run_id)
-    let runs = []
-    for workflow in required {
-      for run in gh_workflow_runs(slug, workflow, nil, 10) {
-        runs = runs + [{...run, workflow: workflow}]
-      }
-    }
-    decision = publish_watch_decision({runs: runs, required_workflows: required, tag: tag})
-    if binary_recovery_dispatched {
-      let assets = release_asset_snapshot(cfg, tag)
-      if assets.ready {
-        decision = {
-          state: "healthy",
-          message: "publish for ${tag} confirmed green by required release assets after binary recovery",
-          failed_workflows: [],
-          failed_runs: [],
-        }
-        break
-      }
-      let recovery_status = publish_binary_recovery_status(
-        {runs: runs, after_iso: binary_recovery_started_iso, terminal_failures: false},
-      )
-      if recovery_status.state == "failed" {
-        decision = {
-          state: "failed",
-          message: "publish for ${tag} is red: automatic binary recovery failed: ${recovery_status.message}",
-          failed_workflows: ["build-release-binaries.yml"],
-          failed_runs: [recovery_status.run ?? {}],
-        }
-        break
-      }
-      if decision.state == "failed" {
-        decision = {
-          state: "pending",
-          message: "binary recovery dispatched for ${tag}; waiting for required release assets. Missing: "
-            + join(assets.missing_assets ?? [], ", "),
-          failed_workflows: [],
-          failed_runs: [],
-        }
-      }
-    }
-    let recovery = publish_binary_recovery_decision(
-      {runs: runs, tag: tag, already_dispatched: binary_recovery_dispatched},
-    )
-    if recovery.should_dispatch ?? false {
-      release_log_event(
-        harness,
-        run_id,
-        "step_started",
-        {step: "watch-publish-binary-recovery", tag: tag, workflow: recovery.workflow},
-      )
-      binary_recovery_started_iso = date_now_iso()
-      let dispatch = gh_workflow_run(slug, recovery.workflow, recovery.fields ?? {tag: tag})
-      binary_recovery_dispatched = true
-      let dispatch_note = "${recovery.message}\n"
-        + "workflow: ${recovery.workflow}\n"
-        + "failed run: ${json_stringify(recovery.failed_run ?? {})}\n"
-      if dispatch.success {
-        watched_steps = watched_steps
-          + [
-          recorded_step(
-            "watch-publish-binary-recovery",
-            "dispatch ${tag} binary-asset recovery",
-            ok(dispatch_note + trim(dispatch.stdout ?? "") + "\n"),
-          ),
-        ]
-        release_log_event(
-          harness,
-          run_id,
-          "step_finished",
-          {step: "watch-publish-binary-recovery", success: true, status: 0},
-        )
-        decision = {state: "pending", message: "binary recovery dispatched for ${tag}; waiting for rerun"}
-        attempt = attempt + 1
-        if attempt < attempts {
-          harness.clock.sleep_ms(interval_ms)
-        }
-        continue
-      }
-      watched_steps = watched_steps
-        + [
-        recorded_step(
-          "watch-publish-binary-recovery",
-          "dispatch ${tag} binary-asset recovery",
-          fail(to_int(dispatch.status ?? "") ?? 1, dispatch_note + trim(dispatch.stderr ?? "") + "\n"),
-        ),
-      ]
-      release_log_event(
-        harness,
-        run_id,
-        "step_finished",
-        {step: "watch-publish-binary-recovery", success: false, status: dispatch.status ?? 1},
-      )
-      decision = {
-        state: "failed",
-        message: "publish for ${tag} is red and automatic binary recovery dispatch failed",
-        failed_workflows: ["build-release-binaries.yml"],
-      }
-      break
-    }
-    if decision.state == "failed" || decision.state == "healthy" {
-      break
-    }
-    attempt = attempt + 1
-    if attempt < attempts {
-      harness.clock.sleep_ms(interval_ms)
-    }
-  }
-  if decision.state == "failed" {
-    let body = ([decision.message]
-      + publish_failure_recovery_lines(tag, slug, decision.failed_workflows ?? [])).join("\n")
-    release_log_event(
-      harness,
-      run_id,
-      "step_finished",
-      {step: "watch-publish", success: false, state: "failed"},
-    )
-    return watched_steps
-      + [recorded_step("watch-publish", "watch ${tag} publish workflows", fail(2, body))]
-  }
-  let note = if decision.state == "healthy" {
-    "publish for ${tag} confirmed green by tag-triggered workflows\n"
+  const result = if is_ok(written) {
+    ok("durable release watch receipt: " + unwrap(written) + "\n")
   } else {
-    decision.message + "\n"
-      + "publish watch for ${tag} did not confirm green within ${attempts} polls "
-      + "at ${interval_s}s intervals (state: ${decision.state}); check the workflows manually "
-      + "— this is not treated as a release failure\n"
+    fail(2, "could not persist release watch receipt: " + to_string(unwrap_err(written)))
   }
   release_log_event(
     harness,
     run_id,
-    "step_finished",
-    {step: "watch-publish", success: true, state: decision.state},
-  )
-  let final_steps = watched_steps + [recorded_step("watch-publish", "watch ${tag} publish workflows", ok(note))]
-  return append_post_publish_warm_cache_dispatch(
-    harness,
-    cfg,
-    final_steps,
-    run_id,
-    tag,
-    slug,
-    decision.state,
-  )
-}
-
-fn post_publish_warm_cache_dispatch_enabled(cfg) {
-  if env_bool("HARN_RELEASE_DISABLE_POST_PUBLISH_WARM_CACHE", false) {
-    return false
-  }
-  return env_bool("HARN_RELEASE_POST_PUBLISH_WARM_CACHE", true)
-    && trim(cfg?.mode ?? "") == "ship-pr"
-    && (cfg?.yes_live_release ?? false)
-}
-
-fn append_post_publish_warm_cache_dispatch(harness: Harness, cfg, steps, run_id, tag, slug, state) {
-  let decision = post_publish_warm_cache_dispatch_decision(
-    {enabled: post_publish_warm_cache_dispatch_enabled(cfg), publish_state: state, slug: slug},
-  )
-  if !(decision.should_dispatch ?? false) {
-    release_log_event(
-      harness,
-      run_id,
-      "post_publish_warm_cache_skipped",
-      {tag: tag, reason: decision.reason ?? ""},
-    )
-    return steps
-  }
-  release_log_event(
-    harness,
-    run_id,
-    "step_started",
-    {step: "post-publish-warm-cache", tag: tag, workflow: decision.workflow},
-  )
-  let dispatch = gh_workflow_run(slug, decision.workflow, decision.fields ?? {})
-  let detail = decision.message + "\nworkflow: " + decision.workflow + "\nfields: "
-    + json_stringify(decision.fields ?? {})
-    + "\n"
-  let body = if dispatch.success {
-    detail + trim(dispatch.stdout ?? "") + "\n"
-  } else {
-    detail + "warning: dispatch failed non-blocking (status ${dispatch.status ?? 1}): "
-      + trim(dispatch.stderr ?? "")
-      + "\n"
-  }
-  release_log_event(
-    harness,
-    run_id,
-    "step_finished",
-    {
-      step: "post-publish-warm-cache",
-      success: dispatch.success,
-      status: dispatch.status ?? 0,
-      workflow: decision.workflow,
-    },
+    "release_watch_receipt_written",
+    {tag: tag, path: path, success: result.success, pr_url: pr_url},
   )
   return steps
-    + [recorded_step("post-publish-warm-cache", "dispatch default-branch release-cache warm", ok(body))]
+    + [recorded_step("persist-release-watch", "persist resumable post-tag watch receipt", result)]
 }
 
 fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
@@ -6145,9 +5830,9 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   if !final_edit.success {
     return steps
   }
-  // Tag + PR handoff is complete. Optionally watch the tag-triggered publish so
-  // a red publish surfaces loudly with a yank path instead of going unnoticed.
-  return watch_publish_health(harness, cfg, version, steps, run_id, pr_url)
+  // Tag + branch + PR are durable. Persist the independent monitor handoff and
+  // return immediately; `watch_harn_release.harn` resumes from this receipt.
+  return persist_release_watch_receipt(harness, cfg, version, steps, run_id, pr_url)
 }
 
 fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
