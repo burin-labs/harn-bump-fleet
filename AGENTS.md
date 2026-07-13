@@ -50,7 +50,8 @@ Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
 are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
 The operation harnesses need `--no-sandbox` because they inspect sibling
-checkouts and invoke `git` / `gh`.
+checkouts, run local Git commands, and let read-only diagnostic agents inspect
+authenticated GitHub state.
 
 Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
 installs the pinned CLI into this repo's ignored `.harn/bin`, and
@@ -59,10 +60,12 @@ stale global `harn` on `PATH`.
 
 ## Implementation rules
 
-Keep GitHub side effects deterministic. GitHub writes go through `gh` or the
-connector helper with `gh` fallback. Model output may summarize, audit, or
-draft text, but deterministic code must validate or parse it before it affects
-files, PRs, tags, dispatches, or merge settings.
+Keep GitHub side effects deterministic. Production GitHub reads and writes go
+through typed connector contracts, and every head-sensitive mutation carries
+the observed PR-head lease. `gh` is limited to read-only diagnostic agent
+allowlists and explicit manual-recovery instructions. Model output may
+summarize, audit, or draft text, but deterministic code must validate or parse
+it before it affects files, PRs, tags, dispatches, or merge settings.
 
 Route model defaults through `lib/llm_defaults`:
 

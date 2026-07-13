@@ -1,15 +1,13 @@
 import { env_bool } from "std/config"
 import {
-  GithubActionsWorkflowRun,
-  gh_actions_warm_cache_dispatch,
-  gh_actions_workflow_run,
-  gh_actions_workflow_run_jobs,
-  gh_argv,
-  gh_auto_merge_cli_attempts,
-  gh_workflow_run,
-  gh_workflow_runs,
-} from "./github_cli"
-import { release_pr_watchdog_decision, release_pr_watchdog_query_args } from "./release_pr_watchdog"
+  github_actions_run,
+  github_actions_run_jobs,
+  github_enable_auto_merge,
+  github_pr_view,
+  github_workflow_dispatch,
+  github_workflow_runs,
+} from "./github"
+import { release_pr_watchdog_decision } from "./release_pr_watchdog"
 import { harn_release_readiness } from "./release_readiness"
 import {
   ReleaseWatchObservation,
@@ -44,27 +42,20 @@ type ReleaseWatchRuntimeWarmSnapshot = {
 fn default_watch_adapter() {
   return {
     now: fn(_poll) { return date_now_iso() },
-    workflow_runs: fn(slug, workflow, _poll) { return gh_workflow_runs(slug, workflow, nil, 20) },
+    workflow_runs: fn(slug, workflow, _poll) {
+      const result = github_workflow_runs(slug, workflow, {}, 20)
+      if is_err(result) {
+        throw unwrap_err(result)
+      }
+      return result.runs
+    },
     readiness: fn(tag, _poll) { return harn_release_readiness(tag) },
-    dispatch: fn(slug, workflow, fields) { return gh_workflow_run(slug, workflow, fields) },
-    warm_dispatch: fn(slug, workflow, fields, _poll) { return gh_actions_warm_cache_dispatch(slug, workflow, fields) },
-    warm_run: fn(slug, run_id, _poll) { return gh_actions_workflow_run(slug, run_id) },
-    warm_jobs: fn(slug, run_id, _poll) { return gh_actions_workflow_run_jobs(slug, run_id) },
-    pr_probe: fn(slug, pr_url) {
-      const args = release_pr_watchdog_query_args(slug, pr_url)
-      if args == nil {
-        return {success: false, status: 2, stdout: "", stderr: "invalid release PR reference"}
-      }
-      return gh_argv(args)
-    },
-    enable_auto_merge: fn(slug, pr_url) {
-      const attempts = gh_auto_merge_cli_attempts(slug, pr_url, "squash")
-      const first = gh_argv(attempts[0])
-      if first.success || len(attempts) < 2 {
-        return first
-      }
-      return gh_argv(attempts[1])
-    },
+    dispatch: fn(slug, workflow, fields) { return github_workflow_dispatch(slug, workflow, fields) },
+    warm_dispatch: fn(slug, workflow, fields, _poll) { return github_workflow_dispatch(slug, workflow, fields) },
+    warm_run: fn(slug, run_id, _poll) { return github_actions_run(slug, run_id) },
+    warm_jobs: fn(slug, run_id, _poll) { return github_actions_run_jobs(slug, run_id) },
+    pr_probe: fn(slug, pr_url) { return github_pr_view(slug, pr_url) },
+    enable_auto_merge: fn(slug, pr) { return github_enable_auto_merge(slug, pr.number, pr.head.sha, "squash") },
   }
 }
 
@@ -83,21 +74,16 @@ fn keep_release_pr_armed(adapter, receipt: ReleaseWatchReceipt) {
     return {action: "skip", reason: "missing_pull_request"}
   }
   const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
-  if !probe.success {
-    return {action: "skip", reason: "pull_request_probe_failed", status: probe.status}
+  if is_err(probe) {
+    return {action: "skip", reason: "pull_request_probe_failed", error: unwrap_err(probe)}
   }
-  const payload = try {
-    json_parse(probe.stdout)
-  } catch (_e) {
-    nil
-  }
-  const decision = release_pr_watchdog_decision(payload ?? {})
+  const decision = release_pr_watchdog_decision(probe)
   if decision.action != "rearm" {
     return decision
   }
-  const armed = adapter.enable_auto_merge(receipt.slug, receipt.pr_url)
-  if !armed.success {
-    return {action: "failed", reason: "auto_merge_rearm_failed", status: armed.status}
+  const armed = adapter.enable_auto_merge(receipt.slug, probe)
+  if is_err(armed) {
+    return {action: "failed", reason: "auto_merge_rearm_failed", error: unwrap_err(armed)}
   }
   return {action: "rearmed", reason: "auto_merge_rearmed"}
 }
@@ -111,17 +97,17 @@ fn readiness_observation(readiness, runs, observed_at) -> ReleaseWatchObservatio
   }
 }
 
-fn warm_cache_run(run: GithubActionsWorkflowRun) -> ReleaseWatchWarmCacheRun {
+fn warm_cache_run(run) -> ReleaseWatchWarmCacheRun {
   return {
-    workflow_run_id: run.workflow_run_id,
-    workflow_run_url: run.workflow_run_url,
-    source_sha: run.source_sha,
+    workflow_run_id: run.id,
+    workflow_run_url: run.url,
+    source_sha: run.head_sha,
     event: run.event,
     head_branch: run.head_branch,
     status: run.status,
     conclusion: run.conclusion,
-    started_at: run.started_at,
-    completed_at: run.completed_at,
+    started_at: run.run_started_at ?? run.created_at ?? "",
+    completed_at: run.updated_at ?? "",
   }
 }
 
@@ -130,19 +116,20 @@ fn observe_warm_cache(adapter, receipt: ReleaseWatchReceipt, poll: int) -> Relea
     return {run: nil, jobs: [], jobs_observed: false}
   }
   const run_probe = adapter.warm_run(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
-  if !run_probe.success || run_probe.value == nil {
+  if is_err(run_probe) {
     return {run: nil, jobs: [], jobs_observed: false}
   }
-  const run: GithubActionsWorkflowRun = run_probe.value
-  if run.status != "completed" {
-    return {run: warm_cache_run(run), jobs: [], jobs_observed: false}
+  if run_probe.status != "completed" {
+    return {run: warm_cache_run(run_probe), jobs: [], jobs_observed: false}
   }
   const jobs_probe = adapter.warm_jobs(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
-  if !jobs_probe.success {
-    return {run: warm_cache_run(run), jobs: [], jobs_observed: false}
+  if is_err(jobs_probe) {
+    return {run: warm_cache_run(run_probe), jobs: [], jobs_observed: false}
   }
-  const jobs: list<ReleaseWatchWarmCacheJob> = jobs_probe.value
-  return {run: warm_cache_run(run), jobs: jobs, jobs_observed: true}
+  const jobs: list<ReleaseWatchWarmCacheJob> = jobs_probe.jobs
+    .map({ job -> return {name: job.name, status: job.status, conclusion: job.conclusion ?? ""} })
+    .to_list()
+  return {run: warm_cache_run(run_probe), jobs: jobs, jobs_observed: true}
 }
 
 fn terminal_result(
@@ -224,9 +211,10 @@ pub fn run_release_watch(
           transition.recovery_workflow,
           transition.recovery_fields ?? {tag: receipt.tag},
         )
-        receipt = release_watch_record_recovery_dispatch(receipt, observed_at, dispatched.success)
+        const dispatch_ok = !is_err(dispatched)
+        receipt = release_watch_record_recovery_dispatch(receipt, observed_at, dispatch_ok)
         release_watch_receipt_write(receipt_path, receipt)
-        if !dispatched.success {
+        if !dispatch_ok {
           return {
             status: 2,
             state: receipt.state,
@@ -234,7 +222,7 @@ pub fn run_release_watch(
             receipt_path: receipt_path,
             polls: poll + 1,
             watchdog: last_watchdog,
-            reason: trim(dispatched.stderr ?? "binary recovery dispatch failed"),
+            reason: to_string(unwrap_err(dispatched)),
           }
         }
       }
@@ -255,19 +243,36 @@ pub fn run_release_watch(
       if warm_transition.action == "dispatch" {
         const dispatch = adapter
           .warm_dispatch(receipt.slug, WARM_CACHE_WORKFLOW, {warm_cache_only: true}, poll)
+        const accepted = !is_err(dispatch)
         receipt = release_watch_record_warm_cache_dispatch(
           receipt,
           {
-            accepted: dispatch.accepted,
+            accepted: accepted,
             observed_at: observed_at,
-            workflow_run_id: dispatch.workflow_run_id,
-            workflow_run_url: dispatch.workflow_run_url,
-            source_sha: dispatch.source_sha,
-            message: dispatch.message,
+            workflow_run_id: if accepted {
+              dispatch.run_id
+            } else {
+              0
+            },
+            workflow_run_url: if accepted {
+              dispatch.url
+            } else {
+              ""
+            },
+            source_sha: if accepted {
+              dispatch.head_sha
+            } else {
+              ""
+            },
+            message: if accepted {
+              "warm-cache dispatch accepted as workflow run ${dispatch.run_id} at ${dispatch.head_sha}"
+            } else {
+              to_string(unwrap_err(dispatch))
+            },
           },
         )
         release_watch_receipt_write(receipt_path, receipt)
-        if !dispatch.accepted {
+        if !accepted {
           return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 2)
         }
       } else if warm_transition.action == "complete" {
@@ -311,86 +316,81 @@ pub fn mock_release_watch_adapter(receipt: ReleaseWatchReceipt) {
     now: fn(poll) { return times[min(poll, len(times) - 1)] },
     workflow_runs: fn(_slug, workflow, _poll) { return [
       {
-        databaseId: if workflow == "publish-release.yml" {
+        id: if workflow == "publish-release.yml" {
           8001
         } else {
           8002
         },
-        createdAt: "2026-07-12T23:00:00Z",
+        created_at: "2026-07-12T23:00:00Z",
         event: "push",
-        headBranch: receipt.tag,
-        headSha: receipt.pin_sha,
+        head_branch: receipt.tag,
+        head_sha: receipt.pin_sha,
         status: "completed",
         conclusion: "success",
         url: "https://github.com/burin-labs/harn/actions/runs/8001",
       },
     ] },
     readiness: fn(_tag, _poll) { return {ready: true, missing_assets: []} },
-    dispatch: fn(_slug, _workflow, _fields) { return {success: true, status: 0, stdout: "", stderr: ""} },
+    dispatch: fn(_slug, _workflow, _fields) { return {
+      accepted: true,
+      run_id: 9001,
+      url: "https://github.test/run/9001",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      head_sha: receipt.pin_sha,
+    } },
     warm_dispatch: fn(_slug, _workflow, _fields, _poll) { return {
       accepted: true,
-      workflow_run_id: run_id,
-      workflow_run_url: run_url,
-      source_sha: warm_source_sha,
-      message: "mock warm-cache dispatch accepted",
+      run_id: run_id,
+      url: run_url,
+      head_sha: warm_source_sha,
+      event: "workflow_dispatch",
+      head_branch: "main",
     } },
-    warm_run: fn(_slug, _run_id, poll) {
-      const run: GithubActionsWorkflowRun = {
-        workflow_run_id: run_id,
-        workflow_run_url: run_url,
-        source_sha: warm_source_sha,
-        event: "workflow_dispatch",
-        head_branch: "main",
-        status: if poll < 2 {
-          "in_progress"
-        } else {
-          "completed"
-        },
-        conclusion: if poll < 2 {
-          ""
-        } else {
-          "success"
-        },
-        created_at: "2026-07-13T00:00:00Z",
-        started_at: "2026-07-13T00:01:00Z",
-        completed_at: if poll < 2 {
-          ""
-        } else {
-          "2026-07-13T00:02:00Z"
-        },
-      }
-      return {success: true, value: run, error: ""}
-    },
+    warm_run: fn(_slug, _run_id, poll) { return {
+      id: run_id,
+      url: run_url,
+      head_sha: warm_source_sha,
+      event: "workflow_dispatch",
+      head_branch: "main",
+      status: if poll < 2 {
+        "in_progress"
+      } else {
+        "completed"
+      },
+      conclusion: if poll < 2 {
+        ""
+      } else {
+        "success"
+      },
+      created_at: "2026-07-13T00:00:00Z",
+      run_started_at: "2026-07-13T00:01:00Z",
+      updated_at: if poll < 2 {
+        ""
+      } else {
+        "2026-07-13T00:02:00Z"
+      },
+    } },
     warm_jobs: fn(_slug, _run_id, _poll) { return {
-      success: true,
-      value: [
+      jobs: [
         {name: "Build aarch64-apple-darwin", status: "completed", conclusion: "success"},
         {name: "Build aarch64-unknown-linux-gnu", status: "completed", conclusion: "success"},
         {name: "Build x86_64-apple-darwin", status: "completed", conclusion: "success"},
         {name: "Build x86_64-pc-windows-msvc", status: "completed", conclusion: "success"},
         {name: "Build x86_64-unknown-linux-gnu", status: "completed", conclusion: "success"},
       ],
-      error: "",
     } },
     pr_probe: fn(_slug, _pr_url) { return {
-      success: true,
-      status: 0,
-      stdout: json_stringify(
-        {
-          data: {
-            repository: {
-              pullRequest: {
-                number: 1,
-                state: "MERGED",
-                mergedAt: "2026-07-12T23:59:00Z",
-                mergeCommit: {oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-              },
-            },
-          },
-        },
-      ),
-      stderr: "",
+      number: 1,
+      merged: true,
+      github_state: "merged",
+      merged_at: "2026-07-12T23:59:00Z",
+      merge_commit_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      in_merge_queue: false,
+      auto_merge_armed: false,
+      mergeable_state: "unknown",
+      head: {sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
     } },
-    enable_auto_merge: fn(_slug, _pr_url) { return {success: true, status: 0} },
+    enable_auto_merge: fn(_slug, _pr) { return {state: "enabled"} },
   }
 }
