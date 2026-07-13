@@ -1,0 +1,434 @@
+import { read_json_result } from "std/fs"
+import {
+  schema_closed_object,
+  schema_int,
+  schema_list,
+  schema_nullable,
+  schema_string,
+  schema_validator,
+} from "std/schema"
+import { actions_workflow_run_jobs, actions_workflow_runs } from "harn-github-connector/default"
+
+pub type MergeGroupAuditConfig = {
+  owner: string,
+  repo: string,
+  workflow: string,
+  event: string,
+  pin_sha: string,
+  required_jobs: list<string>,
+}
+
+pub type MergeGroupAuditRun = {
+  id: int,
+  url: string,
+  head_sha: string,
+  event: string,
+  status: string,
+  conclusion: string,
+}
+
+pub type MergeGroupAuditJob = {
+  id: int,
+  run_id: int,
+  name: string,
+  url: string,
+  status: string,
+  conclusion: string,
+}
+
+pub type MergeGroupAuditObservation = {
+  observed_at: string,
+  total_runs: int,
+  runs: list<MergeGroupAuditRun>,
+  total_jobs: int,
+  jobs: list<MergeGroupAuditJob>,
+}
+
+pub type MergeGroupAuditEvidence = {
+  observed_at: string,
+  head_sha: string,
+  run: MergeGroupAuditRun,
+  jobs: list<MergeGroupAuditJob>,
+}
+
+pub type MergeGroupAuditDecision = {reuse: bool, reason: string, evidence?: MergeGroupAuditEvidence}
+
+pub type ReleaseAuditReceipt = {
+  schema_version: "harn.release_audit_receipt.v1",
+  proof_kind: "merge_group",
+  head_sha: string,
+  run: {
+    id: int,
+    url: string,
+    event: "merge_group",
+    workflow: "CI",
+    head_sha: string,
+    status: "completed",
+    conclusion: "success",
+  },
+  jobs: list<{id: int, name: string, url: string, status: "completed", conclusion: "success"}>,
+  warm: {
+    head_sha: string,
+    command: "cargo build -p harn-cli --bin harn --locked",
+    binary_sha256: string,
+    status: "success",
+  },
+}
+
+type MergeGroupAuditQueryResult = {success: bool, value?: dict, error: string}
+
+/** Typed query policy using job identities read from Harn's owning contract. */
+pub fn merge_group_audit_config(expected_head_sha: string, required_jobs: list<string>) -> MergeGroupAuditConfig {
+  return {
+    owner: "burin-labs",
+    repo: "harn",
+    workflow: "ci.yml",
+    event: "merge_group",
+    pin_sha: lowercase(expected_head_sha),
+    required_jobs: required_jobs,
+  }
+}
+
+fn unique_strings(values: list<string>) -> bool {
+  let seen: list<string> = []
+  for value in values {
+    if seen.contains(value) {
+      return false
+    }
+    seen = seen + [value]
+  }
+  return true
+}
+
+/** Read job identities from Harn's owning release-audit contract. */
+pub fn release_audit_contract_required_jobs(path: string) -> list<string>? {
+  const loaded = read_json_result(path)
+  if !is_ok(loaded) {
+    return nil
+  }
+  const contract = unwrap(loaded)
+  const projected = {
+    merge_group_jobs: (contract?.merge_group_jobs ?? [])
+      .map({ job -> return {name: job?.name, proofs: job?.proofs} })
+      .to_list(),
+  }
+  const report = schema_validator(
+    schema_closed_object(
+      {
+        merge_group_jobs: schema_list(
+          schema_closed_object(
+            {name: schema_string() + {min_len: 1}, proofs: schema_list(schema_string() + {min_len: 1})},
+          ),
+        ),
+      },
+    ),
+  )
+    .report(projected)
+  if !report.ok {
+    return nil
+  }
+  const names = report.value.merge_group_jobs
+    .filter({ job -> len(job.proofs) > 0 })
+    .map({ job -> job.name })
+    .to_list()
+  if len(names) == 0 || !unique_strings(names) {
+    return nil
+  }
+  return names
+}
+
+fn run_schema() {
+  return schema_closed_object(
+    {
+      id: schema_int() + {minimum: 1},
+      url: schema_string()
+        + {pattern: "^https://github[.]com/burin-labs/harn/actions/runs/[0-9]+$"},
+      head_sha: schema_string() + {pattern: "^[0-9a-f]{40}$"},
+      event: schema_string(),
+      status: schema_string(),
+      conclusion: schema_nullable(schema_string()),
+    },
+  )
+}
+
+fn job_schema() {
+  return schema_closed_object(
+    {
+      id: schema_int() + {minimum: 1},
+      run_id: schema_int() + {minimum: 1},
+      name: schema_string() + {min_len: 1},
+      url: schema_string()
+        + {pattern: "^https://github[.]com/burin-labs/harn/actions/runs/[0-9]+/job/[0-9]+$"},
+      status: schema_string(),
+      conclusion: schema_nullable(schema_string()),
+    },
+  )
+}
+
+fn run_list_schema() {
+  return schema_closed_object({total_runs: schema_int(), runs: schema_list(run_schema())})
+}
+
+fn job_list_schema() {
+  return schema_closed_object({total_jobs: schema_int(), jobs: schema_list(job_schema())})
+}
+
+fn projected_run(run) {
+  return {
+    id: run?.id,
+    url: run?.html_url,
+    head_sha: lowercase(run?.head_sha ?? ""),
+    event: run?.event,
+    status: run?.status,
+    conclusion: run?.conclusion,
+  }
+}
+
+fn projected_job(job) {
+  return {
+    id: job?.id,
+    run_id: job?.run_id,
+    name: job?.name,
+    url: job?.html_url,
+    status: job?.status,
+    conclusion: job?.conclusion,
+  }
+}
+
+fn connector_error(stage: string) -> MergeGroupAuditQueryResult {
+  return {success: false, error: "${stage} query failed"}
+}
+
+pub fn merge_group_audit_connector_runs(config: MergeGroupAuditConfig) -> MergeGroupAuditQueryResult {
+  return try {
+    const raw = actions_workflow_runs(
+      config.owner,
+      config.repo,
+      {
+        allow_gh_auth_fallback: true,
+        workflow_id: config.workflow,
+        event: config.event,
+        head_sha: config.pin_sha,
+        per_page: 100,
+        page: 1,
+      },
+    )
+    if raw == nil || is_err(raw) {
+      return connector_error("workflow runs")
+    }
+    return {
+      success: true,
+      value: {
+        total_runs: raw.total_count,
+        runs: (raw.workflow_runs ?? []).map({ run -> projected_run(run) }).to_list(),
+      },
+      error: "",
+    }
+  } catch (_e) {
+    connector_error("workflow runs")
+  }
+}
+
+pub fn merge_group_audit_connector_jobs(config: MergeGroupAuditConfig, run_id: int) -> MergeGroupAuditQueryResult {
+  return try {
+    const raw = actions_workflow_run_jobs(
+      config.owner,
+      config.repo,
+      run_id,
+      {allow_gh_auth_fallback: true, filter: "latest", per_page: 100, page: 1},
+    )
+    if raw == nil || is_err(raw) {
+      return connector_error("workflow jobs")
+    }
+    return {
+      success: true,
+      value: {total_jobs: raw.total_count, jobs: (raw.jobs ?? []).map({ job -> projected_job(job) }).to_list()},
+      error: "",
+    }
+  } catch (_e) {
+    connector_error("workflow jobs")
+  }
+}
+
+fn normalized_runs(value) -> list<MergeGroupAuditRun> {
+  return value.runs
+    .map(
+    { run -> return {
+      id: run.id,
+      url: run.url,
+      head_sha: lowercase(run.head_sha),
+      event: lowercase(run.event),
+      status: lowercase(run.status),
+      conclusion: lowercase(run.conclusion ?? ""),
+    } },
+  )
+    .to_list()
+}
+
+fn normalized_jobs(value) -> list<MergeGroupAuditJob> {
+  return value.jobs
+    .map(
+    { job -> return {
+      id: job.id,
+      run_id: job.run_id,
+      name: job.name,
+      url: job.url,
+      status: lowercase(job.status),
+      conclusion: lowercase(job.conclusion ?? ""),
+    } },
+  )
+    .to_list()
+}
+
+fn fallback(reason: string) -> MergeGroupAuditDecision {
+  return {reuse: false, reason: reason + "; running the full audit locally"}
+}
+
+fn named_jobs(jobs: list<MergeGroupAuditJob>, name: string) -> list<MergeGroupAuditJob> {
+  return jobs.filter({ job -> job.name == name }).to_list()
+}
+
+/** Pure fail-closed reducer over one exact workflow and complete latest-attempt jobs snapshot. */
+pub fn merge_group_audit_transition(
+  config: MergeGroupAuditConfig,
+  observation: MergeGroupAuditObservation,
+) -> MergeGroupAuditDecision {
+  if observation.total_runs != len(observation.runs) {
+    return fallback("workflow run snapshot was incomplete")
+  }
+  if len(observation.runs) != 1 {
+    return fallback(
+      "expected exactly one ${config.workflow} merge-group run for ${config.pin_sha}, observed ${len(observation.runs)}",
+    )
+  }
+  const selected_run = observation.runs[0]
+  if selected_run == nil {
+    return fallback("workflow run selection returned no candidate")
+  }
+  const run: MergeGroupAuditRun = selected_run
+  if run.head_sha != config.pin_sha {
+    return fallback("workflow run ${run.id} has head SHA ${run.head_sha}, expected ${config.pin_sha}")
+  }
+  if run.event != config.event {
+    return fallback("workflow run ${run.id} has event ${run.event}, expected ${config.event}")
+  }
+  if run.status != "completed" || run.conclusion != "success" {
+    return fallback("workflow run ${run.id} is ${run.status}/${run.conclusion}")
+  }
+  if observation.total_jobs != len(observation.jobs) || len(observation.jobs) == 0 {
+    return fallback("workflow run ${run.id} jobs snapshot was missing or incomplete")
+  }
+  for job in observation.jobs {
+    if job.run_id != run.id {
+      return fallback("job ${job.id} belongs to run ${job.run_id}, expected ${run.id}")
+    }
+    if job.status != "completed" {
+      return fallback("observed job `${job.name}` was not completed")
+    }
+    if job.conclusion != "success" && job.conclusion != "skipped" {
+      return fallback("observed job `${job.name}` concluded ${job.conclusion}")
+    }
+  }
+  let selected: list<MergeGroupAuditJob> = []
+  for required_name in config.required_jobs {
+    const matches = named_jobs(observation.jobs, required_name)
+    if len(matches) != 1 {
+      return fallback("required job `${required_name}` was missing or ambiguous")
+    }
+    const required = matches[0]
+    if required.status != "completed" || required.conclusion != "success" {
+      return fallback("required job `${required_name}` did not execute successfully")
+    }
+    selected = selected + [required]
+  }
+  return {
+    reuse: true,
+    reason: "acquired exact merge-group CI evidence from run ${run.id} at ${run.head_sha}",
+    evidence: {observed_at: observation.observed_at, head_sha: run.head_sha, run: run, jobs: selected},
+  }
+}
+
+fn connector_adapter() {
+  return {list_runs: merge_group_audit_connector_runs, list_jobs: merge_group_audit_connector_jobs}
+}
+
+/** Validate connector boundaries once, then reduce typed facts without prose parsing. */
+pub fn resolve_merge_group_audit(config: MergeGroupAuditConfig, query_adapter = nil) -> MergeGroupAuditDecision {
+  const adapter = query_adapter ?? connector_adapter()
+  const queried_runs = adapter.list_runs(config)
+  if !queried_runs.success || queried_runs.value == nil {
+    return fallback(queried_runs.error)
+  }
+  const runs_report = schema_validator(run_list_schema()).report(queried_runs.value)
+  if !runs_report.ok {
+    return fallback("merge-group workflow-run schema validation failed")
+  }
+  const runs = normalized_runs(runs_report.value)
+  if len(runs) != 1 {
+    return merge_group_audit_transition(
+      config,
+      {
+        observed_at: date_now_iso(),
+        total_runs: runs_report.value.total_runs,
+        runs: runs,
+        total_jobs: 0,
+        jobs: [],
+      },
+    )
+  }
+  const selected_run = runs[0]
+  const queried_jobs = adapter.list_jobs(config, selected_run.id)
+  if !queried_jobs.success || queried_jobs.value == nil {
+    return fallback(queried_jobs.error)
+  }
+  const jobs_report = schema_validator(job_list_schema()).report(queried_jobs.value)
+  if !jobs_report.ok {
+    return fallback("merge-group workflow-jobs schema validation failed")
+  }
+  return merge_group_audit_transition(
+    config,
+    {
+      observed_at: date_now_iso(),
+      total_runs: runs_report.value.total_runs,
+      runs: runs,
+      total_jobs: jobs_report.value.total_jobs,
+      jobs: normalized_jobs(jobs_report.value),
+    },
+  )
+}
+
+/**
+ * Close acquired evidence with the exact warmed binary bytes. Harn validates this receipt again.
+ */
+pub fn merge_group_audit_receipt(evidence: MergeGroupAuditEvidence, binary_sha256: string) -> ReleaseAuditReceipt? {
+  const binary_sha = lowercase(trim(binary_sha256))
+  if len(regex_captures("^[0-9a-f]{64}$", binary_sha)) == 0 {
+    return nil
+  }
+  const receipt: ReleaseAuditReceipt = {
+    schema_version: "harn.release_audit_receipt.v1",
+    proof_kind: "merge_group",
+    head_sha: evidence.head_sha,
+    run: {
+      id: evidence.run.id,
+      url: evidence.run.url,
+      event: "merge_group",
+      workflow: "CI",
+      head_sha: evidence.head_sha,
+      status: "completed",
+      conclusion: "success",
+    },
+    jobs: evidence.jobs
+      .map(
+      { job -> return {id: job.id, name: job.name, url: job.url, status: "completed", conclusion: "success"} },
+    )
+      .to_list(),
+    warm: {
+      head_sha: evidence.head_sha,
+      command: "cargo build -p harn-cli --bin harn --locked",
+      binary_sha256: binary_sha,
+      status: "success",
+    },
+  }
+  return receipt
+}
