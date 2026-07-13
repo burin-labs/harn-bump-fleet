@@ -10,7 +10,7 @@ import { agent_preset } from "std/agent/presets"
 import { parse_args } from "std/cli"
 import { command_output_range, command_output_tail } from "std/command"
 import { env_bool, env_str } from "std/config"
-import { git_run } from "std/git"
+import { GitRemoteRef, git_ls_remote, git_run } from "std/git"
 import { read_line } from "std/io"
 import { write_jsonl } from "std/jsonl"
 import { end_timing, start_timing, timed } from "std/timing"
@@ -118,8 +118,8 @@ import {
   release_cutoff_decision,
   release_cutoff_probe,
   remote_release_tag_decision,
-  remote_tag_sha_from_ls_remote,
-  remote_tag_target_sha_from_ls_remote,
+  remote_tag_sha,
+  remote_tag_target_sha,
   repin_tocttou_decision,
 } from "lib/release_repin"
 import { require_release_repo_path } from "lib/release_repo_guard"
@@ -170,6 +170,14 @@ let DEFAULT_PROVIDER = DEFAULT_PLANNER.provider
 let MOCK_AGENT_MODEL = "claude-sonnet-4-7"
 
 let RUN_ROOT = ".harn-runs/release-harn"
+
+type ReleaseGitRemoteObservation = {
+  success: bool,
+  status: int,
+  refs: list<GitRemoteRef>,
+  receipt: dict?,
+  stderr: string,
+}
 
 /**
  * Resolve the checkout root that owns this release harness. `harn run
@@ -533,6 +541,47 @@ fn run_git(cfg, args, options = {}) {
   return git_run(args, options + {repo: cfg.repo})
 }
 
+fn release_git_remote_refs(cfg, refs: list<string>, tags: bool = false) -> ReleaseGitRemoteObservation {
+  if cfg.mock {
+    const mock_refs: list<GitRemoteRef> = if refs.contains("refs/tags/v*") {
+      [
+        {
+          oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          ref: "refs/tags/v0.7.51",
+          name: "refs/tags/v0.7.51",
+          peeled: false,
+        },
+        {
+          oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          ref: "refs/tags/v0.7.52",
+          name: "refs/tags/v0.7.52",
+          peeled: false,
+        },
+      ]
+    } else {
+      []
+    }
+    return {success: true, status: 0, refs: mock_refs, receipt: nil, stderr: ""}
+  }
+  const observed = git_ls_remote("origin", {repo: cfg.repo, refs: refs, tags: tags})
+  return {
+    success: observed.success,
+    status: observed.exit_code,
+    refs: observed.data.refs,
+    receipt: observed,
+    stderr: observed.stderr.inline,
+  }
+}
+
+fn recorded_remote_refs_step(name: string, label: string, observed: ReleaseGitRemoteObservation) {
+  const result = if observed.success {
+    ok("")
+  } else {
+    fail(observed.status, observed.stderr)
+  }
+  return {...recorded_step(name, label, result), git_receipt: observed.receipt, remote_refs: observed.refs}
+}
+
 /** Run a local git command, throwing on failure and returning trimmed stdout. */
 fn checked_git(cfg, args, options = {}) {
   let r = run_git(cfg, args, options)
@@ -658,11 +707,6 @@ fn fake_command(command, cfg, env = nil) {
   if contains(command, "git tag --list") && contains(command, "--sort=-v:refname") {
     return ok("v0.7.52\n")
   }
-  if contains(command, "git ls-remote --tags --refs origin refs/tags/v") {
-    return ok(
-      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.7.51\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v0.7.52\n",
-    )
-  }
   if contains(command, "git describe --tags") {
     return ok("v0.7.51\n")
   }
@@ -697,7 +741,7 @@ fn fake_command(command, cfg, env = nil) {
     return ok("binary_workflow=ok\n")
   }
   if contains(command, "cargo build -p harn-cli --bin harn --locked") {
-    if env_bool("HARN_RELEASE_MOCK_PIN_WARM_FAIL", false) {
+    if (cfg.mock_pin_warm_fail ?? false) || env_bool("HARN_RELEASE_MOCK_PIN_WARM_FAIL", false) {
       return fail(1, "mock exact-pin Harn CLI warm failure\n")
     }
     return ok("exact-pin Harn CLI warm complete\n")
@@ -727,9 +771,6 @@ fn fake_command(command, cfg, env = nil) {
       return ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
     }
     return fail(1, "")
-  }
-  if contains(command, "git ls-remote origin refs/tags/v") {
-    return ok("")
   }
   if contains(command, "git rev-parse --verify") {
     return ok(MOCK_PIN_SHA + "\n")
@@ -1528,12 +1569,12 @@ fn release_session_id(harness: Harness, cfg, analysis, run_id) {
 }
 
 fn latest_release_tag(cfg) {
-  let remote = run_git(cfg, ["ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"])
+  const remote = release_git_remote_refs(cfg, ["refs/tags/v*"], true)
   if !remote.success {
     throw "could not list origin release tags; refusing to derive release history from local-only tags:\n"
-      + trim(remote.stderr ?? "")
+      + trim(remote.stderr)
   }
-  return latest_semver_tag_from_remote_refs(remote.stdout)
+  return latest_semver_tag_from_remote_refs(remote.refs)
 }
 
 fn agent_artifact_paths(run_id) {
@@ -2696,6 +2737,13 @@ fn resolve_prepare_audit_evidence(harness: Harness, cfg, steps, run_id) {
   return resolve_merge_group_audit_reuse(harness, cfg, steps, run_id)
 }
 
+/** Resolve reusable audit evidence and the exact prepare command from one typed plan. */
+pub fn release_prepare_audit_plan(harness: Harness, cfg, steps = [], run_id = nil) {
+  const id = run_id ?? uuid_v7()
+  const evidence = resolve_prepare_audit_evidence(harness, cfg, steps, id)
+  return {...evidence, command: prepare_command(cfg, evidence), run_id: id}
+}
+
 /**
  * Enumerate non-merge prepare commits on the existing release branch
  * — the commits we want to cherry-pick onto fresh `<base>` during a
@@ -3163,12 +3211,18 @@ fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
   }
   let head = trim(head_probe.stdout)
   let pre_steps = steps
-  let remote_tag_probe = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
+  const remote_tag_probe = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
   if !remote_tag_probe.success {
     return pre_steps
-      + [recorded_step("probe-release-tag", "git ls-remote origin refs/tags/" + tag, remote_tag_probe)]
+      + [
+      recorded_remote_refs_step(
+        "probe-release-tag",
+        "std/git::git_ls_remote refs/tags/" + tag,
+        remote_tag_probe,
+      ),
+    ]
   }
-  let remote_target = remote_tag_target_sha_from_ls_remote(remote_tag_probe.stdout)
+  const remote_target = remote_tag_target_sha(remote_tag_probe.refs)
   let remote_decision = remote_release_tag_decision({tag: tag, head_sha: head, remote_target_sha: remote_target})
   if remote_decision.action == "reuse" {
     return pre_steps
@@ -3185,7 +3239,7 @@ fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
       + [
       recorded_step(
         "push-release-tag",
-        "git ls-remote origin refs/tags/" + tag,
+        "std/git::git_ls_remote refs/tags/" + tag,
         fail(2, remote_decision.reason),
       ),
     ]
@@ -3492,7 +3546,7 @@ fn run_repin_tocttou_recheck(cfg, analysis) {
   }
   let release_assets = release_asset_snapshot(cfg, tag)
   let release_exists = release_assets.ready || harn_crate_published(analysis.next_version)
-  let ls = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
+  const ls = release_git_remote_refs(cfg, ["refs/tags/" + tag])
   if !ls.success {
     return {
       success: false,
@@ -3512,7 +3566,7 @@ fn run_repin_tocttou_recheck(cfg, analysis) {
     {
       release_exists: release_exists,
       initial_remote_tag_sha: cfg.repin_initial_remote_tag_sha ?? "",
-      current_remote_tag_sha: remote_tag_sha_from_ls_remote(ls.stdout),
+      current_remote_tag_sha: remote_tag_sha(ls.refs),
       new_pin_sha: trim(pin_probe.stdout),
       tag: tag,
     },
@@ -4017,8 +4071,8 @@ fn detect_fixup_state(cfg, analysis) {
   }
   // Optional informational signals — control which gates we skip but do
   // not gate detection itself.
-  let tag_check = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
-  let tag_exists = tag_check.success && trim(tag_check.stdout) != ""
+  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag])
+  let tag_exists = tag_check.success && len(tag_check.refs) > 0
   let release_body_ref = if tag_exists {
     tag
   } else {
@@ -4200,16 +4254,11 @@ fn detect_post_merge_drift(cfg, analysis) {
       paperwork_branch: paperwork_branch,
     }
   }
-  let tag_check = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
-  if !tag_check.success || trim(tag_check.stdout) == "" {
+  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag])
+  if !tag_check.success || len(tag_check.refs) == 0 {
     return nil
   }
-  let tag_line_parts = split(trim(tag_check.stdout), "\t")
-  let tag_sha = if len(tag_line_parts) > 0 {
-    trim(tag_line_parts[0])
-  } else {
-    ""
-  }
+  const tag_sha = remote_tag_sha(tag_check.refs)
   if tag_sha == "" {
     return nil
   }
@@ -4430,11 +4479,11 @@ fn detect_repin_state(cfg, analysis) {
   if pr_url == "" {
     throw "--repin-latest refused: no open release/${tag} PR found. --repin-latest advances an in-flight PR's pin; for a first-time release use --mode ship-pr without --repin-latest."
   }
-  let ls = run_git(cfg, ["ls-remote", "origin", "refs/tags/" + tag])
+  const ls = release_git_remote_refs(cfg, ["refs/tags/" + tag])
   if !ls.success {
     throw "--repin-latest could not list remote tag ${tag}: ${trim(ls.stderr)}"
   }
-  return {tag: tag, pr_url: pr_url, initial_remote_tag_sha: remote_tag_sha_from_ls_remote(ls.stdout)}
+  return {tag: tag, pr_url: pr_url, initial_remote_tag_sha: remote_tag_sha(ls.refs)}
 }
 
 fn with_repin_state(cfg, repin) {
@@ -5409,10 +5458,9 @@ fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run_id)
     )
     return steps
   }
-  let audit_evidence = resolve_prepare_audit_evidence(harness, cfg, steps, run_id)
-  steps = audit_evidence.steps
-  let cmd = prepare_command(cfg, audit_evidence)
-  let prepare = logged_live_shell_command_step(harness, cfg, steps, "prepare", cmd, run_id)
+  const audit_plan = release_prepare_audit_plan(harness, cfg, steps, run_id)
+  steps = audit_plan.steps
+  let prepare = logged_live_shell_command_step(harness, cfg, steps, "prepare", audit_plan.command, run_id)
   steps = prepare.steps
   if execution_failed(steps) {
     release_log_event(
