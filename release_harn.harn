@@ -99,7 +99,8 @@ import {
 import { harn_crate_published, missing_release_assets } from "lib/release_readiness"
 import {
   local_release_tag_decision,
-  pre_tag_drift_decision,
+  release_cutoff_decision,
+  release_cutoff_probe,
   remote_release_tag_decision,
   remote_tag_sha_from_ls_remote,
   remote_tag_target_sha_from_ls_remote,
@@ -307,11 +308,8 @@ Flags:
                           `--mode ship-pr --yes-live-release`; refuses if the
                           v$next release already shipped (crates.io is immutable).
                           Re-runs audit + dry-run + bump and re-tags at the new pin.
-  --allow-base-drift      Ship the frozen pin even if `origin/<base>` advanced past it
-                          while the run was in flight. By default ship-pr aborts before
-                          the tag push when the pin is behind base HEAD, so a release can
-                          never silently tag a tree that excludes commits already on the
-                          base. Use --repin-latest to fold the new commits in instead.
+  --allow-base-drift      Ship the frozen pin even when its ancestry against
+                          `origin/<base>` cannot be proved (dangerous override).
   --offload-audit         Force the ~548s release_gate.sh audit onto a configured
                           remote builder and skip the duplicate local audit only
                           when the remote run is definitively green. Live
@@ -3092,47 +3090,45 @@ fn release_repo_slug(cfg) {
 }
 
 /**
- * Refuse to tag a pin that has fallen behind `origin/<base>` while the run was
- * in flight. The pin was frozen at startup; this final gate runs immediately
- * before the irreversible tag push because drift can accrue after every earlier
- * check. Returns `{steps, proceed}`; `proceed=false` means a step was recorded
- * and the caller must stop before `ensure_release_tag_pushed`.
+ * Prove the frozen release cutoff remains in `origin/<base>` ancestry before
+ * the irreversible tag push. Normal descendant commits belong to the next
+ * release; divergence or an unprovable cutoff fails closed. Returns
+ * `{steps, proceed}`; `proceed=false` means the caller must stop before
+ * `ensure_release_tag_pushed`.
  *
- * The pure `pre_tag_drift_decision` owns the policy; this only gathers the fresh
+ * The pure `release_cutoff_decision` owns the policy; this only gathers the fresh
  * probe. Repin mode, explicit `--at-sha`, and `--allow-base-drift` short-circuit
  * (their drift is intended or already gated); mock skips the live probe.
  */
-fn pre_tag_drift_gate(harness: Harness, cfg, version, steps, run_id) {
-  let tag = "v${version}"
+fn release_cutoff_gate(harness: Harness, cfg, tag: string, phase: string, steps, run_id) {
   let explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
   if cfg.mock || (cfg.repin_mode ?? false) || explicit_pin || (cfg.allow_base_drift ?? false) {
     return {steps: steps, proceed: true}
   }
-  release_log_event(harness, run_id, "step_started", {step: "pre-tag-drift-check"})
+  const step = "pre-${phase}-cutoff-check"
+  const action = if phase == "tag" {
+    "tagging"
+  } else {
+    "preparing"
+  }
+  release_log_event(harness, run_id, "step_started", {step: step})
   let fetch = run_git(cfg, ["fetch", "origin", "--quiet", cfg.base])
   if !fetch.success {
     let fetch_stderr = trim(fetch.stderr ?? "")
     let recorded = recorded_step(
-      "pre-tag-drift-check",
+      step,
       "git fetch origin ${cfg.base}",
-      fail(
-        2,
-        "pre-tag drift check could not fetch origin/${cfg.base} before tagging ${tag}: ${fetch_stderr}",
-      ),
+      fail(2, "${step} could not fetch origin/${cfg.base} before ${action} ${tag}: ${fetch_stderr}"),
     )
-    release_log_event(harness, run_id, "step_finished", {step: "pre-tag-drift-check", success: false})
+    release_log_event(harness, run_id, "step_finished", {step: step, success: false})
     return {steps: steps + [recorded], proceed: false}
   }
-  let head = run_git(cfg, ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"])
-  let base_head = if head.success {
-    trim(head.stdout ?? "")
-  } else {
-    ""
-  }
-  let decision = pre_tag_drift_decision(
+  const cutoff = release_cutoff_probe({ args -> run_git(cfg, args) }, cfg)
+  let decision = release_cutoff_decision(
     {
       pin_sha: cfg.pin_sha,
-      base_head_sha: base_head,
+      base_head_sha: cutoff.base_head_sha,
+      pin_is_base_ancestor: cutoff.pin_is_base_ancestor,
       base: cfg.base,
       tag: tag,
       repin_latest: false,
@@ -3142,111 +3138,46 @@ fn pre_tag_drift_gate(harness: Harness, cfg, version, steps, run_id) {
   )
   if decision.action == "abort" {
     let recorded = recorded_step(
-      "pre-tag-drift-check",
-      "compare release pin to origin/${cfg.base} HEAD",
+      step,
+      "prove release cutoff is in origin/${cfg.base} ancestry",
       fail(2, decision.reason),
     )
     release_log_event(
       harness,
       run_id,
       "step_finished",
-      {step: "pre-tag-drift-check", success: false, reason: decision.reason},
+      {step: step, success: false, reason: decision.reason},
     )
     return {steps: steps + [recorded], proceed: false}
   }
   let recorded = recorded_step(
-    "pre-tag-drift-check",
-    "compare release pin to origin/${cfg.base} HEAD",
-    ok("pin ${cfg.pin_sha} matches origin/${cfg.base} HEAD; safe to tag ${tag}\n"),
+    step,
+    "prove release cutoff is in origin/${cfg.base} ancestry",
+    ok(
+      "cutoff ${cfg.pin_sha} remains in origin/${cfg.base} ancestry at ${cutoff.base_head_sha}; later base commits belong to the next release; safe to ${phase} ${tag}\n",
+    ),
   )
-  release_log_event(harness, run_id, "step_finished", {step: "pre-tag-drift-check", success: true})
+  release_log_event(harness, run_id, "step_finished", {step: step, success: true})
   return {steps: steps + [recorded], proceed: true}
 }
 
+fn pre_tag_cutoff_gate(harness: Harness, cfg, version, steps, run_id) {
+  return release_cutoff_gate(harness, cfg, "v${version}", "tag", steps, run_id)
+}
+
 /**
- * Fast-fail a normal live release before branch mutation when the frozen pin is
- * already behind `origin/<base>`. The final pre-tag gate above still owns the
- * irreversible safety boundary; this earlier gate avoids spending prepare time
- * and pushing a stale release branch when drift is already observable.
+ * Prove the frozen cutoff is still in base ancestry before branch mutation.
+ * Normal base advancement does not invalidate prepared evidence; divergence
+ * fails before the expensive prepare phase and branch push.
  */
-fn pre_prepare_drift_gate(harness: Harness, cfg, analysis, steps, run_id) {
-  let explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
-  if cfg.mock || (cfg.repin_mode ?? false) || explicit_pin || (cfg.allow_base_drift ?? false) {
-    return {steps: steps, proceed: true}
-  }
+fn pre_prepare_cutoff_gate(harness: Harness, cfg, analysis, steps, run_id) {
   let version = trim(analysis.next_version ?? "")
   let tag = if version == "" {
     "v<unknown>"
   } else {
     "v${version}"
   }
-  release_log_event(harness, run_id, "step_started", {step: "pre-prepare-drift-check"})
-  let fetch = run_git(cfg, ["fetch", "origin", "--quiet", cfg.base])
-  if !fetch.success {
-    let fetch_stderr = trim(fetch.stderr ?? "")
-    let recorded = recorded_step(
-      "pre-prepare-drift-check",
-      "git fetch origin ${cfg.base}",
-      fail(
-        2,
-        "pre-prepare drift check could not fetch origin/${cfg.base} before preparing ${tag}: ${fetch_stderr}",
-      ),
-    )
-    release_log_event(
-      harness,
-      run_id,
-      "step_finished",
-      {step: "pre-prepare-drift-check", success: false},
-    )
-    return {steps: steps + [recorded], proceed: false}
-  }
-  let head = run_git(cfg, ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"])
-  let base_head = if head.success {
-    trim(head.stdout ?? "")
-  } else {
-    ""
-  }
-  let decision = pre_tag_drift_decision(
-    {
-      pin_sha: cfg.pin_sha,
-      base_head_sha: base_head,
-      base: cfg.base,
-      tag: tag,
-      repin_latest: false,
-      explicit_pin: false,
-      allow_drift: false,
-    },
-  )
-  if decision.action == "abort" {
-    let recorded = recorded_step(
-      "pre-prepare-drift-check",
-      "compare release pin to origin/${cfg.base} HEAD",
-      fail(
-        2,
-        decision.reason
-          + " Re-run before prepare so release notes and branch content are regenerated from the fresh base.",
-      ),
-    )
-    release_log_event(
-      harness,
-      run_id,
-      "step_finished",
-      {step: "pre-prepare-drift-check", success: false, reason: decision.reason},
-    )
-    return {steps: steps + [recorded], proceed: false}
-  }
-  let recorded = recorded_step(
-    "pre-prepare-drift-check",
-    "compare release pin to origin/${cfg.base} HEAD",
-    ok("pin ${cfg.pin_sha} matches origin/${cfg.base} HEAD before prepare; safe to mutate ${tag}\n"),
-  )
-  release_log_event(
-    harness,
-    run_id,
-    "step_finished",
-    {step: "pre-prepare-drift-check", success: true},
-  )
-  return {steps: steps + [recorded], proceed: true}
+  return release_cutoff_gate(harness, cfg, tag, "prepare", steps, run_id)
 }
 
 /** Persist the handoff that lets post-tag monitoring resume in another process. */
@@ -5611,7 +5542,7 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   let cfg = pre.cfg
   let analysis = pre.analysis
   let steps = pre.steps
-  let pre_prepare_gate = pre_prepare_drift_gate(harness, cfg, analysis, steps, run_id)
+  let pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
   steps = pre_prepare_gate.steps
   if !pre_prepare_gate.proceed {
     return steps
@@ -5749,13 +5680,11 @@ fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result,
   if !delete_outcome.success {
     return steps
   }
-  // Refuse to publish a pin that fell behind origin/<base> while the run was
-  // in flight: the tag below fires publish-release.yml, and a behind-base pin
-  // would ship a tree missing commits already on the base. --repin-latest,
-  // --at-sha, and --allow-base-drift opt out of this guard.
-  let drift_gate = pre_tag_drift_gate(harness, cfg, version, steps, run_id)
-  steps = drift_gate.steps
-  if !drift_gate.proceed {
+  // The tag below fires publish-release.yml from the frozen cutoff. Prove that
+  // cutoff remains in base ancestry; commits that landed later ship next time.
+  let cutoff_gate = pre_tag_cutoff_gate(harness, cfg, version, steps, run_id)
+  steps = cutoff_gate.steps
+  if !cutoff_gate.proceed {
     return steps
   }
   // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
