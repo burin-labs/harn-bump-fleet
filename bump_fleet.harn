@@ -3,8 +3,7 @@
 // bump_fleet.harn — orchestrate Harn-version bump PRs across every repo in
 // ~/projects/{*harn*,*burin*} that ships a `.github/workflows/bump-harn.yml`.
 //
-// Determinism: every GitHub interaction is a `gh` shell-out with JSON output.
-// GitHub connector helpers are used where available with `gh` fallback. The
+// Determinism: every GitHub interaction uses the typed connector boundary. The
 // single LLM call at the end is a read-only summary against a local model — it
 // never drives any side-effect.
 //
@@ -18,7 +17,6 @@
 import { agent_host_tools } from "std/agent/host_tools"
 import { agent_preset } from "std/agent/presets"
 import { parse_args } from "std/cli"
-import { command_json } from "std/command"
 import { env_str } from "std/config"
 import { strip_think_blocks } from "std/llm/safe"
 import { poll_until } from "std/poll"
@@ -43,14 +41,15 @@ import {
 import { checkout_cleanup } from "lib/checkout_cleanup"
 import { remote_url_to_slug } from "lib/git"
 import {
-  gh_enable_auto_merge,
-  gh_file_text_at_ref,
-  gh_latest_release_tag,
-  gh_pr_close,
-  gh_pr_comment,
-  gh_workflow_run,
-  gh_workflow_runs,
-} from "lib/github_cli"
+  github_actions_run,
+  github_enable_auto_merge,
+  github_file_text_at_ref,
+  github_latest_release_tag,
+  github_pr_close,
+  github_pr_comment,
+  github_pr_list,
+  github_workflow_dispatch,
+} from "lib/github"
 import {
   cost_budget_audit_line,
   install_cost_budget,
@@ -65,7 +64,6 @@ import {
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { is_v_semver, strip_v } from "lib/semver"
 import { timing_artifacts } from "lib/timing_report"
-import { workflow_run_poll_result } from "lib/workflow_runs"
 
 let BUMP_BRANCH = "automation/bump-harn-runtime"
 
@@ -74,8 +72,6 @@ let HARN_REPO = "burin-labs/harn"
 let DEFAULT_HARN_REPO_PATH = path_join(env_str("HOME") ?? "", "projects/harn")
 
 let POLL_INTERVAL_MS = 15000
-
-let POST_DISPATCH_GRACE_MS = 8000
 
 let POST_RUN_SETTLE_MS = 90 * 1000
 
@@ -420,17 +416,17 @@ fn dispatched_status(s) {
 }
 
 /**
- * Probe the version pinned on origin/main by reading the canonical surface over
- * `gh api`. Tries .harn-version first (most repos), falls back to exact
+ * Probe the version pinned on origin/main by reading the canonical connector surface.
+ * Tries .harn-version first (most repos), falls back to exact
  * Harn Cargo pins (harn-cloud). Returns `{pin, evidence}` where `pin` is the
  * bare "X.Y.Z" string with any leading "v" already stripped, or nil.
  */
 fn read_remote_pin_probe_at_ref(slug, ref) {
-  let hv = gh_file_text_at_ref(slug, ".harn-version", ref)
+  let hv = github_file_text_at_ref(slug, ".harn-version", ref)
   if hv != nil && trim(hv) != "" {
     return harn_version_pin_probe(hv)
   }
-  let cargo = gh_file_text_at_ref(slug, "Cargo.toml", ref)
+  let cargo = github_file_text_at_ref(slug, "Cargo.toml", ref)
   if cargo != nil && trim(cargo) != "" {
     return cargo_harn_pin_probe(cargo)
   }
@@ -445,38 +441,36 @@ fn read_remote_pin(slug) {
   return read_remote_pin_at_ref(slug, "main")
 }
 
-/**
- * Idempotently nudge auto-merge on. `gh pr merge --auto --squash` is itself
- * idempotent: re-enabling on an already-auto-merging PR exits 0 with a
- * noop message. Treat any non-zero exit as a soft failure carrying the
- * gh stderr forward.
- */
-fn ensure_auto_merge(slug, pr_number) {
-  let r = gh_enable_auto_merge(slug, pr_number)
-  return if r.success {
-    r.status
+/** Idempotently arm auto-merge under the PR head observed by the preceding read. */
+fn ensure_auto_merge(slug, pr) {
+  const result = github_enable_auto_merge(slug, pr.number, pr.head.sha)
+  return if is_err(result) {
+    "failed: " + to_string(unwrap_err(result))
   } else {
-    "failed: ${r.stderr}"
+    result.state
   }
 }
 
 fn annotate_bump_pr_with_view_metadata(slug, pr_number, target, view_gate) {
   let body = run_session_view_downstream_markdown(target, view_gate)
-  let r = gh_pr_comment(slug, pr_number, body)
-  return if r.success {
-    {success: true, detail: "run/session view metadata comment posted"}
+  const result = github_pr_comment(slug, pr_number, body)
+  return if is_err(result) {
+    {
+      success: false,
+      detail: "run/session view metadata comment failed: " + to_string(unwrap_err(result)),
+    }
   } else {
-    {success: false, detail: "run/session view metadata comment failed: " + trim(r.stderr ?? "")}
+    {success: true, detail: "run/session view metadata comment posted"}
   }
 }
 
 fn close_stale_pr(slug, pr, target, evidence) {
   let msg = "Closing stale Harn runtime bump PR: this fleet run targets ${target}, but ${evidence}."
-  let r = gh_pr_close(slug, pr.number, msg)
-  return if r.success {
+  const result = github_pr_close(slug, pr.number, msg)
+  return if result.ok {
     "closed stale PR #${pr.number}"
   } else {
-    "failed to close stale PR #${pr.number}: ${trim(r.stderr)}"
+    "failed to close stale PR #${pr.number}: " + to_string(result.error)
   }
 }
 
@@ -520,10 +514,10 @@ fn targeted_pr_outcome(base, slug, target, pr, view_gate) {
       },
     )
   }
-  let am = if pr.autoMergeRequest != nil {
+  let am = if pr.auto_merge_armed {
     "already_enabled"
   } else {
-    ensure_auto_merge(slug, pr.number)
+    ensure_auto_merge(slug, pr)
   }
   let final_status = if starts_with(am, "failed") {
     "pr_open_for_target_auto_merge_failed"
@@ -582,28 +576,24 @@ fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate
 }
 
 fn dispatch_bump_workflow(harness: Harness, repo, base, target) {
-  let dispatch_ts = date_now_iso()
-  let dispatch = gh_workflow_run(repo.slug, "bump-harn.yml", {version: target})
-  if !dispatch.success {
-    return finish_outcome(base, {status: "dispatch_failed", detail: trim(dispatch.stderr)})
+  const dispatch = github_workflow_dispatch(repo.slug, "bump-harn.yml", {version: target})
+  if is_err(dispatch) {
+    return finish_outcome(base, {status: "dispatch_failed", detail: to_string(unwrap_err(dispatch))})
   }
-  harness.clock.sleep_ms(POST_DISPATCH_GRACE_MS)
-  let polled = poll_for_completion(repo.slug, dispatch_ts)
-  return if polled == nil {
-    {...base, status: "run_not_found", detail: "no workflow_dispatch run after ${MAX_POLL_MS / 1000}s"}
-  } else if polled.status != "completed" {
+  const polled = poll_exact_workflow_run(repo.slug, dispatch.run_id)
+  return if polled.status != "completed" {
     {
       ...base,
-      run_id: polled.id,
-      run_url: polled.url,
+      run_id: dispatch.run_id,
+      run_url: dispatch.url,
       status: "run_in_progress",
       detail: "workflow still ${polled.status} after ${MAX_POLL_MS / 1000}s",
     }
   } else {
     {
       ...base,
-      run_id: polled.id,
-      run_url: polled.url,
+      run_id: dispatch.run_id,
+      run_url: dispatch.url,
       status: "run_${polled.conclusion}",
       detail: "workflow concluded ${polled.conclusion}",
     }
@@ -646,7 +636,7 @@ fn classify_post_dispatch(slug, target, target_no_v, run_outcome, stale_note) {
       } else {
         run_outcome.status
       },
-      detail: stale_note + "${run_outcome.detail}; PR #${pr.number} on ${pr.headRefName}; ${probe.evidence}",
+      detail: stale_note + "${run_outcome.detail}; PR #${pr.number} on ${pr.head.ref}; ${probe.evidence}",
     }
   }
   return {outcome: outcome, pr: pr}
@@ -667,10 +657,10 @@ fn with_auto_merge(slug, classified, target, view_gate) {
       auto_merge: nil,
     }
   }
-  let am = if pr.autoMergeRequest != nil {
+  let am = if pr.auto_merge_armed {
     "already_enabled"
   } else {
-    ensure_auto_merge(slug, pr.number)
+    ensure_auto_merge(slug, pr)
   }
   let detail = if starts_with(am, "failed") {
     "${with_pr.detail}; auto-merge: ${am}"
@@ -732,7 +722,7 @@ fn bump_one(harness: Harness, repo, target, dry_run, view_gate) {
 
 fn pr_target_probe(slug, pr, target) {
   let target_no_v = strip_v(target)
-  let probe = read_remote_pin_probe_at_ref(slug, pr.headRefName)
+  let probe = read_remote_pin_probe_at_ref(slug, pr.head.ref)
   let pin = probe.pin
   if pin == nil {
     return {matches: false, pin: nil, evidence: "PR head pin is unknown: ${probe.evidence}"}
@@ -744,71 +734,35 @@ fn pr_target_probe(slug, pr, target) {
   }
 }
 
-fn completed_run_after(slug, after_iso) {
-  let runs = try {
-    gh_workflow_runs(slug, "bump-harn.yml", "workflow_dispatch", 10)
-  } catch (e) {
-    nil
-  }
-  if runs == nil {
-    return nil
-  }
-  let best = workflow_run_poll_result(runs, after_iso)
-  if best != nil && best.status == "completed" {
-    return best
-  }
-  return nil
-}
-
-fn latest_run_after(slug, after_iso) {
-  let runs = try {
-    gh_workflow_runs(slug, "bump-harn.yml", "workflow_dispatch", 10)
-  } catch (e) {
-    nil
-  }
-  if runs == nil {
-    return nil
-  }
-  return workflow_run_poll_result(runs, after_iso)
-}
-
-fn poll_for_completion(slug, after_iso) {
-  let completed = poll_until(
-    fn() { return completed_run_after(slug, after_iso) },
+fn poll_exact_workflow_run(slug, run_id) {
+  const completed = poll_until(
+    fn() {
+      const run = github_actions_run(slug, run_id)
+      if is_err(run) {
+        throw to_string(unwrap_err(run))
+      }
+      return if run.status == "completed" {
+        run
+      } else {
+        nil
+      }
+    },
     {timeout_ms: MAX_POLL_MS, interval_ms: POLL_INTERVAL_MS},
   )
   if completed != nil {
     return completed
   }
-  return latest_run_after(slug, after_iso)
+  const final = github_actions_run(slug, run_id)
+  if is_err(final) {
+    throw to_string(unwrap_err(final))
+  }
+  return final
 }
 
 fn find_existing_pr(slug) {
-  let prs = try {
-    command_json(
-      [
-        "gh",
-        "pr",
-        "list",
-        "--repo",
-        slug,
-        "--head",
-        BUMP_BRANCH,
-        "--base",
-        "main",
-        "--state",
-        "open",
-        "--json",
-        "number,url,title,headRefName,autoMergeRequest,headRefOid",
-        "--limit",
-        "1",
-      ],
-    )
-  } catch (e) {
-    nil
-  }
-  if prs == nil {
-    return nil
+  const prs = github_pr_list(slug, {head: BUMP_BRANCH, base: "main", state: "open", limit: 1})
+  if is_err(prs) {
+    throw "GitHub PR lookup failed for ${slug}: " + to_string(unwrap_err(prs))
   }
   if len(prs) == 0 {
     return nil
@@ -936,7 +890,7 @@ fn llm_summary_once(prompt, system) {
 // -------------------------------------------------------------------------------------------------
 
 fn resolve_latest_release() {
-  return gh_latest_release_tag(HARN_REPO)
+  return github_latest_release_tag(HARN_REPO)
 }
 
 fn wait_for_target_release_readiness(harness: Harness, target) {

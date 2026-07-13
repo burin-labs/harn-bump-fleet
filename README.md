@@ -21,9 +21,9 @@ from private Burin repositories. Generated run artifacts are intentionally
 ignored under `.harn-runs/` and `.harn/`.
 
 Harn sandboxes `harn run` by default. These local ops harnesses inspect
-`~/projects` and authenticated GitHub CLI state, so use `harn run --no-sandbox`
-for real local release and bump runs. Mock release rehearsals can stay
-sandboxed.
+`~/projects`, local Git state, and authenticated GitHub connector state, so use
+`harn run --no-sandbox` for real local release and bump runs. Mock release
+rehearsals can stay sandboxed.
 
 ## Usage
 
@@ -52,8 +52,9 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
   harn run --no-sandbox bump_fleet.harn
 ```
 
-These operation harnesses inspect sibling checkouts under `~/projects` and
-shell out to `git` / `gh`, so Harn's default run sandbox must be disabled.
+These operation harnesses inspect sibling checkouts under `~/projects`, run
+local Git commands, and call the GitHub connector, so Harn's default run
+sandbox must be disabled.
 
 ### Signed bot PRs
 
@@ -62,9 +63,10 @@ ruleset requires signed commits, but a bot-authored dependency branch contains
 unsigned commits. GitHub can show the PR as green while merge-queue admission
 stays blocked by policy.
 
-The helper is dry-run by default. It reads PR commit signatures and the merge
-queue via GraphQL, then prints whether each selected PR can be rewritten. Live
-mode refuses queued PRs, missing head branches/OIDs, and already-signed PRs.
+The helper is dry-run by default. It reads typed PR commit-signature and
+merge-queue evidence through `harn-github-connector`, then prints whether each
+selected PR can be rewritten. Live mode refuses queued PRs, missing head
+branches/OIDs, and already-signed PRs.
 It also refuses forks and non-bot authors unless the corresponding override is
 passed. A live rewrite verifies the local checkout's origin matches `--repo`,
 uses a fsmonitor-disabled temp worktree, soft-resets the PR tree to
@@ -231,7 +233,9 @@ because they don't rebuild `harn` mid-run.
 ## Dependencies
 
 - The Harn version pinned in `.harn-version`.
-- Authenticated `gh` CLI. The script never embeds tokens; it shells out.
+- Authenticated GitHub connector credentials. The connector supports explicit
+  tokens and GitHub App credentials; local runs opt into the existing `gh auth`
+  token as a fallback. Read-only diagnostic agent commands also use `gh`.
 - Cloud planner API keys from `~/projects/burin-code/.env`, sourced via
   `scripts/with_env.sh`. The default route is OpenRouter
   `qwen/qwen3.6-35b-a3b` (needs `OPENROUTER_API_KEY`); the Cerebras binder
@@ -267,8 +271,8 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
 1. **Discover** every directory under `~/projects/*harn*` and `~/projects/*burin*`
    that owns `.github/workflows/bump-harn.yml`. Worktrees are deduped via
    `git rev-parse --git-common-dir`.
-2. **Resolve** the target Harn release. Defaults to
-   `gh api repos/burin-labs/harn/releases/latest`; an explicit `vX.Y.Z` arg
+2. **Resolve** the target Harn release through the connector's typed release
+   contract. An explicit `vX.Y.Z` arg
    overrides.
 3. **Wait for release readiness** on live runs. Before dispatching anything,
    the fleet waits for `harn-cli@X.Y.Z` to be visible on crates.io and for all
@@ -292,11 +296,12 @@ fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
      `pr_open_for_target`.
    - If that automation PR is stale, close it before redispatching so an old
      version bump cannot accidentally sit in the merge queue.
-5. **Otherwise dispatch** `bump-harn.yml` with `-F version=<target>`, poll
-   the resulting workflow run to completion, locate the PR the workflow
-   pushed, verify its head pin matches the target, and idempotently call
-   `gh pr merge --auto --squash` on it. A successful workflow with no matching
-   PR and no matching origin/main pin is a failed fleet outcome.
+5. **Otherwise dispatch** `bump-harn.yml` with `version=<target>`, retain and
+   poll the connector-resolved exact workflow run ID to completion, locate the
+   PR the workflow pushed, verify its head pin matches the target, and call
+   typed auto-merge under the observed PR-head lease. A successful workflow
+   with no matching PR and no matching origin/main pin is a failed fleet
+   outcome.
 6. **Audit**: write `audit.json` and a rendered markdown report to
    `.harn-runs/bump-fleet/<run-id>/`. Includes a SHA3-256 hash of the JSON
    payload and a UUIDv7 run id for cross-referencing with Harn's own run

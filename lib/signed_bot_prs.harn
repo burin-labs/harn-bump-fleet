@@ -1,6 +1,7 @@
-import { command_json, command_run } from "std/command"
+import { command_run } from "std/command"
 import { remote_url_to_slug } from "./git"
-import { gh_enable_auto_merge } from "./github_cli"
+import { github_enable_auto_merge } from "./github"
+import { call, github_pr_commits } from "harn-github-connector/default"
 
 let DEFAULT_BASE = "main"
 
@@ -51,101 +52,58 @@ pub fn parse_pr_numbers(raw) {
   return out
 }
 
-/** Build the GraphQL argv for PR metadata, including per-commit signature state. */
-pub fn pr_signature_query_args(slug, pr_number) {
-  let parts = slug_parts(slug)
-  if parts == nil {
-    throw "repo must be owner/name, got: " + to_string(slug)
-  }
-  let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number title url state isCrossRepository mergeStateStatus baseRefName headRefName headRefOid author{login __typename} headRepositoryOwner{login} headRepository{nameWithOwner} autoMergeRequest{enabledAt} commits(first:100){nodes{commit{oid messageHeadline signature{state signer{login}}}}}}}}"
-  return [
-    "api",
-    "graphql",
-    "-f",
-    "owner=" + parts.owner,
-    "-f",
-    "name=" + parts.repo,
-    "-F",
-    "number=" + to_string(pr_number),
-    "-f",
-    "query=" + query,
-  ]
-}
-
-/** Build the GraphQL argv for reading the merge queue attached to a base branch. */
-pub fn merge_queue_query_args(slug, base = DEFAULT_BASE) {
-  let parts = slug_parts(slug)
-  if parts == nil {
-    throw "repo must be owner/name, got: " + to_string(slug)
-  }
-  let query = "query($owner:String!,$name:String!,$base:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$base){entries(first:100){nodes{state pullRequest{number title headRefName}}}}}}"
-  return [
-    "api",
-    "graphql",
-    "-f",
-    "owner=" + parts.owner,
-    "-f",
-    "name=" + parts.repo,
-    "-f",
-    "base=" + base,
-    "-f",
-    "query=" + query,
-  ]
-}
-
 pub fn load_pr_signature_metadata(slug, pr_number) {
-  return normalize_pr_signature_payload(
-    slug,
-    command_json(["gh", ...pr_signature_query_args(slug, pr_number)]),
-  )
-}
-
-pub fn load_queued_pr_numbers(slug, base = DEFAULT_BASE) {
-  return queued_pr_numbers(command_json(["gh", ...merge_queue_query_args(slug, base)]))
-}
-
-pub fn normalize_pr_signature_payload(slug, payload) {
-  let pr = payload?.data?.repository?.pullRequest
-  if pr == nil {
-    return nil
+  const auth = {allow_gh_auth_fallback: true}
+  const parts = slug_parts(slug)
+  if parts == nil {
+    throw "repo must be owner/name, got: " + to_string(slug)
   }
-  let commits = (pr?.commits?.nodes ?? [])
-    .map(
-    { node ->
-      let commit = node?.commit ?? {}
-      return {
-        oid: commit?.oid ?? "",
-        message: commit?.messageHeadline ?? "",
-        signature_state: commit?.signature?.state,
-        signer_login: commit?.signature?.signer?.login,
-      }
-    },
-  )
-  let head_repo = pr?.headRepository?.nameWithOwner ?? ""
+  const pr = call("github.pr.view", auth + {repo: slug, number: pr_number})
+  if is_err(pr) {
+    throw "GitHub PR view failed: " + to_string(unwrap_err(pr))
+  }
+  const evidence = github_pr_commits(parts.owner, parts.repo, pr.number, auth + {expected_head_oid: pr.head.sha})
+  if is_err(evidence) {
+    throw "GitHub PR commit evidence failed: " + to_string(unwrap_err(evidence))
+  }
   return {
     slug: slug,
     number: pr.number,
-    title: pr.title ?? "",
-    url: pr.url ?? "",
-    state: pr.state ?? "",
-    base_ref_name: pr.baseRefName ?? DEFAULT_BASE,
-    head_ref_name: pr.headRefName ?? "",
-    head_oid: pr.headRefOid ?? "",
-    head_repo: head_repo,
-    head_owner: pr?.headRepositoryOwner?.login ?? "",
-    author_login: pr?.author?.login ?? "",
-    author_type: pr?.author?.__typename ?? "",
-    merge_state_status: pr?.mergeStateStatus ?? "",
-    auto_merge_enabled: pr?.autoMergeRequest != nil,
-    cross_repository: (pr?.isCrossRepository ?? false) || (head_repo != "" && head_repo != slug),
-    commits: commits,
+    title: pr.title,
+    url: pr.url,
+    state: pr.github_state,
+    base_ref_name: pr.base.ref,
+    head_ref_name: pr.head.ref,
+    head_oid: pr.head.sha,
+    head_repo: pr.head.repo,
+    head_owner: pr.head.owner,
+    author_login: pr.user?.login ?? "",
+    author_type: pr.user?.type ?? "",
+    merge_state_status: pr.mergeable_state,
+    auto_merge_enabled: pr.auto_merge_armed,
+    cross_repository: pr.head.repo != slug,
+    commits: evidence.commits
+      .map(
+      { commit -> return {
+        oid: commit.sha,
+        message: commit.message,
+        signature_verified: commit.signature.verified,
+        signature_reason: commit.signature.reason,
+      } },
+    )
+      .to_list(),
   }
 }
 
-pub fn queued_pr_numbers(payload) {
-  return (payload?.data?.repository?.mergeQueue?.entries?.nodes ?? [])
-    .map({ node -> node?.pullRequest?.number })
-    .filter({ n -> n != nil })
+pub fn load_queued_pr_numbers(slug, base = DEFAULT_BASE) {
+  const queue = call(
+    "github.merge_queue.entries",
+    {allow_gh_auth_fallback: true, repo: slug, branch: base, limit: 100},
+  )
+  if is_err(queue) {
+    throw "GitHub merge queue lookup failed: " + to_string(unwrap_err(queue))
+  }
+  return queue.entries.map({ entry -> entry.pull_number })
 }
 
 pub fn is_bot_pr_author(pr) {
@@ -159,7 +117,7 @@ pub fn is_bot_pr_author(pr) {
 }
 
 pub fn unsigned_commits(pr) {
-  return (pr?.commits ?? []).filter({ commit -> commit?.signature_state != "VALID" })
+  return (pr?.commits ?? []).filter({ commit -> !commit.signature_verified })
 }
 
 pub fn signed_bot_pr_decision(pr, queued_numbers = [], options = {}) {
@@ -349,9 +307,9 @@ pub fn run_rewrite_commands(plan) {
   return {success: true, failed_step: "", steps: steps}
 }
 
-pub fn maybe_enable_auto_merge(slug, pr_number, enabled = true) {
+pub fn maybe_enable_auto_merge(slug, pr_number, expected_head_oid, enabled = true) {
   if !enabled {
-    return {success: true, status: "skipped", stderr: "", strategy: "disabled"}
+    return {state: "skipped"}
   }
-  return gh_enable_auto_merge(slug, pr_number, "squash")
+  return github_enable_auto_merge(slug, pr_number, expected_head_oid, "squash")
 }
