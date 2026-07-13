@@ -1,0 +1,364 @@
+import { read_json_result, write_json } from "std/fs"
+import {
+  schema_bool,
+  schema_closed_object,
+  schema_enum,
+  schema_int,
+  schema_list,
+  schema_literal,
+  schema_string,
+  schema_validator,
+} from "std/schema"
+import { publish_binary_recovery_decision, publish_watch_decision } from "./release_health"
+
+pub type ReleaseDispatchStatus = "not_requested" | "succeeded" | "failed"
+
+pub type ReleaseWatchState = "pending" | "recovering" | "healthy" | "failed"
+
+pub type ReleaseWatchAction = "wait" | "complete" | "fail" | "dispatch_binary_recovery"
+
+pub type ReleaseWatchRecovery = {
+  dispatched: bool,
+  dispatched_at: string,
+  dispatch_status: ReleaseDispatchStatus,
+}
+
+pub type ReleaseWatchWarmCache = {
+  dispatched: bool,
+  dispatched_at: string,
+  dispatch_status: ReleaseDispatchStatus,
+}
+
+pub type ReleaseWatchReceipt = {
+  schema_version: "release_harn.publish_watch.v1",
+  tag: string,
+  slug: string,
+  pin_sha: string,
+  pr_url: string,
+  required_workflows: list<string>,
+  observed_run_ids: list<int>,
+  state: ReleaseWatchState,
+  message: string,
+  recovery: ReleaseWatchRecovery,
+  warm_cache: ReleaseWatchWarmCache,
+  created_at: string,
+  updated_at: string,
+}
+
+pub type ReleaseWatchObservation = {
+  runs: list<dict>,
+  assets_ready: bool,
+  missing_assets: list<string>,
+  observed_at: string,
+}
+
+pub type ReleaseWatchTransition = {
+  receipt: ReleaseWatchReceipt,
+  action: ReleaseWatchAction,
+  recovery_workflow?: string,
+  recovery_fields?: dict,
+}
+
+fn release_watch_recovery_schema() {
+  return schema_closed_object(
+    {
+      dispatched: schema_bool(),
+      dispatched_at: schema_string(),
+      dispatch_status: schema_enum(["not_requested", "succeeded", "failed"]),
+    },
+  )
+}
+
+fn release_watch_warm_cache_schema() {
+  return schema_closed_object(
+    {
+      dispatched: schema_bool(),
+      dispatched_at: schema_string(),
+      dispatch_status: schema_enum(["not_requested", "succeeded", "failed"]),
+    },
+  )
+}
+
+pub fn release_watch_receipt_schema() {
+  return schema_closed_object(
+    {
+      schema_version: schema_literal("release_harn.publish_watch.v1"),
+      tag: schema_string() + {pattern: "^v[0-9]+[.][0-9]+[.][0-9]+$"},
+      slug: schema_string() + {pattern: "^[^/]+/[^/]+$"},
+      pin_sha: schema_string() + {pattern: "^[0-9a-f]{40}$"},
+      pr_url: schema_string() + {pattern: "^https://github[.]com/[^/]+/[^/]+/pull/[0-9]+$"},
+      required_workflows: schema_list(schema_string()),
+      observed_run_ids: schema_list(schema_int()),
+      state: schema_enum(["pending", "recovering", "healthy", "failed"]),
+      message: schema_string(),
+      recovery: release_watch_recovery_schema(),
+      warm_cache: release_watch_warm_cache_schema(),
+      created_at: schema_string(),
+      updated_at: schema_string(),
+    },
+  )
+}
+
+fn receipt_from_validated(value) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: value.tag,
+    slug: value.slug,
+    pin_sha: value.pin_sha,
+    pr_url: value.pr_url,
+    required_workflows: value.required_workflows,
+    observed_run_ids: value.observed_run_ids,
+    state: value.state,
+    message: value.message,
+    recovery: {
+      dispatched: value.recovery.dispatched,
+      dispatched_at: value.recovery.dispatched_at,
+      dispatch_status: value.recovery.dispatch_status,
+    },
+    warm_cache: {
+      dispatched: value.warm_cache.dispatched,
+      dispatched_at: value.warm_cache.dispatched_at,
+      dispatch_status: value.warm_cache.dispatch_status,
+    },
+    created_at: value.created_at,
+    updated_at: value.updated_at,
+  }
+}
+
+/** Validate an untyped JSON value once at the persistence boundary. */
+pub fn release_watch_receipt_parse(value) -> ReleaseWatchReceipt? {
+  const report = schema_validator(release_watch_receipt_schema()).report(value)
+  if !report.ok {
+    return nil
+  }
+  return receipt_from_validated(report.value)
+}
+
+/** Read and validate a durable watch receipt. */
+pub fn release_watch_receipt_read(path: string) -> ReleaseWatchReceipt? {
+  const loaded = read_json_result(path)
+  if !loaded.ok {
+    return nil
+  }
+  return release_watch_receipt_parse(loaded.value)
+}
+
+/** Write a receipt through rename-into-place so interruption cannot truncate it. */
+pub fn release_watch_receipt_write(path: string, receipt: ReleaseWatchReceipt) {
+  const temp_path = path + ".tmp-" + uuid_v7()
+  write_json(temp_path, receipt, {pretty: true})
+  harness.fs.rename(temp_path, path)
+  return path
+}
+
+/** Resolve one stable receipt path, rejecting traversal through the tag. */
+pub fn release_watch_receipt_path(root: string, tag: string) -> string {
+  const clean_tag = trim(tag)
+  if len(regex_captures("^v[0-9]+[.][0-9]+[.][0-9]+$", clean_tag)) == 0 {
+    throw "release watch tag must be vX.Y.Z, got: " + clean_tag
+  }
+  return path_join(root, "watches", clean_tag + ".json")
+}
+
+fn receipt_with_observation(receipt: ReleaseWatchReceipt, run_ids: list<int>, observed_at: string) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    pr_url: receipt.pr_url,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    created_at: receipt.created_at,
+    updated_at: observed_at,
+  }
+}
+
+fn receipt_with_status(receipt: ReleaseWatchReceipt, state: ReleaseWatchState, message: string) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    pr_url: receipt.pr_url,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: state,
+    message: message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    created_at: receipt.created_at,
+    updated_at: receipt.updated_at,
+  }
+}
+
+fn observed_run_ids(runs: list<dict>, tag: string) -> list<int> {
+  let ids: list<int> = []
+  for run in runs {
+    const head = trim(run?.headBranch ?? run?.head_branch ?? "")
+    if head != tag {
+      continue
+    }
+    const id = to_int(run?.databaseId ?? run?.id)
+    if id != nil && !ids.any({ existing -> existing == id }) {
+      ids = ids + [id]
+    }
+  }
+  return ids
+}
+
+fn merge_run_ids(existing: list<int>, observed: list<int>) -> list<int> {
+  let merged = existing
+  for id in observed {
+    if !merged.any({ prior -> prior == id }) {
+      merged = merged + [id]
+    }
+  }
+  return merged
+}
+
+/** Create the durable state written immediately after tag/branch/PR creation. */
+pub fn release_watch_receipt(inputs) -> ReleaseWatchReceipt {
+  const created_at = trim(inputs?.created_at ?? "")
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: trim(inputs?.tag ?? ""),
+    slug: trim(inputs?.slug ?? ""),
+    pin_sha: trim(inputs?.pin_sha ?? ""),
+    pr_url: trim(inputs?.pr_url ?? ""),
+    required_workflows: inputs?.required_workflows
+      ?? ["publish-release.yml", "build-release-binaries.yml"],
+    observed_run_ids: [],
+    state: "pending",
+    message: "release publish has not been observed yet",
+    recovery: {dispatched: false, dispatched_at: "", dispatch_status: "not_requested"},
+    warm_cache: {dispatched: false, dispatched_at: "", dispatch_status: "not_requested"},
+    created_at: created_at,
+    updated_at: created_at,
+  }
+}
+
+/**
+ * Reduce one GitHub/assets snapshot into a persistent watch transition.
+ * This function has no clock, filesystem, process, or network dependency;
+ * live polling is only an adapter around this state machine.
+ */
+pub fn release_watch_transition(receipt: ReleaseWatchReceipt, observation: ReleaseWatchObservation) -> ReleaseWatchTransition {
+  const run_ids = merge_run_ids(receipt.observed_run_ids, observed_run_ids(observation.runs, receipt.tag))
+  const base = receipt_with_observation(receipt, run_ids, observation.observed_at)
+  if observation.assets_ready {
+    return {
+      receipt: receipt_with_status(base, "healthy", "required release assets are published"),
+      action: "complete",
+    }
+  }
+  const decision = publish_watch_decision(
+    {runs: observation.runs, required_workflows: receipt.required_workflows, tag: receipt.tag},
+  )
+  if decision.state != "failed" {
+    const message = if decision.state == "healthy" {
+      "release workflows are green; waiting for finalized release assets: "
+        + join(observation.missing_assets, ", ")
+    } else {
+      decision.message
+    }
+    return {receipt: receipt_with_status(base, "pending", message), action: "wait"}
+  }
+  const recovery = publish_binary_recovery_decision(
+    {runs: observation.runs, tag: receipt.tag, already_dispatched: receipt.recovery.dispatched},
+  )
+  if recovery.should_dispatch ?? false {
+    return {
+      receipt: receipt_with_status(base, "recovering", recovery.message),
+      action: "dispatch_binary_recovery",
+      recovery_workflow: recovery.workflow,
+      recovery_fields: recovery.fields,
+    }
+  }
+  if receipt.recovery.dispatched {
+    return {
+      receipt: receipt_with_status(
+        base,
+        "recovering",
+        "binary recovery was already dispatched; waiting for required assets: "
+          + join(observation.missing_assets, ", "),
+      ),
+      action: "wait",
+    }
+  }
+  return {receipt: receipt_with_status(base, "failed", decision.message), action: "fail"}
+}
+
+/** Persist dispatch outcome before another poll can request duplicate recovery. */
+pub fn release_watch_record_recovery_dispatch(
+  receipt: ReleaseWatchReceipt,
+  dispatched_at: string,
+  success: bool,
+) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    pr_url: receipt.pr_url,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: if success {
+      "recovering"
+    } else {
+      "failed"
+    },
+    message: if success {
+      "binary recovery dispatched; waiting for required release assets"
+    } else {
+      "binary recovery dispatch failed"
+    },
+    recovery: {
+      dispatched: success,
+      dispatched_at: dispatched_at,
+      dispatch_status: if success {
+        "succeeded"
+      } else {
+        "failed"
+      },
+    },
+    warm_cache: receipt.warm_cache,
+    created_at: receipt.created_at,
+    updated_at: dispatched_at,
+  }
+}
+
+/** Persist post-publish warm dispatch so a resumed monitor cannot repeat it. */
+pub fn release_watch_record_warm_cache_dispatch(
+  receipt: ReleaseWatchReceipt,
+  dispatched_at: string,
+  success: bool,
+) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v1",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    pr_url: receipt.pr_url,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: {
+      dispatched: success,
+      dispatched_at: dispatched_at,
+      dispatch_status: if success {
+        "succeeded"
+      } else {
+        "failed"
+      },
+    },
+    created_at: receipt.created_at,
+    updated_at: dispatched_at,
+  }
+}

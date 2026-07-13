@@ -420,7 +420,21 @@ harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
 harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+
+# Resume the independent post-tag monitor. Safe to stop and rerun.
+harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 ```
+
+`ship-pr` returns as soon as the tag, branch, PR, auto-merge handoff, and typed
+watch receipt are durable. It does not hold the operator process open while
+GitHub compiles release binaries. The receipt lives at
+`.harn-runs/release-harn/watches/vX.Y.Z.json` and records the pin, PR, observed
+workflow run IDs, recovery dispatch state, and finalized-asset state.
+`watch_harn_release.harn` validates that receipt at the JSON boundary, rewrites
+it through rename-into-place after every snapshot, and may be restarted without
+repeating release preparation, tag creation, or binary recovery dispatch. A
+release is complete only when crates.io and all five archives plus `SHA256SUMS`
+and `release-assets.json` are present; workflow success alone is not enough.
 
 Live `prepare` and `ship-pr` runs auto-attempt the fail-open remote audit
 offload before the local prepare step. A green remote audit passes
