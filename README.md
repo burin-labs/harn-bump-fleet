@@ -429,12 +429,22 @@ harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 watch receipt are durable. It does not hold the operator process open while
 GitHub compiles release binaries. The receipt lives at
 `.harn-runs/release-harn/watches/vX.Y.Z.json` and records the pin, PR, observed
-workflow run IDs, recovery dispatch state, and finalized-asset state.
+workflow run IDs, recovery dispatch state, finalized-asset state, and the exact
+warm-cache run identity and outcome.
 `watch_harn_release.harn` validates that receipt at the JSON boundary, rewrites
 it through rename-into-place after every snapshot, and may be restarted without
-repeating release preparation, tag creation, or binary recovery dispatch. A
-release is complete only when crates.io and all five archives plus `SHA256SUMS`
-and `release-assets.json` are present; workflow success alone is not enough.
+repeating release preparation, tag creation, binary recovery dispatch, or an
+accepted warm-cache run. A normal invocation continues after release health is
+proven until the release PR merges and the warm matrix completes or fails. The
+warm dispatch runs on `main`; its receipt stores the source SHA observed by
+GitHub, which may differ from the release commit after squash merge or later
+mainline changes. Hitting `--max-polls` returns a durable pending receipt;
+rerunning the command resumes the exact run ID. An all-skipped warm is recorded
+as suppressed and retried only after overlapping release/recovery work clears.
+`--no-warm-cache` is the explicit release-only escape hatch. A release is
+healthy only when crates.io and all five archives plus `SHA256SUMS` and
+`release-assets.json` are present; a cache is warm only after the exact five-job
+release matrix completes successfully.
 
 Live `prepare` and `ship-pr` runs auto-attempt the fail-open remote audit
 offload before the local prepare step. A green remote audit passes

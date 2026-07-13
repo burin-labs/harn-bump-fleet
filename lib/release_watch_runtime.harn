@@ -1,21 +1,32 @@
 import { env_bool } from "std/config"
 import {
+  GithubActionsWorkflowRun,
+  gh_actions_warm_cache_dispatch,
+  gh_actions_workflow_run,
+  gh_actions_workflow_run_jobs,
   gh_argv,
   gh_auto_merge_cli_attempts,
   gh_workflow_run,
   gh_workflow_runs,
 } from "./github_cli"
-import { post_publish_warm_cache_dispatch_decision } from "./release_health"
 import { release_pr_watchdog_decision, release_pr_watchdog_query_args } from "./release_pr_watchdog"
 import { harn_release_readiness } from "./release_readiness"
 import {
   ReleaseWatchObservation,
   ReleaseWatchReceipt,
+  ReleaseWatchWarmCacheJob,
+  ReleaseWatchWarmCacheObservation,
+  ReleaseWatchWarmCacheRun,
+  release_watch_apply_warm_cache_transition,
   release_watch_receipt_write,
   release_watch_record_recovery_dispatch,
   release_watch_record_warm_cache_dispatch,
   release_watch_transition,
+  release_watch_warm_cache_overlap,
+  release_watch_warm_cache_transition,
 } from "./release_watch_state"
+
+const WARM_CACHE_WORKFLOW = "build-release-binaries.yml"
 
 pub type ReleaseWatchRuntimeOptions = {
   max_polls?: int,
@@ -24,11 +35,21 @@ pub type ReleaseWatchRuntimeOptions = {
   dispatch_warm_cache?: bool,
 }
 
+type ReleaseWatchRuntimeWarmSnapshot = {
+  run: ReleaseWatchWarmCacheRun?,
+  jobs: list<ReleaseWatchWarmCacheJob>,
+  jobs_observed: bool,
+}
+
 fn default_watch_adapter() {
   return {
-    workflow_runs: fn(slug, workflow) { return gh_workflow_runs(slug, workflow, nil, 20) },
-    readiness: fn(tag) { return harn_release_readiness(tag) },
+    now: fn(_poll) { return date_now_iso() },
+    workflow_runs: fn(slug, workflow, _poll) { return gh_workflow_runs(slug, workflow, nil, 20) },
+    readiness: fn(tag, _poll) { return harn_release_readiness(tag) },
     dispatch: fn(slug, workflow, fields) { return gh_workflow_run(slug, workflow, fields) },
+    warm_dispatch: fn(slug, workflow, fields, _poll) { return gh_actions_warm_cache_dispatch(slug, workflow, fields) },
+    warm_run: fn(slug, run_id, _poll) { return gh_actions_workflow_run(slug, run_id) },
+    warm_jobs: fn(slug, run_id, _poll) { return gh_actions_workflow_run_jobs(slug, run_id) },
     pr_probe: fn(slug, pr_url) {
       const args = release_pr_watchdog_query_args(slug, pr_url)
       if args == nil {
@@ -47,10 +68,10 @@ fn default_watch_adapter() {
   }
 }
 
-fn collect_runs(adapter, receipt: ReleaseWatchReceipt) -> list<dict> {
+fn collect_runs(adapter, receipt: ReleaseWatchReceipt, poll: int) -> list<dict> {
   let runs: list<dict> = []
   for workflow in receipt.required_workflows {
-    for run in adapter.workflow_runs(receipt.slug, workflow) {
+    for run in adapter.workflow_runs(receipt.slug, workflow, poll) {
       runs = runs + [{...run, workflow: workflow}]
     }
   }
@@ -90,35 +111,63 @@ fn readiness_observation(readiness, runs, observed_at) -> ReleaseWatchObservatio
   }
 }
 
-fn maybe_dispatch_warm_cache(adapter, receipt: ReleaseWatchReceipt, enabled: bool) {
-  if receipt.warm_cache.dispatched {
-    return {
-      receipt: receipt,
-      result: {attempted: false, success: true, reason: "warm-cache dispatch already persisted"},
-    }
-  }
-  const decision = post_publish_warm_cache_dispatch_decision(
-    {enabled: enabled, publish_state: receipt.state, slug: receipt.slug},
-  )
-  if !(decision.should_dispatch ?? false) {
-    return {receipt: receipt, result: {attempted: false, success: true, reason: decision.reason ?? ""}}
-  }
-  const result = adapter.dispatch(receipt.slug, decision.workflow, decision.fields ?? {})
+fn warm_cache_run(run: GithubActionsWorkflowRun) -> ReleaseWatchWarmCacheRun {
   return {
-    receipt: release_watch_record_warm_cache_dispatch(receipt, date_now_iso(), result.success),
-    result: {
-      attempted: true,
-      success: result.success,
-      workflow: decision.workflow,
-      status: result.status,
-      stderr: trim(result.stderr ?? ""),
-    },
+    workflow_run_id: run.workflow_run_id,
+    workflow_run_url: run.workflow_run_url,
+    source_sha: run.source_sha,
+    event: run.event,
+    head_branch: run.head_branch,
+    status: run.status,
+    conclusion: run.conclusion,
+    started_at: run.started_at,
+    completed_at: run.completed_at,
+  }
+}
+
+fn observe_warm_cache(adapter, receipt: ReleaseWatchReceipt, poll: int) -> ReleaseWatchRuntimeWarmSnapshot {
+  if receipt.warm_cache.state != "dispatch_accepted" && receipt.warm_cache.state != "running" {
+    return {run: nil, jobs: [], jobs_observed: false}
+  }
+  const run_probe = adapter.warm_run(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
+  if !run_probe.success || run_probe.value == nil {
+    return {run: nil, jobs: [], jobs_observed: false}
+  }
+  const run: GithubActionsWorkflowRun = run_probe.value
+  if run.status != "completed" {
+    return {run: warm_cache_run(run), jobs: [], jobs_observed: false}
+  }
+  const jobs_probe = adapter.warm_jobs(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
+  if !jobs_probe.success {
+    return {run: warm_cache_run(run), jobs: [], jobs_observed: false}
+  }
+  const jobs: list<ReleaseWatchWarmCacheJob> = jobs_probe.value
+  return {run: warm_cache_run(run), jobs: jobs, jobs_observed: true}
+}
+
+fn terminal_result(
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  polls: int,
+  watchdog,
+  status: int,
+) {
+  return {
+    status: status,
+    state: receipt.state,
+    receipt: receipt,
+    receipt_path: receipt_path,
+    polls: polls,
+    watchdog: watchdog,
+    warm_cache: receipt.warm_cache,
+    reason: receipt.warm_cache.message,
   }
 }
 
 /**
- * Monitor a durable release receipt. Tests inject an adapter and zero interval;
- * production supplies GitHub/process adapters and performs the only real wait.
+ * Monitor release publication and continue autonomously through terminal warming.
+ * Tests inject immutable snapshots and virtual timestamps; only the production
+ * adapter reads the clock, GitHub, process state, or sleeps between polls.
  */
 pub fn run_release_watch(
   harness: Harness,
@@ -136,66 +185,97 @@ pub fn run_release_watch(
   const adapter = injected_adapter ?? default_watch_adapter()
   let receipt = initial_receipt
   let poll = 0
+  let last_watchdog: dict = {action: "skip", reason: "not_polled"}
   while poll < max_polls {
-    const watchdog = keep_release_pr_armed(adapter, receipt)
-    const runs = collect_runs(adapter, receipt)
-    const readiness = adapter.readiness(receipt.tag)
-    const transition = release_watch_transition(receipt, readiness_observation(readiness, runs, date_now_iso()))
-    receipt = transition.receipt
-    release_watch_receipt_write(receipt_path, receipt)
-    if transition.action == "complete" {
-      const warm = maybe_dispatch_warm_cache(adapter, receipt, dispatch_warm)
-      receipt = warm.receipt
+    const observed_at = adapter.now(poll)
+    last_watchdog = keep_release_pr_armed(adapter, receipt)
+    const runs = collect_runs(adapter, receipt, poll)
+    if receipt.state != "healthy" {
+      const readiness = adapter.readiness(receipt.tag, poll)
+      const transition = release_watch_transition(receipt, readiness_observation(readiness, runs, observed_at))
+      receipt = transition.receipt
       release_watch_receipt_write(receipt_path, receipt)
-      return {
-        status: 0,
-        state: receipt.state,
-        receipt: receipt,
-        receipt_path: receipt_path,
-        polls: poll + 1,
-        watchdog: watchdog,
-        warm_cache: warm.result,
-      }
-    }
-    if transition.action == "fail" {
-      return {
-        status: 2,
-        state: receipt.state,
-        receipt: receipt,
-        receipt_path: receipt_path,
-        polls: poll + 1,
-        watchdog: watchdog,
-        reason: receipt.message,
-      }
-    }
-    if transition.action == "dispatch_binary_recovery" {
-      if !dispatch_recovery {
-        return {
-          status: 2,
-          state: "failed",
-          receipt: receipt,
-          receipt_path: receipt_path,
-          polls: poll + 1,
-          reason: "binary recovery required but dispatch is disabled",
-        }
-      }
-      const dispatched = adapter
-        .dispatch(
-        receipt.slug,
-        transition.recovery_workflow,
-        transition.recovery_fields ?? {tag: receipt.tag},
-      )
-      receipt = release_watch_record_recovery_dispatch(receipt, date_now_iso(), dispatched.success)
-      release_watch_receipt_write(receipt_path, receipt)
-      if !dispatched.success {
+      if transition.action == "fail" {
         return {
           status: 2,
           state: receipt.state,
           receipt: receipt,
           receipt_path: receipt_path,
           polls: poll + 1,
-          reason: trim(dispatched.stderr ?? "binary recovery dispatch failed"),
+          watchdog: last_watchdog,
+          reason: receipt.message,
         }
+      }
+      if transition.action == "dispatch_binary_recovery" {
+        if !dispatch_recovery {
+          return {
+            status: 2,
+            state: "failed",
+            receipt: receipt,
+            receipt_path: receipt_path,
+            polls: poll + 1,
+            watchdog: last_watchdog,
+            reason: "binary recovery required but dispatch is disabled",
+          }
+        }
+        const dispatched = adapter
+          .dispatch(
+          receipt.slug,
+          transition.recovery_workflow,
+          transition.recovery_fields ?? {tag: receipt.tag},
+        )
+        receipt = release_watch_record_recovery_dispatch(receipt, observed_at, dispatched.success)
+        release_watch_receipt_write(receipt_path, receipt)
+        if !dispatched.success {
+          return {
+            status: 2,
+            state: receipt.state,
+            receipt: receipt,
+            receipt_path: receipt_path,
+            polls: poll + 1,
+            watchdog: last_watchdog,
+            reason: trim(dispatched.stderr ?? "binary recovery dispatch failed"),
+          }
+        }
+      }
+    }
+    if receipt.state == "healthy" {
+      const snapshot = observe_warm_cache(adapter, receipt, poll)
+      const warm_observation: ReleaseWatchWarmCacheObservation = {
+        observed_at: observed_at,
+        release_pr_merged: last_watchdog.action == "done",
+        overlap_active: release_watch_warm_cache_overlap(receipt, runs),
+        run: snapshot.run,
+        jobs: snapshot.jobs,
+        jobs_observed: snapshot.jobs_observed,
+      }
+      const warm_transition = release_watch_warm_cache_transition(receipt.warm_cache, dispatch_warm, warm_observation)
+      receipt = release_watch_apply_warm_cache_transition(receipt, warm_transition)
+      release_watch_receipt_write(receipt_path, receipt)
+      if warm_transition.action == "dispatch" {
+        const dispatch = adapter
+          .warm_dispatch(receipt.slug, WARM_CACHE_WORKFLOW, {warm_cache_only: true}, poll)
+        receipt = release_watch_record_warm_cache_dispatch(
+          receipt,
+          {
+            accepted: dispatch.accepted,
+            observed_at: observed_at,
+            workflow_run_id: dispatch.workflow_run_id,
+            workflow_run_url: dispatch.workflow_run_url,
+            source_sha: dispatch.source_sha,
+            message: dispatch.message,
+          },
+        )
+        release_watch_receipt_write(receipt_path, receipt)
+        if !dispatch.accepted {
+          return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 2)
+        }
+      } else if warm_transition.action == "complete" {
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 0)
+      } else if warm_transition.action == "fail" {
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 2)
+      } else if warm_transition.action == "disabled" {
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 0)
       }
     }
     poll = poll + 1
@@ -203,12 +283,114 @@ pub fn run_release_watch(
       harness.clock.sleep_ms(interval_ms)
     }
   }
+  const reason = if receipt.state == "healthy" {
+    "release is healthy but warm-cache state remains ${receipt.warm_cache.state} after ${poll} polls"
+  } else {
+    "release remains incomplete after ${poll} polls"
+  }
   return {
     status: 3,
     state: receipt.state,
     receipt: receipt,
     receipt_path: receipt_path,
     polls: poll,
-    reason: "release remains incomplete after ${max_polls} polls",
+    warm_cache: receipt.warm_cache,
+    reason: reason,
+  }
+}
+
+/**
+ * Deterministic command rehearsal: publish succeeds, dispatch persists, then five matrix jobs pass.
+ */
+pub fn mock_release_watch_adapter(receipt: ReleaseWatchReceipt) {
+  const run_id = 9001
+  const run_url = "https://github.com/burin-labs/harn/actions/runs/${run_id}"
+  const warm_source_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const times = ["2026-07-13T00:00:00Z", "2026-07-13T00:01:00Z", "2026-07-13T00:02:00Z"]
+  return {
+    now: fn(poll) { return times[min(poll, len(times) - 1)] },
+    workflow_runs: fn(_slug, workflow, _poll) { return [
+      {
+        databaseId: if workflow == "publish-release.yml" {
+          8001
+        } else {
+          8002
+        },
+        createdAt: "2026-07-12T23:00:00Z",
+        event: "push",
+        headBranch: receipt.tag,
+        headSha: receipt.pin_sha,
+        status: "completed",
+        conclusion: "success",
+        url: "https://github.com/burin-labs/harn/actions/runs/8001",
+      },
+    ] },
+    readiness: fn(_tag, _poll) { return {ready: true, missing_assets: []} },
+    dispatch: fn(_slug, _workflow, _fields) { return {success: true, status: 0, stdout: "", stderr: ""} },
+    warm_dispatch: fn(_slug, _workflow, _fields, _poll) { return {
+      accepted: true,
+      workflow_run_id: run_id,
+      workflow_run_url: run_url,
+      source_sha: warm_source_sha,
+      message: "mock warm-cache dispatch accepted",
+    } },
+    warm_run: fn(_slug, _run_id, poll) {
+      const run: GithubActionsWorkflowRun = {
+        workflow_run_id: run_id,
+        workflow_run_url: run_url,
+        source_sha: warm_source_sha,
+        event: "workflow_dispatch",
+        head_branch: "main",
+        status: if poll < 2 {
+          "in_progress"
+        } else {
+          "completed"
+        },
+        conclusion: if poll < 2 {
+          ""
+        } else {
+          "success"
+        },
+        created_at: "2026-07-13T00:00:00Z",
+        started_at: "2026-07-13T00:01:00Z",
+        completed_at: if poll < 2 {
+          ""
+        } else {
+          "2026-07-13T00:02:00Z"
+        },
+      }
+      return {success: true, value: run, error: ""}
+    },
+    warm_jobs: fn(_slug, _run_id, _poll) { return {
+      success: true,
+      value: [
+        {name: "Build aarch64-apple-darwin", status: "completed", conclusion: "success"},
+        {name: "Build aarch64-unknown-linux-gnu", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-apple-darwin", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-pc-windows-msvc", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-unknown-linux-gnu", status: "completed", conclusion: "success"},
+      ],
+      error: "",
+    } },
+    pr_probe: fn(_slug, _pr_url) { return {
+      success: true,
+      status: 0,
+      stdout: json_stringify(
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                number: 1,
+                state: "MERGED",
+                mergedAt: "2026-07-12T23:59:00Z",
+                mergeCommit: {oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+              },
+            },
+          },
+        },
+      ),
+      stderr: "",
+    } },
+    enable_auto_merge: fn(_slug, _pr_url) { return {success: true, status: 0} },
   }
 }
