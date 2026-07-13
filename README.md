@@ -446,17 +446,26 @@ healthy only when crates.io and all five archives plus `SHA256SUMS` and
 `release-assets.json` are present; a cache is warm only after the exact five-job
 release matrix completes successfully.
 
-Live `prepare` and `ship-pr` runs auto-attempt the fail-open remote audit
-offload before the local prepare step. A green remote audit passes
-`--skip-audit` to `scripts/release_ship.sh`; every other outcome runs the full
-local audit as the correctness backstop. Use `--local-audit` or
-`HARN_RELEASE_OFFLOAD_AUDIT=0` when the remote probe should be skipped.
-Use `--offload-exclude-host` or `HARN_RELEASE_OFFLOAD_EXCLUDE_HOST` to skip
-configured builders for a quiet-box window; skipped hosts are recorded as
-structured release events before the harness tries the next eligible host.
-Remote builders must have Harn's release-gate toolchain on `PATH`, including
-`cargo-nextest`; otherwise `make test` would silently use the slower plain
-`cargo test --workspace` fallback and erase the offload win.
+Live `prepare` and `ship-pr` runs first query the typed GitHub Actions API for
+the `ci.yml` `merge_group` run at the exact release pin. Required job identities
+come from Harn's checked-in release-audit contract. Exactly one successful run,
+one successful row for every required job, and a complete latest-attempt jobs
+snapshot are required. Missing, ambiguous, skipped, cancelled, failed,
+stale-SHA, query-error, and schema-error evidence deterministically keeps the
+full local audit. Before closing the receipt, the harness builds the exact pin's
+Harn CLI with the contract's canonical locked Cargo command and hashes the
+actual binary bytes through Harn's crypto API. A failed warm or invalid hash
+also keeps the local audit.
+
+A reused receipt is immutable at
+`.harn-runs/release-harn/<run-id>/merge-group-audit-receipt.json` and its run
+ID, URL, head SHA, exact successful job evidence, warmed command, and binary
+SHA-256 are copied into run events, the release report, and the release PR body.
+The harness passes only `--audit-receipt` and the exact `HARN_BIN`; Harn validates
+the receipt again and owns the residual lane plan. Generated-content,
+docs/grammar/security/smoke, pre-tag Linux binary-size, and publish checks remain
+mandatory. Use `--local-audit` to force full local execution without a GitHub
+probe. The retired remote-audit/blanket-skip path is no longer exposed.
 
 Options:
 
