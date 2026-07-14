@@ -96,8 +96,4 @@ if [ "$need_restage" -eq 1 ]; then
   printf '%s' "$src_fp" > "$fingerprint_file"
 fi
 
-if [ -z "${HARN_RELEASE_OWNER_PID:-}" ]; then
-  export HARN_RELEASE_OWNER_PID="$$"
-fi
-
 exec "$staged" "$@"

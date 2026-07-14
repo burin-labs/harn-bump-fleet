@@ -1,4 +1,5 @@
 import { coord_acquire_dir_lock } from "std/coordination"
+import { process_result_success, process_shell, shell_quote } from "std/runtime"
 import {
   release_owner_guard_acquire,
   release_owner_guard_decision,
@@ -7,6 +8,34 @@ import {
   release_owner_guard_update,
   release_owner_lock_path,
 } from "../lib/release_owner_guard"
+
+fn wait_for_file(harness: Harness, path, attempts) {
+  let remaining = attempts
+  while !harness.fs.exists(path) && remaining > 0 {
+    sleep(25ms)
+    remaining = remaining - 1
+  }
+  require harness.fs.exists(path), "timed out waiting for " + path
+}
+
+fn process_alive(pid_text) {
+  const result = process_shell("kill -0 " + pid_text + " >/dev/null 2>&1", {timeout_ms: 2000})
+  return process_result_success(result)
+}
+
+fn wait_for_process_exit(pid_text, attempts) {
+  let remaining = attempts
+  while process_alive(pid_text) && remaining > 0 {
+    sleep(25ms)
+    remaining = remaining - 1
+  }
+  return !process_alive(pid_text)
+}
+
+fn stop_process(pid_text) {
+  const _ = process_shell("kill -TERM " + pid_text + " >/dev/null 2>&1 || true")
+  return wait_for_process_exit(pid_text, 200)
+}
 
 pipeline test_release_owner_guard_required_only_for_live_mutations(task) {
   assert_eq(release_owner_guard_required({mode: "audit", yes_live_release: true}), false)
@@ -404,6 +433,112 @@ pipeline test_release_owner_guard_blocks_orphaned_pid_while_a_live_process_exist
   let persisted = json_parse(harness.fs.read_text(path))
   assert_eq(persisted.run_id, "live-run")
   unmock_time()
+}
+
+pipeline test_release_owner_guard_raw_harn_process_blocks_then_releases_ownership(task) {
+  const root = path_join(harness.fs.temp_dir(), "release-owner-process-" + uuid_v7())
+  const path = path_join(root, "owner.json")
+  const log_path = path_join(root, "holder.log")
+  const holder = path_join(project_root() ?? cwd(), "testdata/release_owner_guard_holder.harn")
+  const harn_bin = harness.env.get_or("HARN_BIN", "harn")
+  harness.fs.mkdir(root, true)
+  const start = process_shell(
+    "env -u HARN_RELEASE_OWNER_PID "
+      + shell_quote(harn_bin)
+      + " run --no-sandbox "
+      + shell_quote(holder)
+      + " -- "
+      + shell_quote(path)
+      + " >"
+      + shell_quote(log_path)
+      + " 2>&1 & echo $!",
+  )
+  require process_result_success(start), "failed to start raw Harn owner process"
+  const child_pid = trim(start.stdout ?? "")
+  require child_pid != "", "raw Harn owner process did not report its pid"
+  const outcome = try {
+    wait_for_file(harness, path, 200)
+    const child_owner = json_parse(harness.fs.read_text(path))
+    assert_eq(child_owner.run_id, "holder-run")
+    assert_eq(child_owner.owner_pid, to_int(child_pid))
+    const cfg = {
+      repo: "/tmp/harn-owner-guard-holder",
+      base: "main",
+      mode: "ship-pr",
+      bump: "patch",
+      yes_live_release: true,
+      mock: false,
+      pin_sha: "replacement-pin",
+      owner_guard_path: path,
+      owner_guard_ttl_ms: 60000,
+    }
+    const blocked = try {
+      release_owner_guard_acquire(
+        harness,
+        cfg,
+        {current_version: "0.0.1", next_version: "0.0.2"},
+        "replacement-run",
+      )
+      nil
+    } catch (e) {
+      e
+    }
+    require blocked != nil, "a live owner process must block replacement"
+    assert_eq(json_parse(harness.fs.read_text(path)).run_id, "holder-run")
+    require stop_process(child_pid), "raw Harn owner process did not exit"
+    const acquired = release_owner_guard_acquire(
+      harness,
+      cfg,
+      {current_version: "0.0.1", next_version: "0.0.2"},
+      "replacement-run",
+    )
+    assert_eq(acquired.decision.action, "replace_dead_process")
+    assert_eq(acquired.record.run_id, "replacement-run")
+    assert_eq(acquired.record.owner_pid, pid())
+    {error: nil}
+  } catch (e) {
+    {error: e}
+  }
+  const stopped = stop_process(child_pid)
+  require stopped, "raw Harn owner process cleanup failed"
+  if outcome.error != nil {
+    throw outcome.error
+  }
+}
+
+pipeline test_release_owner_guard_finish_cannot_overwrite_a_replacement(task) {
+  const root = path_join(harness.fs.temp_dir(), "release-owner-replacement-" + uuid_v7())
+  const path = path_join(root, "owner.json")
+  const base_cfg = {
+    repo: "/tmp/harn",
+    base: "main",
+    mode: "ship-pr",
+    bump: "patch",
+    yes_live_release: true,
+    mock: false,
+    pin_sha: "first-pin",
+    owner_guard_path: path,
+    owner_guard_pid: 111,
+    owner_guard_existing_owner_alive: true,
+  }
+  const first = release_owner_guard_acquire(
+    harness,
+    base_cfg,
+    {current_version: "0.9.0", next_version: "0.9.1"},
+    "first-run",
+  )
+  const second = release_owner_guard_acquire(
+    harness,
+    {...base_cfg, pin_sha: "second-pin", owner_guard_pid: 222, owner_guard_takeover: true},
+    {current_version: "0.9.0", next_version: "0.9.1"},
+    "second-run",
+  )
+  assert_eq(second.record.run_id, "second-run")
+  assert_eq(release_owner_guard_finish(harness, first, "stale finish", false, base_cfg), nil)
+  const persisted = json_parse(harness.fs.read_text(path))
+  assert_eq(persisted.run_id, "second-run")
+  assert_eq(persisted.status, "active")
+  assert_eq(persisted.pin_sha, "second-pin")
 }
 
 pipeline test_release_owner_guard_blocks_when_atomic_lock_is_held(task) {
