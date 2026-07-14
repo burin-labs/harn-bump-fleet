@@ -33,13 +33,8 @@ pub fn preflight_remediation_decision(inputs) {
     if !(inputs.branch_exists ?? false) {
       return {action: "noop", safe: true, reason: "no stale release/${label} branch present"}
     }
-    if inputs.dirty_tree ?? false {
-      return {
-        action: "fail",
-        safe: false,
-        reason: "release/${label} branch present but the working tree is dirty; commit or stash before recreating the release branch",
-      }
-    }
+    // An open PR or unique un-pushed work always wins, dirty or not: recreating
+    // the branch would clobber the PR, and deleting it would lose commits.
     if inputs.has_open_pr ?? false {
       return {
         action: "fail",
@@ -52,6 +47,26 @@ pub fn preflight_remediation_decision(inputs) {
         action: "fail",
         safe: false,
         reason: "release/${label} has commits not present on origin; refusing to delete it to avoid losing un-pushed work",
+      }
+    }
+    // A dirty tree normally fails loud (uncommitted work is not ours to discard).
+    // The one exception is a branch we can PROVE is a crashed run's regenerable
+    // artifact: the owner guard reclaimed a provably dead owner for this exact
+    // version, AND (checked above) there is no open PR and no unique un-pushed
+    // work. Only then is the dirty tree the dead run's output, safe to discard.
+    if inputs.dirty_tree ?? false {
+      if inputs.crashed_reclaim ?? false {
+        return {
+          action: "remediate",
+          safe: true,
+          discard_dirty: true,
+          reason: "release/${label} is a crashed run's branch (owner reclaimed dead for this version, no open PR, no unique commits); discarding its dirty working tree and recreating at the pin",
+        }
+      }
+      return {
+        action: "fail",
+        safe: false,
+        reason: "release/${label} branch present but the working tree is dirty; commit or stash before recreating the release branch",
       }
     }
     return {
@@ -83,6 +98,15 @@ pub fn preflight_remediation_decision(inputs) {
 fn tree_is_dirty(git) {
   const status = git(["status", "--porcelain", "--untracked-files=normal"])
   return trim(status.stdout ?? "") != ""
+}
+
+fn tree_status_lines(git) {
+  const status = git(["status", "--porcelain", "--untracked-files=normal"])
+  const out = trim(status.stdout ?? "")
+  if out == "" {
+    return []
+  }
+  return split(out, "\n")
 }
 
 fn local_branch_present(git, branch) {
@@ -143,18 +167,20 @@ fn current_worktree_path(git) {
 pub fn preflight_remediate_stale_release_branch(git, open_pr_count, config) {
   const version = trim(config.version ?? "")
   const base = trim(config.base ?? "main")
+  const crashed_reclaim = config.crashed_reclaim ?? false
   const branch = "release/${version}"
   const branch_exists = local_branch_present(git, branch)
+  const status_lines = if branch_exists {
+    tree_status_lines(git)
+  } else {
+    []
+  }
   const decision = preflight_remediation_decision(
     {
       kind: "stale_release_branch",
       label: version,
       branch_exists: branch_exists,
-      dirty_tree: if branch_exists {
-        tree_is_dirty(git)
-      } else {
-        false
-      },
+      dirty_tree: len(status_lines) > 0,
       has_open_pr: if branch_exists {
         open_pr_count(branch) > 0
       } else {
@@ -165,10 +191,22 @@ pub fn preflight_remediate_stale_release_branch(git, open_pr_count, config) {
       } else {
         false
       },
+      crashed_reclaim: crashed_reclaim,
     },
   )
   if decision.action != "remediate" {
     return {...decision, remediated: false, verified: decision.action == "noop", decision: decision}
+  }
+  // Forensic receipt of a dirty discard, captured before anything is destroyed
+  // so a wrong discard is recoverable from the log via the branch head sha.
+  const discarded = if decision.discard_dirty ?? false {
+    {
+      branch: branch,
+      head_sha: trim(git(["rev-parse", branch]).stdout ?? ""),
+      dirty_file_count: len(status_lines),
+    }
+  } else {
+    nil
   }
   // If another clean worktree owns this known-stale branch, remove that holder
   // first; otherwise `git branch -D` fails even though the branch is safe.
@@ -201,6 +239,12 @@ pub fn preflight_remediate_stale_release_branch(git, open_pr_count, config) {
   // Only switch when we are standing on the branch we are about to remove.
   const current = trim(git(["branch", "--show-current"]).stdout ?? "")
   if current == branch {
+    // For a confirmed-crashed discard, clear the crashed run's dirty working
+    // tree (tracked and untracked) so the switch off the branch can proceed.
+    if decision.discard_dirty ?? false {
+      git(["reset", "--hard"])
+      git(["clean", "-fd"])
+    }
     git(["switch", base])
   }
   const deleted = git(["branch", "-D", branch])
@@ -215,7 +259,7 @@ pub fn preflight_remediate_stale_release_branch(git, open_pr_count, config) {
       decision: decision,
     }
   }
-  return {...decision, remediated: true, verified: true, decision: decision}
+  return {...decision, remediated: true, verified: true, decision: decision, discarded: discarded}
 }
 
 /**
