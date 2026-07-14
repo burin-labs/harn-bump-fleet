@@ -1,0 +1,594 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { agent_host_tools } from "std/agent/host_tools"
+import { command_output_range, command_output_tail } from "std/command"
+import { git_status } from "std/git"
+import {
+  agent_changelog_section,
+  raw_agent_changelog_section,
+  validate_release_agent_audit_with_context,
+  validate_release_fixup_audit_with_context,
+} from "./release_audit"
+import { require_release_repo_path } from "./release_repo_guard"
+import { safe_shell_arg } from "./shell_util"
+import { truncate_text } from "./text_util"
+import {
+  first_post_tag_commit,
+  pr_evidence_count,
+  pr_evidence_sample,
+  release_changelog_draft_prompt,
+  release_fact_sheet,
+  release_finalization_prompt,
+} from "release_analysis"
+import {
+  prompt_asset,
+  read_repo_file,
+  release_run_dir,
+  run_cmd,
+  run_output_dir,
+} from "release_runtime"
+
+fn argv_contains_any(argv, disallowed) {
+  for arg in argv {
+    for flag in disallowed {
+      if arg == flag || starts_with(arg, flag + "=") {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+fn release_run_policy(request, _args) {
+  const argv = request?.argv ?? []
+  if len(argv) < 2 {
+    return true
+  }
+  if argv[0] == "git" && argv[1] == "tag" {
+    if argv_contains_any(
+      argv,
+      ["-a", "-d", "-f", "-m", "-s", "--annotate", "--delete", "--force", "--message", "--sign"],
+    ) {
+      return "release_run is read-only; git tag creation, deletion, signing, and force flags are blocked"
+    }
+  }
+  if argv[0] == "git" && argv[1] == "branch" {
+    if argv_contains_any(argv, ["-c", "-C", "-d", "-D", "-m", "-M", "--copy", "--delete", "--move"]) {
+      return "release_run is read-only; git branch mutation flags are blocked"
+    }
+  }
+  if argv[0] == "gh" {
+    if argv_contains_any(argv, ["--web"]) {
+      return "release_run is non-interactive; gh --web is blocked"
+    }
+  }
+  return true
+}
+
+fn mock_argv_command(args) {
+  if type_of(args?.argv) == "list" && len(args.argv) > 0 {
+    return args.argv.join(" ")
+  }
+  return args?.command ?? ""
+}
+
+fn mock_release_tools(harness: Harness, cfg, run_id) {
+  let tools = tool_registry()
+  tools = tool_define(
+    tools,
+    "release_read",
+    "Read a file from the mocked Harn repo.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> truncate_text(read_repo_file(harness, cfg, args.path), 12000) },
+    },
+  )
+  tools = tool_define(
+    tools,
+    "release_search",
+    "Search the mocked Harn repo.",
+    {
+      parameters: {pattern: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "search", side_effect_level: "read_only"},
+      handler: { args ->
+        const pattern = safe_shell_arg(args.pattern)
+        if pattern == nil {
+          return "blocked: search pattern contains unsupported shell quoting characters"
+        }
+        const r = run_cmd(cfg, "rg -n -- " + pattern + " README.md CHANGELOG.md docs/src scripts .github")
+        if r.success {
+          r.stdout
+        } else {
+          r.stderr
+        }
+      },
+    },
+  )
+  tools = tool_define(
+    tools,
+    "release_run",
+    "Run one read-only mocked release inspection command. Prefer argv arrays, for example {argv: [\"git\", \"log\", \"--oneline\", \"vX.Y.Z..HEAD\", \"--max-count=40\"]}.",
+    {
+      parameters: {
+        argv: {type: "array", items: {type: "string"}, required: false},
+        command: {type: "string", required: false},
+      },
+      returns: {type: "string"},
+      annotations: {kind: "execute", side_effect_level: "process_exec"},
+      handler: { args ->
+        const command = mock_argv_command(args)
+        const r = run_cmd(cfg, command)
+        return truncate_text("exit=${r.status}\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}", 20000)
+      },
+    },
+  )
+  return add_release_artifact_tools(harness, tools, run_id)
+}
+
+fn add_release_artifact_tools(harness: Harness, tools, run_id) {
+  let out = tools
+  out = tool_define(
+    out,
+    "release_artifact_tail",
+    "Read the last 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> read_artifact_window(harness, run_id, args.path, 12000, false) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_artifact_head",
+    "Read the first 12000 characters from a release-run artifact or live log. Pass a path from the failure context, such as `live-logs/prepare.log`.",
+    {
+      parameters: {path: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> read_artifact_window(harness, run_id, args.path, 12000, true) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_artifact_search",
+    "Search a release-run artifact or live log with ripgrep and return matching lines. Use this before reading a large log.",
+    {
+      parameters: {path: {type: "string"}, pattern: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "read", side_effect_level: "read_only"},
+      handler: { args -> search_artifact(harness, run_id, args.path, args.pattern) },
+    },
+  )
+  return out
+}
+
+fn release_repair_relative_path(path) {
+  const raw = trim(path ?? "")
+  if raw == "" {
+    throw "release repair path must be non-empty"
+  }
+  const normalized = raw.replace("\\", "/")
+  if starts_with(normalized, "/") || contains(normalized, "..") {
+    throw "release repair path must be repo-relative and must not contain '..'"
+  }
+  return normalized
+}
+
+fn require_release_repair_file(harness: Harness, cfg, path) {
+  const rel = release_repair_relative_path(path)
+  const status = git_status(cfg.repo)
+  const modified = status.data.entries
+    .any({ entry -> entry.path == rel && entry.xy != "??" })
+  if !status.success || !modified {
+    throw "release repair edits are limited to tracked files already modified by the generated release diff: ${rel}"
+  }
+  const full = path_join(cfg.repo, rel)
+  if !harness.fs.exists(full) {
+    throw "release repair file does not exist: ${rel}"
+  }
+  return {rel: rel, full: full}
+}
+
+fn release_replace_file(harness: Harness, cfg, args) {
+  const path = require_release_repair_file(harness, cfg, args.path)
+  const old_text = args.old_text ?? ""
+  const new_text = args.new_text ?? ""
+  if old_text == "" {
+    throw "release_replace_file requires non-empty old_text"
+  }
+  const before = harness.fs.read_text(path.full)
+  const pieces = before.split(old_text)
+  const count = len(pieces) - 1
+  if count == 0 {
+    throw "old_text was not found in " + path.rel
+  }
+  const expected = args?.expected_replacements
+  if expected != nil && count != expected {
+    throw "expected ${expected} replacement(s) in ${path.rel}, found ${count}"
+  }
+  harness.fs.write_text(path.full, before.replace(old_text, new_text))
+  return "replaced ${count} occurrence(s) in ${path.rel}"
+}
+
+fn release_write_file(harness: Harness, cfg, args) {
+  const path = require_release_repair_file(harness, cfg, args.path)
+  const content = args.content ?? ""
+  harness.fs.write_text(path.full, content)
+  return "wrote ${len(content)} bytes to ${path.rel}"
+}
+
+fn add_release_repair_tools(harness: Harness, tools, cfg) {
+  let out = tools
+  out = tool_define(
+    out,
+    "release_replace_file",
+    "Replace exact text in a tracked file already modified by the generated release diff. Use this for small release-note, lint, or generated-content repairs.",
+    {
+      parameters: {
+        path: {type: "string"},
+        old_text: {type: "string"},
+        new_text: {type: "string"},
+        expected_replacements: {type: "integer", required: false},
+      },
+      returns: {type: "string"},
+      annotations: {kind: "edit", side_effect_level: "filesystem_write"},
+      handler: { args -> release_replace_file(harness, cfg, args) },
+    },
+  )
+  out = tool_define(
+    out,
+    "release_write_file",
+    "Overwrite a tracked file already modified by the generated release diff. Prefer release_replace_file for small edits.",
+    {
+      parameters: {path: {type: "string"}, content: {type: "string"}},
+      returns: {type: "string"},
+      annotations: {kind: "edit", side_effect_level: "filesystem_write"},
+      handler: { args -> release_write_file(harness, cfg, args) },
+    },
+  )
+  return out
+}
+
+fn release_host_tools(harness: Harness, cfg, run_id) {
+  require_release_repo_path(harness, cfg, "release agent tool setup")
+  let tools = agent_host_tools(
+    nil,
+    {
+      root: cfg.repo,
+      cwd: cfg.repo,
+      max_inline_bytes: 12000,
+      read_bytes: 12000,
+      tail_bytes: 12000,
+      search_max_matches: 120,
+      exclude_globs: [".git/**", ".harn-runs/**", "target/**"],
+      allow_argv_prefixes: RELEASE_RUN_ARGV_PREFIXES,
+      command_policy: release_run_policy,
+      names: {
+        read_file: "release_read",
+        read_file_tail: "release_read_tail",
+        search_files: "release_search",
+        git_inspect: "release_git",
+        run_command: "release_run",
+        read_command_output: "release_run_output",
+        read_command_output_tail: "release_run_tail",
+      },
+      descriptions: {
+        read_file: "Read a UTF-8 file under the Harn repo by repo-relative path. Prefer bounded reads with limit_bytes; the harness caps returned content.",
+        search_files: "Search Harn repo contents. Provide a pattern; use path/glob only to narrow the search.",
+        git_inspect: "Inspect git status, diff, log, show, blame, branches, or remotes without mutating the repo.",
+        run_command: "Run one bounded read-only release inspection command from the Harn repo. Pass argv as an array of strings; shell command strings are not accepted. Inline output is capped, and large output can be read with release_run_output or release_run_tail using the returned command_id.",
+      },
+      result_formatter: release_host_tool_formatter,
+      annotations: {run_command: {workflow_phase: "release_audit"}},
+      output_format: "json",
+    },
+  )
+  return add_release_artifact_tools(harness, tools, run_id)
+}
+
+pub fn release_tools(harness: Harness, cfg, run_id) {
+  if cfg.mock {
+    return mock_release_tools(harness, cfg, run_id)
+  }
+  return release_host_tools(harness, cfg, run_id)
+}
+
+pub fn release_repair_tools(harness: Harness, cfg, run_id) {
+  return add_release_repair_tools(harness, release_tools(harness, cfg, run_id), cfg)
+}
+
+pub fn release_review_post_turn(payload, analysis) {
+  const successful = payload?.session_successful_tools ?? payload?.successful_tool_names ?? []
+  const has_delta_command = successful.contains("release_run") || successful.contains("release_git")
+  const has_content_evidence = successful.contains("release_read") || successful.contains("release_search")
+    || successful.contains("release_git")
+    || successful.contains("release_run_output")
+    || successful.contains("release_run_tail")
+  if has_delta_command && (has_content_evidence || analysis.mock) {
+    const final_tools = tool_registry()
+    return {
+      message: release_finalization_prompt(analysis),
+      next_options: {
+        tools: final_tools,
+        tool_choice: "none",
+        max_tokens: 8000,
+        loop_until_done: false,
+        max_iterations: 1,
+        max_nudges: 0,
+        iteration_budget: {mode: "fixed", initial: 1, max: 1, extend_by: 0},
+        post_turn_callback: nil,
+      },
+    }
+  }
+  // Sized for a comprehensive `## Unreleased` rewrite (20+ bullets,
+  // detail-heavy prose). Earlier 2200 cap truncated drafts mid-sentence
+  // on releases with substantial post-tag content.
+  if has_delta_command && !has_content_evidence {
+    return {
+      message: "Before finalizing, inspect at least one concrete content source with release_read, release_search, release_git, release_run_output, or release_run_tail. Prefer PR bodies, touched docs, or representative diffs over commit titles.",
+    }
+  }
+  return nil
+}
+
+fn release_host_tool_formatter(value, _key) {
+  if type_of(value) != "dict" {
+    return json_stringify(value)
+  }
+  let out = value
+  if type_of(out?.content) == "string" {
+    out = out
+      + {content: truncate_text(out.content, 12000), content_truncated_by_harness: len(out.content) > 12000}
+  }
+  if type_of(out?.stdout) == "string" {
+    out = out
+      + {stdout: truncate_text(out.stdout, 12000), stdout_truncated_by_harness: len(out.stdout) > 12000}
+  }
+  if type_of(out?.stderr) == "string" {
+    out = out
+      + {stderr: truncate_text(out.stderr, 4000), stderr_truncated_by_harness: len(out.stderr) > 4000}
+  }
+  return json_stringify(out)
+}
+
+pub fn validate_agent_attempt(_cfg, analysis, result, text) {
+  const fixup_mode = analysis.fixup_mode ?? false
+  let findings = if fixup_mode {
+    validate_release_fixup_audit_with_context(
+      analysis.next_version,
+      result,
+      text,
+      {fixup_tag: analysis.fixup_tag ?? ""},
+    )
+  } else {
+    validate_release_agent_audit_with_context(
+      analysis.next_version,
+      result,
+      text,
+      {
+        first_post_tag_commit: first_post_tag_commit(analysis),
+        post_tag_pr_numbers: analysis.post_tag_pr_numbers ?? [],
+      },
+    )
+  }
+  const successful = result?.tools?.successful ?? []
+  const audit_shape_ok = if fixup_mode {
+    starts_with(trim(text), "Audit:")
+  } else {
+    starts_with(trim(text), "Audit:") && raw_agent_changelog_section(text) != ""
+  }
+  if len(successful) > 0 && audit_shape_ok {
+    let filtered = []
+    for finding in findings {
+      if starts_with(finding, "agent_loop ended with status `budget_exhausted`") {
+        continue
+      }
+      filtered = filtered + [finding]
+    }
+    findings = filtered
+  }
+  if len(successful) > 0 {
+    const has_delta = successful.contains("release_run") || successful.contains("release_git")
+    const has_content = successful.contains("release_read") || successful.contains("release_search")
+      || successful.contains("release_git")
+      || successful.contains("release_run_output")
+      || successful.contains("release_run_tail")
+    if !has_delta {
+      findings = findings
+        + ["agent did not successfully inspect the release delta with release_run or release_git"]
+    }
+    if !has_content && !analysis.mock {
+      findings = findings
+        + [
+        if fixup_mode {
+          "agent did not successfully inspect concrete CHANGELOG/PR/diff evidence before confirming the fixup fold"
+        } else {
+          "agent did not successfully inspect concrete PR, file, or diff evidence before drafting"
+        },
+      ]
+    }
+  }
+  return findings
+}
+
+fn agent_repair_prompt(validation_findings, _prior_text, analysis) {
+  if analysis.fixup_mode ?? false {
+    return render(
+      prompt_asset("release_fixup_repair_prompt.harn.prompt"),
+      {
+        validation_findings: validation_findings.join("\n"),
+        release_fact_sheet: release_fact_sheet(analysis),
+        target_version: analysis.next_version,
+        fixup_tag: analysis.fixup_tag ?? "",
+      },
+    )
+  }
+  return render(
+    prompt_asset("release_repair_prompt.harn.prompt"),
+    {
+      validation_findings: validation_findings.join("\n"),
+      release_fact_sheet: release_fact_sheet(analysis),
+      target_version: "v${analysis.next_version}",
+      first_post_tag_commit: first_post_tag_commit(analysis),
+      post_tag_pr_count: pr_evidence_count(analysis),
+      sample_pr: pr_evidence_sample(analysis),
+      changelog_draft_instructions: release_changelog_draft_prompt(analysis),
+    },
+  )
+}
+
+fn agent_repair_system() {
+  return render(prompt_asset("release_repair_system.harn.prompt"), {})
+}
+
+/**
+ * Pick the system prompt, user prompt, tool-evidence flag, and session suffix
+ * for the Nth release-review attempt. Attempt 1 is the tool-driven initial
+ * audit (`system`/`prompt`, tool evidence required, no suffix); every later
+ * attempt is a findings-driven repair pass that re-prompts with
+ * `agent_repair_prompt` off the prior attempt's findings and text
+ * (`ctx.prior_findings` / `ctx.prior_text`) under the repair system prompt.
+ * This is the per-attempt branch the `workflow_run_repair` executor runs; it is
+ * `pub` so the release-review loop test can prove the repair prompt threads the
+ * prior findings.
+ */
+pub fn agent_review_attempt_selection(ctx, analysis, base_system, base_prompt) {
+  if ctx.attempt <= 1 {
+    return {system: base_system, prompt: base_prompt, require_tool_evidence: true, session_suffix: ""}
+  }
+  return {
+    system: agent_repair_system(),
+    prompt: agent_repair_prompt(ctx.prior_findings, ctx.prior_text, analysis),
+    require_tool_evidence: false,
+    session_suffix: "-repair-" + to_string(ctx.attempt - 1),
+  }
+}
+
+pub fn persist_agent_changelog(harness: Harness, run_id, text, next_version) {
+  const section = agent_changelog_section(text, next_version)
+  if section == "" {
+    return nil
+  }
+  const paths = agent_artifact_paths(run_id)
+  harness.fs.mkdir(paths.out_dir, true)
+  harness.fs.write_text(paths.draft_changelog_md, section + "\n")
+  return paths.draft_changelog_md
+}
+
+pub fn release_session_id(harness: Harness, cfg, analysis, run_id) {
+  const session_override = harness.env.get_or("HARN_RELEASE_SESSION_ID", "")
+  if trim(session_override) != "" {
+    return session_override
+  }
+  return "release-harn-"
+    + if cfg.mock {
+    "mock"
+  } else {
+    analysis.next_version
+  }
+    + "-"
+    + run_id
+}
+
+pub fn agent_artifact_paths(run_id) {
+  const out_dir = release_run_dir(run_id)
+  return {
+    out_dir: out_dir,
+    raw_result_json: path_join(out_dir, "agent-result.json"),
+    trace_json: path_join(out_dir, "agent-trace.json"),
+    transcript_context_json: path_join(out_dir, "agent-transcript-context.json"),
+    llm_transcript_dir: path_join(out_dir, "agent-llm"),
+    llm_transcript_jsonl: path_join(out_dir, "agent-llm/llm_transcript.jsonl"),
+    draft_changelog_md: path_join(out_dir, "agent-draft-changelog.md"),
+  }
+}
+
+fn artifact_path_for_tool(run_id, path) {
+  const p = trim(path ?? "")
+  if p == "" || contains(p, "..") {
+    return nil
+  }
+  const root = run_output_dir(run_id)
+  if starts_with(p, root + "/") {
+    return p
+  }
+  const rel_prefix = ".harn-runs/release-harn/" + run_id + "/"
+  if starts_with(p, rel_prefix) {
+    return path_join(cwd(), p)
+  }
+  if starts_with(p, "/") {
+    if contains(p, "/harn-command-") {
+      return p
+    }
+    return nil
+  }
+  return path_join(root, p)
+}
+
+fn read_artifact_window(harness: Harness, run_id, path, max_chars, from_start) {
+  const resolved = artifact_path_for_tool(run_id, path)
+  if resolved == nil {
+    return "blocked: artifact path must be inside this release run directory"
+  }
+  if !harness.fs.exists(resolved) {
+    return "missing artifact: ${resolved}"
+  }
+  const limit = max_chars ?? 12000
+  const read = try {
+    if from_start ?? false {
+      command_output_range({path: resolved}, {offset: 0, length: limit})
+    } else {
+      command_output_tail({path: resolved}, {length: limit})
+    }
+  } catch (_e) {
+    nil
+  }
+  if read != nil {
+    const shown = if read.total_bytes <= limit {
+      "full"
+    } else if from_start ?? false {
+      "first ${limit} bytes"
+    } else {
+      "last ${limit} bytes"
+    }
+    return "path: ${resolved}\nsize: ${read.total_bytes}\nshown: ${shown}\n\n" + read.content
+  }
+  const text = harness.fs.read_text(resolved)
+  if len(text) <= limit {
+    return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: full\n\n" + text
+  }
+  if from_start ?? false {
+    return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: first ${limit} chars\n\n"
+      + text[0:limit]
+      + "\n\n... output continues; use release_artifact_search or read from the end ..."
+  }
+  return "path: ${resolved}\nsize: ${stat(resolved).size}\nshown: last ${limit} chars\n\n"
+    + text[len(text) - limit:len(text)]
+}
+
+fn search_artifact(harness: Harness, run_id, path, pattern) {
+  const resolved = artifact_path_for_tool(run_id, path)
+  if resolved == nil {
+    return "blocked: artifact path must be inside this release run directory"
+  }
+  if !harness.fs.exists(resolved) {
+    return "missing artifact: ${resolved}"
+  }
+  const pattern_arg = safe_shell_arg(pattern)
+  const path_arg = safe_shell_arg(resolved)
+  if pattern_arg == nil || path_arg == nil {
+    return "blocked: unsupported shell quoting characters in artifact search"
+  }
+  const r = shell("rg -n -- " + pattern_arg + " " + path_arg + " | head -120")
+  if r.success && trim(r.stdout) != "" {
+    return r.stdout
+  }
+  let out = trim(r.stdout + "\n" + r.stderr)
+  if out == "" {
+    return "(no matches)"
+  }
+  return out
+}

@@ -21,6 +21,27 @@ The entry points are:
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
 
+`release_harn.harn` is the thin orchestration entrypoint and public facade.
+Release implementation changes belong in the stage that owns the behavior:
+
+- `release_runtime`: CLI/config, harness paths, typed git/GitHub adapters,
+  mock commands, run events, and timing
+- `release_analysis`: release facts, commit/PR evidence, and deterministic
+  analysis prompts
+- `release_agent_tools` / `release_agent`: agent tool boundaries, review,
+  validation, artifacts, and recovery
+- `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
+  reconciliation, branch setup, and checkout state
+- `release_notes`: fragments, release notes, and fixup/repin/drift state
+- `release_reporting`: PR rendering, execution summaries, and crystallization
+  fixtures
+- `release_modes` / `release_preflight`: prepare/ship execution, cleanup,
+  interactive flags, planner/fleet/sccache checks, and build-lock lifecycle
+
+Do not put stage policy back in the entrypoint or add a second implementation
+behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line
+ceiling for every maintained handwritten source file.
+
 ## Commands
 
 Use the pinned Harn version from `.harn-version`.

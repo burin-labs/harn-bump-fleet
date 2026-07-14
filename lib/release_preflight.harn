@@ -1,0 +1,383 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { env_str } from "std/config"
+import { git_run } from "std/git"
+import { read_line } from "std/io"
+import { acquire_build_lock, release_build_lock } from "./build_mutex"
+import {
+  chat_cfg_from_run_dir,
+  chat_enabled,
+  pick_recent_run,
+  resolve_chat_run_path,
+  run_chat_loop,
+} from "./chat_loop"
+import { fleet_self_check } from "./fleet_selfcheck"
+import { planner_preflight_audit_line, run_planner_preflight } from "./llm_defaults"
+import {
+  preflight_remediate_base_behind,
+  preflight_remediate_stale_release_branch,
+} from "./preflight_remediation"
+import { release_repair_tools } from "./release_agent_tools"
+import { coerce_flag_choice, release_flag_passed } from "./release_commands"
+import { expand_home, release_log_event, release_open_pr_count, run_git } from "./release_runtime"
+import { ensure_healthy_sccache } from "./sccache_preflight"
+
+pub fn release_chat_only(harness: Harness, raw_cfg) {
+  if !chat_enabled(raw_cfg) {
+    harness.stdio.eprintln("--chat-only requires an interactive terminal (and HARN_CHAT != 0)")
+    return 2
+  }
+  const kind = "release-harn"
+  const target_dir = if trim(raw_cfg.chat_run ?? "") != "" {
+    resolve_chat_run_path(harness, kind, raw_cfg.chat_run)
+  } else {
+    const pick = pick_recent_run(harness, kind, 12)
+    if pick == nil {
+      nil
+    } else {
+      pick.dir
+    }
+  }
+  if target_dir == nil {
+    harness.stdio.println("(no run selected; exiting)")
+    return 0
+  }
+  const chat_cfg = chat_cfg_from_run_dir(
+    harness,
+    {
+      provider: raw_cfg.provider,
+      model: raw_cfg.model,
+      repo: expand_home(harness, raw_cfg.repo),
+      mock: raw_cfg.mock,
+      timeout_s: raw_cfg.chat_timeout_s,
+      tools: release_repair_tools(
+        harness,
+        {...raw_cfg, repo: expand_home(harness, raw_cfg.repo)},
+        basename(target_dir),
+      ),
+      no_chat: raw_cfg.no_chat,
+    },
+    kind,
+    target_dir,
+  )
+  run_chat_loop(harness, chat_cfg)
+  return 0
+}
+
+/** Prompt once for a single release-shaping flag and echo any fallback note. */
+fn release_prompt_flag(harness: Harness, label, choices, default_val) {
+  const r = read_line({prompt: label, timeout_ms: 60000, trim: true})
+  const resolved = coerce_flag_choice(r.value ?? "", r.ok ?? false, choices, default_val)
+  if resolved.note != "" {
+    harness.stdio.println("   ↳ ${resolved.note}")
+  }
+  return resolved.value
+}
+
+/**
+ * On an interactive terminal, fill in the release-shaping flags the operator
+ * didn't pass (`--mode`, `--bump`) with a short prompt. Gated by
+ * `chat_enabled`, so CI, piped/redirected stdin, `--no-chat`, and
+ * `HARN_CHAT=0` all keep today's silent-default behavior untouched. Returns
+ * `cfg` with the resolved values.
+ */
+pub fn resolve_release_flags_interactively(harness: Harness, cfg, argv) {
+  if !chat_enabled(cfg) {
+    return cfg
+  }
+  let out = cfg
+  if !release_flag_passed(argv, "--mode") {
+    out = {
+      ...out,
+      mode: release_prompt_flag(
+        harness,
+        "ℹ No --mode given. Release mode — audit / prepare / ship-pr [audit]: ",
+        ["audit", "prepare", "ship-pr"],
+        "audit",
+      ),
+    }
+  }
+  if !release_flag_passed(argv, "--bump") {
+    out = {
+      ...out,
+      bump: release_prompt_flag(
+        harness,
+        "ℹ No --bump given. Version bump — patch / minor / major [patch]: ",
+        ["patch", "minor", "major"],
+        "patch",
+      ),
+    }
+  }
+  // A non-audit mode picked interactively still needs the explicit live flag —
+  // surface that so the operator isn't surprised by a read-only "live" run.
+  if out.mode != "audit" && !(out.yes_live_release ?? false)
+    && !release_flag_passed(argv, "--yes-live-release") {
+    harness.stdio
+      .println(
+      "   ↳ note: live ${out.mode} side effects still require --yes-live-release; without it this run stays read-only",
+    )
+  }
+  return out
+}
+
+/**
+ * Clear a poisoned `sccache` daemon before the build-heavy `prepare` step.
+ *
+ * Only relevant for modes that compile (`prepare`/`ship-pr`) and never for
+ * mock runs. A daemon left confined by an earlier sandboxed build (harn's
+ * sandbox, a sandboxed agent shell, …) breaks every cargo build machine-wide
+ * with `Operation not permitted` — which is exactly how the v0.8.82 release's
+ * warm-prebuild died despite running `--no-sandbox`. See lib/sccache_preflight.
+ */
+pub fn release_sccache_preflight(harness: Harness, cfg) {
+  if cfg.mock ?? false {
+    return
+  }
+  if !(cfg.mode == "prepare" || cfg.mode == "ship-pr") {
+    return
+  }
+  const result = ensure_healthy_sccache({ cmd -> shell(cmd) })
+  if result.restarted {
+    harness.stdio
+      .println(
+      "   ⚠ ${result.detail} — stale sandbox confinement cleared; the prepare build will spawn a fresh server",
+    )
+  } else if result.checked {
+    harness.stdio.println("   ✓ sccache daemon healthy")
+  }
+}
+
+/**
+ * The bump-fleet checkout's own default branch. This is the repo
+ * release_harn.harn lives in, NOT the target release repo (`cfg.repo`/`cfg.base`).
+ */
+fn fleet_default_branch() {
+  return env_str("HARN_FLEET_DEFAULT_BRANCH") ?? "main"
+}
+
+/**
+ * F4: guard against the bump-fleet checkout running its own stale release code.
+ *
+ * release_harn checks the TARGET repo's freshness but never its own; a stale
+ * bump-fleet runs old logic and can crash mid-cut (the v0.9.21 failure). Only
+ * mutating modes gate; pure audit is read-only. Fails loud with the exact
+ * `git -C <root> pull --ff-only` remediation unless `--self-update` /
+ * `FLEET_SELF_UPDATE=1` opted into an auto fast-forward. Never silently stale.
+ */
+pub fn release_fleet_self_check(harness: Harness, cfg, run_id) {
+  if cfg.mock ?? false {
+    return
+  }
+  if cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
+    return
+  }
+  const result = fleet_self_check(
+    { args -> git_run(args) },
+    { p -> harness.fs.exists(p) },
+    {mode: cfg.mode, opt_in: cfg.self_update ?? false, default_branch: fleet_default_branch()},
+  )
+  release_log_event(
+    harness,
+    run_id,
+    "fleet_self_check",
+    {
+      action: result.action,
+      reason: result.reason,
+      fleet_root: result.fleet_root ?? "",
+      remote_ref: result.remote_ref ?? "",
+      local_sha: result.local_sha ?? "",
+      remote_sha: result.remote_sha ?? "",
+    },
+  )
+  if result.action == "fail" {
+    harness.stdio.println("   ✗ bump-fleet self-check: ${result.reason}")
+    throw "bump-fleet checkout is stale: ${result.reason}\nremediation: ${result.remediation ?? "git pull --ff-only"}"
+  }
+  if result.action == "autoff" {
+    const ff_ok = (result.ff ?? {}).success ?? false
+    if !ff_ok {
+      throw "bump-fleet self-update fast-forward failed: ${(result.ff ?? {}).stderr ?? ""}\nremediation: ${result.remediation ?? "git pull --ff-only"}"
+    }
+    harness.stdio.println("   ↻ bump-fleet self-update: ${result.reason}")
+  } else if result.action == "warn" {
+    harness.stdio.println("   ⚠ bump-fleet self-check: ${result.reason}")
+  } else if result.action == "proceed" {
+    harness.stdio.println("   ✓ bump-fleet self-check: ${result.reason}")
+  }
+}
+
+/**
+ * F2/F3: heal the known-safe preflight blockers deterministically before a live
+ * mutating run — a stale `release/vX.Y.Z` local branch with no open PR and no
+ * unique un-pushed commits, and a base branch behind origin with a clean tree.
+ * Anything not known-safe (open PR, unique work, dirty tree) fails loud instead
+ * of destroying anything. Skipped for repin/fixup, which own their own branch
+ * handling.
+ */
+pub fn release_preflight_autoremediate(harness: Harness, cfg, analysis, run_id) {
+  if cfg.mock ?? false {
+    return
+  }
+  if cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
+    return
+  }
+  if (cfg.repin_mode ?? false) || (cfg.fixup_mode ?? false) {
+    return
+  }
+  const git = { args -> run_git(cfg, args) }
+  const base_result = preflight_remediate_base_behind(git, {base: cfg.base})
+  release_preflight_report(harness, run_id, "base-behind", base_result)
+  const version = trim(analysis.next_version ?? "")
+  if version != "" {
+    const open_pr_count = { branch -> release_open_pr_count(cfg, branch) }
+    const branch_result = preflight_remediate_stale_release_branch(
+      git,
+      open_pr_count,
+      {version: "v${version}", base: cfg.base},
+    )
+    release_preflight_report(harness, run_id, "stale-release-branch", branch_result)
+  }
+}
+
+fn release_preflight_report(harness: Harness, run_id, label, result) {
+  release_log_event(
+    harness,
+    run_id,
+    "preflight_autoremediate",
+    {
+      case: label,
+      action: result.action,
+      safe: result.safe ?? false,
+      reason: result.reason,
+      remediated: result.remediated ?? false,
+    },
+  )
+  if result.action == "fail" {
+    harness.stdio.println("   ✗ preflight (${label}): ${result.reason}")
+    throw "preflight remediation refused (${label}): ${result.reason}"
+  }
+  if result.remediated ?? false {
+    harness.stdio.println("   ↻ preflight (${label}): ${result.reason}")
+  }
+}
+
+fn release_build_lock_path() {
+  const tmp = env_str("HARN_RELEASE_BUILD_LOCK") ?? ""
+  if trim(tmp) != "" {
+    return trim(tmp)
+  }
+  const base = env_str("TMPDIR") ?? "/tmp"
+  return path_join(base, "harn-release-build.lock")
+}
+
+/**
+ * F6a: acquire the advisory local build mutex before the build-heavy prepare
+ * phase so two releases/builds do not thrash the shared Cargo build dir.
+ * Returns `nil` when no lock is needed (mock/audit/non-live). Fails fast when a
+ * live owner holds the lock unless `--wait` was passed. A stale lock left by a
+ * crashed release is stolen automatically (its owner pid is dead).
+ */
+pub fn release_acquire_build_lock(harness: Harness, cfg, run_id) {
+  if cfg.mock ?? false {
+    return nil
+  }
+  if !(cfg.mode == "prepare" || cfg.mode == "ship-pr") || !(cfg.yes_live_release ?? false) {
+    return nil
+  }
+  const lock_path = release_build_lock_path()
+  const result = acquire_build_lock(
+    { cmd -> shell(cmd) },
+    {
+      lock_path: lock_path,
+      pid: pid(),
+      wait: cfg.wait_build_lock ?? false,
+      note: "release_harn ${cfg.mode} ${run_id}",
+    },
+  )
+  release_log_event(
+    harness,
+    run_id,
+    "build_lock",
+    {
+      action: result.action,
+      lock_path: result.lock_path,
+      acquired: result.acquired,
+      reason: result.reason,
+    },
+  )
+  if !(result.acquired ?? false) {
+    harness.stdio.println("   ✗ build lock: ${result.reason}")
+    throw "release build lock: ${result.reason}"
+  }
+  if (result.waited_polls ?? 0) > 0 {
+    harness.stdio
+      .println("   ⏱ build lock acquired after waiting (${to_string(result.waited_polls)} polls)")
+  } else {
+    harness.stdio.println("   ✓ build lock: ${result.lock_path}")
+  }
+  return result.lock_path
+}
+
+pub fn release_release_build_lock(harness: Harness, lock_path, run_id) {
+  if lock_path == nil || trim(lock_path) == "" {
+    return
+  }
+  release_build_lock({ cmd -> shell(cmd) }, lock_path)
+  release_log_event(harness, run_id, "build_lock_released", {lock_path: lock_path})
+}
+
+fn release_planner_preflight_required(cfg) {
+  return cfg.agent && cfg.mode != "audit" && (cfg.yes_live_release ?? false) && !(cfg.mock ?? false)
+}
+
+fn release_planner_preflight_error(decision) {
+  let lines = ["release planner preflight found no healthy provider before mutation"]
+  for attempt in decision?.attempts ?? [] {
+    const detail = trim(attempt.message ?? "")
+    const suffix = if detail == "" {
+      ""
+    } else {
+      ": " + detail
+    }
+    lines = lines
+      + [
+      "- ${attempt.provider}/${attempt.model}: ${attempt.classification} (${attempt.health_status})${suffix}",
+    ]
+  }
+  return lines.join("\n")
+}
+
+pub fn preflight_release_planner(harness: Harness, cfg, run_id) {
+  if !release_planner_preflight_required(cfg) {
+    return cfg
+  }
+  harness.stdio.println("== planner preflight ...")
+  release_log_event(
+    harness,
+    run_id,
+    "planner_preflight_started",
+    {provider: cfg.provider, model: cfg.model, source: cfg.planner_source ?? ""},
+  )
+  const decision = run_planner_preflight(
+    {provider: cfg.provider, model: cfg.model, source: cfg.planner_source ?? "requested"},
+  )
+  release_log_event(harness, run_id, "planner_preflight_finished", decision)
+  harness.stdio.println("   ${planner_preflight_audit_line(decision)}")
+  for attempt in decision.attempts ?? [] {
+    if attempt.valid {
+      harness.stdio.println("   ✓ ${attempt.provider}/${attempt.model}")
+    } else {
+      harness.stdio
+        .println(
+        "   ✗ ${attempt.provider}/${attempt.model}: ${attempt.classification} (${attempt.health_status})",
+      )
+    }
+  }
+  if !(decision.healthy ?? false) {
+    throw release_planner_preflight_error(decision)
+  }
+  if decision.disable_binder ?? false {
+    harness.stdio.println("   ↳ binder disabled: its provider failed planner preflight")
+  }
+  const selected = decision.selected
+  return {...cfg, provider: selected.provider, model: selected.model, planner_preflight: decision}
+}

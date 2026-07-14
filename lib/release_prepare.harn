@@ -1,0 +1,452 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import {
+  merge_group_audit_config,
+  merge_group_audit_receipt,
+  release_audit_contract_required_jobs,
+  resolve_merge_group_audit,
+} from "./merge_group_audit"
+import {
+  release_cargo_cache_prune_command,
+  release_pin_cli_warm_command,
+  release_prepare_env,
+} from "./release_commands"
+import { recorded_step } from "./release_execution"
+import { command_output, fail, ok, safe_shell_arg } from "./shell_util"
+import { truncate_text } from "./text_util"
+import {
+  append_command_step,
+  argv_label,
+  release_log_event,
+  release_run_dir,
+  run_cmd,
+  run_git,
+} from "release_runtime"
+
+fn prepare_command(cfg, audit_evidence = nil) {
+  // Keep the bootstrap Harn used to run this harness out of the target repo's
+  // release gate. release_gate.sh intentionally exports HARN_BIN to its Harn
+  // audit lanes, but it must resolve that binary from the release worktree.
+  //
+  // Also override any inherited CARGO_TARGET_DIR. Release sessions are often
+  // launched from agent shells that carry repo-specific Cargo target dirs; using
+  // one of those here can block Harn package/audit steps behind unrelated builds.
+  //
+  const receipt_path = trim(audit_evidence?.receipt_path ?? "")
+  const harn_bin = trim(audit_evidence?.harn_bin ?? "")
+  if receipt_path == "" != (harn_bin == "") {
+    throw "release audit receipt and warmed HARN_BIN must be supplied together"
+  }
+  const reuse = receipt_path != ""
+  const prefix = if reuse {
+    ""
+  } else {
+    release_cargo_cache_prune_command(cfg.release_cargo_target_dir) + " && "
+  }
+  let env = release_prepare_env(cfg.repo, cfg.bootstrap_new_crates, cfg.release_cargo_target_dir)
+  let args = " ./scripts/release_ship.sh --prepare --bump ${cfg.bump}"
+  if reuse {
+    env = env + " HARN_BIN=" + safe_shell_arg(harn_bin)
+    args = args + " --audit-receipt " + safe_shell_arg(receipt_path)
+  }
+  return prefix + env + args
+}
+
+fn mock_merge_group_audit_adapter() {
+  return {
+    list_runs: fn(config) { return Ok(
+      {
+        total_count: 1,
+        runs: [
+          {
+            id: 6001,
+            url: "https://github.com/burin-labs/harn/actions/runs/6001",
+            head_sha: config.pin_sha,
+            event: config.event,
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
+      },
+    ) },
+    list_jobs: fn(_config, run_id) { return Ok(
+      {
+        total_count: 5,
+        jobs: [
+          {
+            id: 6101,
+            run_id: run_id,
+            name: "Format check",
+            url: "https://github.com/burin-labs/harn/actions/runs/6001/job/6101",
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 6102,
+            run_id: run_id,
+            name: "Rust lint",
+            url: "https://github.com/burin-labs/harn/actions/runs/6001/job/6102",
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 6103,
+            run_id: run_id,
+            name: "Rust test",
+            url: "https://github.com/burin-labs/harn/actions/runs/6001/job/6103",
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 6104,
+            run_id: run_id,
+            name: "Harn conformance + audit",
+            url: "https://github.com/burin-labs/harn/actions/runs/6001/job/6104",
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 6105,
+            run_id: run_id,
+            name: "Rust on macOS (deny-warnings build + lint)",
+            url: "https://github.com/burin-labs/harn/actions/runs/6001/job/6105",
+            status: "completed",
+            conclusion: "skipped",
+          },
+        ],
+      },
+    ) },
+  }
+}
+
+fn merge_group_audit_receipt_path(run_id) {
+  return path_join(release_run_dir(run_id), "merge-group-audit-receipt.json")
+}
+
+fn persist_merge_group_audit_receipt(harness: Harness, run_id, receipt) {
+  const path = merge_group_audit_receipt_path(run_id)
+  harness.fs.mkdir(dirname(path), true)
+  if harness.fs.exists(path) {
+    return nil
+  }
+  harness.fs.write_text(path, json_stringify(receipt) + "\n")
+  return path
+}
+
+fn mock_release_audit_required_jobs() {
+  return ["Format check", "Rust lint", "Rust test", "Harn conformance + audit"]
+}
+
+fn exact_pin_harn_binary(harness: Harness, cfg) {
+  const plain = path_join(cfg.release_cargo_target_dir, "debug", "harn")
+  if cfg.mock || harness.fs.exists(plain) {
+    return plain
+  }
+  const windows = plain + ".exe"
+  if harness.fs.exists(windows) {
+    return windows
+  }
+  return nil
+}
+
+/**
+ * Resolve exact-pin merge-group evidence. Any unavailable, ambiguous, or
+ * malformed evidence is a successful decision to retain the local audit.
+ */
+fn resolve_merge_group_audit_reuse(harness: Harness, cfg, steps, run_id) {
+  const required_jobs = if cfg.mock {
+    mock_release_audit_required_jobs()
+  } else {
+    release_audit_contract_required_jobs(path_join(cfg.repo, "scripts", "release_audit_contract.json"))
+  }
+  if required_jobs == nil {
+    const reason = "Harn release-audit contract was missing or invalid; running the full audit locally"
+    return {
+      steps: steps
+        + [recorded_step("merge-group-audit-reuse", "read Harn release-audit contract", ok(reason + "\n"))],
+      receipt_path: "",
+      harn_bin: "",
+    }
+  }
+  const config = merge_group_audit_config(cfg.pin_sha, required_jobs)
+  const decision = if cfg.mock {
+    resolve_merge_group_audit(config, mock_merge_group_audit_adapter())
+  } else {
+    resolve_merge_group_audit(config)
+  }
+  if !decision.reuse || decision.evidence == nil {
+    const recorded = {
+      ...recorded_step(
+        "merge-group-audit-reuse",
+        "inspect typed merge-group CI receipt for exact release pin",
+        ok(decision.reason + "\n"),
+      ),
+      audit_source: "merge-group-ci",
+      receipt_reused: false,
+    }
+    release_log_event(
+      harness,
+      run_id,
+      "merge_group_audit_reuse",
+      {reuse: false, reason: decision.reason},
+    )
+    return {steps: steps + [recorded], receipt_path: "", harn_bin: ""}
+  }
+  let resolved_steps = steps
+  const warm_command = release_pin_cli_warm_command(
+    cfg.repo,
+    cfg.pin_sha,
+    cfg.bootstrap_new_crates,
+    cfg.release_cargo_target_dir,
+  )
+  release_log_event(
+    harness,
+    run_id,
+    "step_started",
+    {step: "warm-exact-pin-harn-cli", pin_sha: cfg.pin_sha},
+  )
+  const warmed = run_cmd(cfg, warm_command)
+  if !warmed.success {
+    const reason = "exact-pin Harn CLI warm failed; running the full audit locally"
+    const fallback_step = {
+      ...recorded_step("warm-exact-pin-harn-cli", warm_command, ok(reason + "\n")),
+      warm_success: false,
+      warm_status: warmed.status,
+      diagnostic_output: truncate_text(command_output(warmed), 12000),
+    }
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {
+        step: "warm-exact-pin-harn-cli",
+        success: true,
+        warm_success: false,
+        warm_status: warmed.status,
+        fallback: "local-audit",
+      },
+    )
+    return {steps: resolved_steps + [fallback_step], receipt_path: "", harn_bin: ""}
+  }
+  const harn_bin = exact_pin_harn_binary(harness, cfg)
+  if harn_bin == nil {
+    const reason = "exact-pin Harn CLI binary was not produced; running the full audit locally"
+    return {
+      steps: resolved_steps
+        + [recorded_step("warm-exact-pin-harn-cli", warm_command, ok(reason + "\n"))],
+      receipt_path: "",
+      harn_bin: "",
+    }
+  }
+  const binary_sha256 = if cfg.mock {
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  } else {
+    harness.crypto.sha256(harness.fs.read_bytes(harn_bin))
+  }
+  const receipt = merge_group_audit_receipt(decision.evidence, binary_sha256)
+  if receipt == nil {
+    const reason = "exact-pin Harn CLI hash was invalid; running the full audit locally"
+    return {
+      steps: resolved_steps
+        + [recorded_step("warm-exact-pin-harn-cli", warm_command, ok(reason + "\n"))],
+      receipt_path: "",
+      harn_bin: "",
+    }
+  }
+  const receipt_path = try {
+    persist_merge_group_audit_receipt(harness, run_id, receipt)
+  } catch (_e) {
+    nil
+  }
+  if receipt_path == nil {
+    const reason = "merge-group audit receipt could not be persisted; running the full audit locally"
+    return {
+      steps: resolved_steps
+        + [recorded_step("merge-group-audit-reuse", "persist Harn release-audit receipt", ok(reason + "\n"))],
+      receipt_path: "",
+      harn_bin: "",
+    }
+  }
+  const warm_step = {
+    ...recorded_step("warm-exact-pin-harn-cli", warm_command, warmed),
+    pin_sha: cfg.pin_sha,
+    cargo_target_dir: cfg.release_cargo_target_dir,
+    binary_sha256: binary_sha256,
+    harn_bin: harn_bin,
+  }
+  resolved_steps = resolved_steps + [warm_step]
+  const receipt_step = {
+    ...recorded_step(
+      "merge-group-audit-reuse",
+      "acquire exact merge-group CI evidence and close the Harn receipt",
+      ok(decision.reason + "\nreceipt: ${receipt_path}\n"),
+    ),
+    audit_source: "merge-group-ci",
+    receipt_reused: true,
+    merge_group_audit_receipt_path: receipt_path,
+    merge_group_audit_receipt: receipt,
+  }
+  resolved_steps = resolved_steps + [receipt_step]
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {
+      step: "warm-exact-pin-harn-cli",
+      success: true,
+      pin_sha: cfg.pin_sha,
+      cargo_target_dir: cfg.release_cargo_target_dir,
+      binary_sha256: binary_sha256,
+      harn_bin: harn_bin,
+    },
+  )
+  release_log_event(
+    harness,
+    run_id,
+    "merge_group_audit_reuse",
+    {reuse: true, reason: decision.reason, receipt_path: receipt_path, receipt: receipt},
+  )
+  return {steps: resolved_steps, receipt_path: receipt_path, harn_bin: harn_bin}
+}
+
+fn resolve_prepare_audit_evidence(harness: Harness, cfg, steps, run_id) {
+  if cfg.local_audit ?? false {
+    return {steps: steps, receipt_path: "", harn_bin: ""}
+  }
+  return resolve_merge_group_audit_reuse(harness, cfg, steps, run_id)
+}
+
+/** Resolve reusable audit evidence and the exact prepare command from one typed plan. */
+pub fn release_prepare_audit_plan(harness: Harness, cfg, steps = [], run_id = nil) {
+  const id = run_id ?? uuid_v7()
+  const evidence = resolve_prepare_audit_evidence(harness, cfg, steps, id)
+  return {...evidence, command: prepare_command(cfg, evidence), run_id: id}
+}
+
+/**
+ * Enumerate non-merge prepare commits on the existing release branch
+ * — the commits we want to cherry-pick onto fresh `<base>` during a
+ * fixup pass instead of re-running `./scripts/release_ship.sh --prepare`.
+ *
+ * Skips merges so the `Tie release/v$ver to shipped tag (ours)` merge
+ * commit that a prior fixup may have laid down does not get replayed
+ * (it has no tree delta and `execute_ship_pr` rebuilds it later if
+ * needed). Reads from `origin/release/v$ver` because by the time this
+ * runs we have already reset the local branch to fresh `<base>`; the
+ * authoritative shape is the remote.
+ */
+fn fixup_prepare_commits(cfg, analysis) {
+  const branch = "release/v${analysis.next_version}"
+  const r = run_git(
+    cfg,
+    ["log", "--reverse", "--no-merges", "--format=%H", "origin/${cfg.base}..origin/${branch}"],
+  )
+  if !r.success {
+    return {success: false, commits: [], stderr: r.stderr ?? ""}
+  }
+  let commits = []
+  for line in split(r.stdout ?? "", "\n") {
+    const sha = trim(line)
+    if sha != "" {
+      commits = commits + [sha]
+    }
+  }
+  return {success: true, commits: commits, stderr: ""}
+}
+
+fn fixup_cherry_pick_argv(commits) {
+  return ["git", "cherry-pick", "--no-commit", "--strategy-option=ours"] + commits
+}
+
+/**
+ * Replace `./scripts/release_ship.sh --prepare` (which re-derives the
+ * Cargo.toml workspace bumps and regenerated artifacts in ~110s on the
+ * full harn workspace) with a cherry-pick of the original release
+ * branch's prepare commits onto fresh `<base>`. `--strategy-option=ours`
+ * keeps fresh-`<base>` content for any conflicting hunk (most commonly
+ * CHANGELOG.md, where `<base>` drift collides with the prepare commit's
+ * `## Unreleased` → `## v$ver` rewrite); the follow-up `git checkout
+ * HEAD -- CHANGELOG.md` step in `execute_prepare` neutralizes any
+ * non-conflicting CHANGELOG hunks the cherry-pick still applied, so
+ * the smart-subtract CHANGELOG writer that runs next is unambiguously
+ * authoritative. `--no-commit` lets the downstream `git add -u` /
+ * `git commit -m "Release v$ver"` step in `execute_ship_pr` produce a
+ * single canonical release commit.
+ */
+pub fn execute_fixup_cherry_pick(harness: Harness, cfg, analysis, steps, run_id) {
+  const probe = fixup_prepare_commits(cfg, analysis)
+  if !probe.success {
+    return steps
+      + [
+      recorded_step(
+        "fixup-list-prepare-commits",
+        "git log --reverse --no-merges origin/${cfg.base}..origin/release/v${analysis.next_version}",
+        fail(2, "could not enumerate prepare commits to cherry-pick:\n${trim(probe.stderr ?? "")}"),
+      ),
+    ]
+  }
+  if len(probe.commits) == 0 {
+    return steps
+      + [
+      recorded_step(
+        "fixup-list-prepare-commits",
+        "git log --reverse --no-merges origin/${cfg.base}..origin/release/v${analysis.next_version}",
+        fail(
+          2,
+          "no non-merge commits on origin/release/v${analysis.next_version} to cherry-pick; the existing release branch looks empty",
+        ),
+      ),
+    ]
+  }
+  const cherry_argv = fixup_cherry_pick_argv(probe.commits)
+  release_log_event(
+    harness,
+    run_id,
+    "step_started",
+    {
+      step: "fixup-cherry-pick-prepare-commits",
+      command: argv_label(cherry_argv),
+      commit_count: len(probe.commits),
+    },
+  )
+  const result = append_command_step(harness, cfg, steps, "fixup-cherry-pick-prepare-commits", cherry_argv)
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {
+      step: "fixup-cherry-pick-prepare-commits",
+      success: result.success,
+      status: result.status,
+      commit_count: len(probe.commits),
+    },
+  )
+  if result.success {
+    return result.steps
+  }
+  // Failure leaves CHERRY_PICK_HEAD set, which would block the next run.
+  // Abort defensively; `|| true` keeps the cleanup itself from masking
+  // the original failure when there is nothing to abort.
+  const abort = append_command_step(
+    harness,
+    cfg,
+    result.steps,
+    "fixup-cherry-pick-abort",
+    "git cherry-pick --abort 2>/dev/null || true",
+  )
+  return abort.steps
+}
+
+fn release_adds_workspace_crate(analysis) {
+  const changes = analysis.commit_file_changes_since_latest_tag ?? ""
+  return contains(changes, "A\tcrates/") && contains(changes, "/Cargo.toml")
+}
+
+pub fn with_derived_release_options(cfg, analysis) {
+  if cfg.bootstrap_new_crates ?? false {
+    return cfg
+  }
+  if release_adds_workspace_crate(analysis) {
+    return {...cfg, bootstrap_new_crates: true}
+  }
+  return cfg
+}
