@@ -1,0 +1,647 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { env_str } from "std/config"
+import { write_jsonl } from "std/jsonl"
+import { release_log_range_arg } from "./git"
+import { github_pr_view } from "./github"
+import { recorded_step } from "./release_execution"
+import { fail, ok } from "./shell_util"
+import { markdown_multiline } from "./text_util"
+import { logged_github_operation_step } from "release_agent"
+import {
+  prompt_asset,
+  release_github_enable_auto_merge,
+  release_github_pr_view,
+  release_repo_slug,
+  release_run_dir,
+  run_output_dir,
+} from "release_runtime"
+
+fn execution_step_count(execution) {
+  return len(execution ?? [])
+}
+
+fn execution_status_summary(execution) {
+  let ok = 0
+  let failed = 0
+  for step in execution ?? [] {
+    if step.success {
+      ok = ok + 1
+    } else {
+      failed = failed + 1
+    }
+  }
+  if failed == 0 {
+    return "all ok"
+  }
+  return "${ok} ok, ${failed} failed"
+}
+
+fn fixup_changelog_block(analysis) {
+  const promoted = trim(markdown_multiline(analysis.changelog_section ?? ""))
+  const unreleased = trim(markdown_multiline(analysis.changelog_unreleased_section ?? ""))
+  let parts = [
+    "**v${analysis.next_version}** (promoted from pin-time `## Unreleased`):",
+    "",
+    "```markdown",
+    "## v${analysis.next_version}",
+    "",
+    promoted,
+    "```",
+  ]
+  if unreleased != "" {
+    parts = parts
+      + [
+      "",
+      "**Held in `## Unreleased`** (post-pin drift on `${analysis.base_branch}` — describes work landing AFTER this release):",
+      "",
+      "```markdown",
+      "## Unreleased",
+      "",
+      unreleased,
+      "```",
+    ]
+  } else {
+    parts = parts + ["", "_No `## Unreleased` drift since the original pin._"]
+  }
+  return parts.join("\n")
+}
+
+fn standard_changelog_block(analysis) {
+  const body = trim(markdown_multiline(analysis.changelog_section ?? ""))
+  return "```markdown\n## v${analysis.next_version}\n\n${body}\n```"
+}
+
+fn merge_group_audit_pr_block(execution) {
+  for step in execution ?? [] {
+    if step.merge_group_audit_receipt != nil {
+      const receipt = step.merge_group_audit_receipt
+      let lines = [
+        "## Reused merge-group audit",
+        "",
+        "- **Run:** [${receipt.run.id}](${receipt.run.url})",
+        "- **Head SHA:** `${receipt.head_sha}`",
+        "- **Workflow:** `${receipt.run.workflow}` (`${receipt.run.event}`)",
+        "- **Run result:** `${receipt.run.status}/${receipt.run.conclusion}`",
+        "- **Warm proof:** `${receipt.warm.command}` -> `${receipt.warm.binary_sha256}`",
+        "- **Receipt:** `${step.merge_group_audit_receipt_path}`",
+        "",
+        "| Job | Conclusion | Evidence |",
+        "|-----|------------|----------|",
+      ]
+      for job in receipt.jobs {
+        lines = lines + ["| `${job.name}` | `${job.status}/${job.conclusion}` | [${job.id}](${job.url}) |"]
+      }
+      return lines.join("\n")
+    }
+  }
+  return ""
+}
+
+pub fn pr_body_text(analysis, agent_review_result, execution, run_id) {
+  const agent_artifacts = agent_review_result.artifacts ?? {}
+  const draft_path = agent_review_result.draft_changelog ?? ""
+  const validation = agent_review_result.validation_findings ?? []
+  const execution_summary = if execution == nil {
+    "(no side-effecting steps recorded)"
+  } else {
+    execution_table(execution)
+  }
+  const pin_sha_note = if trim(analysis.pin_sha_input ?? "") == "" {
+    "(`origin/${analysis.base_branch}` at run start)"
+  } else {
+    "(`--at-sha ${analysis.pin_sha_input}`)"
+  }
+  const fixup_note = if analysis.fixup_mode ?? false {
+    "\n\n> **Repair pass for an existing release PR.** Recovered the original pin SHA via `git merge-base`, recreated the branch on fresh `${analysis.base_branch}`, and re-derived v${analysis.next_version} from pin-time `## Unreleased`. Post-pin bullets on the current `## Unreleased` are preserved — they describe work landing AFTER this release. Auto-merge state is left untouched so the operator can review the corrective diff before merging."
+  } else if analysis.repin_mode ?? false {
+    "\n\n> **Repin pass: advanced pin to fresh `${analysis.base_branch}` HEAD.** TOCTTOU re-checked (no shipped release, remote tag unchanged) immediately before resetting the release branch. v${analysis.next_version} now folds in every commit that landed on `${analysis.base_branch}` after the original pin. The previous tag was deleted on origin and re-pushed at the new pin; `publish-release.yml` will fire on the new tag."
+  } else {
+    ""
+  }
+  const tag_publish_note = if analysis.fixup_mode ?? false {
+    "tag handling depends on origin state: skipped if `v${analysis.next_version}` already exists on origin (artifact shipped); otherwise pushed pre-PR like a normal first-time release."
+  } else if analysis.repin_mode ?? false {
+    "stale `v${analysis.next_version}` tag deleted on origin and re-pushed at the new pin; `publish-release.yml` ships from the freshly pushed tag."
+  } else {
+    "pushed pre-PR; `publish-release.yml` ships from the tag so post-PR drift on `${analysis.base_branch}` cannot leak into the artifact."
+  }
+  const changelog_block = if analysis.fixup_mode ?? false {
+    fixup_changelog_block(analysis)
+  } else {
+    standard_changelog_block(analysis)
+  }
+  const run_session_view = analysis.run_session_view ?? {}
+  const view_check = run_session_view.check ?? {}
+  const view_note = run_session_view.release_note ?? {}
+  const view_summary = run_session_view.summary_line ?? "unknown"
+  const view_fixture_status = if view_check.success ?? false {
+    "passed"
+  } else {
+    "failed"
+  }
+  const view_release_note = if view_note.required ?? false {
+    if view_note.present ?? false {
+      "contract files changed; release note present"
+    } else {
+      "contract files changed; release note missing"
+    }
+  } else {
+    "no contract-file change detected"
+  }
+  return render(
+    prompt_asset("release_pr_body.harn.prompt"),
+    {
+      next_version: analysis.next_version,
+      run_id: run_id ?? "",
+      fixup_note: fixup_note,
+      tag_publish_note: tag_publish_note,
+      current_version: analysis.current_version,
+      branch: analysis.branch,
+      base_branch: analysis.base_branch,
+      pin_sha: analysis.pin_sha ?? "(unset)",
+      pin_sha_note: pin_sha_note,
+      latest_tag: analysis.latest_tag,
+      changelog_block: changelog_block,
+      run_session_view_summary: view_summary,
+      run_session_view_fixture_status: view_fixture_status,
+      run_session_view_release_note: view_release_note,
+      merge_group_audit_block: merge_group_audit_pr_block(execution),
+      commits_since_latest_tag: analysis.commits_since_latest_tag,
+      execution_summary: execution_summary,
+      execution_step_count: execution_step_count(execution),
+      execution_status_summary: execution_status_summary(execution),
+      audit_transcript: agent_artifacts.llm_transcript_jsonl ?? "not generated",
+      draft_changelog: draft_path,
+      validation_findings: if len(validation) == 0 {
+        "none"
+      } else {
+        validation.join("; ")
+      },
+    },
+  )
+}
+
+fn execution_table(execution) {
+  let lines = ["| Step | Status | Classification |", "|------|--------|----------------|"]
+  for step in execution {
+    const status = if step.success {
+      "ok"
+    } else {
+      "failed (${step.status})"
+    }
+    lines = lines + ["| `${step.name}` | ${status} | `${step.classification ?? ""}` |"]
+  }
+  return lines.join("\n")
+}
+
+pub fn write_pr_body(harness: Harness, run_id, analysis, agent_review_result, execution) {
+  const body_path = path_join(release_run_dir(run_id), "pr-body.md")
+  harness.fs.mkdir(dirname(body_path), true)
+  harness.fs.write_text(body_path, pr_body_text(analysis, agent_review_result, execution, run_id))
+  return body_path
+}
+
+pub fn append_pr_auto_merge_steps(harness: Harness, cfg, steps, pr_url, run_id) {
+  if pr_url == "" {
+    return {
+      steps: steps
+        + [
+        recorded_step(
+          "auto-merge",
+          "enable release PR auto-merge",
+          fail(2, "could not determine PR URL for release PR"),
+        ),
+      ],
+      success: false,
+      pr_url: "",
+    }
+  }
+  const probe = logged_github_operation_step(
+    harness,
+    steps,
+    "inspect-auto-merge",
+    "inspect release PR auto-merge state",
+    run_id,
+    fn() { return if cfg.mock {
+      release_github_pr_view(cfg, pr_url)
+    } else {
+      github_pr_view(release_repo_slug(cfg), pr_url)
+    } },
+  )
+  let out = probe.steps
+  if !probe.success {
+    return {steps: out, success: false, pr_url: pr_url}
+  }
+  const pr = probe.value
+  if pr.auto_merge_armed {
+    out = out
+      + [
+      recorded_step(
+        "auto-merge-already-enabled",
+        "typed auto-merge state is armed on " + pr_url,
+        ok("release PR already has auto-merge enabled\n"),
+      ),
+    ]
+    return {steps: out, success: true, pr_url: pr_url}
+  }
+  // Fixup mode means we're repairing an existing release PR. The operator
+  // typically disabled auto-merge so they can review the corrective diff
+  // before letting it land — re-enabling would defeat that.
+  if cfg.fixup_mode ?? false {
+    out = out
+      + [
+      recorded_step(
+        "auto-merge-skipped",
+        "fixup mode: leaving auto-merge disabled so the operator can review the repaired diff",
+        ok("auto-merge state preserved (fixup mode)\n"),
+      ),
+    ]
+    return {steps: out, success: true, pr_url: pr_url}
+  }
+  const auto_merge = logged_github_operation_step(
+    harness,
+    out,
+    "auto-merge",
+    "enable squash auto-merge at expected head " + pr.head.sha,
+    run_id,
+    fn() { return release_github_enable_auto_merge(cfg, pr) },
+  )
+  return {steps: auto_merge.steps, success: auto_merge.success, pr_url: pr_url}
+}
+
+fn crystallization_fixture_paths(run_id) {
+  const out_dir = path_join(run_output_dir(run_id), "crystallization-input")
+  return {
+    out_dir: out_dir,
+    manifest_json: path_join(out_dir, "manifest.json"),
+    release_run_json: path_join(out_dir, "release-run.json"),
+    deterministic_events_jsonl: path_join(out_dir, "deterministic-events.jsonl"),
+    agent_events_jsonl: path_join(out_dir, "agent-events.jsonl"),
+    tool_observations_jsonl: path_join(out_dir, "tool-observations.jsonl"),
+    readme_md: path_join(out_dir, "README.md"),
+  }
+}
+
+fn artifact_text(harness: Harness, path) {
+  const p = path ?? ""
+  if p == "" || !harness.fs.exists(p) {
+    return ""
+  }
+  return harness.fs.read_text(p)
+}
+
+const FIXTURE_SCHEMA_VERSION = "release_harn.crystallization_input.v1"
+
+type AgentReviewAttemptFixtureRecord = {
+  name?: string,
+  status?: string,
+  text?: string,
+  validation_findings?: list<string>,
+  llm?: dict,
+  tools?: dict,
+}
+
+const AGENT_REVIEW_ATTEMPT_FIXTURE_RECORD_SCHEMA = {
+  type: "dict",
+  properties: {
+    name: {type: "string"},
+    status: {type: "string"},
+    text: {type: "string"},
+    validation_findings: {type: "list", items: {type: "string"}},
+    llm: {type: "dict"},
+    tools: {type: "dict"},
+  },
+}
+
+fn fixture_event(event_type, source, timestamp, data) {
+  return {
+    schema_version: FIXTURE_SCHEMA_VERSION,
+    event_type: event_type,
+    source: source,
+    timestamp: timestamp,
+    data: data,
+  }
+}
+
+fn tool_event(timestamp, source, data) {
+  return fixture_event("tool_observation", source, timestamp, data)
+}
+
+fn shell_tool_event(timestamp, command, stdout) {
+  return tool_event(
+    timestamp,
+    "deterministic",
+    {tool: "shell", command: command, success: true, status: 0, stdout: stdout, stderr: ""},
+  )
+}
+
+fn read_file_tool_event(timestamp, path, stdout) {
+  return tool_event(
+    timestamp,
+    "deterministic",
+    {tool: "read_file", path: path, success: true, status: 0, stdout: stdout, stderr: ""},
+  )
+}
+
+fn artifact_snapshot(harness: Harness, artifacts, optional_keys) {
+  let snap: dict = {
+    raw_result_json_path: artifacts.raw_result_json ?? "",
+    raw_result_json: artifact_text(harness, artifacts.raw_result_json ?? ""),
+    trace_json_path: artifacts.trace_json ?? "",
+    trace_json: artifact_text(harness, artifacts.trace_json ?? ""),
+    llm_transcript_jsonl_path: artifacts.llm_transcript_jsonl ?? "",
+    llm_transcript_jsonl: artifact_text(harness, artifacts.llm_transcript_jsonl ?? ""),
+  }
+  for key in optional_keys ?? [] {
+    snap = snap
+      + {[key + "_path"]: artifacts[key] ?? "", [key]: artifact_text(harness, artifacts[key] ?? "")}
+  }
+  return snap
+}
+
+fn deterministic_fixture_events(payload) {
+  const a = payload.analysis
+  let events = [
+    fixture_event(
+      "release_analysis",
+      "deterministic",
+      payload.started_iso,
+      {
+        repo: a.repo,
+        mode: a.mode,
+        mock: a.mock,
+        bump: a.bump,
+        starting_branch: a.branch,
+        target_release_branch: a.expected_branch,
+        base_branch: a.base_branch,
+        current_version: a.current_version,
+        next_version: a.next_version,
+        latest_tag: a.latest_tag,
+        git_log_range: release_log_range_arg(a.latest_tag, a.pin_sha ?? ""),
+        dirty_files: a.dirty_files,
+        status: a.status,
+      },
+    ),
+    fixture_event(
+      "changelog_audit_inputs",
+      "deterministic",
+      payload.started_iso,
+      {
+        expected_version: a.next_version,
+        changelog_top: a.changelog_top,
+        changelog_section: a.changelog_section,
+        changelog_unreleased_section: a.changelog_unreleased_section ?? "",
+        commits_since_latest_tag: a.commits_since_latest_tag,
+        commit_stats_since_latest_tag: a.commit_stats_since_latest_tag,
+        commit_file_changes_since_latest_tag: a.commit_file_changes_since_latest_tag,
+        post_tag_pr_numbers: a.post_tag_pr_numbers ?? [],
+        post_tag_pr_details: a.post_tag_pr_details ?? "",
+      },
+    ),
+  ]
+  for finding in a.deterministic_findings {
+    events = events
+      + [fixture_event("deterministic_finding", "deterministic", payload.finished_iso, {finding: finding})]
+  }
+  for step in payload.execution ?? [] {
+    events = events
+      + [
+      fixture_event(
+        "release_step_recorded",
+        "deterministic",
+        payload.finished_iso,
+        {
+          name: step.name,
+          command: step.command,
+          success: step.success,
+          status: step.status,
+          classification: step.classification ?? "",
+          recovery_hint: step.recovery_hint ?? "",
+        },
+      ),
+    ]
+  }
+  return events
+}
+
+fn agent_artifact_snapshot(harness: Harness, agent_detail) {
+  return artifact_snapshot(harness, agent_detail.artifacts ?? {}, ["draft_changelog_md"])
+}
+
+fn recovery_artifact_snapshot(harness: Harness, step) {
+  return artifact_snapshot(harness, step.artifacts ?? {}, ["advice_md"])
+}
+
+fn agent_attempt_fixture_name(index: int, attempt: AgentReviewAttemptFixtureRecord) -> string {
+  const name = attempt.name ?? ""
+  if name != "" {
+    return name
+  }
+  return "attempt-" + to_string(index + 1)
+}
+
+fn agent_attempt_fixture_event(index: int, attempt: AgentReviewAttemptFixtureRecord, ts: string) {
+  return fixture_event(
+    "agent_review_attempt",
+    "agent",
+    ts,
+    {
+      index: index,
+      name: agent_attempt_fixture_name(index, attempt),
+      status: attempt.status ?? "",
+      text: attempt.text ?? "",
+      validation_findings: attempt.validation_findings ?? [],
+      llm: attempt.llm ?? {},
+      tools: attempt.tools ?? {},
+    },
+  )
+}
+
+fn invalid_agent_attempt_fixture_event(index, attempt, ts) {
+  const report = schema_report(attempt, AGENT_REVIEW_ATTEMPT_FIXTURE_RECORD_SCHEMA, false)
+  return fixture_event(
+    "agent_review_attempt_invalid",
+    "agent",
+    ts,
+    {
+      index: index,
+      observed_type: type_of(attempt),
+      reason: report.message ?? "agent review attempt record was missing or malformed",
+      issues: report.issues ?? [],
+    },
+  )
+}
+
+pub fn agent_fixture_events(harness: Harness, payload) {
+  const detail = payload.agent_review_detail ?? {}
+  const attempts = detail.attempts ?? []
+  const ts = payload.finished_iso
+  let events = []
+  if len(attempts) == 0 {
+    events = events + [fixture_event("agent_review_skipped", "agent", ts, {reason: payload.agent_review})]
+  }
+  for {index, value} in attempts.enumerate() {
+    const attempt = value
+    if schema_is(attempt, AGENT_REVIEW_ATTEMPT_FIXTURE_RECORD_SCHEMA) {
+      events = events + [agent_attempt_fixture_event(index, attempt, ts)]
+    } else {
+      events = events + [invalid_agent_attempt_fixture_event(index, attempt, ts)]
+    }
+  }
+  if len(attempts) > 0 {
+    events = events
+      + [fixture_event("agent_review_artifacts", "agent", ts, agent_artifact_snapshot(harness, detail))]
+  }
+  for step in payload.execution ?? [] {
+    if starts_with(step.name, "agent-recovery-advice-") {
+      events = events
+        + [
+        fixture_event(
+          "agent_recovery_advice",
+          "agent",
+          ts,
+          {
+            step_name: step.name,
+            status: step.agent_status ?? "",
+            text: step.stdout,
+            llm: step.llm ?? {},
+            tools: step.tools ?? {},
+            artifacts: recovery_artifact_snapshot(harness, step),
+          },
+        ),
+      ]
+    }
+  }
+  return events
+}
+
+fn tool_observation_events(payload) {
+  const a = payload.analysis
+  const ts = payload.started_iso
+  const log_range = release_log_range_arg(a.latest_tag, a.pin_sha ?? "")
+  let events = [
+    shell_tool_event(ts, "git status --porcelain --untracked-files=normal", a.status),
+    shell_tool_event(ts, "git diff HEAD --stat", a.diff_stat),
+    shell_tool_event(ts, "git log --oneline --no-merges " + log_range, a.commits_since_latest_tag),
+    shell_tool_event(
+      ts,
+      "git log --name-status --pretty=format:'commit %h %s' --no-merges " + log_range,
+      a.commit_file_changes_since_latest_tag,
+    ),
+    read_file_tool_event(ts, "CHANGELOG.md", a.changelog_section),
+    read_file_tool_event(ts, "CHANGELOG.md#Unreleased", a.changelog_unreleased_section ?? ""),
+  ]
+  for step in payload.execution ?? [] {
+    const is_recovery = starts_with(step.name, "agent-recovery-advice-")
+    events = events
+      + [
+      tool_event(
+        payload.finished_iso,
+        if is_recovery {
+          "agent"
+        } else {
+          "deterministic"
+        },
+        {
+          tool: if is_recovery {
+            "agent_loop"
+          } else {
+            "shell"
+          },
+          step_name: step.name,
+          command: step.command,
+          success: step.success,
+          status: step.status,
+          classification: step.classification ?? "",
+          recovery_hint: step.recovery_hint ?? "",
+          stdout: step.stdout,
+          stderr: step.stderr,
+        },
+      ),
+    ]
+  }
+  return events
+}
+
+fn fixture_manifest(run_id, payload, report_paths, paths) {
+  return {
+    schema_version: FIXTURE_SCHEMA_VERSION,
+    kind: "release_harn_crystallization_input",
+    generated_by: "release_harn.harn",
+    generated_at: date_now_iso(),
+    run_id: run_id,
+    source_issue: env_str("HARN_RELEASE_SOURCE_ISSUE") ?? "",
+    consumer_issue: env_str("HARN_RELEASE_CONSUMER_ISSUE") ?? "",
+    source_artifacts: {release_audit_json: report_paths.json_path, release_audit_md: report_paths.md_path},
+    release: {
+      repo: payload.analysis.repo,
+      mode: payload.analysis.mode,
+      mock: payload.analysis.mock,
+      current_version: payload.analysis.current_version,
+      next_version: payload.analysis.next_version,
+      starting_branch: payload.analysis.branch,
+      target_release_branch: payload.analysis.expected_branch,
+      base_branch: payload.analysis.base_branch,
+      latest_tag: payload.analysis.latest_tag,
+    },
+    files: {
+      manifest_json: paths.manifest_json,
+      release_run_json: paths.release_run_json,
+      deterministic_events_jsonl: paths.deterministic_events_jsonl,
+      agent_events_jsonl: paths.agent_events_jsonl,
+      tool_observations_jsonl: paths.tool_observations_jsonl,
+      readme_md: paths.readme_md,
+    },
+    semantics: {
+      deterministic_events: "Facts and harness decisions emitted by release_harn.harn.",
+      agent_events: "Model-authored audit, changelog synthesis, and recovery advice. Not deterministic truth.",
+      tool_observations: "Shell/read/tool observations with stdout/stderr preserved for replay and audit.",
+    },
+  }
+}
+
+fn fixture_readme(payload) {
+  const a = payload.analysis
+  return render(
+    prompt_asset("release_fixture_readme.harn.prompt"),
+    {
+      repo: a.repo,
+      mode: a.mode,
+      mock: a.mock,
+      current_version: a.current_version,
+      next_version: a.next_version,
+      branch: a.branch,
+      expected_branch: a.expected_branch,
+      latest_tag: a.latest_tag,
+    },
+  )
+}
+
+pub fn write_crystallization_fixture(harness: Harness, run_id, payload, report_paths) {
+  const paths = crystallization_fixture_paths(run_id)
+  harness.fs.mkdir(paths.out_dir, true)
+  harness.fs
+    .write_text(
+    paths.release_run_json,
+    json_stringify({schema_version: FIXTURE_SCHEMA_VERSION, kind: "release_harn_run", payload: payload})
+      + "\n",
+  )
+  write_jsonl(paths.deterministic_events_jsonl, deterministic_fixture_events(payload))
+  write_jsonl(paths.agent_events_jsonl, agent_fixture_events(harness, payload))
+  write_jsonl(paths.tool_observations_jsonl, tool_observation_events(payload))
+  harness.fs.write_text(paths.readme_md, fixture_readme(payload))
+  harness.fs
+    .write_text(
+    paths.manifest_json,
+    json_stringify(fixture_manifest(run_id, payload, report_paths, paths)) + "\n",
+  )
+  return {
+    out_dir: paths.out_dir,
+    manifest_json: paths.manifest_json,
+    release_run_json: paths.release_run_json,
+    deterministic_events_jsonl: paths.deterministic_events_jsonl,
+    agent_events_jsonl: paths.agent_events_jsonl,
+    tool_observations_jsonl: paths.tool_observations_jsonl,
+    readme_md: paths.readme_md,
+  }
+}

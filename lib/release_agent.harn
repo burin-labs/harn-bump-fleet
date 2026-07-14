@@ -1,0 +1,692 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { agent_preset } from "std/agent/presets"
+import { command_output_tail } from "std/command"
+import { timed } from "std/timing"
+import { changelog_latest_version_section_from_text } from "./changelog"
+import { install_binder_after_preflight, release_agent_infra_defaults } from "./llm_defaults"
+import { agent_result_text } from "./release_audit"
+import {
+  hook_light_env,
+  markdownlint_source_context,
+  markdownlint_violations_from_text,
+  recorded_step,
+  recovery_step_ref,
+  recovery_step_refs,
+} from "./release_execution"
+import { agent_review_execute } from "./release_review_loop"
+import { fail, ok, safe_shell_arg } from "./shell_util"
+import { truncate_text } from "./text_util"
+import {
+  agent_transcript_context_metadata,
+  release_compaction_policy,
+  summary_projection_policy,
+  tool_repair_projection_policy,
+} from "./transcript_context"
+import {
+  agent_artifact_paths,
+  agent_review_attempt_selection,
+  persist_agent_changelog,
+  release_repair_tools,
+  release_review_post_turn,
+  release_session_id,
+  release_tools,
+  validate_agent_attempt,
+} from "release_agent_tools"
+import { compact_agent_analysis } from "release_analysis"
+import {
+  append_command_step,
+  command_live_log_path,
+  log_step_finished,
+  log_step_started,
+  prompt_asset,
+  read_repo_file,
+  release_run_dir,
+  run_git,
+} from "release_runtime"
+
+fn run_release_agent_loop(
+  harness: Harness,
+  cfg,
+  analysis,
+  system,
+  prompt,
+  run_id,
+  require_tool_evidence,
+  session_suffix,
+  audit_tools,
+) {
+  const paths = agent_artifact_paths(run_id)
+  const role = if require_tool_evidence {
+    "audit"
+  } else {
+    "summary"
+  }
+  const raw_tools = if require_tool_evidence {
+    audit_tools
+  } else {
+    tool_registry()
+  }
+  // Compose the natural-language tool binder (no-op when the binder is
+  // disabled or no tools are registered) so the planner's tool calls get
+  // canonicalized via Cerebras GPT-OSS-120B by default. The summary-style
+  // call (`tool_choice: "none"`) makes no tool calls; install_binder is
+  // still safe because the binder layer only fires when tools have
+  // schemas and `_nl_intent` arrives in the call.
+  const binder = install_binder_after_preflight(raw_tools, cfg.planner_preflight)
+  const compaction_policy = if require_tool_evidence {
+    release_compaction_policy("audit")
+  } else {
+    release_compaction_policy("validation_repair")
+  }
+  const projection_policy = if require_tool_evidence {
+    tool_repair_projection_policy()
+  } else {
+    summary_projection_policy(4)
+  }
+  let options = agent_preset(
+    role,
+    {
+      ...release_agent_infra_defaults(cfg, MOCK_AGENT_MODEL),
+      max_tokens: if require_tool_evidence {
+        2048
+      } else {
+        8000
+      },
+      tools: binder.tools,
+      tool_caller: binder.tool_caller,
+      iteration_budget: if require_tool_evidence {
+        {mode: "adaptive", initial: 4, max: 8, extend_by: 2}
+      } else {
+        {mode: "fixed", initial: 1, max: 1, extend_by: 0}
+      },
+      turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
+      post_turn_callback: if require_tool_evidence {
+        { payload -> release_review_post_turn(payload, analysis) }
+      } else {
+        nil
+      },
+      compaction: {strategy: "hybrid", keep_last_n: 8, policy: compaction_policy},
+      transcript_projection: projection_policy,
+      session_id: release_session_id(harness, cfg, analysis, run_id) + session_suffix,
+      llm_transcript_dir: paths.llm_transcript_dir,
+    },
+  )
+  // Single-turn finalize budget. Sized for a comprehensive
+  // `## Unreleased` rewrite (20+ bullets); earlier 2200 cap
+  // truncated drafts mid-sentence on substantial releases.
+  if !require_tool_evidence {
+    options = {...options, tool_choice: "none"}
+  }
+  return agent_loop(prompt, system, options)
+}
+
+fn persist_agent_artifacts(harness: Harness, run_id, result, attempts, validation_findings) {
+  const paths = agent_artifact_paths(run_id)
+  harness.fs.mkdir(paths.out_dir, true)
+  harness.fs
+    .write_text(
+    paths.raw_result_json,
+    json_stringify({attempts: attempts, final_result: result}) + "\n",
+  )
+  harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  const transcript_context = agent_transcript_context_metadata(result)
+  harness.fs.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
+  return {
+    raw_result_json: paths.raw_result_json,
+    trace_json: paths.trace_json,
+    transcript_context_json: paths.transcript_context_json,
+    llm_transcript_jsonl: paths.llm_transcript_jsonl,
+    draft_changelog_md: paths.draft_changelog_md,
+    transcript_context: transcript_context,
+    validation_findings: validation_findings,
+  }
+}
+
+fn recovery_artifact_paths(run_id, step_name) {
+  const safe_step = regex_replace_all("[^A-Za-z0-9_.-]+", "-", step_name)
+  const out_dir = path_join(release_run_dir(run_id), "recovery")
+  return {
+    out_dir: out_dir,
+    raw_result_json: path_join(out_dir, safe_step + "-agent-result.json"),
+    trace_json: path_join(out_dir, safe_step + "-agent-trace.json"),
+    transcript_context_json: path_join(out_dir, safe_step + "-transcript-context.json"),
+    advice_md: path_join(out_dir, safe_step + "-advice.md"),
+    llm_transcript_dir: path_join(out_dir, safe_step + "-llm"),
+    llm_transcript_jsonl: path_join(out_dir, safe_step + "-llm/llm_transcript.jsonl"),
+  }
+}
+
+fn recovery_session_id(harness: Harness, cfg, analysis, run_id, step_name) {
+  return release_session_id(harness, cfg, analysis, run_id) + "-recovery-" + step_name
+}
+
+fn unique_markdownlint_paths(violations) {
+  let seen = {}
+  let out = []
+  for violation in violations ?? [] {
+    const path = violation.path ?? ""
+    if path == "" || (seen[path] ?? false) {
+      continue
+    }
+    seen[path] = true
+    out = out + [path]
+  }
+  return out
+}
+
+fn markdownlint_files_for_context(harness: Harness, cfg, paths) {
+  let files = {}
+  for path in paths ?? [] {
+    const text = read_repo_file(harness, cfg, path)
+    if text != "" {
+      files[path] = text
+    }
+  }
+  return files
+}
+
+fn candidate_diff_for_paths(cfg, paths) {
+  const pathlist = paths ?? []
+  if len(pathlist) == 0 {
+    return ""
+  }
+  const r = run_git(cfg, ["diff", "--"] + pathlist)
+  if !r.success {
+    return ""
+  }
+  return truncate_text(r.stdout, 12000)
+}
+
+fn includes_changelog_path(paths) {
+  for path in paths ?? [] {
+    if path == "CHANGELOG.md" || ends_with(path, "/CHANGELOG.md") {
+      return true
+    }
+  }
+  return false
+}
+
+fn changelog_lint_excerpt(harness: Harness, cfg, analysis, paths) {
+  if !includes_changelog_path(paths) {
+    return ""
+  }
+  const text = read_repo_file(harness, cfg, "CHANGELOG.md")
+  if text == "" {
+    return ""
+  }
+  const section = changelog_latest_version_section_from_text(text)
+  if trim(section) == "" {
+    return ""
+  }
+  return "Current top CHANGELOG section for v${analysis.next_version}:\n"
+    + truncate_text(section, 8000)
+}
+
+fn markdownlint_recovery_context(harness: Harness, cfg, analysis, log_text) {
+  const violations = markdownlint_violations_from_text(log_text)
+  if len(violations) == 0 {
+    return nil
+  }
+  const paths = unique_markdownlint_paths(violations)
+  let files = markdownlint_files_for_context(harness, cfg, paths)
+  return {
+    classification: "generated_markdown_lint_failed",
+    violations: violations,
+    source_context: markdownlint_source_context(violations, files, 2),
+    candidate_diff: candidate_diff_for_paths(cfg, paths),
+    changelog_excerpt: changelog_lint_excerpt(harness, cfg, analysis, paths),
+    preferred_edit_tool: "release_replace_file",
+    fallback_edit_tool: "release_write_file",
+    edit_guidance: "Prefer release_replace_file for narrow prose wrapping and line-length fixes; use release_write_file only when exact replacement cannot safely express the repair.",
+    bounded_verification: ["make -s lint-md"],
+    repeated_read_guidance: "Use source_context, candidate_diff, and changelog_excerpt before calling release_read. If more release_read calls are necessary, state the concrete missing fact.",
+  }
+}
+
+fn live_log_failure_context(harness: Harness, cfg, analysis, step) {
+  const log_path = step?.output_path ?? step?.live_log ?? ""
+  if log_path == "" {
+    return nil
+  }
+  const tail_read = try {
+    command_output_tail(step, {length: 12000})
+  } catch (_e) {
+    nil
+  }
+  const tail = if tail_read != nil {
+    tail_read.content
+  } else if harness.fs.exists(log_path) {
+    const text = harness.fs.read_text(log_path)
+    const limit = 12000
+    if len(text) > limit {
+      text[len(text) - limit:len(text)]
+    } else {
+      text
+    }
+  } else {
+    step?.tail ?? step?.stderr ?? ""
+  }
+  const pattern_arg = safe_shell_arg("fail|failed|error|ERROR|Summary:|MD[0-9]+")
+  const path_arg = safe_shell_arg(log_path)
+  const matches = if harness.fs.exists(log_path) && pattern_arg != nil && path_arg != nil {
+    trim(shell("rg -n -- " + pattern_arg + " " + path_arg + " | tail -80").stdout)
+  } else {
+    ""
+  }
+  const matched_log_text = trim(matches + "\n" + tail)
+  return {
+    path: log_path,
+    command_id: step?.command_id ?? "",
+    matches: matches,
+    tail: tail,
+    markdownlint: markdownlint_recovery_context(harness, cfg, analysis, matched_log_text),
+  }
+}
+
+fn recovery_failure_class(failed_step, live_context) {
+  if live_context?.markdownlint != nil {
+    return "generated_markdown_lint_failed"
+  }
+  return failed_step.classification ?? ""
+}
+
+/**
+ * Pre-warm the Ollama model before kicking the recovery agent off. The
+ * release pipeline keeps the model loaded during the up-front agent review
+ * but `prepare` can run for 5-15 minutes, by which point Ollama's default
+ * `keep_alive` (30m on the wire, but pressured by macOS memory reclaim
+ * during heavy cargo builds) has typically dropped the runner. The first
+ * recovery turn would then sit silently behind a generic
+ * `[INFO] [llm] warming up Ollama model …` line for 10-30s while the
+ * model paged back in. Doing the warmup here means the wait happens with
+ * a step prefix the operator can place in context, and refreshing
+ * `keep_alive` keeps the runner pinned through the rest of the recovery
+ * loop. Non-blocking: a warmup error never aborts the recovery — the
+ * agent_loop call still runs and will surface a real failure if Ollama
+ * is genuinely broken.
+ */
+fn warm_local_model_for_recovery(harness: Harness, cfg) {
+  if cfg.mock ?? false {
+    return
+  }
+  const provider = if cfg.provider == "auto" {
+    "ollama"
+  } else {
+    cfg.provider
+  }
+  if provider != "ollama" {
+    return
+  }
+  const model = trim(cfg.model ?? "")
+  if model == "" {
+    return
+  }
+  harness.stdio.println("   → warming local model ${model} (long prepare may have cooled it)")
+  const warm = timed(
+    "release.agent_warmup",
+    {provider: "ollama", model: model},
+    { -> return try {
+      llm_healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
+    } catch (e) {
+      {valid: false, status: "error", message: "${e}"}
+    } },
+  )
+  const result = warm.result
+  const elapsed_s = (warm.timing.duration_ms + 500) / 1000
+  if result?.valid ?? false {
+    harness.stdio.println("   ✓ warmed ${model} in ${elapsed_s}s")
+  } else {
+    const status = result?.status ?? "error"
+    const message = result?.message ?? "unknown"
+    harness.stdio
+      .println(
+      "   ⚠ model warmup non-blocking failure (${status}): ${message} — continuing into recovery anyway",
+    )
+  }
+}
+
+pub fn run_recovery_agent_loop(harness: Harness, cfg, analysis, prompt, run_id, step_name) {
+  const paths = recovery_artifact_paths(run_id, step_name)
+  const system = render(prompt_asset("release_recovery_system.harn.prompt"), {})
+  warm_local_model_for_recovery(harness, cfg)
+  const binder = install_binder_after_preflight(release_repair_tools(harness, cfg, run_id), cfg.planner_preflight)
+  let options = agent_preset(
+    "repair",
+    {
+      ...release_agent_infra_defaults(cfg, MOCK_AGENT_MODEL),
+      tools: binder.tools,
+      tool_caller: binder.tool_caller,
+      max_nudges: 1,
+      iteration_budget: {mode: "adaptive", initial: 4, max: 10, extend_by: 2},
+      turn_policy: {allow_done_sentinel: false, max_prose_chars: 9000},
+      compaction: {strategy: "hybrid", keep_last_n: 6, policy: release_compaction_policy("recovery")},
+      transcript_projection: tool_repair_projection_policy(),
+      session_id: recovery_session_id(harness, cfg, analysis, run_id, step_name),
+      llm_transcript_dir: paths.llm_transcript_dir,
+    },
+  )
+  return agent_loop(prompt, system, options)
+}
+
+fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, run_id) {
+  if cfg.mock {
+    llm_mock_clear()
+    llm_mock(
+      {
+        text: "I will inspect the mocked push failure before recommending recovery.",
+        tool_calls: [
+          {
+            id: "recovery_run_1",
+            name: "release_run",
+            arguments: {argv: ["git", "status", "--porcelain", "--untracked-files=normal"]},
+          },
+        ],
+      },
+    )
+    llm_mock(
+      {
+        text: "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry the normal push with `HARN_HOOKS_NO_LOCAL_BUILD=1` and keep both attempts in the run artifacts.",
+      },
+    )
+  }
+  const live_context = live_log_failure_context(harness, cfg, analysis, failed_step)
+  const classification = recovery_failure_class(failed_step, live_context)
+  const prompt = render(
+    prompt_asset("release_recovery_prompt.harn.prompt"),
+    {
+      failure_context_json: json_stringify(
+        {
+          analysis: analysis,
+          failed_step: recovery_step_ref(failed_step),
+          live_log_excerpt: live_context,
+          execution_so_far: recovery_step_refs(steps),
+          classification: classification,
+          recovery_hint: failed_step.recovery_hint ?? "",
+        },
+      ),
+    },
+  )
+  const result = run_recovery_agent_loop(harness, cfg, analysis, prompt, run_id, failed_step.name)
+  const text = agent_result_text(result)
+  const paths = recovery_artifact_paths(run_id, failed_step.name)
+  harness.fs.mkdir(paths.out_dir, true)
+  harness.fs.write_text(paths.raw_result_json, json_stringify(result) + "\n")
+  harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  const transcript_context = agent_transcript_context_metadata(result)
+  harness.fs.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
+  harness.fs.write_text(paths.advice_md, text + "\n")
+  return {
+    text: text,
+    artifacts: {
+      raw_result_json: paths.raw_result_json,
+      trace_json: paths.trace_json,
+      transcript_context_json: paths.transcript_context_json,
+      advice_md: paths.advice_md,
+      llm_transcript_jsonl: paths.llm_transcript_jsonl,
+      transcript_context: transcript_context,
+    },
+    llm: result.llm ?? {},
+    tools: result.tools ?? {},
+    status: result.status ?? "",
+  }
+}
+
+pub fn maybe_recovery_advice_step(harness: Harness, cfg, analysis, steps, failed_step, run_id) {
+  if !cfg.agent {
+    return steps
+  }
+  // The recovery agent can sit for tens of seconds while the model re-warms
+  // and the first turn lands. Print a step header up front so the operator
+  // sees harness progress instead of a silent terminal after the failure.
+  harness.stdio.println("   → recovery diagnosis (agent_loop on failed step `${failed_step.name}`)")
+  const advice = recovery_agent_advice(harness, cfg, analysis, steps, failed_step, run_id)
+  const r = ok(advice.text)
+  const step = recorded_step(
+    "agent-recovery-advice-${failed_step.name}",
+    "agent_loop recovery diagnosis for failed ${failed_step.name}",
+    r,
+  )
+  return steps
+    + [
+    {
+      ...step,
+      artifacts: advice.artifacts,
+      agent_status: advice.status,
+      llm: advice.llm,
+      tools: advice.tools,
+    },
+  ]
+}
+
+pub fn retry_commands_after_agent_repair(step) {
+  if step.name == "commit" {
+    const commit_retry = if starts_with(step.command, "git commit -m ") {
+      {command: step.command, env: hook_light_env()}
+    } else {
+      step.command
+    }
+    return [
+      {name: "stage-after-agent-repair-commit", command: "git add -u"},
+      {name: "commit-after-agent-repair", command: commit_retry},
+    ]
+  }
+  return []
+}
+
+pub fn logged_command_step(harness: Harness, cfg, steps, name, command, run_id, extra_fn = nil) {
+  log_step_started(harness, run_id, name, command)
+  const result = append_command_step(harness, cfg, steps, name, command)
+  const extra = if extra_fn == nil {
+    nil
+  } else {
+    extra_fn(result)
+  }
+  log_step_finished(harness, run_id, name, result, extra)
+  return result
+}
+
+pub fn logged_github_operation_step(harness: Harness, steps, name, label, run_id, operation) {
+  log_step_started(harness, run_id, name, label)
+  const receipt = operation()
+  const result = if is_err(receipt) {
+    fail(1, to_string(unwrap_err(receipt)))
+  } else {
+    ok(json_stringify(receipt))
+  }
+  const step = recorded_step(name, label, result) + {github_receipt: receipt}
+  log_step_finished(harness, run_id, name, step, {github_receipt: receipt})
+  return {
+    steps: steps + [step],
+    success: !is_err(receipt),
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    value: receipt,
+  }
+}
+
+pub fn logged_live_shell_command_step(harness: Harness, cfg, steps, name, command, run_id) {
+  const live_log = command_live_log_path(run_id, name)
+  harness.fs.mkdir(dirname(live_log), true)
+  log_step_started(
+    harness,
+    run_id,
+    name,
+    command,
+    {live_log: live_log, tail_hint: "tail -f " + live_log},
+  )
+  const result = append_command_step(harness, cfg, steps, name, command, {live_log_path: live_log})
+  log_step_finished(harness, run_id, name, result, {live_log: live_log})
+  return result
+}
+
+pub fn run_retry_commands_after_agent_repair(harness: Harness, cfg, steps, retry_commands, run_id) {
+  let out = steps
+  for retry_step in retry_commands {
+    const result = logged_command_step(harness, cfg, out, retry_step.name, retry_step.command, run_id)
+    out = result.steps
+    if !result.success {
+      return {steps: out, success: false}
+    }
+  }
+  return {steps: out, success: true}
+}
+
+pub fn retry_prepare_after_agent_repair(harness: Harness, cfg, steps, failed_step, run_id) {
+  const cmd = failed_step.command ?? ""
+  const result = logged_live_shell_command_step(harness, cfg, steps, "prepare-after-agent-repair", cmd, run_id)
+  return result.steps
+}
+
+pub fn release_repair_fingerprint(cfg) {
+  const diff = run_git(cfg, ["diff", "--binary", "--no-ext-diff", "HEAD"])
+  if !diff.success {
+    return ""
+  }
+  return sha256(diff.stdout)
+}
+
+pub fn prepare_repair_changed(before_fingerprint: string, after_fingerprint: string) -> bool {
+  return before_fingerprint != "" && after_fingerprint != "" && before_fingerprint != after_fingerprint
+}
+
+fn release_generated_content_checks(_cfg, _analysis) {
+  return [{name: "release-markdown-lint", command: "make -s lint-md"}]
+}
+
+pub fn run_release_generated_content_checks(harness: Harness, cfg, analysis, steps, run_id) {
+  let out = steps
+  for check in release_generated_content_checks(cfg, analysis) {
+    const result = logged_command_step(harness, cfg, out, check.name, check.command, run_id)
+    out = result.steps
+    if result.success {
+      continue
+    }
+    const failed_step = out[len(out) - 1]
+    out = maybe_recovery_advice_step(harness, cfg, analysis, out, failed_step, run_id)
+    if cfg.agent {
+      const retry_result = logged_command_step(harness, cfg, out, check.name + "-after-agent-repair", check.command, run_id)
+      out = retry_result.steps
+      if retry_result.success {
+        continue
+      }
+    }
+    return {steps: out, success: false}
+  }
+  return {steps: out, success: true}
+}
+
+pub fn agent_review(harness: Harness, cfg, analysis, run_id) {
+  if cfg.mock {
+    llm_mock_clear()
+    llm_mock(
+      {
+        text: "I will inspect the mocked release evidence.",
+        tool_calls: [
+          {
+            id: "run_1",
+            name: "release_run",
+            arguments: {argv: ["git", "log", "--oneline", "v0.7.52..HEAD", "--max-count=30"]},
+          },
+          {id: "read_1", name: "release_read", arguments: {path: "CHANGELOG.md"}},
+        ],
+      },
+    )
+    const mock_final = {
+      text: "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
+    }
+    llm_mock(mock_final)
+    llm_mock(mock_final)
+    llm_mock(mock_final)
+    llm_mock(mock_final)
+  }
+  const fixup_mode = analysis.fixup_mode ?? false
+  const system = if fixup_mode {
+    render(
+      prompt_asset("release_fixup_system.harn.prompt"),
+      {
+        target_version: analysis.next_version,
+        fixup_tag: analysis.fixup_tag ?? "",
+        fixup_pr_url: analysis.fixup_pr_url ?? "",
+        base_branch: analysis.base_branch,
+      },
+    )
+  } else {
+    render(prompt_asset("release_agent_system.harn.prompt"), {})
+  }
+  const prompt = if fixup_mode {
+    render(
+      prompt_asset("release_fixup_user.harn.prompt"),
+      {
+        analysis_json: json_stringify(compact_agent_analysis(analysis)),
+        target_version: analysis.next_version,
+        fixup_tag: analysis.fixup_tag ?? "",
+        release_branch: analysis.expected_branch,
+        base_branch: analysis.base_branch,
+      },
+    )
+  } else {
+    render(
+      prompt_asset("release_agent_user.harn.prompt"),
+      {analysis_json: json_stringify(compact_agent_analysis(analysis))},
+    )
+  }
+  // Construct repo-scoped tools after the parent pipeline has validated the
+  // checkout. Workflow attempt executors consume these prepared capabilities
+  // instead of re-probing filesystem visibility from their child context.
+  const audit_tools = release_tools(harness, cfg, run_id)
+  // Run the validate->repair-with-feedback loop on harn's canonical
+  // `workflow_run_repair` primitive (inline executor + retry-context feedback)
+  // instead of a hand-rolled while loop. The executor owns each attempt: it
+  // selects the initial vs. repair system/prompt off `ctx.attempt` (threading
+  // the prior attempt's findings via `ctx.prior_findings`/`ctx.prior_text`),
+  // runs the agent, validates, and returns a "failed" branch while findings
+  // remain — which is what drives the primitive's retry up to 3 attempts.
+  const review = agent_review_execute(
+    {
+      task: prompt,
+      max_attempts: 3,
+      run_attempt: { ctx ->
+        const selection = agent_review_attempt_selection(ctx, analysis, system, prompt)
+        run_release_agent_loop(
+          harness,
+          cfg,
+          analysis,
+          selection.system,
+          selection.prompt,
+          run_id,
+          selection.require_tool_evidence,
+          selection.session_suffix,
+          audit_tools,
+        )
+      },
+      validate: { attempt_result, attempt_text -> validate_agent_attempt(cfg, analysis, attempt_result, attempt_text) },
+      make_record: { name, attempt_text, findings, attempt_result -> agent_attempt_record(name, attempt_text, findings, attempt_result) },
+    },
+  )
+  const result = review.final_result
+  const text = review.text
+  const validation_findings = review.validation_findings
+  const attempts = review.attempts
+  const draft_changelog = persist_agent_changelog(harness, run_id, text, analysis.next_version)
+  const artifacts = persist_agent_artifacts(harness, run_id, result, attempts, validation_findings)
+  return {
+    text: text,
+    attempts: attempts,
+    validation_findings: validation_findings,
+    draft_changelog: draft_changelog,
+    artifacts: artifacts,
+  }
+}
+
+fn agent_attempt_record(name, text, validation_findings, result) {
+  return {
+    name: name,
+    text: text,
+    validation_findings: validation_findings,
+    llm: result.llm ?? {},
+    tools: result.tools ?? {},
+    status: result.status ?? "",
+    transcript_context: agent_transcript_context_metadata(result),
+  }
+}

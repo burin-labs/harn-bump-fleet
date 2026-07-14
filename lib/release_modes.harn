@@ -1,0 +1,552 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { checkout_cleanup } from "./checkout_cleanup"
+import {
+  logged_command_step,
+  logged_github_operation_step,
+  logged_live_shell_command_step,
+  maybe_recovery_advice_step,
+  prepare_repair_changed,
+  release_repair_fingerprint,
+  retry_commands_after_agent_repair,
+  retry_prepare_after_agent_repair,
+  run_release_generated_content_checks,
+  run_retry_commands_after_agent_repair,
+} from "./release_agent"
+import { analyze_release } from "./release_analysis"
+import {
+  ensure_release_tag_pushed,
+  maybe_delete_stale_repin_tag,
+  persist_release_watch_receipt,
+  pre_prepare_cutoff_gate,
+  pre_tag_cutoff_gate,
+  release_branch_push_argv,
+  run_pre_tag_binary_size_gate,
+  run_repin_tocttou_recheck,
+  setup_release_branch,
+  target_release_checkout_state,
+} from "./release_checkout"
+import {
+  execution_failed,
+  hook_light_env,
+  last_failed_step,
+  push_hook_budget_exceeded,
+  recorded_step,
+  recovery_step_ref,
+} from "./release_execution"
+import { ensure_release_notes_with_run_id, prepared_release_analysis } from "./release_notes"
+import { execute_fixup_cherry_pick, release_prepare_audit_plan } from "./release_prepare"
+import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
+import {
+  append_command_step,
+  prompt_asset,
+  release_github_open_pr,
+  release_github_pr_create,
+  release_github_pr_edit,
+  release_log_event,
+  release_run_dir,
+  require_live_confirmation,
+  run_cmd,
+} from "./release_runtime"
+import { fail, ok } from "./shell_util"
+
+pub fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run_id) {
+  require_live_confirmation(cfg)
+  release_log_event(
+    harness,
+    run_id,
+    "phase_started",
+    {phase: "prepare", message: "starting release branch setup and prepare"},
+  )
+  let steps = []
+  const initial_target_state = target_release_checkout_state(harness, cfg, analysis)
+  if initial_target_state.matches {
+    steps = steps
+      + [
+      recorded_step(
+        "prepare-already-complete",
+        "prepared release branch already has v${analysis.next_version} release content",
+        ok(
+          "skipped prepare because branch ${initial_target_state.branch}, Cargo version ${initial_target_state.current_version}, and CHANGELOG top v${initial_target_state.changelog_top} already target v${analysis.next_version}",
+        ),
+      ),
+    ]
+    release_log_event(
+      harness,
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
+  }
+  steps = setup_release_branch(harness, cfg, analysis)
+  if execution_failed(steps) {
+    release_log_event(
+      harness,
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  // Fixup: replace `release_ship.sh --prepare` (~110s of Cargo.toml
+  // workspace bumps + generator reruns + pre-commit `cargo check`) with
+  // a cherry-pick of the existing release branch's prepare commits onto
+  // fresh `<base>`. The smart-subtract CHANGELOG writer that runs next
+  // is the source of truth for CHANGELOG.md, so any CHANGELOG hunks the
+  // cherry-pick applied get reset to HEAD here — otherwise smart-subtract
+  // would see `## v$ver` already present and short-circuit, leaving
+  // potentially duplicated bullets between Unreleased and v$ver.
+  if cfg.fixup_mode ?? false {
+    steps = execute_fixup_cherry_pick(harness, cfg, analysis, steps, run_id)
+    if execution_failed(steps) {
+      release_log_event(
+        harness,
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+    }
+    release_log_event(harness, run_id, "step_started", {step: "fixup-reset-changelog"})
+    const reset = append_command_step(
+      harness,
+      cfg,
+      steps,
+      "fixup-reset-changelog",
+      ["git", "checkout", "HEAD", "--", "CHANGELOG.md"],
+    )
+    steps = reset.steps
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "fixup-reset-changelog", success: reset.success, status: reset.status},
+    )
+    if execution_failed(steps) {
+      release_log_event(
+        harness,
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+    }
+  }
+  release_log_event(harness, run_id, "step_started", {step: "ensure-release-notes"})
+  steps = steps + ensure_release_notes_with_run_id(harness, cfg, analysis, agent_review_result, run_id)
+  if execution_failed(steps) {
+    release_log_event(
+      harness,
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  if cfg.fixup_mode ?? false {
+    release_log_event(harness, run_id, "phase_finished", {phase: "prepare", success: true})
+    return steps
+  }
+  const target_state = target_release_checkout_state(harness, cfg, analysis)
+  if target_state.matches {
+    steps = steps
+      + [
+      recorded_step(
+        "prepare-already-complete",
+        "prepared release branch already has v${analysis.next_version} release content",
+        ok(
+          "skipped prepare because branch ${target_state.branch}, Cargo version ${target_state.current_version}, and CHANGELOG top v${target_state.changelog_top} already target v${analysis.next_version}",
+        ),
+      ),
+    ]
+    release_log_event(
+      harness,
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
+  }
+  const audit_plan = release_prepare_audit_plan(harness, cfg, steps, run_id)
+  steps = audit_plan.steps
+  const prepare = logged_live_shell_command_step(harness, cfg, steps, "prepare", audit_plan.command, run_id)
+  steps = prepare.steps
+  if execution_failed(steps) {
+    release_log_event(
+      harness,
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  release_log_event(harness, run_id, "phase_finished", {phase: "prepare", success: true})
+  return steps
+}
+
+/**
+ * Run the repin TOCTTOU re-check and return refreshed (cfg, analysis,
+ * prelude_steps). Returns `failed_steps != nil` when the operator must
+ * abort; otherwise mutates pin SHA in cfg/analysis to the freshly-locked
+ * value.
+ */
+fn repin_prelude(harness: Harness, cfg, analysis, run_id) {
+  if !(cfg.repin_mode ?? false) {
+    return {cfg: cfg, analysis: analysis, steps: [], failed_steps: nil}
+  }
+  release_log_event(harness, run_id, "step_started", {step: "repin-tocttou-recheck"})
+  const recheck = run_repin_tocttou_recheck(cfg, analysis)
+  if !recheck.success {
+    release_log_event(
+      harness,
+      run_id,
+      "step_finished",
+      {step: "repin-tocttou-recheck", success: false, message: recheck.message},
+    )
+    return {
+      cfg: cfg,
+      analysis: analysis,
+      steps: [],
+      failed_steps: [
+        recorded_step(
+          "repin-tocttou-recheck",
+          "repin TOCTTOU re-check before branch reset",
+          fail(2, recheck.message),
+        ),
+      ],
+    }
+  }
+  const old_pin = cfg.pin_sha
+  const msg = if recheck.new_pin_sha == old_pin {
+    "repin: TOCTTOU re-check passed; pin unchanged at ${recheck.new_pin_sha}\n"
+  } else {
+    "repin: TOCTTOU re-check passed; pin advanced from ${old_pin} to ${recheck.new_pin_sha}\n"
+  }
+  release_log_event(
+    harness,
+    run_id,
+    "step_finished",
+    {step: "repin-tocttou-recheck", success: true, new_pin: recheck.new_pin_sha},
+  )
+  return {
+    cfg: {...cfg, pin_sha: recheck.new_pin_sha},
+    analysis: {...analysis, pin_sha: recheck.new_pin_sha},
+    steps: [recorded_step("repin-tocttou-recheck", "repin TOCTTOU re-check before branch reset", ok(msg))],
+    failed_steps: nil,
+  }
+}
+
+@complexity(allow)
+pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result, run_id) {
+  require_live_confirmation(raw_cfg)
+  // Repin mode advances the pin to fresh `origin/<base>` HEAD. The TOCTTOU
+  // re-check (re-fetch origin, re-probe release+tag, re-resolve pin) runs
+  // once here so the locked pin propagates into setup_release_branch and
+  // the re-analysis after prepare. Abort cleanly if anything moved.
+  const pre = repin_prelude(harness, raw_cfg, raw_analysis, run_id)
+  if pre.failed_steps != nil {
+    return pre.failed_steps
+  }
+  const cfg = pre.cfg
+  const analysis = pre.analysis
+  let steps = pre.steps
+  const pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
+  steps = pre_prepare_gate.steps
+  if !pre_prepare_gate.proceed {
+    return steps
+  }
+  steps = steps + execute_prepare(harness, cfg, analysis, agent_review_result, run_id)
+  if execution_failed(steps) {
+    return steps
+  }
+  const validation_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const validation = run_release_generated_content_checks(harness, cfg, validation_analysis, steps, run_id)
+  steps = validation.steps
+  if !validation.success {
+    return steps
+  }
+  const post_prepare_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const version = post_prepare_analysis.next_version
+  const branch = "release/v${version}"
+  // The release gate, generated-content checks, and markdown lint have already
+  // produced stronger evidence than the target repo's expensive local-build
+  // hook path. Keep hooks enabled, but ask harn-side hooks to skip duplicated
+  // local builds for the canonical generated release push.
+  const push_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
+  let commands = []
+  let committed_release_content = false
+  if trim(post_prepare_analysis.status ?? "") == ""
+    && trim(post_prepare_analysis.diff_names ?? "") != ""
+    && post_prepare_analysis.branch == branch {
+    committed_release_content = true
+    steps = steps
+      + [
+      recorded_step(
+        "commit-already-complete",
+        "release branch already has v${version} commit content",
+        ok(
+          "skipped commit because the working tree is clean and ${branch} already differs from pin ${cfg.pin_sha}",
+        ),
+      ),
+    ]
+  } else {
+    commands = commands + [{name: "stage-tracked-release-content", argv: ["git", "add", "-u"]}]
+    // The release gate has already run the expensive audit, generated-content
+    // checks, and markdown lint before this canonical generated commit. Keep
+    // hooks enabled, but skip duplicated harn-side local builds.
+    commands = commands
+      + [
+      {
+        name: "commit",
+        argv: {argv: ["git", "commit", "-m", "Release v${version}"], env: hook_light_env()},
+      },
+    ]
+  }
+  commands = commands
+    + [
+    {
+      name: "verify-release-commit-signature",
+      argv: [
+        "sh",
+        "-c",
+        "sig=$(git log -1 --format=%G? HEAD); case \"$sig\" in N|B) echo \"release commit signature is not valid (%G?=$sig); configure commit signing or amend the release commit before publishing\" >&2; exit 1;; *) echo \"release commit signature state: $sig\";; esac",
+      ],
+    },
+  ]
+  // No `git rebase` here — pinning the release branch's parent is the
+  // whole point of `cfg.pin_sha`. Rebasing onto origin/<base> would fold
+  // commits that landed on main after this run started into the release.
+  // We still fetch tags so the upcoming tag step sees existing remote tags.
+  commands = commands + [{name: "fetch-base", argv: ["git", "fetch", "origin", "--tags", cfg.base]}]
+  // Fixup mode: the originally-shipped release commit (the v$tag target)
+  // is an ancestor of the published tag but NOT of fresh `<base>`, because
+  // the original Release PR never merged. The harn-side
+  // `verify_release_metadata.py` audit refuses to run when Cargo.toml
+  // claims version X but HEAD doesn't include the X tag's commit, since
+  // that means the tagged tree and the about-to-be-merged tree disagree.
+  // Merge the tag with `-s ours` to bring it into HEAD's ancestry without
+  // changing the tree — the harness has already laid down the
+  // canonically-shipped CHANGELOG body and version bump on top of fresh
+  // main, and that's the tree we want the fixup PR to land. The merge
+  // commit gives the audit a path from HEAD back to the tag, so the
+  // ancestry check passes; on squash-merge the merge commit is collapsed
+  // away and main ends up with a single commit applying the bump.
+  // Only ours-merge when the tag actually exists on origin (cfg.skip_tag
+  // implies the tag is already pushed and shipped). When fixup_mode is on
+  // because the PR exists but the tag was never pushed, there is no
+  // shipped tag to merge in.
+  if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false) && trim(cfg.fixup_tag ?? "") != "" {
+    commands = commands
+      + [
+      {
+        name: "merge-shipped-tag-ours",
+        argv: [
+          "git",
+          "merge",
+          "--no-ff",
+          "-s",
+          "ours",
+          cfg.fixup_tag,
+          "-m",
+          "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
+        ],
+      },
+    ]
+  }
+  commands = commands + [{name: "push", argv: push_argv}]
+  for step in commands {
+    const result = logged_command_step(harness, cfg, steps, step.name, step.argv, run_id)
+    steps = result.steps
+    if !result.success {
+      const failed_step = steps[len(steps) - 1]
+      if step.name == "push" {
+        steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
+        if push_hook_budget_exceeded(failed_step.command, failed_step) {
+          const retry_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
+          const push_retry = append_command_step(harness, cfg, steps, "push-hook-light-after-green-hook-budget", retry_argv)
+          steps = push_retry.steps
+          if push_retry.success {
+            continue
+          }
+        }
+      } else {
+        steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
+        const retry_commands = retry_commands_after_agent_repair(step)
+        if len(retry_commands) > 0 {
+          const repair_retry = run_retry_commands_after_agent_repair(harness, cfg, steps, retry_commands, run_id)
+          steps = repair_retry.steps
+          if repair_retry.success {
+            continue
+          }
+        }
+      }
+      return steps
+    }
+  }
+  const delete_outcome = maybe_delete_stale_repin_tag(harness, cfg, version, steps, run_id)
+  steps = delete_outcome.steps
+  if !delete_outcome.success {
+    return steps
+  }
+  // The tag below fires publish-release.yml from the frozen cutoff. Prove that
+  // cutoff remains in base ancestry; commits that landed later ship next time.
+  const cutoff_gate = pre_tag_cutoff_gate(harness, cfg, version, steps, run_id)
+  steps = cutoff_gate.steps
+  if !cutoff_gate.proceed {
+    return steps
+  }
+  // The release branch is now durable and still names the intended commit.
+  // Exercise Harn's real Linux release build + size ratchet without publishing
+  // anything, and block signed tag creation unless that exact SHA is green.
+  if !(cfg.skip_tag ?? false) {
+    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, branch, steps, run_id)
+    steps = binary_gate.steps
+    if !binary_gate.success {
+      return steps
+    }
+  }
+  // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
+  // fires on this tag push and ships crates.io + the GitHub release
+  // from the pinned commit; the PR that follows is paperwork (lands the
+  // Cargo.toml/CHANGELOG bump on main) and doesn't influence what was
+  // shipped. If the tag push fails, abort early so we don't open a PR
+  // for a release that hasn't been published.
+  steps = ensure_release_tag_pushed(harness, cfg, version, steps, run_id)
+  if execution_failed(steps) {
+    return steps
+  }
+  const body_path = write_pr_body(harness, run_id, post_prepare_analysis, agent_review_result, steps)
+  const existing_pr = logged_github_operation_step(
+    harness,
+    steps,
+    "find-existing-pr",
+    "find open release PR for " + branch,
+    run_id,
+    fn() {
+      const pr = release_github_open_pr(cfg, branch)
+      return {found: pr != nil, pull_request: pr}
+    },
+  )
+  steps = existing_pr.steps
+  if !existing_pr.success {
+    return steps
+  }
+  let pr_url = if existing_pr.value.found {
+    existing_pr.value.pull_request.url
+  } else {
+    ""
+  }
+  const body = harness.fs.read_text(body_path)
+  if pr_url == "" {
+    const created = logged_github_operation_step(
+      harness,
+      steps,
+      "create-pr",
+      "create Release v${version} PR from " + branch,
+      run_id,
+      fn() { return release_github_pr_create(cfg, "Release v${version}", branch, cfg.base, body) },
+    )
+    steps = created.steps
+    if !created.success {
+      return steps
+    }
+    pr_url = created.value.url
+  } else {
+    const edited = logged_github_operation_step(
+      harness,
+      steps,
+      "refresh-existing-pr-body",
+      "refresh Release v${version} PR metadata",
+      run_id,
+      fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: body}) },
+    )
+    steps = edited.steps
+    if !edited.success {
+      return steps
+    }
+  }
+  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id)
+  steps = merge_handoff.steps
+  if !merge_handoff.success {
+    return steps
+  }
+  const final_body_path = write_pr_body(harness, run_id, post_prepare_analysis, agent_review_result, steps)
+  const final_body = harness.fs.read_text(final_body_path)
+  const final_edit = logged_github_operation_step(
+    harness,
+    steps,
+    "refresh-pr-body-final",
+    "write final Release v${version} PR receipt",
+    run_id,
+    fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: final_body}) },
+  )
+  steps = final_edit.steps
+  if !final_edit.success {
+    return steps
+  }
+  // Tag + branch + PR are durable. Persist the independent monitor handoff and
+  // return immediately; `watch_harn_release.harn` resumes from this receipt.
+  return persist_release_watch_receipt(harness, cfg, version, steps, run_id, pr_url)
+}
+
+fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
+  const failed = last_failed_step(steps)
+  if failed == nil {
+    return steps
+  }
+  const before_repair = release_repair_fingerprint(cfg)
+  const recovered = maybe_recovery_advice_step(harness, cfg, analysis, steps, failed, run_id)
+  if cfg.agent && failed.name == "prepare" {
+    const after_repair = release_repair_fingerprint(cfg)
+    if prepare_repair_changed(before_repair, after_repair) {
+      return retry_prepare_after_agent_repair(harness, cfg, recovered, failed, run_id)
+    }
+    harness.stdio
+      .println(
+      "   → prepare retry skipped: recovery diagnosis made no tracked release-diff change",
+    )
+  }
+  return recovered
+}
+
+pub fn restore_release_checkout_to_base(harness: Harness, cfg, execution, run_id) {
+  if cfg.mock || cfg.mode != "ship-pr" || execution_failed(execution) {
+    return nil
+  }
+  release_log_event(harness, run_id, "checkout_cleanup_started", {repo: cfg.repo, base: cfg.base})
+  const runner = if cfg.mock {
+    { command -> run_cmd(cfg, command) }
+  } else {
+    nil
+  }
+  const cleanup = checkout_cleanup(runner, cfg.base, cfg.repo)
+  release_log_event(
+    harness,
+    run_id,
+    "checkout_cleanup_finished",
+    {
+      repo: cfg.repo,
+      base: cfg.base,
+      success: cleanup.success,
+      skipped: cleanup.skipped,
+      branch: cleanup.branch,
+      detail: cleanup.detail,
+      warning: cleanup.warning ?? "",
+      fatal: cleanup.fatal ?? false,
+    },
+  )
+  return cleanup
+}
+
+pub fn write_report(harness: Harness, run_id, payload) {
+  const out_dir = release_run_dir(run_id)
+  harness.fs.mkdir(out_dir, true)
+  const body = json_stringify(payload)
+  const json_path = path_join(out_dir, "release-audit.json")
+  harness.fs.write_text(json_path, body + "\n")
+  const md_payload = {...payload, audit_sha: sha3_256(body)[0:16]}
+  const md = render(prompt_asset("release_report.harn.prompt"), md_payload)
+  const md_path = path_join(out_dir, "release-audit.md")
+  harness.fs.write_text(md_path, md)
+  return {json_path: json_path, md_path: md_path}
+}

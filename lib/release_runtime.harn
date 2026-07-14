@@ -1,0 +1,880 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { parse_args } from "std/cli"
+import { env_bool, env_str } from "std/config"
+import { GitRemoteRef, git_ls_remote, git_run } from "std/git"
+import { end_timing, start_timing } from "std/timing"
+import {
+  github_enable_auto_merge,
+  github_pr_create,
+  github_pr_edit,
+  github_pr_files,
+  github_pr_list,
+  github_pr_mergeability,
+  github_pr_view,
+  github_release_at_tag,
+} from "./github"
+import { planner_defaults } from "./llm_defaults"
+import { append_std_command_step, resolve_release_cargo_target_dir } from "./release_commands"
+import { execution_failed, mock_release_tag_command, recorded_step } from "./release_execution"
+import { require_release_repo_path } from "./release_repo_guard"
+import { latest_semver_tag_from_remote_refs } from "./semver"
+import { fail, ok } from "./shell_util"
+
+const DEFAULT_REPO = path_join(env_str("HOME") ?? "", "projects/harn")
+
+const DEFAULT_BASE = env_str("HARN_RELEASE_BASE") ?? "main"
+
+// Defaults route through `lib/llm_defaults::planner_defaults` so the
+// cloud/local cell decision (and `HARN_RELEASE_*` env overrides) live in
+// one place across every harness in this repo. See `lib/llm_defaults` for
+// the empirical-best planner/binder pair (PR burin-labs/harn#1814).
+pub const DEFAULT_PLANNER = planner_defaults("HARN_RELEASE")
+
+const DEFAULT_MODEL = DEFAULT_PLANNER.model
+
+const DEFAULT_PROVIDER = DEFAULT_PLANNER.provider
+
+const _ = "claude-sonnet-4-7"
+
+const RUN_ROOT = ".harn-runs/release-harn"
+
+type ReleaseGitRemoteObservation = {
+  success: bool,
+  status: int,
+  refs: list<GitRemoteRef>,
+  receipt: dict?,
+  stderr: string,
+}
+
+/**
+ * Resolve the checkout root that owns this release harness. `harn run
+ * /abs/path/release_harn.harn` may be launched from another repo, so this must
+ * not depend on the process cwd.
+ */
+pub fn release_harness_root() {
+  const root = runtime_paths().asset_root
+  const leaf = basename(root)
+  if leaf == "lib" || leaf == "tests" {
+    return dirname(root)
+  }
+  return root
+}
+
+pub fn release_run_root() {
+  return path_join(release_harness_root(), RUN_ROOT)
+}
+
+pub fn release_run_dir(run_id) {
+  return path_join(release_run_root(), run_id)
+}
+
+pub fn prompt_asset(name) {
+  return path_join(release_harness_root(), "prompts", name)
+}
+
+pub fn release_cli_help_requested(parsed) {
+  return (parsed._help ?? false) || (parsed.help ?? false)
+}
+
+fn timing_status(success) {
+  return if success {
+    "ok"
+  } else {
+    "error"
+  }
+}
+
+pub fn finish_release_run_timing(handle, outcome, success) {
+  return end_timing(handle, {status: timing_status(success), outcome: outcome})
+}
+
+pub fn timed_release_steps(name, attrs, callback) {
+  const handle = start_timing(name, attrs)
+  try {
+    const steps = callback()
+    const failed = execution_failed(steps)
+    end_timing(
+      handle,
+      {
+        status: timing_status(!failed),
+        outcome: if failed {
+          "failed"
+        } else {
+          "ok"
+        },
+        step_count: len(steps ?? []),
+      },
+    )
+    return steps
+  } catch (e) {
+    end_timing(handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
+// Mock-mode placeholder for the pinned base SHA. 40 hex chars so it
+// looks like a real commit SHA in audit reports, fixtures, and tests.
+const MOCK_PIN_SHA = "abcdef1234567890abcdef1234567890abcdef12"
+
+const _ = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "branch"],
+  ["git", "rev-parse"],
+  ["git", "diff-tree"],
+  ["git", "ls-files"],
+  ["git", "describe"],
+  ["git", "tag"],
+  ["git", "verify-tag"],
+  ["gh", "pr", "list"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "list"],
+  ["gh", "run", "view"],
+  ["gh", "workflow", "list"],
+  ["gh", "workflow", "view"],
+  ["gh", "release", "list"],
+  ["gh", "release", "view"],
+  ["make", "lint-md"],
+  ["make", "-s", "lint-md"],
+  ["npx", "markdownlint-cli2"],
+  ["rg"],
+  ["grep"],
+  ["sed", "-n"],
+  ["head"],
+  ["cat"],
+  ["ls"],
+  ["test"],
+]
+
+pub fn usage() {
+  return """
+Usage:
+  harn run --no-sandbox release_harn.harn
+  harn run --no-sandbox release_harn.harn -- --agent
+  harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+  harn run --no-sandbox release_harn.harn -- --repo ~/projects/harn --mode prepare --yes-live-release
+
+Modes:
+  audit    Inspect release readiness and write an audit report. Default.
+  prepare  Run ./scripts/release_ship.sh --prepare --bump <type>.
+  ship-pr  Prepare, commit, push, tag, open Release vX.Y.Z PR, and enable
+           auto-merge. Auto-detects an existing open release/v$next PR and
+           switches to repair mode: recovers the original pin via
+           `git merge-base`, recreates the branch on fresh `<base>`,
+           re-derives v$next from pin-time `## Unreleased` (preserving
+           any post-pin drift on the current Unreleased), skips audit /
+           dry-run / re-tagging when those gates already passed, and
+           force-pushes.
+
+Flags:
+  --repo PATH             Harn repo path. Defaults to ~/projects/harn.
+  --base BRANCH           Base branch for the release PR. Defaults to main.
+  --bump patch|minor|major  Version bump type. Defaults to patch.
+  --mode audit|prepare|ship-pr
+  --at-sha SHA            Pin the release to a concrete commit on `--base` (default:
+                          `origin/<base>` HEAD at startup). Locks the release branch's
+                          parent so commits that land on the base afterward cannot
+                          slip into the published artifact.
+  --repin-latest          Advance an existing open release/v$next PR's pin to current
+                          `origin/<base>` HEAD so commits that landed after the
+                          original pin fold into the same release. Requires
+                          `--mode ship-pr --yes-live-release`; refuses if the
+                          v$next release already shipped (crates.io is immutable).
+                          Re-runs audit + dry-run + bump and re-tags at the new pin.
+  --allow-base-drift      Ship the frozen pin even when its ancestry against
+                          `origin/<base>` cannot be proved (dangerous override).
+  --local-audit           Disable merge-group receipt reuse and run the complete local audit.
+                          Also HARN_RELEASE_LOCAL_AUDIT=1.
+  --agent                 Ask the configured planner to review release evidence with read/search/run tools.
+                          Live prepare/ship-pr requires --agent unless CHANGELOG.md
+                          already starts with the target version.
+  --model MODEL           Model id for --agent. Defaults through HARN_RELEASE_*, shared planner env,
+                          then lib/llm_defaults' cloud cell (OpenRouter qwen/qwen3.6-35b-a3b).
+  --provider PROVIDER     LLM provider for --agent. Uses the same default cascade.
+  --mock                  Use fake command/file tools for a v0.7.52 -> v0.7.53 release rehearsal.
+  --bootstrap-new-crates  First release that adds a workspace crate depended on by published crates.
+  --focus TEXT            Operator context the model must consider while compiling release notes.
+  --yes-live-release      Required for live prepare/ship-pr modes.
+
+Release ownership:
+  Live prepare/ship-pr runs write ~/.burin/release-owners/harn-release-owner.json
+  immediately after pin resolution and refuse to proceed when another active
+  owner is recorded. The owner record is refreshed with the discovered version
+  after release analysis. Use HARN_RELEASE_OWNER_TAKEOVER=1 only after confirming
+  the recorded run is stale in the coordination log. HARN_RELEASE_OWNER_TTL_SECONDS
+  controls stale-owner replacement (default 12h), and HARN_RELEASE_OWNER_PATH may
+  override the guard file path.
+
+Chat (interactive postmortem / pre-release review):
+  Defaults to ON whenever stdin is a controlling terminal (/dev/tty
+  reachable) and the HARN_CHAT env var is not 0. CI never enters chat
+  because /dev/tty is unreachable from a piped/non-TTY context.
+
+  --no-chat               Hard kill switch; skip every chat hook even on a TTY.
+  --chat-only             Skip the release pipeline entirely; open the chat
+                          loop over a prior run. Use --chat-run to pick one;
+                          omit it for a carousel of recent runs.
+  --chat-run RUN_ID|DIR   Preselect the run to discuss. Accepts a bare uuid
+                          (resolved under .harn-runs/release-harn/), an
+                          absolute path to a run dir, or a path to a
+                          release-audit.json.
+  --chat-timeout-s N      Start-typing timeout in seconds before the chat
+                          ends automatically. Defaults to 60.
+"""
+}
+
+const RELEASE_ARG_SPEC = [
+  {kind: "option", name: "repo", flags: ["--repo"], default: DEFAULT_REPO},
+  {kind: "option", name: "base", flags: ["--base"], default: DEFAULT_BASE},
+  {kind: "option", name: "bump", flags: ["--bump"], default: "patch"},
+  {kind: "option", name: "mode", flags: ["--mode"], default: "audit"},
+  {kind: "flag", name: "agent", flags: ["--agent"]},
+  {kind: "option", name: "model", flags: ["--model"], default: DEFAULT_MODEL},
+  {kind: "option", name: "provider", flags: ["--provider"], default: DEFAULT_PROVIDER},
+  {kind: "flag", name: "mock", flags: ["--mock"]},
+  {kind: "flag", name: "help", flags: ["--help", "-h"]},
+  {kind: "flag", name: "bootstrap_new_crates", flags: ["--bootstrap-new-crates"]},
+  {kind: "option", name: "release_focus", flags: ["--focus"], default: ""},
+  {kind: "flag", name: "yes_live_release", flags: ["--yes-live-release"]},
+  {kind: "option", name: "pin_sha_input", flags: ["--at-sha"], default: ""},
+  {kind: "flag", name: "repin_latest", flags: ["--repin-latest"]},
+  {kind: "flag", name: "allow_base_drift", flags: ["--allow-base-drift"]},
+  {kind: "flag", name: "local_audit", flags: ["--local-audit"]},
+  {kind: "flag", name: "self_update", flags: ["--self-update"]},
+  {kind: "flag", name: "wait_build_lock", flags: ["--wait"]},
+  {kind: "flag", name: "no_chat", flags: ["--no-chat"]},
+  {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
+  {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
+  {kind: "option", name: "chat_timeout_s", flags: ["--chat-timeout-s"], default: "60"},
+]
+
+pub fn parse_release_args(harness: Harness, args) {
+  const parsed = parse_args(args, RELEASE_ARG_SPEC)
+  if len(parsed._extras) > 0 {
+    throw "unknown arg: " + parsed._extras[0]
+  }
+  if len(parsed._errors) > 0 {
+    throw join(parsed._errors, "; ")
+  }
+  const bootstrap = parsed.bootstrap_new_crates || env_bool("HARN_RELEASE_BOOTSTRAP_NEW_CRATES", false)
+  const release_focus = if parsed.release_focus != "" {
+    parsed.release_focus
+  } else {
+    env_str("HARN_RELEASE_FOCUS") ?? ""
+  }
+  const pin_sha_input = if parsed.pin_sha_input != "" {
+    parsed.pin_sha_input
+  } else {
+    env_str("HARN_RELEASE_PIN_SHA") ?? ""
+  }
+  const release_cargo_target_dir = resolve_release_cargo_target_dir(
+    env_str("HARN_RELEASE_CARGO_TARGET_DIR") ?? "",
+    env_str("HOME") ?? "",
+    env_str("XDG_CACHE_HOME") ?? "",
+  )
+  const cfg = {
+    repo: expand_home(harness, parsed.repo),
+    base: parsed.base,
+    bump: parsed.bump,
+    mode: parsed.mode,
+    agent: parsed.agent,
+    model: parsed.model,
+    provider: parsed.provider,
+    mock: parsed.mock,
+    help: release_cli_help_requested(parsed),
+    bootstrap_new_crates: bootstrap,
+    release_cargo_target_dir: release_cargo_target_dir,
+    release_focus: release_focus,
+    yes_live_release: parsed.yes_live_release,
+    pin_sha_input: pin_sha_input,
+    pin_sha: "",
+    planner_source: DEFAULT_PLANNER.source,
+    planner_preflight: nil,
+    fixup_mode: false,
+    skip_tag: false,
+    fixup_tag: "",
+    fixup_pr_url: "",
+    fixup_pin_unreleased: "",
+    fixup_release_body_source: "",
+    repin_latest: parsed.repin_latest,
+    allow_base_drift: parsed.allow_base_drift,
+    local_audit: parsed.local_audit || env_bool("HARN_RELEASE_LOCAL_AUDIT", false),
+    repin_mode: false,
+    repin_tag: "",
+    repin_pr_url: "",
+    repin_initial_remote_tag_sha: "",
+    no_chat: parsed.no_chat,
+    chat_only: parsed.chat_only,
+    chat_run: parsed.chat_run,
+    chat_timeout_s: to_int(parsed.chat_timeout_s) ?? 60,
+    self_update: parsed.self_update || env_bool("FLEET_SELF_UPDATE", false),
+    wait_build_lock: parsed.wait_build_lock || env_bool("HARN_RELEASE_WAIT_BUILD_LOCK", false),
+  }
+  if cfg.help {
+    return cfg
+  }
+  if !(cfg.bump == "patch" || cfg.bump == "minor" || cfg.bump == "major") {
+    throw "--bump must be patch, minor, or major"
+  }
+  if !(cfg.mode == "audit" || cfg.mode == "prepare" || cfg.mode == "ship-pr") {
+    throw "--mode must be audit, prepare, or ship-pr"
+  }
+  if cfg.repin_latest && cfg.mode != "ship-pr" {
+    throw "--repin-latest requires --mode ship-pr"
+  }
+  if cfg.repin_latest && !cfg.yes_live_release && !cfg.mock {
+    throw "--repin-latest requires --yes-live-release"
+  }
+  if cfg.repin_latest && trim(cfg.pin_sha_input ?? "") != "" {
+    throw "--repin-latest and --at-sha are mutually exclusive: --repin-latest advances the pin to origin/<base>"
+  }
+  return cfg
+}
+
+pub fn expand_home(harness: Harness, path) {
+  if path == "~" {
+    return harness.env.get_or("HOME", "")
+  }
+  if starts_with(path, "~/") {
+    return harness.env.get_or("HOME", "") + path[1:len(path)]
+  }
+  return path
+}
+
+/**
+ * Resolve `cfg.pin_sha_input` (or `origin/<base>` when no input is given)
+ * to a concrete 40-char commit SHA. Frozen here so every downstream step
+ * — branch creation, audit ranges, PR body, tag push — uses the same
+ * commit even if `origin/<base>` advances mid-run.
+ */
+pub fn resolve_pin_sha(cfg) {
+  if cfg.mock {
+    if cfg.pin_sha_input != "" {
+      return cfg.pin_sha_input
+    }
+    return MOCK_PIN_SHA
+  }
+  if cfg.pin_sha_input != "" {
+    const raw = trim(cfg.pin_sha_input)
+    const r = git_run(["rev-parse", "--verify", raw + "^{commit}"], {repo: cfg.repo})
+    if !r.success {
+      throw "--at-sha did not resolve to a commit: ${raw}\n${trim(r.stderr)}"
+    }
+    return trim(r.stdout)
+  }
+  // For modes that mutate (prepare/ship-pr with --yes-live-release),
+  // refresh origin first so the pin reflects the latest base. Audit
+  // mode stays read-only and uses whatever is already cached locally.
+  if cfg.mode != "audit" || cfg.yes_live_release {
+    const f = git_run(["fetch", "origin", "--prune", "--quiet"], {repo: cfg.repo})
+    if !f.success {
+      throw "failed to fetch origin before pinning the release SHA:\n${trim(f.stderr)}"
+    }
+  }
+  const r = git_run(["rev-parse", "--verify", "origin/${cfg.base}^{commit}"], {repo: cfg.repo})
+  if !r.success {
+    throw "failed to resolve origin/${cfg.base}:\n${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
+}
+
+pub fn run_cmd(cfg, command) {
+  if cfg.mock {
+    return fake_command(command, cfg)
+  }
+  return shell_at(cfg.repo, command)
+}
+
+/** Build a shell-equivalent label string from an argv list. */
+pub fn argv_label(argv) {
+  return join(argv.map({ a -> to_string(a) }), " ")
+}
+
+/**
+ * Run a local git command in argv form, scoped to `cfg.repo`.
+ *
+ * Routes through `fake_command` in mock mode so the legacy substring-keyed
+ * mock fixtures continue to match; otherwise dispatches to `std/git`
+ * `git_run`, which executes argv without shell quoting and strips ambient
+ * GIT_* env.
+ */
+pub fn run_git(cfg, args, options = {}) {
+  if cfg.mock {
+    return fake_command(argv_label(["git"] + args), cfg, options.env)
+  }
+  return git_run(args, options + {repo: cfg.repo})
+}
+
+pub fn release_git_remote_refs(cfg, refs: list<string>, tags: bool = false) -> ReleaseGitRemoteObservation {
+  if cfg.mock {
+    const mock_refs: list<GitRemoteRef> = if refs.contains("refs/tags/v*") {
+      [
+        {
+          oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          ref: "refs/tags/v0.7.51",
+          name: "refs/tags/v0.7.51",
+          peeled: false,
+        },
+        {
+          oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          ref: "refs/tags/v0.7.52",
+          name: "refs/tags/v0.7.52",
+          peeled: false,
+        },
+      ]
+    } else {
+      []
+    }
+    return {success: true, status: 0, refs: mock_refs, receipt: nil, stderr: ""}
+  }
+  const observed = git_ls_remote("origin", {repo: cfg.repo, refs: refs, tags: tags})
+  return {
+    success: observed.success,
+    status: observed.exit_code,
+    refs: observed.data.refs,
+    receipt: observed,
+    stderr: observed.stderr.inline,
+  }
+}
+
+pub fn recorded_remote_refs_step(name: string, label: string, observed: ReleaseGitRemoteObservation) {
+  const result = if observed.success {
+    ok("")
+  } else {
+    fail(observed.status, observed.stderr)
+  }
+  return {...recorded_step(name, label, result), git_receipt: observed.receipt, remote_refs: observed.refs}
+}
+
+/** Run a local git command, throwing on failure and returning trimmed stdout. */
+pub fn checked_git(cfg, args, options = {}) {
+  const r = run_git(cfg, args, options)
+  if !r.success {
+    throw "git command failed (${r.status}): " + argv_label(["git"] + args) + "\n${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
+}
+
+/** Boolean probe over a local git command. */
+pub fn probe_git_ok(cfg, args, options = {}) {
+  return run_git(cfg, args, options).success
+}
+
+fn github_slug_from_remote_url(url) {
+  const cleaned = regex_replace("[.]git$", "", trim(url ?? ""))
+  const matches = regex_captures("github[.]com[:/]([^/]+/[^/]+)$", cleaned)
+  if len(matches) == 0 {
+    return ""
+  }
+  return matches[0].groups[0]
+}
+
+fn mock_release_pr(number = 999, branch = "release/v0.7.53") {
+  return {
+    repo: "burin-labs/harn",
+    number: number,
+    title: "Release v0.7.53",
+    body: "Mock PR body describing the one-PR release handoff.",
+    url: "https://github.com/burin-labs/harn/pull/${number}",
+    state: "open",
+    github_state: "open",
+    draft: false,
+    merged: false,
+    mergeable: true,
+    mergeable_state: "clean",
+    base: {ref: "main", sha: MOCK_PIN_SHA, repo: "burin-labs/harn", owner: "burin-labs"},
+    head: {ref: branch, sha: MOCK_PIN_SHA, repo: "burin-labs/harn", owner: "burin-labs"},
+    labels: [],
+    auto_merge_armed: false,
+    in_merge_queue: false,
+  }
+}
+
+pub fn release_github_pr_list(cfg, filters) {
+  if cfg.mock {
+    return if filters?.state == "merged" {
+      [
+        mock_release_pr(998)
+          + {
+          state: "merged",
+          github_state: "closed",
+          merged: true,
+          merged_at: "2026-05-03T00:00:00Z",
+          merge_commit_oid: MOCK_PIN_SHA,
+        },
+      ]
+    } else {
+      []
+    }
+  }
+  const result = github_pr_list(release_repo_slug(cfg), filters)
+  if is_err(result) {
+    throw "GitHub PR list failed: " + to_string(unwrap_err(result))
+  }
+  return result
+}
+
+pub fn release_github_open_pr(cfg, branch) {
+  const prs = release_github_pr_list(cfg, {base: cfg.base, head: branch, state: "open", limit: 1})
+  return if len(prs) == 0 {
+    nil
+  } else {
+    prs[0]
+  }
+}
+
+pub fn release_github_pr_view(cfg, pr_ref) {
+  if cfg.mock {
+    return mock_release_pr(to_int(pr_ref) ?? 999)
+  }
+  const result = github_pr_view(release_repo_slug(cfg), pr_ref)
+  if is_err(result) {
+    throw "GitHub PR view failed: " + to_string(unwrap_err(result))
+  }
+  return result
+}
+
+pub fn release_github_pr_files(cfg, pr_ref) {
+  if cfg.mock {
+    return {
+      pull_number: to_int(pr_ref) ?? 999,
+      files: [{filename: "CHANGELOG.md"}, {filename: "scripts/release_ship.sh"}],
+    }
+  }
+  const result = github_pr_files(release_repo_slug(cfg), pr_ref)
+  if is_err(result) {
+    throw "GitHub PR files failed: " + to_string(unwrap_err(result))
+  }
+  return result
+}
+
+pub fn release_github_pr_create(cfg, title, head, base, body) {
+  if cfg.mock {
+    return mock_release_pr(999, head) + {title: title, body: body, created: true}
+  }
+  return github_pr_create(release_repo_slug(cfg), title, head, base, body)
+}
+
+pub fn release_github_pr_edit(cfg, pr_ref, edits) {
+  if cfg.mock {
+    return mock_release_pr(to_int(pr_ref) ?? 999) + edits + {ok: true, updated: true}
+  }
+  return github_pr_edit(release_repo_slug(cfg), pr_ref, edits)
+}
+
+pub fn release_github_release(cfg, tag) {
+  if cfg.mock {
+    return {repo: "burin-labs/harn", tag: tag, state: "absent", found: false, release: nil}
+  }
+  return github_release_at_tag(release_repo_slug(cfg), tag)
+}
+
+pub fn release_github_mergeability(cfg, pr_ref) {
+  if cfg.mock {
+    return {mergeable: true, mergeable_state: "clean", is_conflict: false}
+  }
+  return github_pr_mergeability(release_repo_slug(cfg), pr_ref)
+}
+
+pub fn release_github_enable_auto_merge(cfg, pr) {
+  if cfg.mock {
+    return {state: "enabled", expected_head_oid: pr.head.sha, observed_head_oid: pr.head.sha}
+  }
+  return github_enable_auto_merge(release_repo_slug(cfg), pr.number, pr.head.sha, "squash")
+}
+
+pub fn read_repo_file(harness: Harness, cfg, path) {
+  if cfg.mock {
+    return fake_file(path)
+  }
+  require_release_repo_path(harness, cfg, "reading repo file " + path)
+  const full = path_join(cfg.repo, path)
+  if !harness.fs.exists(full) {
+    return ""
+  }
+  return harness.fs.read_text(full)
+}
+
+fn fake_file(path) {
+  if path == "CHANGELOG.md" {
+    return """
+# Changelog
+
+## v0.7.53
+
+- Added merge-queue-safe release orchestration that ships from one release PR.
+- Tightened release metadata verification and changelog drift checks.
+- Documented the harn-release-bot workflow cascade.
+
+## v0.7.52
+
+- Previous release baseline.
+"""
+  }
+  if path == "Cargo.toml" {
+    return """
+[workspace.package]
+version = "0.7.52"
+"""
+  }
+  if path == "README.md" {
+    return "# Harn\n\nAgent harness language.\n"
+  }
+  return ""
+}
+
+@complexity(allow)
+fn fake_command(command, cfg, env = nil) {
+  const mock_stale_local_tag = env_str("HARN_RELEASE_MOCK_STALE_LOCAL_TAG") == "1"
+  // Lets the mock ship path prove signature failure halts before tag publication.
+  const mock_tag_verify_fail = env_str("HARN_RELEASE_MOCK_TAG_VERIFY_FAIL") == "1"
+  const tag_command = mock_release_tag_command(command, mock_tag_verify_fail)
+  if tag_command != nil {
+    return tag_command
+  }
+  if contains(command, "git branch --show-current") {
+    return ok("release/v0.7.53\n")
+  }
+  if contains(command, "git status --porcelain") {
+    return ok("")
+  }
+  if contains(command, "git diff") && contains(command, "--stat") {
+    return ok(
+      " CHANGELOG.md             | 12 ++++++++++++\n README.md                |  4 ++++\n scripts/release_ship.sh  |  8 ++++++++\n 3 files changed, 24 insertions(+)\n",
+    )
+  }
+  if contains(command, "git diff") && contains(command, "--name-only") {
+    return ok("CHANGELOG.md\nREADME.md\nscripts/release_ship.sh\n")
+  }
+  if contains(command, "git tag --list") && contains(command, "--sort=-v:refname") {
+    return ok("v0.7.52\n")
+  }
+  if contains(command, "git describe --tags") {
+    return ok("v0.7.51\n")
+  }
+  if contains(command, "git log --name-status") {
+    return ok(
+      "commit abc1234 release: consolidate harn release PR flow\nM\tCHANGELOG.md\nM\tscripts/release_ship.sh\n\ncommit bcd2345 ci: publish release from tag drift\nM\t.github/workflows/publish-release.yml\n\ncommit cde3456 docs: clarify local developer loop\nM\tREADME.md\n",
+    )
+  }
+  if contains(command, "git log --stat") {
+    return ok(
+      "abc1234 release: consolidate harn release PR flow\n CHANGELOG.md            | 12 ++++++++++++\n scripts/release_ship.sh |  8 ++++++++\n\nbcd2345 ci: publish release from tag drift\n .github/workflows/publish-release.yml | 5 +++++\n\ncde3456 docs: clarify local developer loop\n README.md | 4 ++++\n",
+    )
+  }
+  if contains(command, "git log --oneline") {
+    return ok(
+      "abc1234 release: consolidate harn release PR flow\nbcd2345 ci: publish release from tag drift\ncde3456 docs: clarify local developer loop\n",
+    )
+  }
+  if contains(command, "git log -1 --format=%G?") {
+    return ok("G\n")
+  }
+  if contains(command, "test -x scripts/release_ship.sh") {
+    return ok("release_ship=ok\n")
+  }
+  if contains(command, "test -x scripts/release_gate.sh") {
+    return ok("release_gate=ok\n")
+  }
+  if contains(command, "test -f .github/workflows/publish-release.yml") {
+    return ok("publish_workflow=ok\n")
+  }
+  if contains(command, "test -f .github/workflows/build-release-binaries.yml") {
+    return ok("binary_workflow=ok\n")
+  }
+  if contains(command, "cargo build -p harn-cli --bin harn --locked") {
+    if (cfg.mock_pin_warm_fail ?? false) || env_bool("HARN_RELEASE_MOCK_PIN_WARM_FAIL", false) {
+      return fail(1, "mock exact-pin Harn CLI warm failure\n")
+    }
+    return ok("exact-pin Harn CLI warm complete\n")
+  }
+  if contains(command, "./scripts/release_ship.sh --prepare") {
+    return ok(
+      "=== Release audit ===\n=== Publish dry run ===\n=== Stage release content ===\nRelease content staged on release/v0.7.53:\n  Previous version: 0.7.52\n  Next version:     0.7.53\n",
+    )
+  }
+  if contains(command, "git commit -m") {
+    return ok("[release/v0.7.53 9999999] Release v0.7.53\n")
+  }
+  if contains(command, "git add -u") {
+    return ok("")
+  }
+  if contains(command, "git fetch origin") || contains(command, "git rebase") {
+    return ok("Current branch release/v0.7.53 is up to date.\n")
+  }
+  if contains(command, "git rev-parse HEAD") {
+    return ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git rev-parse --verify") && contains(command, "origin/") {
+    return ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-parse -q --verify refs/tags/") {
+    if mock_stale_local_tag {
+      return ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
+    return fail(1, "")
+  }
+  if contains(command, "git rev-parse --verify") {
+    return ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-list -n 1") {
+    if mock_stale_local_tag {
+      return ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
+    return ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git tag -d") {
+    return ok("Deleted tag 'v0.7.53' (was eeeeeee)\n")
+  }
+  if contains(command, "git push origin v") {
+    return ok("To github.com:burin-labs/harn.git\n * [new tag]         v0.7.53 -> v0.7.53\n")
+  }
+  if contains(command, "git reset --hard") {
+    return ok("HEAD is now at abc1234 main\n")
+  }
+  if contains(command, "make -s lint-md") || contains(command, "make lint-md")
+    || contains(command, "npx markdownlint-cli2") {
+    return ok("markdownlint-cli2 v0.22.1\nSummary: 0 error(s)\n")
+  }
+  if contains(command, "git push -u origin") && (env?.HARN_HOOKS_NO_LOCAL_BUILD ?? "") == "1" {
+    return ok("branch 'release/v0.7.53' set up to track 'origin/release/v0.7.53'.\n")
+  }
+  if contains(command, "git push -u origin") {
+    return fail(1, "pre-push hook: make test passed (3187/3187) but exceeded 120s wall-clock budget\n")
+  }
+  if contains(command, "rg ") {
+    return ok("CHANGELOG.md:3:## v0.7.53\nscripts/release_ship.sh:82:Release vX.Y.Z\n")
+  }
+  return fail(127, "mock has no response for command: ${command}")
+}
+
+pub fn require_live_confirmation(cfg) {
+  if !cfg.mock && !cfg.yes_live_release {
+    throw "live ${cfg.mode} mode requires --yes-live-release"
+  }
+}
+
+fn run_events_path(run_id) {
+  return path_join(release_run_dir(run_id), "run-events.jsonl")
+}
+
+fn live_logs_dir(run_id) {
+  return path_join(release_run_dir(run_id), "live-logs")
+}
+
+pub fn command_live_log_path(run_id, name) {
+  const safe_name = regex_replace_all("[^A-Za-z0-9_.-]+", "-", name)
+  return path_join(live_logs_dir(run_id), safe_name + ".log")
+}
+
+pub fn release_log_event(harness: Harness, run_id, event_type, data) {
+  const path = run_events_path(run_id)
+  harness.fs.mkdir(dirname(path), true)
+  harness.fs
+    .append(
+    path,
+    json_stringify(
+      {
+        schema_version: "release_harn.run_event.v1",
+        timestamp: date_now_iso(),
+        event_type: event_type,
+        data: data,
+      },
+    )
+      + "\n",
+  )
+  return path
+}
+
+fn command_label(command) {
+  if command?.argv != nil {
+    return argv_label(command.argv)
+  }
+  if command?.command != nil {
+    return command.command
+  }
+  if type_of(command) == "list" {
+    return argv_label(command)
+  }
+  return command
+}
+
+pub fn log_step_started(harness: Harness, run_id, name, command, extra = nil) {
+  const extra_fields = extra ?? {}
+  release_log_event(
+    harness,
+    run_id,
+    "step_started",
+    {step: name, command: command_label(command)} + extra_fields,
+  )
+}
+
+pub fn log_step_finished(harness: Harness, run_id, name, result, extra) {
+  const base = {step: name, success: result.success, status: result.status}
+  const extra_fields = extra ?? {}
+  release_log_event(harness, run_id, "step_finished", base + extra_fields)
+}
+
+fn release_command_runner(cfg) {
+  if !cfg.mock {
+    return nil
+  }
+  return { spec, _options ->
+    const label = if spec?.argv != nil {
+      join(spec.argv.map({ a -> to_string(a) }), " ")
+    } else {
+      spec?.command ?? ""
+    }
+    fake_command(label, cfg, spec?.env)
+  }
+}
+
+pub fn append_command_step(harness: Harness, cfg, steps, name, command, extra = nil) {
+  return append_std_command_step(harness, cfg, steps, name, command, release_command_runner(cfg), extra)
+}
+
+pub fn release_open_pr_count(cfg, branch) {
+  const result = try {
+    release_github_pr_list(cfg, {head: branch, state: "open"})
+  } catch (_e) {
+    nil
+  }
+  if result == nil {
+    // Unknown PR state is not known-safe: report a nonzero count so the
+    // remediation refuses to delete the branch.
+    return 1
+  }
+  return len(result)
+}
+
+pub fn release_repo_slug(cfg) {
+  const remote = run_git(cfg, ["remote", "get-url", "origin"])
+  if !remote.success {
+    return ""
+  }
+  return github_slug_from_remote_url(remote.stdout)
+}
+
+pub fn probe_ok(cfg, command) {
+  return run_cmd(cfg, command).success
+}
+
+pub fn latest_release_tag(cfg) {
+  const remote = release_git_remote_refs(cfg, ["refs/tags/v*"], true)
+  if !remote.success {
+    throw "could not list origin release tags; refusing to derive release history from local-only tags:\n"
+      + trim(remote.stderr)
+  }
+  return latest_semver_tag_from_remote_refs(remote.refs)
+}
+
+pub fn run_output_dir(run_id) {
+  return release_run_dir(run_id)
+}
+/**
+ * F6a: resolve the advisory local build-lock path. A fixed machine-wide path so
+ * concurrent releases/builds serialize on the shared Cargo build dir.
+ */
