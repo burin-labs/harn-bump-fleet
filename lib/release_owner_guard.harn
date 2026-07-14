@@ -63,13 +63,17 @@ fn owner_pid(harness: Harness, cfg) {
   if configured > 0 {
     return configured
   }
-  return positive_int(harness.env.get_or("HARN_RELEASE_OWNER_PID", ""), 0)
+  let from_env = positive_int(harness.env.get_or("HARN_RELEASE_OWNER_PID", ""), 0)
+  if from_env > 0 {
+    return from_env
+  }
+  // Record the real process id so a crashed run leaves a probeable owner. A
+  // 0 here is the reason a dead run cannot be told apart from a live one, so
+  // the owner record must always carry a genuine pid unless a test/env pins it.
+  return pid()
 }
 
-fn owner_process_alive(harness: Harness, cfg, pid) {
-  if cfg?.owner_guard_existing_owner_alive != nil {
-    return cfg.owner_guard_existing_owner_alive ? true : false
-  }
+fn owner_process_alive(pid) {
   let n = positive_int(pid ?? "", 0)
   if n <= 0 {
     return nil
@@ -85,15 +89,64 @@ fn owner_process_alive(harness: Harness, cfg, pid) {
   return process_result_success(probe)
 }
 
-fn existing_owner_process_alive(harness: Harness, cfg, record) {
-  let pid = positive_int(record?.owner_pid ?? "", 0)
-  if pid <= 0 {
+/**
+ * Whether any live `release_harn` process other than this one exists on the
+ * host. Used as a last resort for an owner record that carries no pid
+ * (owner_pid==0): we cannot probe a specific process, but a host scan still
+ * refuses to reclaim while a concurrent live run exists and only frees a
+ * genuinely crashed run's orphaned lock. Returns nil when the scan itself
+ * cannot answer, so an ambiguous result blocks rather than reclaims.
+ */
+fn host_release_process_alive(harness: Harness, cfg) {
+  if cfg?.owner_guard_host_process_alive != nil {
+    return cfg.owner_guard_host_process_alive ? true : false
+  }
+  let self_pid = pid()
+  let probe = try {
+    process_shell("pgrep -f release_harn.harn", {timeout_ms: 3000})
+  } catch (_e) {
+    nil
+  }
+  if probe == nil {
     return nil
   }
+  let code = probe.exit_code ?? probe.exit_status ?? -1
+  // pgrep: exit 1 means nothing matched (no live harness -> orphaned lock),
+  // exit 0 means at least one match, exit >=2 is an operational error.
+  if code == 1 {
+    return false
+  }
+  if code != 0 {
+    return nil
+  }
+  for line in split(probe.stdout ?? "", "\n") {
+    let other = positive_int(trim(line), 0)
+    if other > 0 && other != self_pid {
+      return true
+    }
+  }
+  return false
+}
+
+fn existing_owner_process_alive(harness: Harness, cfg, record) {
+  // Explicit override wins so the decision matrix stays pure and testable.
+  if cfg?.owner_guard_existing_owner_alive != nil {
+    return cfg.owner_guard_existing_owner_alive ? true : false
+  }
+  // Liveness only means something for a record written on this host; a pid from
+  // another machine says nothing about a local process.
   if trim(record?.host ?? "") != hostname() {
     return nil
   }
-  return owner_process_alive(harness, cfg, pid)
+  let pid = positive_int(record?.owner_pid ?? "", 0)
+  if pid > 0 {
+    return owner_process_alive(pid)
+  }
+  // A record with no recorded pid cannot be probed for a specific process.
+  // Liveness stays unknown here so precise signals (published release, stale
+  // TTL) decide first; the coarse host scan is a last resort in the acquire
+  // path, consulted only when the decision would otherwise block.
+  return nil
 }
 
 fn owner_record_repo_slug(cfg, record) {
@@ -439,6 +492,34 @@ fn read_owner_record(harness: Harness, path) {
   return {record: nil, malformed: trim(harness.fs.read_text(path))}
 }
 
+/**
+ * Last resort before blocking a same-host owner record that carries no
+ * probeable pid (owner_pid==0). A precise signal (published release, stale TTL,
+ * dead pid) already had its chance in the pure decision; only when it would
+ * otherwise block do we consult the coarse host scan. If no other live
+ * release_harn process remains, the recorded owner crashed without releasing
+ * its lock, so reclaim it. Any live process, a foreign host, or an inconclusive
+ * scan leaves the block in place.
+ */
+fn reclaim_orphaned_owner_if_dead(harness: Harness, cfg, record, decision) {
+  if decision.action != "block" {
+    return decision
+  }
+  if positive_int(record?.owner_pid ?? "", 0) > 0 {
+    return decision
+  }
+  if trim(record?.host ?? "") != hostname() {
+    return decision
+  }
+  if host_release_process_alive(harness, cfg) == false {
+    return {
+      action: "replace_orphaned_lock",
+      reason: "existing owner recorded no pid and no live release_harn process remains on this host",
+    }
+  }
+  return decision
+}
+
 /** Acquire the live-release owner guard, or throw a collision/malformed-owner error. */
 pub fn release_owner_guard_acquire(harness: Harness, cfg, analysis, run_id) {
   if !release_owner_guard_required(cfg) {
@@ -463,7 +544,7 @@ pub fn release_owner_guard_acquire(harness: Harness, cfg, analysis, run_id) {
           + "Refusing live release until the stale owner record is inspected. "
           + "Rerun with HARN_RELEASE_OWNER_TAKEOVER=1 only after confirming no live release is active."
       }
-      let decision = if error != nil {
+      let decision0 = if error != nil {
         {action: "error", reason: error}
       } else if existing.malformed != "" && takeover {
         {action: "replace_malformed", reason: "takeover of malformed owner record requested"}
@@ -479,13 +560,33 @@ pub fn release_owner_guard_acquire(harness: Harness, cfg, analysis, run_id) {
           existing_owner_release_completed(cfg, existing.record),
         )
       }
+      let decision = reclaim_orphaned_owner_if_dead(harness, cfg, existing.record, decision0)
       if decision.action == "block" {
         error = decision.reason + "\nGuard file: " + path
       }
       if error != nil {
         throw error
       }
-      let record = {...requested, acquire_action: decision.action, acquire_reason: decision.reason}
+      let reclaimed_prior = if existing.record != nil
+        && decision.action != "acquire"
+        && decision.action != "refresh" {
+        {
+          run_id: existing.record?.run_id ?? "",
+          owner_pid: existing.record?.owner_pid ?? 0,
+          status: owner_status(existing.record),
+          operator: existing.record?.operator ?? "",
+          host: existing.record?.host ?? "",
+          next_version: existing.record?.next_version ?? "",
+        }
+      } else {
+        nil
+      }
+      let record = {
+        ...requested,
+        acquire_action: decision.action,
+        acquire_reason: decision.reason,
+        reclaimed_prior: reclaimed_prior,
+      }
       write_json(path, record)
       return {enabled: true, path: path, record: record, decision: decision}
     },
