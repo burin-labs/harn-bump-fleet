@@ -17,6 +17,7 @@
 import { agent_host_tools } from "std/agent/host_tools"
 import { agent_preset } from "std/agent/presets"
 import { parse_args } from "std/cli"
+import { command_run } from "std/command"
 import { env_str } from "std/config"
 import { strip_think_blocks } from "std/llm/safe"
 import { poll_until } from "std/poll"
@@ -31,6 +32,7 @@ import {
   bump_summary_result,
   bump_summary_skipped,
 } from "lib/bump_summary"
+import { changelog_named_section_from_text } from "lib/changelog"
 import {
   chat_cfg_from_run_dir,
   chat_enabled,
@@ -48,6 +50,7 @@ import {
   github_pr_close,
   github_pr_comment,
   github_pr_list,
+  github_release_at_tag,
   github_workflow_dispatch,
 } from "lib/github"
 import {
@@ -56,6 +59,12 @@ import {
   planner_defaults,
   retrying_llm_caller,
 } from "lib/llm_defaults"
+import {
+  public_surface_impact_for_repo,
+  public_surface_impact_for_repos,
+  public_surface_impact_markdown,
+  public_surface_impact_report_from_surfaces,
+} from "lib/public_surface_impact"
 import { harn_release_readiness, release_readiness_detail } from "lib/release_readiness"
 import {
   run_session_view_downstream_markdown,
@@ -451,16 +460,126 @@ fn ensure_auto_merge(slug, pr) {
   }
 }
 
-fn annotate_bump_pr_with_view_metadata(slug, pr_number, target, view_gate) {
+fn local_harn_changelog_section(target, harn_repo) {
+  const result = command_run(
+    {
+      argv: ["git", "show", "${target}:CHANGELOG.md"],
+      cwd: harn_repo,
+      capture: {max_inline_bytes: 256000},
+    },
+    {timeout_ms: 30000},
+  )
+  if !(result?.success ?? false) {
+    return {
+      status: "local_changelog_unavailable",
+      detail: trim(to_string(result?.stderr ?? result?.stdout ?? "git show failed")),
+      body: "",
+    }
+  }
+  const body = changelog_named_section_from_text(result.stdout ?? "", "## ${target}")
+  if trim(body) == "" {
+    return {
+      status: "local_changelog_section_missing",
+      detail: "CHANGELOG.md at ${target} did not contain a ## ${target} section",
+      body: "",
+    }
+  }
+  return {status: "local_tag_changelog", detail: "CHANGELOG.md section at ${target}", body: body}
+}
+
+fn release_public_surface_analysis(target, harn_repo) {
+  const empty = {
+    changelog_section: "",
+    changelog_unreleased_section: "",
+    diff_names: "",
+    commit_file_changes_since_latest_tag: "",
+    commit_stats_since_latest_tag: "",
+  }
+  let evidence_parts = []
+  let source_statuses = []
+  let source_details = []
+  const local_changelog = local_harn_changelog_section(target, harn_repo)
+  if trim(local_changelog.body) != "" {
+    evidence_parts = evidence_parts + [local_changelog.body]
+    source_statuses = source_statuses + [local_changelog.status]
+    source_details = source_details + [local_changelog.detail]
+  }
+  const lookup = try {
+    github_release_at_tag(HARN_REPO, target)
+  } catch (e) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_lookup_failed"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(source_details + ["GitHub release lookup failed: " + to_string(e)], "; "),
+      analysis: {...empty, changelog_section: join(evidence_parts, "\n\n")},
+    }
+  }
+  if is_err(lookup) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_lookup_failed"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(source_details + ["GitHub release lookup failed: " + to_string(unwrap_err(lookup))], "; "),
+      analysis: {...empty, changelog_section: join(evidence_parts, "\n\n")},
+    }
+  }
+  if !(lookup?.found ?? false) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_not_found"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(source_details + ["GitHub release ${target} was not found"], "; "),
+      analysis: {...empty, changelog_section: join(evidence_parts, "\n\n")},
+    }
+  }
+  const release = lookup.release ?? {}
+  if trim(release.body ?? "") != "" {
+    evidence_parts = evidence_parts + [release.body]
+    source_statuses = source_statuses + ["github_release_notes"]
+    source_details = source_details + ["GitHub release body for ${target}"]
+  }
+  return {
+    status: if len(source_statuses) == 0 {
+      "release_notes_empty"
+    } else {
+      join(source_statuses, "+")
+    },
+    detail: if len(source_details) == 0 {
+      "no changelog or release-note evidence found for ${target}"
+    } else {
+      join(source_details, "; ")
+    },
+    analysis: {...empty, changelog_section: join(evidence_parts, "\n\n")},
+  }
+}
+
+fn public_surface_impact_scan(target, repos, harn_repo) {
+  const source = release_public_surface_analysis(target, harn_repo)
+  const base = public_surface_impact_for_repos(target, source.analysis, repos)
+  return {...base, source_status: source.status, source_detail: source.detail}
+}
+
+fn skipped_public_surface_impact(target, reason) {
+  return public_surface_impact_report_from_surfaces(target, [], [], "skipped", reason)
+}
+
+fn annotate_bump_pr_with_view_metadata(slug, pr_number, target, view_gate, public_surface_impact) {
+  const repo_impact = public_surface_impact_for_repo(public_surface_impact, slug)
   let body = run_session_view_downstream_markdown(target, view_gate)
+    + "\n\n"
+    + public_surface_impact_markdown(target, repo_impact)
   const result = github_pr_comment(slug, pr_number, body)
   return if is_err(result) {
-    {
-      success: false,
-      detail: "run/session view metadata comment failed: " + to_string(unwrap_err(result)),
-    }
+    {success: false, detail: "metadata comment failed: " + to_string(unwrap_err(result))}
   } else {
-    {success: true, detail: "run/session view metadata comment posted"}
+    {success: true, detail: "run/session view and public-surface metadata comment posted"}
   }
 }
 
@@ -500,8 +619,8 @@ fn already_current_outcome(base, remote_pin, existing_pr) {
   )
 }
 
-fn targeted_pr_outcome(base, slug, target, pr, view_gate) {
-  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate)
+fn targeted_pr_outcome(base, slug, target, pr, view_gate, public_surface_impact) {
+  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate, public_surface_impact)
   if !annotated.success {
     return finish_outcome(
       base,
@@ -536,7 +655,15 @@ fn targeted_pr_outcome(base, slug, target, pr, view_gate) {
   )
 }
 
-fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate) {
+fn predispatch_resolution(
+  repo,
+  base,
+  target,
+  target_no_v,
+  remote_pin,
+  view_gate,
+  public_surface_impact,
+) {
   let existing_pr = find_existing_pr(repo.slug)
   let existing_probe = if existing_pr == nil {
     nil
@@ -549,7 +676,7 @@ fn predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate
   if existing_pr != nil && existing_probe.matches {
     return {
       done: true,
-      outcome: targeted_pr_outcome(base, repo.slug, target, existing_pr, view_gate),
+      outcome: targeted_pr_outcome(base, repo.slug, target, existing_pr, view_gate, public_surface_impact),
       stale_note: "",
     }
   }
@@ -642,13 +769,13 @@ fn classify_post_dispatch(slug, target, target_no_v, run_outcome, stale_note) {
   return {outcome: outcome, pr: pr}
 }
 
-fn with_auto_merge(slug, classified, target, view_gate) {
+fn with_auto_merge(slug, classified, target, view_gate, public_surface_impact) {
   let with_pr = classified.outcome
   let pr = classified.pr
   if pr == nil || with_pr.status == "stale_pr_after_run" {
     return with_pr
   }
-  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate)
+  let annotated = annotate_bump_pr_with_view_metadata(slug, pr.number, target, view_gate, public_surface_impact)
   if !annotated.success {
     return {
       ...with_pr,
@@ -670,7 +797,7 @@ fn with_auto_merge(slug, classified, target, view_gate) {
   return {...with_pr, auto_merge: am, detail: detail}
 }
 
-fn bump_one(harness: Harness, repo, target, dry_run, view_gate) {
+fn bump_one(harness: Harness, repo, target, dry_run, view_gate, public_surface_impact) {
   return timed_bump_outcome(
     "bump.repo",
     {repo: repo.slug, dry_run: dry_run, target: strip_v(target)},
@@ -696,7 +823,15 @@ fn bump_one(harness: Harness, repo, target, dry_run, view_gate) {
       let pre = timed(
         "bump.repo.pre_dispatch_resolution",
         {repo: repo.slug},
-        { -> return predispatch_resolution(repo, base, target, target_no_v, remote_pin, view_gate) },
+        { -> return predispatch_resolution(
+          repo,
+          base,
+          target,
+          target_no_v,
+          remote_pin,
+          view_gate,
+          public_surface_impact,
+        ) },
       ).result
       if pre.done {
         return pre.outcome
@@ -714,7 +849,7 @@ fn bump_one(harness: Harness, repo, target, dry_run, view_gate) {
       return timed_bump_phase(
         "bump.repo.auto_merge",
         {repo: repo.slug},
-        { -> return with_auto_merge(repo.slug, classified, target, view_gate) },
+        { -> return with_auto_merge(repo.slug, classified, target, view_gate, public_surface_impact) },
       )
     },
   )
@@ -930,7 +1065,16 @@ fn wait_for_target_release_readiness(harness: Harness, target) {
  * outcomes list plus a per-slug `passes` map (1 = original try, 2+ =
  * retry attempts) for the audit trail.
  */
-fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max_retries, view_gate) {
+fn retry_failed_outcomes(
+  harness: Harness,
+  repos,
+  outcomes,
+  target,
+  dry_run,
+  max_retries,
+  view_gate,
+  public_surface_impact,
+) {
   let current = outcomes
   let passes_by_slug = {}
   for o in current {
@@ -962,7 +1106,7 @@ fn retry_failed_outcomes(harness: Harness, repos, outcomes, target, dry_run, max
     )
     let retry_repos = pending.map({ slug -> idx_map[slug] })
     let settled = parallel settle retry_repos with { max_concurrent: PARALLEL_LIMIT } { r ->
-      bump_one(harness, r, target, dry_run, view_gate)
+      bump_one(harness, r, target, dry_run, view_gate, public_surface_impact)
     }
     let retried = map_settled(
       settled.results,
@@ -1084,6 +1228,7 @@ pipeline main() {
     gate
   }
   if !view_gate.ok {
+    const public_surface_impact = skipped_public_surface_impact(target, "run/session view compatibility gate failed before dispatch")
     harness.stdio
       .eprintln(
       "error: run/session view compatibility gate failed: " + trim(view_gate.check.stderr ?? ""),
@@ -1106,6 +1251,7 @@ pipeline main() {
       summary: {source: "deterministic_gate", text: "- run/session view compatibility gate failed before dispatch"},
       outcomes: [],
       run_session_view: view_gate,
+      public_surface_impact: public_surface_impact,
       trace_spans: timing.trace_spans,
       timing_summary: timing.timing_summary,
     }
@@ -1113,12 +1259,22 @@ pipeline main() {
     harness.stdio.println("   audit : ${written.md_path}")
     return 1
   }
+  harness.stdio.println("\n== public surface impact scan ...")
+  const public_surface_impact = timed(
+    "bump.public_surface_impact",
+    {target: strip_v(target), repo_count: len(repos)},
+    { -> return public_surface_impact_scan(target, repos, parsed.harn_repo) },
+  ).result
+  harness.stdio
+    .println(
+    "   source: ${public_surface_impact.source_status}; surfaces: ${public_surface_impact.surface_count}; affected repos: ${public_surface_impact.affected_repo_count}",
+  )
   harness.stdio.println("\n== dispatching (max_concurrent=${PARALLEL_LIMIT}) ...")
   let settled = timed(
     "bump.dispatch_settle",
     {repo_count: len(repos), max_concurrent: PARALLEL_LIMIT},
     { -> return parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
-      bump_one(harness, repo, target, parsed.dry_run, view_gate)
+      bump_one(harness, repo, target, parsed.dry_run, view_gate, public_surface_impact)
     } },
   ).result
   let initial_outcomes = map_settled(
@@ -1140,6 +1296,7 @@ pipeline main() {
       parsed.dry_run,
       parsed.retry_failed,
       view_gate,
+      public_surface_impact,
     ) },
   ).result
   let outcomes = retry_result.outcomes
@@ -1157,6 +1314,7 @@ pipeline main() {
     summary_model: SUMMARY_MODEL,
     summary_text: "",
     run_session_view: view_gate,
+    public_surface_impact: public_surface_impact,
     outcomes: outcomes,
   }
   harness.stdio.println("\n== summarizing with ${SUMMARY_MODEL} ...")
