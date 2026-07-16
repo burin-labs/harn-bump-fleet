@@ -398,7 +398,17 @@ harn run --no-sandbox release_harn.harn -- --mock --agent
 # Mock the full command sequence: prepare, commit, rebase, push, PR,
 # and auto-merge. Still no repo/GitHub writes.
 harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+
+# Run the scheduled fail-collect rehearsal matrix. This uses the safe mock
+# release path under adversarial operator environments and writes JSON/Markdown
+# reports under .harn-runs/release-rehearsal/.
+harn run --no-sandbox release_harn.harn -- --rehearsal --no-chat
 ```
+
+Real release cuts should have a green release rehearsal from the previous
+24 hours. If the latest rehearsal is red, read the full failure-set report
+before starting `--mode ship-pr`; real releases stay fail-fast, but rehearsal
+must report every failed leg in one pass.
 
 Live modes require the explicit guard flag. Before resolving the pin SHA, the
 harness fast-forwards the local base branch from `origin/<base>`: if the
