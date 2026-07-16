@@ -46,6 +46,9 @@ harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,370
 # Rewrite one selected in-repo bot PR head as a signed commit and re-check auto-merge.
 harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --pr 3704 --live
 
+# Verify a release prerequisite PR is actually merged before acting on it.
+harn run --no-sandbox verify_prerequisite_pr.harn -- --repo burin-labs/harn --pr 4872 --expected-head <sha>
+
 # Use a different local LLM for the summary.
 HARN_BUMP_FLEET_MODEL=gpt-oss:120b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
