@@ -1,0 +1,322 @@
+// Interactive post-run inspection and recovery chat.
+import { agent_chat_loop, agent_chat_route_input } from "std/agent/chat"
+import { command_run } from "std/command"
+import {
+  run_artifact_path,
+  run_artifact_transcript_dir,
+  run_artifacts_from_dir,
+} from "std/run_artifacts"
+import { page, rule } from "std/tui"
+import { chat_run_artifact_root, pick_recent_run } from "./chat_runs"
+import { chat_ansi, chat_prompt_line, print_chat_assistant_turn } from "./chat_ui"
+import { install_binder, planner_defaults, retrying_llm_caller } from "./llm_defaults"
+import { safe_shell_arg } from "./shell_util"
+import { truncate_text } from "./text_util"
+
+/**
+ * Build the shell command that surfaces error-signature lines and a bounded
+ * tail for every live log under an already shell-escaped directory argument.
+ */
+pub fn failing_step_logs_command(dir_arg) {
+  return "for f in " + dir_arg + "/*.log; do [ -f \"$f\" ] || continue; "
+    + "hits=$(grep -nEi 'error|fail|operation not permitted|panic|fatal' \"$f\" | tail -40); "
+    + "[ -n \"$hits\" ] || continue; "
+    + "echo \"### $(basename \"$f\")\"; echo \"$hits\"; echo '--- tail ---'; tail -c 2500 \"$f\"; echo; done"
+}
+
+/** Wrap captured live-log error text into a seed-context section, or an empty string. */
+pub fn format_failing_logs_section(body) {
+  const trimmed = trim(body ?? "")
+  if trimmed == "" {
+    return ""
+  }
+  return "## Failing-step live logs (error lines + tail)\n\n"
+    + "These are the real stderr/stdout of the steps that failed — diagnose from "
+    + "these, not from step status alone.\n\n```text\n"
+    + truncate_text(trimmed, 12000)
+    + "\n```"
+}
+
+fn load_failing_step_logs(harness: Harness, chat_cfg) {
+  const run_dir = chat_cfg?.run_dir ?? ""
+  if run_dir == "" {
+    return ""
+  }
+  const dir = path_join(run_dir, "live-logs")
+  if !harness.fs.exists(dir) {
+    return ""
+  }
+  const dir_arg = safe_shell_arg(dir)
+  if dir_arg == nil {
+    return ""
+  }
+  const result = shell(failing_step_logs_command(dir_arg))
+  return format_failing_logs_section(result.stdout)
+}
+
+fn load_seed_context(harness: Harness, chat_cfg) {
+  let sections = []
+  const audit_md_path = chat_cfg?.audit_md_path
+  if audit_md_path != nil && harness.fs.exists(audit_md_path) {
+    const body = truncate_text(harness.fs.read_text(audit_md_path), 14000)
+    sections = sections + ["## Run audit (${basename(audit_md_path)})\n\n${body}"]
+  }
+  const failing_logs = load_failing_step_logs(harness, chat_cfg)
+  if failing_logs != "" {
+    sections = sections + [failing_logs]
+  }
+  const audit_json_path = chat_cfg?.audit_json_path
+  if audit_json_path != nil && harness.fs.exists(audit_json_path) {
+    const body = truncate_text(harness.fs.read_text(audit_json_path), 10000)
+    sections = sections + ["## Run audit JSON (truncated)\n\n```json\n${body}\n```"]
+  }
+  if len(sections) == 0 {
+    return "(no audit artifacts available)"
+  }
+  return join(sections, "\n\n")
+}
+
+fn chat_system_prompt(chat_cfg, seed_context) {
+  return render(
+    "@prompts/chat_post_run_system.harn.prompt",
+    {
+      harness_kind: chat_cfg?.harness_kind ?? "?",
+      run_id: chat_cfg?.run_id ?? "?",
+      run_dir: chat_cfg?.run_dir ?? "?",
+      outcome: chat_cfg?.outcome ?? "?",
+      repo: chat_cfg?.repo ?? "",
+      mode: chat_cfg?.mode_hint ?? "",
+      seed_context: seed_context,
+    },
+  )
+}
+
+fn chat_banner(harness: Harness, chat_cfg) {
+  const ansi = chat_ansi()
+  const kind = chat_cfg?.harness_kind ?? "?"
+  const outcome = chat_cfg?.outcome ?? "?"
+  const outcome_colour = if contains(outcome, "FAIL") || contains(outcome, "error") {
+    ansi.red
+  } else {
+    ansi.green
+  }
+  harness.stdio.println("")
+  harness.stdio
+    .println(
+    ansi.bold + "── chat (${kind}) ──" + ansi.reset + " run " + ansi.dim
+      + (chat_cfg?.run_id ?? "?")
+      + ansi.reset
+      + " · outcome "
+      + outcome_colour
+      + outcome
+      + ansi.reset,
+  )
+  if (chat_cfg?.audit_md_path ?? "") != "" {
+    harness.stdio.println(ansi.dim + "   report: ${chat_cfg.audit_md_path}" + ansi.reset)
+  }
+  harness.stdio
+    .println(
+    ansi.dim
+      + "   /help for commands · /exit to quit · ${chat_cfg?.timeout_s ?? 60}s start-typing timeout"
+      + ansi.reset,
+  )
+  harness.stdio.println(ansi.dim + rule("─") + ansi.reset)
+}
+
+fn print_chat_help(harness: Harness) {
+  const ansi = chat_ansi()
+  harness.stdio.println("")
+  harness.stdio.println(ansi.bold + "   commands" + ansi.reset)
+  harness.stdio.println("     /exit, /quit       end the chat")
+  harness.stdio.println("     /help              this help text")
+  harness.stdio.println("     /cat <path>        page a file (under the run dir or repo)")
+  harness.stdio.println("     /diff <path?>      page `git diff` for a path (or whole tree)")
+  harness.stdio.println("     /runs              list recent runs of this harness")
+  harness.stdio.println("     anything else      forward to the agent")
+  harness.stdio.println("")
+}
+
+fn handle_cat(harness: Harness, args, chat_cfg) {
+  const ansi = chat_ansi()
+  if len(args) == 0 {
+    harness.stdio.println(ansi.yellow + "   /cat needs a path" + ansi.reset)
+    return
+  }
+  const resolved = resolve_chat_path(harness, args[0], chat_cfg)
+  if !harness.fs.exists(resolved) {
+    harness.stdio.println(ansi.yellow + "   no such file: ${resolved}" + ansi.reset)
+    return
+  }
+  page({title: resolved, body: harness.fs.read_text(resolved)})
+}
+
+fn handle_diff(harness: Harness, args, chat_cfg) {
+  const ansi = chat_ansi()
+  const path_arg = if len(args) > 0 {
+    args[0]
+  } else {
+    ""
+  }
+  const repo = chat_cfg?.repo
+  let argv = if repo != nil && repo != "" {
+    ["git", "-C", repo, "diff"]
+  } else {
+    ["git", "diff"]
+  }
+  if path_arg != "" {
+    argv = argv + ["--", path_arg]
+  }
+  const result = try {
+    command_run({argv: argv, timeout_ms: 10000})
+  } catch (error) {
+    harness.stdio.println(ansi.red + "   git diff error: ${error}" + ansi.reset)
+    return
+  }
+  const output = result?.stdout ?? ""
+  if trim(output) == "" {
+    harness.stdio.println(ansi.dim + "   (no diff)" + ansi.reset)
+    return
+  }
+  page({title: "git diff " + path_arg, body: output})
+}
+
+fn handle_runs(harness: Harness, chat_cfg) {
+  const ansi = chat_ansi()
+  const kind = chat_cfg?.harness_kind ?? "release-harn"
+  const picked = pick_recent_run(harness, kind, 12)
+  if picked == nil {
+    return
+  }
+  harness.stdio
+    .println(
+    ansi.dim
+      + "   (selected ${picked.run_id} — re-invoke with --chat-run ${picked.run_id} to chat over it)"
+      + ansi.reset,
+  )
+}
+
+fn resolve_chat_path(harness: Harness, raw, chat_cfg) {
+  const path = raw ?? ""
+  if starts_with(path, "/") {
+    return path
+  }
+  const run_dir = chat_cfg?.run_dir ?? ""
+  if run_dir != "" {
+    const run = run_artifacts_from_dir(chat_cfg?.harness_kind ?? "run", run_dir)
+    const candidate = try {
+      run_artifact_path(run, path)
+    } catch (_error) {
+      ""
+    }
+    if harness.fs.exists(candidate) {
+      return candidate
+    }
+  }
+  const repo = chat_cfg?.repo ?? ""
+  if repo != "" {
+    const candidate = path_join(repo, path)
+    if harness.fs.exists(candidate) {
+      return candidate
+    }
+  }
+  return path_join(cwd(), path)
+}
+
+/** Main entry point for post-run chat. */
+pub fn run_chat_loop(harness: Harness, chat_cfg) {
+  if chat_cfg == nil {
+    return nil
+  }
+  const ansi = chat_ansi()
+  const chat_kind = chat_cfg?.harness_kind ?? "?"
+  const chat_run_id = chat_cfg?.run_id ?? uuid_v7()
+  const session_id = "chat-" + chat_kind + "-" + chat_run_id
+  const transcript_dir = if (chat_cfg?.run_dir ?? "") != "" {
+    run_artifact_transcript_dir(
+      run_artifacts_from_dir(chat_cfg?.harness_kind ?? "ad-hoc", chat_cfg.run_dir),
+      "chat-llm",
+    )
+  } else {
+    path_join(chat_run_artifact_root(), "ad-hoc", "chat-llm")
+  }
+  harness.fs.mkdir(transcript_dir, true)
+  const prior_transcript = chat_cfg?.llm_transcript_path
+  if prior_transcript != nil && harness.fs.exists(prior_transcript) {
+    try {
+      agent_session_seed_from_jsonl(
+        prior_transcript,
+        {rename_session: session_id, truncate_to_last: 24, drop_tool_calls: false, validate: false},
+      )
+    } catch (_error) {
+      nil
+    }
+  }
+  chat_banner(harness, chat_cfg)
+  const seed_context = load_seed_context(harness, chat_cfg)
+  const system = chat_system_prompt(chat_cfg, seed_context)
+  const timeout_s = chat_cfg?.timeout_s ?? 60
+  const slash_handlers = {
+    "/cat": { req ->
+      handle_cat(harness, req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/diff": { req ->
+      handle_diff(harness, req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/pager": { req ->
+      handle_cat(harness, req.args, chat_cfg)
+      return {kind: "handled"}
+    },
+    "/runs": { _req ->
+      handle_runs(harness, chat_cfg)
+      return {kind: "handled"}
+    },
+  }
+  const defaults = planner_defaults("HARN_CHAT")
+  const binder = install_binder(chat_cfg?.tools ?? tool_registry())
+  const result = agent_chat_loop(
+    {
+      session_id: session_id,
+      provider: chat_cfg?.provider ?? defaults.provider,
+      model: chat_cfg?.model ?? defaults.model,
+      tools: binder.tools,
+      tool_caller: binder.tool_caller,
+      system_prompt: system,
+      max_iterations: 8,
+      iteration_budget: {mode: "adaptive", initial: 4, max: 8, extend_by: 2},
+      max_tokens: 4000,
+      temperature: 0.3,
+      llm_caller: retrying_llm_caller(2),
+      llm_transcript_dir: transcript_dir,
+      slash_commands: slash_handlers,
+      on_user_input: { state ->
+        const label = if (state.turns ?? 0) == 0 {
+          ansi.cyan + "you> " + ansi.reset + ansi.dim + "(/help to list commands) " + ansi.reset
+        } else {
+          ansi.cyan + "you> " + ansi.reset
+        }
+        const line = chat_prompt_line(label, timeout_s)
+        if line == nil {
+          harness.stdio.println(ansi.dim + "(no input within ${timeout_s}s — ending chat)" + ansi.reset)
+          return {kind: "exit", reason: "timeout"}
+        }
+        if line == "/help" || line == "/?" {
+          print_chat_help(harness)
+          return {kind: "handled"}
+        }
+        return agent_chat_route_input(line, state, slash_handlers)
+      },
+      on_model_turn: { turn, _state ->
+        print_chat_assistant_turn(harness, turn)
+        return nil
+      },
+    },
+  )
+  harness.stdio
+    .println(
+    ansi.dim + "(chat closed — ${result.turns} turn(s), reason: ${result.stop_reason})"
+      + ansi.reset,
+  )
+  return nil
+}
