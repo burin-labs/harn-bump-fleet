@@ -398,7 +398,7 @@ harn run --no-sandbox release_harn.harn -- --mock
 # Mocked agent/tool loop using Harn's mock LLM provider.
 harn run --no-sandbox release_harn.harn -- --mock --agent
 
-# Mock the full command sequence: prepare, commit, rebase, push, PR,
+# Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
 harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 

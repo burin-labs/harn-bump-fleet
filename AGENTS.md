@@ -32,7 +32,7 @@ Release implementation changes belong in the stage that owns the behavior:
   validation, artifacts, and recovery
 - `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
   reconciliation, branch setup, and checkout state
-- `release_notes`: fragments, release notes, and fixup/repin/drift state
+- `release_notes`: fragments, release notes, and fixup/drift state
 - `release_reporting`: PR rendering, execution summaries, and crystallization
   fixtures
 - `release_modes` / `release_preflight`: prepare/ship execution, cleanup,
