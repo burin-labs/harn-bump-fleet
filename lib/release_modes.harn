@@ -13,21 +13,17 @@ import {
   run_retry_commands_after_agent_repair,
 } from "./release_agent"
 import { analyze_release } from "./release_analysis"
-import {
-  release_branch_push_argv,
-  setup_release_branch,
-  target_release_checkout_state,
-} from "./release_checkout"
+import { setup_release_branch, target_release_checkout_state } from "./release_checkout"
 import {
   execution_failed,
   hook_light_env,
   last_failed_step,
-  push_hook_budget_exceeded,
   recorded_step,
   recovery_step_ref,
 } from "./release_execution"
 import { ensure_release_notes_with_run_id, prepared_release_analysis } from "./release_notes"
 import { execute_fixup_cherry_pick, release_prepare_audit_plan } from "./release_prepare"
+import { publish_release_publication, release_publication } from "./release_publication"
 import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
 import {
   append_command_step,
@@ -42,12 +38,10 @@ import {
 } from "./release_runtime"
 import {
   ensure_release_tag_pushed,
-  maybe_delete_stale_repin_tag,
   persist_release_watch_receipt,
   pre_prepare_cutoff_gate,
   pre_tag_cutoff_gate,
   run_pre_tag_binary_size_gate,
-  run_repin_tocttou_recheck,
 } from "./release_tag"
 import { fail, ok } from "./shell_util"
 
@@ -186,72 +180,10 @@ pub fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run
   return steps
 }
 
-/**
- * Run the repin TOCTTOU re-check and return refreshed (cfg, analysis,
- * prelude_steps). Returns `failed_steps != nil` when the operator must
- * abort; otherwise mutates pin SHA in cfg/analysis to the freshly-locked
- * value.
- */
-fn repin_prelude(harness: Harness, cfg, analysis, run_id) {
-  if !(cfg.repin_mode ?? false) {
-    return {cfg: cfg, analysis: analysis, steps: [], failed_steps: nil}
-  }
-  release_log_event(harness, run_id, "step_started", {step: "repin-tocttou-recheck"})
-  const recheck = run_repin_tocttou_recheck(cfg, analysis)
-  if !recheck.success {
-    release_log_event(
-      harness,
-      run_id,
-      "step_finished",
-      {step: "repin-tocttou-recheck", success: false, message: recheck.message},
-    )
-    return {
-      cfg: cfg,
-      analysis: analysis,
-      steps: [],
-      failed_steps: [
-        recorded_step(
-          "repin-tocttou-recheck",
-          "repin TOCTTOU re-check before branch reset",
-          fail(2, recheck.message),
-        ),
-      ],
-    }
-  }
-  const old_pin = cfg.pin_sha
-  const msg = if recheck.new_pin_sha == old_pin {
-    "repin: TOCTTOU re-check passed; pin unchanged at ${recheck.new_pin_sha}\n"
-  } else {
-    "repin: TOCTTOU re-check passed; pin advanced from ${old_pin} to ${recheck.new_pin_sha}\n"
-  }
-  release_log_event(
-    harness,
-    run_id,
-    "step_finished",
-    {step: "repin-tocttou-recheck", success: true, new_pin: recheck.new_pin_sha},
-  )
-  return {
-    cfg: {...cfg, pin_sha: recheck.new_pin_sha},
-    analysis: {...analysis, pin_sha: recheck.new_pin_sha},
-    steps: [recorded_step("repin-tocttou-recheck", "repin TOCTTOU re-check before branch reset", ok(msg))],
-    failed_steps: nil,
-  }
-}
-
 @complexity(allow)
-pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_result, run_id) {
-  require_live_confirmation(raw_cfg)
-  // Repin mode advances the pin to fresh `origin/<base>` HEAD. The TOCTTOU
-  // re-check (re-fetch origin, re-probe release+tag, re-resolve pin) runs
-  // once here so the locked pin propagates into setup_release_branch and
-  // the re-analysis after prepare. Abort cleanly if anything moved.
-  const pre = repin_prelude(harness, raw_cfg, raw_analysis, run_id)
-  if pre.failed_steps != nil {
-    return pre.failed_steps
-  }
-  const cfg = pre.cfg
-  const analysis = pre.analysis
-  let steps = pre.steps
+pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run_id) {
+  require_live_confirmation(cfg)
+  let steps = []
   const pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
   steps = pre_prepare_gate.steps
   if !pre_prepare_gate.proceed {
@@ -269,17 +201,12 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
   }
   const post_prepare_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
   const version = post_prepare_analysis.next_version
-  const branch = "release/v${version}"
-  // The release gate, generated-content checks, and markdown lint have already
-  // produced stronger evidence than the target repo's expensive local-build
-  // hook path. Keep hooks enabled, but ask harn-side hooks to skip duplicated
-  // local builds for the canonical generated release push.
-  const push_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
+  const local_branch = "release/v${version}"
   let commands = []
   let committed_release_content = false
   if trim(post_prepare_analysis.status ?? "") == ""
     && trim(post_prepare_analysis.diff_names ?? "") != ""
-    && post_prepare_analysis.branch == branch {
+    && post_prepare_analysis.branch == local_branch {
     committed_release_content = true
     steps = steps
       + [
@@ -287,7 +214,7 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
         "commit-already-complete",
         "release branch already has v${version} commit content",
         ok(
-          "skipped commit because the working tree is clean and ${branch} already differs from pin ${cfg.pin_sha}",
+          "skipped commit because the working tree is clean and ${local_branch} already differs from pin ${cfg.pin_sha}",
         ),
       ),
     ]
@@ -355,39 +282,68 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
       },
     ]
   }
-  commands = commands + [{name: "push", argv: push_argv}]
   for step in commands {
     const result = logged_command_step(harness, cfg, steps, step.name, step.argv, run_id)
     steps = result.steps
     if !result.success {
       const failed_step = steps[len(steps) - 1]
-      if step.name == "push" {
-        steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
-        if push_hook_budget_exceeded(failed_step.command, failed_step) {
-          const retry_argv = {argv: release_branch_push_argv(cfg, branch), env: hook_light_env()}
-          const push_retry = append_command_step(harness, cfg, steps, "push-hook-light-after-green-hook-budget", retry_argv)
-          steps = push_retry.steps
-          if push_retry.success {
-            continue
-          }
-        }
-      } else {
-        steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
-        const retry_commands = retry_commands_after_agent_repair(step)
-        if len(retry_commands) > 0 {
-          const repair_retry = run_retry_commands_after_agent_repair(harness, cfg, steps, retry_commands, run_id)
-          steps = repair_retry.steps
-          if repair_retry.success {
-            continue
-          }
+      steps = maybe_recovery_advice_step(harness, cfg, post_prepare_analysis, steps, failed_step, run_id)
+      const retry_commands = retry_commands_after_agent_repair(step)
+      if len(retry_commands) > 0 {
+        const repair_retry = run_retry_commands_after_agent_repair(harness, cfg, steps, retry_commands, run_id)
+        steps = repair_retry.steps
+        if repair_retry.success {
+          continue
         }
       }
       return steps
     }
   }
-  const delete_outcome = maybe_delete_stale_repin_tag(harness, cfg, version, steps, run_id)
-  steps = delete_outcome.steps
-  if !delete_outcome.success {
+  const head = append_command_step(
+    harness,
+    cfg,
+    steps,
+    "resolve-release-publication-head",
+    ["git", "rev-parse", "HEAD"],
+  )
+  steps = head.steps
+  if !head.success {
+    return steps
+  }
+  const publication = release_publication(version, trim(head.stdout ?? ""))
+  release_log_event(
+    harness,
+    run_id,
+    "immutable_publication_started",
+    {remote_ref: publication.remote_ref, head_oid: publication.head_oid},
+  )
+  const published = publish_release_publication(cfg, publication)
+  const publish_result = if published.success {
+    ok(published.reason + "\n")
+  } else {
+    fail(2, published.reason)
+  }
+  steps = steps
+    + [
+    recorded_step(
+      "publish-immutable-release-attempt",
+      "std/git push origin HEAD:refs/heads/${publication.remote_ref}",
+      publish_result,
+    )
+      + {publication: publication, git_receipt: published.receipt},
+  ]
+  release_log_event(
+    harness,
+    run_id,
+    "immutable_publication_finished",
+    {
+      remote_ref: publication.remote_ref,
+      head_oid: publication.head_oid,
+      success: published.success,
+      action: published.action,
+    },
+  )
+  if !published.success {
     return steps
   }
   // The tag below fires publish-release.yml from the frozen cutoff. Prove that
@@ -401,7 +357,7 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
   // Exercise Harn's real Linux release build + size ratchet without publishing
   // anything, and block signed tag creation unless that exact SHA is green.
   if !(cfg.skip_tag ?? false) {
-    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, branch, steps, run_id)
+    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, publication.remote_ref, steps, run_id)
     steps = binary_gate.steps
     if !binary_gate.success {
       return steps
@@ -422,10 +378,10 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
     harness,
     steps,
     "find-existing-pr",
-    "find open release PR for " + branch,
+    "find open release PR for " + publication.remote_ref,
     run_id,
     fn() {
-      const pr = release_github_open_pr(cfg, branch)
+      const pr = release_github_open_pr(cfg, publication.remote_ref)
       return {found: pr != nil, pull_request: pr}
     },
   )
@@ -444,9 +400,9 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
       harness,
       steps,
       "create-pr",
-      "create Release v${version} PR from " + branch,
+      "create Release v${version} PR from " + publication.remote_ref,
       run_id,
-      fn() { return release_github_pr_create(cfg, "Release v${version}", branch, cfg.base, body) },
+      fn() { return release_github_pr_create(cfg, "Release v${version}", publication.remote_ref, cfg.base, body) },
     )
     steps = created.steps
     if !created.success {
@@ -488,7 +444,7 @@ pub fn execute_ship_pr(harness: Harness, raw_cfg, raw_analysis, agent_review_res
   }
   // Tag + branch + PR are durable. Persist the independent monitor handoff and
   // return immediately; `watch_harn_release.harn` resumes from this receipt.
-  return persist_release_watch_receipt(harness, cfg, version, steps, run_id, pr_url)
+  return persist_release_watch_receipt(harness, cfg, version, publication, steps, run_id, pr_url)
 }
 
 fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
