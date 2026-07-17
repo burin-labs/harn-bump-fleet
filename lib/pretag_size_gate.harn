@@ -13,6 +13,8 @@ pub type PreTagSizeGateResult = {
   phase: PreTagSizeGatePhase,
   run_id?: int,
   completion_timeout_ms?: int,
+  view_attempts?: int,
+  transient_view_retries?: int,
   run_url: string,
   message: string,
 }
@@ -26,12 +28,16 @@ fn gate_result(
   run_id = nil,
   run_url = "",
   completion_timeout_ms = nil,
+  view_attempts = nil,
+  transient_view_retries = nil,
 ) -> PreTagSizeGateResult {
   const result: PreTagSizeGateResult = {
     success: success,
     phase: phase,
     run_id: run_id,
     completion_timeout_ms: completion_timeout_ms,
+    view_attempts: view_attempts,
+    transient_view_retries: transient_view_retries,
     run_url: run_url,
     message: message,
   }
@@ -55,9 +61,54 @@ pub fn pre_tag_size_gate_event(result: PreTagSizeGateResult) {
     phase: result.phase,
     run_id: result.run_id,
     completion_timeout_ms: result.completion_timeout_ms,
+    view_attempts: result.view_attempts,
+    transient_view_retries: result.transient_view_retries,
     run_url: result.run_url,
     message: result.message,
   }
+}
+
+/**
+ * GitHub connector errors are normalized at this boundary. Only the
+ * connector's explicit transport code can retry: malformed responses,
+ * authorization, and terminal workflow evidence all remain fail-closed.
+ */
+fn is_transient_view_error(error) -> bool {
+  return lowercase(trim(to_string(error?.code ?? ""))) == "network"
+}
+
+fn view_exact_run_with_transient_retry(config: PreTagBinaryGateConfig, adapter, run_id: int) {
+  const max_attempts = if config.transient_view_retry_max_attempts > 0 {
+    config.transient_view_retry_max_attempts
+  } else {
+    1
+  }
+  const base_delay_ms = if config.transient_view_retry_base_ms > 0 {
+    config.transient_view_retry_base_ms
+  } else {
+    1
+  }
+  const cap_delay_ms = if config.transient_view_retry_cap_ms >= base_delay_ms {
+    config.transient_view_retry_cap_ms
+  } else {
+    base_delay_ms
+  }
+  let attempts = 0
+  let delay_ms = base_delay_ms
+  let last_error = nil
+  while attempts < max_attempts {
+    const viewed = adapter.view_run(run_id)
+    attempts = attempts + 1
+    if !is_err(viewed) || !is_transient_view_error(unwrap_err(viewed)) {
+      return {viewed: viewed, attempts: attempts, transient_retries: attempts - 1}
+    }
+    last_error = unwrap_err(viewed)
+    if attempts < max_attempts {
+      adapter.wait(delay_ms)
+      delay_ms = min(delay_ms * 2, cap_delay_ms)
+    }
+  }
+  return {viewed: Err(last_error), attempts: attempts, transient_retries: attempts - 1}
 }
 
 pub fn pre_tag_size_gate_started_event(config: PreTagBinaryGateConfig, dispatched) {
@@ -73,6 +124,9 @@ pub fn pre_tag_size_gate_started_event(config: PreTagBinaryGateConfig, dispatche
     targets: config.targets,
     completion_timeout_ms: config.completion_timeout_ms,
     completion_interval_ms: config.completion_interval_ms,
+    transient_view_retry_max_attempts: config.transient_view_retry_max_attempts,
+    transient_view_retry_base_ms: config.transient_view_retry_base_ms,
+    transient_view_retry_cap_ms: config.transient_view_retry_cap_ms,
     run_id: dispatched.run_id,
     run_url: dispatched.url,
     observed_event: dispatched.event,
@@ -107,15 +161,48 @@ pub fn run_pre_tag_size_gate(config: PreTagBinaryGateConfig, adapter, on_started
     )
   }
   let attempt = 0
+  let view_attempts = 0
+  let transient_view_retries = 0
   const max_attempts = config.completion_timeout_ms / config.completion_interval_ms
   while attempt < max_attempts {
-    const viewed = adapter.view_run(run_id)
+    const view = view_exact_run_with_transient_retry(config, adapter, run_id)
+    view_attempts = view_attempts + view.attempts
+    transient_view_retries = transient_view_retries + view.transient_retries
+    const viewed = view.viewed
     if is_err(viewed) {
-      return gate_result(false, "inspect", to_string(unwrap_err(viewed)), run_id, run_url)
+      const retry_suffix = if transient_view_retries > 0 {
+        " after ${transient_view_retries} transient status-read retries"
+      } else {
+        ""
+      }
+      return gate_result(
+        false,
+        "inspect",
+        to_string(unwrap_err(viewed)) + retry_suffix,
+        run_id,
+        run_url,
+        nil,
+        view_attempts,
+        transient_view_retries,
+      )
     }
     const verdict = pre_tag_binary_gate_verdict(config, viewed.run, viewed.jobs)
     if verdict.action == "pass" || verdict.action == "fail" {
-      return gate_result(verdict.action == "pass", "complete", verdict.message, run_id, viewed.run.url)
+      const recovery_suffix = if transient_view_retries > 0 {
+        " after ${transient_view_retries} transient status-read retries"
+      } else {
+        ""
+      }
+      return gate_result(
+        verdict.action == "pass",
+        "complete",
+        verdict.message + recovery_suffix,
+        run_id,
+        viewed.run.url,
+        nil,
+        view_attempts,
+        transient_view_retries,
+      )
     }
     attempt = attempt + 1
     if attempt < max_attempts {
