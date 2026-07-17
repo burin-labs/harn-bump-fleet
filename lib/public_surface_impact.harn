@@ -18,6 +18,16 @@ pub type PublicSurfaceImpactReport = {
   affected_repo_count: int,
 }
 
+pub type PublicSurfaceReleaseDiff = {
+  known: bool,
+  status: string,
+  detail: string,
+  base_tag: string,
+  target_tag: string,
+  paths: list<string>,
+  patch: string,
+}
+
 const IMPACT_KEYWORDS = [
   "breaking",
   "removed",
@@ -89,6 +99,117 @@ fn looks_like_public_surface(value) {
   return len(regex_captures("[A-Za-z]", token)) > 0
 }
 
+fn normalize_release_tag(target) {
+  const value = trim(to_string(target ?? ""))
+  if starts_with(value, "v") {
+    return value
+  }
+  return "v" + value
+}
+
+fn is_public_surface_source_path(path) {
+  const value = trim(to_string(path ?? ""))
+  if starts_with(value, "crates/") && ends_with(value, ".rs") && !contains(value, "/tests/")
+    && !ends_with(value, "_tests.rs") {
+    return true
+  }
+  if (starts_with(value, "stdlib/") || starts_with(value, "scripts/"))
+    && !starts_with(value, "scripts/tests/")
+    && ends_with(value, ".harn") {
+    return true
+  }
+  return (starts_with(value, "spec/") || starts_with(value, "conformance/protocols/"))
+    && (ends_with(value, ".json") || ends_with(value, ".toml") || ends_with(value, ".harn"))
+}
+
+pub fn public_surface_diff_paths_from_text(text: string) -> list<string> {
+  let paths = []
+  for line in split(text ?? "", "\n") {
+    const path = trim(line)
+    if is_public_surface_source_path(path) {
+      paths = unique_push_text(paths, path)
+    }
+  }
+  return paths.sort()
+}
+
+fn release_diff_runner(harn_repo, runner) {
+  return if runner == nil {
+    { spec -> command_run(spec + {cwd: harn_repo, capture: {max_inline_bytes: 512000}}, {timeout_ms: 30000}) }
+  } else {
+    runner
+  }
+}
+
+/**
+ * Read a bounded, source-only release diff. Failure to resolve historical tags
+ * is evidence unavailable, never a release or downstream-bump blocker.
+ */
+pub fn public_surface_release_diff(target: string, harn_repo: string, runner = nil) -> PublicSurfaceReleaseDiff {
+  const run = release_diff_runner(harn_repo, runner)
+  const target_tag = normalize_release_tag(target)
+  const previous = run({argv: ["git", "describe", "--tags", "--abbrev=0", target_tag + "^"]})
+  if !(previous?.success ?? false) || trim(previous?.stdout ?? "") == "" {
+    return {
+      known: false,
+      status: "previous_tag_unavailable",
+      detail: trim(previous?.stderr ?? "could not resolve previous release tag"),
+      base_tag: "",
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const base_tag = trim(previous.stdout)
+  const changed = run({argv: ["git", "diff", "--name-only", base_tag + ".." + target_tag]})
+  if !(changed?.success ?? false) {
+    return {
+      known: false,
+      status: "release_diff_paths_unavailable",
+      detail: trim(changed?.stderr ?? "could not list release diff paths"),
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const paths = public_surface_diff_paths_from_text(changed.stdout ?? "")
+  if len(paths) == 0 {
+    return {
+      known: true,
+      status: "git_release_diff",
+      detail: "no public-surface source files changed from ${base_tag} to ${target_tag}",
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const diff = run(
+    {argv: ["git", "diff", "--unified=0", "--no-ext-diff", base_tag + ".." + target_tag, "--"] + paths},
+  )
+  if !(diff?.success ?? false) {
+    return {
+      known: false,
+      status: "release_diff_unavailable",
+      detail: trim(diff?.stderr ?? "could not read public-surface release diff"),
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: paths,
+      patch: "",
+    }
+  }
+  return {
+    known: true,
+    status: "git_release_diff",
+    detail: "inspected ${len(paths)} public-surface source file(s) from ${base_tag} to ${target_tag}",
+    base_tag: base_tag,
+    target_tag: target_tag,
+    paths: paths,
+    patch: diff.stdout ?? "",
+  }
+}
+
 fn backtick_tokens(line) {
   let values = []
   for capture in regex_captures("`([^`]+)`", line ?? "") ?? [] {
@@ -113,6 +234,76 @@ fn symbol_tokens(line) {
     }
   }
   return values
+}
+
+fn capture_tokens(line, pattern) {
+  let values = []
+  for capture in regex_captures(pattern, line ?? "") ?? [] {
+    const groups = capture?.groups ?? []
+    const raw = if len(groups) > 0 {
+      groups[0]
+    } else {
+      capture?.match ?? ""
+    }
+    const token = normalize_public_surface_token(raw)
+    if token != "" {
+      values = unique_push_text(values, token)
+    }
+  }
+  return values
+}
+
+fn diff_line_is_content(line) {
+  return (starts_with(line, "+") && !starts_with(line, "+++"))
+    || (starts_with(line, "-") && !starts_with(line, "---"))
+}
+
+fn public_surface_tokens_from_diff_line(line) {
+  const lower = lowercase(line ?? "")
+  let values = []
+  for capture in regex_captures(
+    "^[-+]\\s*pub\\s+(fn|type|struct|enum|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+    line ?? "",
+  )
+    ?? [] {
+    const groups = capture?.groups ?? []
+    if len(groups) > 1 {
+      values = unique_push_text(values, groups[1])
+    }
+  }
+  for field in capture_tokens(line, "^[-+]\\s*pub\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*:") {
+    if contains(field, "_") {
+      values = unique_push_text(values, field)
+    }
+  }
+  for constant in capture_tokens(line, "[A-Z0-9_]*SCHEMA_VERSION") {
+    values = unique_push_text(values, constant)
+  }
+  if contains(lower, "schema") || contains(lower, "protocol") || contains(lower, "event")
+    || contains(lower, "command(name") {
+    for token in capture_tokens(line, "\\\"([A-Za-z][A-Za-z0-9_.-]*)\\\"") {
+      const cli_subcommand = contains(lower, "command(name")
+        && len(regex_captures("^[A-Za-z][A-Za-z0-9-]*$", token)) > 0
+      if looks_like_public_surface(token) || cli_subcommand {
+        values = unique_push_text(values, token)
+      }
+    }
+  }
+  return values
+}
+
+/** Extract downstream-searchable symbols from changed public source lines. */
+pub fn public_surface_candidates_from_diff(diff: string) -> list<string> {
+  let surfaces = []
+  for line in split(diff ?? "", "\n") {
+    if !diff_line_is_content(line) {
+      continue
+    }
+    for token in public_surface_tokens_from_diff_line(line) {
+      surfaces = unique_push_text(surfaces, token)
+    }
+  }
+  return surfaces.sort()
 }
 
 /**
@@ -146,7 +337,12 @@ pub fn public_surface_candidates_from_analysis(analysis) -> list<string> {
     ],
     "\n",
   )
-  return public_surface_candidates_from_text(evidence)
+  let surfaces = []
+  for token in public_surface_candidates_from_text(evidence)
+    + public_surface_candidates_from_diff(analysis?.public_surface_diff ?? "") {
+    surfaces = unique_push_text(surfaces, token)
+  }
+  return surfaces.sort()
 }
 
 pub fn public_surface_usage_from_text(repo: string, text: string, surfaces: list<string>) -> PublicSurfaceUsage {
