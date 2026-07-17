@@ -1,0 +1,433 @@
+// Deterministic release-triviality classification and interactive approval.
+import { agent_chat_loop, agent_chat_route_input } from "std/agent/chat"
+import { command_run } from "std/command"
+import { run_artifact_transcript_dir, run_artifacts_from_dir } from "std/run_artifacts"
+import { page } from "std/tui"
+import { chat_run_artifact_root } from "./chat_runs"
+import { chat_ansi, chat_prompt_line, print_chat_assistant_turn } from "./chat_ui"
+import { install_binder, planner_defaults, retrying_llm_caller } from "./llm_defaults"
+import { truncate_text } from "./text_util"
+
+/**
+ * Deterministic metrics on a CHANGELOG and PR-body draft used to seed the
+ * triviality classifier prompt. Exposed so tests exercise the classification
+ * floor without invoking an LLM.
+ */
+pub fn classifier_payload(inputs) {
+  const changelog = inputs?.changelog ?? ""
+  const pr_body = inputs?.pr_body ?? ""
+  const findings = inputs?.findings ?? []
+  const lines = (changelog ?? "").split("\n")
+  const breaking_hits = if type_of(changelog) == "string" {
+    let hits = 0
+    for line in lines {
+      const lower = line.to_lower()
+      if contains(lower, "breaking") || contains(lower, "incompatible") {
+        hits = hits + 1
+      }
+    }
+    hits
+  } else {
+    0
+  }
+  const section_lines = if type_of(changelog) == "string" {
+    let count = 0
+    for line in lines {
+      if starts_with(line, "### ") {
+        count = count + 1
+      }
+    }
+    count
+  } else {
+    0
+  }
+  const bullet_lines = if type_of(changelog) == "string" {
+    let count = 0
+    for line in lines {
+      if starts_with(line, "- ") || starts_with(line, "* ") {
+        count = count + 1
+      }
+    }
+    count
+  } else {
+    0
+  }
+  return {
+    changelog: truncate_text(changelog, 6000),
+    pr_body: truncate_text(pr_body, 4000),
+    findings: findings,
+    metrics: {
+      changelog_chars: len(changelog),
+      changelog_lines: len(lines),
+      pr_body_chars: len(pr_body),
+      breaking_hits: breaking_hits,
+      section_lines: section_lines,
+      bullet_lines: bullet_lines,
+      finding_count: len(findings),
+    },
+  }
+}
+
+fn classify_triviality(cfg, inputs) {
+  const payload = classifier_payload(inputs)
+  const metrics = payload.metrics
+  const cheap_non_trivial = metrics.breaking_hits > 0
+    || metrics.section_lines >= 3
+    || metrics.bullet_lines > 12
+    || metrics.finding_count > 0
+  if cheap_non_trivial {
+    return {
+      non_trivial: true,
+      why: "deterministic: " + classifier_reason_text(metrics),
+      source: "deterministic",
+    }
+  }
+  if cfg?.mock ?? false {
+    return {non_trivial: false, why: "mock release; classifier skipped", source: "mock"}
+  }
+  const system = render("@prompts/chat_triviality_classifier.harn.prompt", payload)
+  const defaults = planner_defaults("HARN_CHAT")
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {non_trivial: {type: "boolean"}, why: {type: "string"}},
+    required: ["non_trivial", "why"],
+  }
+  const envelope = try {
+    llm_call_structured_result(
+      "Classify this CHANGELOG draft. Respond with one JSON object only.",
+      schema,
+      {
+        system: system,
+        provider: cfg?.provider ?? defaults.provider,
+        model: cfg?.model ?? defaults.model,
+        max_tokens: 200,
+        temperature: 0.0,
+        schema_retries: 0,
+      },
+    )
+  } catch (error) {
+    return {non_trivial: true, why: "classifier_error: ${error}", source: "fail_open"}
+  }
+  if !(envelope?.ok ?? false) {
+    const why = if envelope?.error_category != nil {
+      "classifier ${envelope.error_category}, defaulting to non-trivial"
+    } else {
+      "classifier output unparseable, defaulting to non-trivial"
+    }
+    return {
+      non_trivial: true,
+      why: why,
+      source: "fail_open",
+      raw: truncate_text(to_string(envelope?.raw_text ?? ""), 400),
+    }
+  }
+  const data = envelope?.data ?? {}
+  return {non_trivial: data?.non_trivial ?? true, why: data?.why ?? "", source: "llm"}
+}
+
+fn classifier_reason_text(metrics) {
+  let parts = []
+  if metrics.breaking_hits > 0 {
+    parts = parts + ["${metrics.breaking_hits} BREAKING mention(s)"]
+  }
+  if metrics.section_lines >= 3 {
+    parts = parts + ["${metrics.section_lines} sections"]
+  }
+  if metrics.bullet_lines > 12 {
+    parts = parts + ["${metrics.bullet_lines} bullets"]
+  }
+  if metrics.finding_count > 0 {
+    parts = parts + ["${metrics.finding_count} deterministic finding(s)"]
+  }
+  if len(parts) == 0 {
+    return "none"
+  }
+  return join(parts, ", ")
+}
+
+/** Render a markdown changelog section with the gate's existing ANSI weight. */
+pub fn colorize_changelog(text) {
+  if contains(text ?? "", "[0m") {
+    return text
+  }
+  const ansi = chat_ansi()
+  const lines = (text ?? "").split("\n")
+  let output = []
+  for raw in lines {
+    const line = raw ?? ""
+    if starts_with(line, "## ") {
+      output = output + [ansi.bold + ansi.cyan + line + ansi.reset]
+    } else if starts_with(line, "### ") {
+      output = output + [ansi.bold + ansi.yellow + line + ansi.reset]
+    } else if starts_with(line, "#### ") {
+      output = output + [ansi.bold + line + ansi.reset]
+    } else if starts_with(line, "- ") || starts_with(line, "* ") {
+      const lower = line.to_lower()
+      const coloured = if contains(lower, "breaking") || contains(lower, "incompatible") {
+        ansi.red + ansi.bold + line + ansi.reset
+      } else {
+        ansi.green + "+ " + ansi.reset + substring(line, 2, len(line))
+      }
+      output = output + [coloured]
+    } else if starts_with(line, "  ") {
+      output = output + [ansi.dim + line + ansi.reset]
+    } else {
+      output = output + [line]
+    }
+  }
+  return join(output, "\n")
+}
+
+fn commit_range(ctx) {
+  const latest = trim(ctx?.latest_tag ?? "")
+  const pin = trim(ctx?.pin_sha ?? "")
+  if latest == "" || pin == "" {
+    return ""
+  }
+  return "${latest}..${pin}"
+}
+
+fn release_range_diffstat(ctx) {
+  const repo = ctx?.repo ?? ""
+  const range = commit_range(ctx)
+  if repo == "" || range == "" {
+    return ""
+  }
+  const argv = ["git", "-C", repo, "-c", "color.ui=always", "diff", "--stat", "--stat-count=40", range]
+  const result = try {
+    command_run({argv: argv, timeout_ms: 8000})
+  } catch (_error) {
+    nil
+  }
+  if result == nil || !(result?.success ?? false) {
+    return ""
+  }
+  return trim(result?.stdout ?? "")
+}
+
+fn release_range_oneline_log(ctx, limit) {
+  const repo = ctx?.repo ?? ""
+  const range = commit_range(ctx)
+  if repo == "" || range == "" {
+    return ""
+  }
+  const cap = limit ?? 25
+  const argv = [
+    "git",
+    "-C",
+    repo,
+    "-c",
+    "color.ui=always",
+    "log",
+    "--oneline",
+    "--no-merges",
+    "--max-count=${cap}",
+    range,
+  ]
+  const result = try {
+    command_run({argv: argv, timeout_ms: 8000})
+  } catch (_error) {
+    nil
+  }
+  if result == nil || !(result?.success ?? false) {
+    return ""
+  }
+  return trim(result?.stdout ?? "")
+}
+
+fn release_range_full_diff(ctx) {
+  const repo = ctx?.repo ?? ""
+  const range = commit_range(ctx)
+  if repo == "" || range == "" {
+    return ""
+  }
+  const argv = ["git", "-C", repo, "-c", "color.ui=always", "diff", "--patch", "--stat", range]
+  const result = try {
+    command_run({argv: argv, timeout_ms: 20000, capture: {max_inline_bytes: 4194304}})
+  } catch (_error) {
+    nil
+  }
+  if result == nil || !(result?.success ?? false) {
+    return ""
+  }
+  return result?.stdout ?? ""
+}
+
+/**
+ * Render a pre-release approval gate. It returns {decision: "approve"|"abort",
+ * reason: string}; callers invoke it only after chat_enabled has passed.
+ */
+pub fn pre_release_gate(harness: Harness, cfg, inputs, ctx) {
+  const ansi = chat_ansi()
+  const triviality = classify_triviality(cfg, inputs)
+  if !triviality.non_trivial {
+    harness.stdio
+      .println(
+      ansi.dim + "   chat: classifier — trivial release (" + triviality.why + "); auto-approve"
+        + ansi.reset,
+    )
+    return {decision: "approve", reason: "trivial:" + triviality.why}
+  }
+  harness.stdio.println("")
+  harness.stdio.println(ansi.bold + "== chat: pre-release approval gate" + ansi.reset)
+  harness.stdio
+    .println(
+    "   non-trivial release (${triviality.source}): " + ansi.yellow + triviality.why + ansi.reset,
+  )
+  const range = commit_range(ctx)
+  if range != "" {
+    const current_version = trim(ctx?.current_version ?? "")
+    const next_version = trim(ctx?.next_version ?? "?")
+    const version_line = if current_version == "" {
+      "v${next_version}"
+    } else {
+      "v${current_version} → v${next_version}"
+    }
+    harness.stdio
+      .println(
+      ansi.dim + "   commit range " + ansi.reset + ansi.bold + range + ansi.reset + ansi.dim
+        + " (releasing as ${version_line})"
+        + ansi.reset,
+    )
+  }
+  const oneline = release_range_oneline_log(ctx, 12)
+  if oneline != "" {
+    harness.stdio.println("")
+    harness.stdio.println(ansi.bold + "── commits in this release ──" + ansi.reset)
+    harness.stdio.println(oneline)
+  }
+  const diffstat = release_range_diffstat(ctx)
+  if diffstat != "" {
+    harness.stdio.println("")
+    harness.stdio.println(ansi.bold + "── files touched (git diff --stat) ──" + ansi.reset)
+    harness.stdio.println(diffstat)
+  }
+  harness.stdio.println("")
+  harness.stdio.println(ansi.bold + "── proposed CHANGELOG section ──" + ansi.reset)
+  const coloured = colorize_changelog(inputs?.changelog ?? "(empty)")
+  const version_label = ctx?.next_version ?? "?"
+  page({title: "v${version_label} CHANGELOG delta", body: coloured, format: "text"})
+  const pr_body = inputs?.pr_body ?? ""
+  if trim(pr_body) != "" {
+    page({title: "PR body", body: colorize_changelog(pr_body), format: "text"})
+  }
+  harness.stdio.println("")
+  harness.stdio
+    .println(
+    ansi.dim
+      + "   approve [a], abort [q], chat [c] to discuss, diff [d] to view the full coloured diff"
+      + ansi.reset,
+  )
+  while true {
+    const line = chat_prompt_line(ansi.cyan + "gate> " + ansi.reset + "[a/q/c/d] ", 120)
+    if line == nil {
+      return {decision: "abort", reason: "no response within timeout"}
+    }
+    const answer = trim(line).to_lower()
+    if answer == "a" || answer == "approve" || answer == "y" || answer == "yes" {
+      return {decision: "approve", reason: "operator approved"}
+    }
+    if answer == "q" || answer == "abort" || answer == "n" || answer == "no" || answer == "/exit" {
+      return {decision: "abort", reason: "operator aborted"}
+    }
+    if answer == "d" || answer == "diff" {
+      const full = release_range_full_diff(ctx)
+      if trim(full) == "" {
+        harness.stdio
+          .println(
+          ansi.yellow + "   (no diff available — repo/range unset, or git diff returned empty)"
+            + ansi.reset,
+        )
+      } else {
+        page({title: "git diff ${range}", body: full, format: "text"})
+      }
+      continue
+    }
+    if answer == "c" || answer == "chat" {
+      const outcome = run_gate_chat(harness, cfg, inputs, ctx, triviality)
+      if outcome?.decision != nil {
+        return outcome
+      }
+      continue
+    }
+    harness.stdio
+      .println(ansi.yellow + "   (didn't understand '${answer}'; type a, q, c, or d)" + ansi.reset)
+  }
+}
+
+fn gate_chat_system_prompt(ctx, inputs, triviality) {
+  return render(
+    "@prompts/chat_pre_release_system.harn.prompt",
+    {
+      next_version: ctx?.next_version ?? "?",
+      mode: ctx?.mode ?? "?",
+      why: triviality?.why ?? "",
+      changelog: truncate_text(inputs?.changelog ?? "", 8000),
+      pr_body: truncate_text(inputs?.pr_body ?? "", 4000),
+      findings: inputs?.findings ?? [],
+    },
+  )
+}
+
+fn run_gate_chat(harness: Harness, cfg, inputs, ctx, triviality) {
+  const ansi = chat_ansi()
+  const system = gate_chat_system_prompt(ctx, inputs, triviality)
+  const gate_run_id = ctx?.run_id ?? uuid_v7()
+  const session_id = "release-gate-" + gate_run_id
+  const defaults = planner_defaults("HARN_CHAT")
+  const binder = install_binder(cfg?.tools ?? tool_registry())
+  const gate_run = run_artifacts_from_dir(
+    "release-harn",
+    path_join(chat_run_artifact_root(), "release-harn", ctx?.run_id ?? "ad-hoc"),
+  )
+  const transcript_dir = run_artifact_transcript_dir(gate_run, "chat-gate-llm")
+  harness.fs.mkdir(transcript_dir, true)
+  harness.stdio.println("")
+  harness.stdio
+    .println(
+    ansi.bold
+      + "   ── pre-release chat ── /approve to ship, /abort to halt, /exit to back out to the gate prompt"
+      + ansi.reset,
+  )
+  const gate_handlers = {
+    "/approve": { _req -> {kind: "exit", reason: "approved_from_chat"} },
+    "/abort": { _req -> {kind: "exit", reason: "aborted_from_chat"} },
+  }
+  const result = agent_chat_loop(
+    {
+      session_id: session_id,
+      provider: cfg?.provider ?? defaults.provider,
+      model: cfg?.model ?? defaults.model,
+      tools: binder.tools,
+      tool_caller: binder.tool_caller,
+      system_prompt: system,
+      max_iterations: 6,
+      iteration_budget: {mode: "adaptive", initial: 3, max: 6, extend_by: 2},
+      max_tokens: 4000,
+      temperature: 0.2,
+      llm_caller: retrying_llm_caller(2),
+      llm_transcript_dir: transcript_dir,
+      slash_commands: gate_handlers,
+      on_user_input: { state ->
+        const line = chat_prompt_line(ansi.cyan + "you> " + ansi.reset, cfg?.timeout_s ?? 60)
+        if line == nil {
+          return {kind: "exit", reason: "timeout"}
+        }
+        return agent_chat_route_input(line, state, gate_handlers)
+      },
+      on_model_turn: { turn, _state ->
+        print_chat_assistant_turn(harness, turn)
+        return nil
+      },
+    },
+  )
+  if result.stop_reason == "approved_from_chat" {
+    return {decision: "approve", reason: "approved from chat"}
+  }
+  if result.stop_reason == "aborted_from_chat" {
+    return {decision: "abort", reason: "aborted from chat"}
+  }
+  harness.stdio.println(ansi.dim + "   (returning to gate prompt)" + ansi.reset)
+  return {}
+}
