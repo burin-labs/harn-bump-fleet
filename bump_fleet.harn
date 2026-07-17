@@ -14,9 +14,7 @@
 //   harn run --no-sandbox bump_fleet.harn -- --dry-run v0.7.52
 //   harn run --no-sandbox bump_fleet.harn -- --retry-failed 3  // re-dispatch dispatch_failed/run_failure
 //                                                              // repos up to 3 more times each
-import { agent_host_tools } from "std/agent/host_tools"
 import { agent_preset } from "std/agent/presets"
-import { parse_args } from "std/cli"
 import { command_run } from "std/command"
 import { env_str } from "std/config"
 import { strip_think_blocks } from "std/llm/safe"
@@ -25,6 +23,8 @@ import { map_settled } from "std/settled"
 import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
 import { workflow_run_repair } from "std/workflow/repair"
 import { dry_run_predispatch_outcome, local_pin_drift_detail } from "lib/bump_decision"
+import { bump_chat_only, run_bump_post_run_chat } from "lib/bump_fleet_chat"
+import { parse_bump_fleet_args } from "lib/bump_fleet_options"
 import { cargo_harn_pin_probe, harn_version_pin_probe } from "lib/bump_pins"
 import {
   bump_summary_format_ok,
@@ -33,12 +33,6 @@ import {
   bump_summary_skipped,
 } from "lib/bump_summary"
 import { changelog_named_section_from_text } from "lib/changelog"
-import {
-  chat_cfg_from_run_dir,
-  chat_enabled,
-  pick_recent_run,
-  resolve_chat_run_path,
-} from "lib/chat_runs"
 import { checkout_cleanup } from "lib/checkout_cleanup"
 import { remote_url_to_slug } from "lib/git"
 import {
@@ -58,7 +52,6 @@ import {
   planner_defaults,
   retrying_llm_caller,
 } from "lib/llm_defaults"
-import { run_chat_loop } from "lib/post_run_chat"
 import {
   public_surface_impact_for_repo,
   public_surface_impact_for_repos,
@@ -78,8 +71,6 @@ import { timing_artifacts } from "lib/timing_report"
 let BUMP_BRANCH = "automation/bump-harn-runtime"
 
 let HARN_REPO = "burin-labs/harn"
-
-let DEFAULT_HARN_REPO_PATH = path_join(env_str("HOME") ?? "", "projects/harn")
 
 let POLL_INTERVAL_MS = 15000
 
@@ -107,18 +98,6 @@ let SUMMARY_MODEL = env_str("HARN_BUMP_FLEET_MODEL") ?? __BUMP_FLEET_DEFAULT.mod
 
 let SUMMARY_PROVIDER = env_str("HARN_BUMP_FLEET_PROVIDER") ?? __BUMP_FLEET_DEFAULT.provider
 
-let ARG_SPEC = [
-  {kind: "positional", name: "target", required: false},
-  {kind: "flag", name: "dry_run", flags: ["--dry-run"]},
-  {kind: "option", name: "only", flags: ["--only"]},
-  {kind: "flag", name: "no_chat", flags: ["--no-chat"]},
-  {kind: "flag", name: "chat_only", flags: ["--chat-only"]},
-  {kind: "option", name: "chat_run", flags: ["--chat-run"], default: ""},
-  {kind: "option", name: "chat_timeout_s", flags: ["--chat-timeout-s"], default: "60"},
-  {kind: "option", name: "retry_failed", flags: ["--retry-failed"], default: "0"},
-  {kind: "option", name: "harn_repo", flags: ["--harn-repo"], default: DEFAULT_HARN_REPO_PATH},
-]
-
 // Outcome statuses that are transient enough to be worth retrying. Codeload
 // flakes, action-download HTTP 5xx, workflow_dispatch HTTP 500 during a
 // GitHub Actions incident, and per-run race conditions all surface as one of
@@ -127,95 +106,6 @@ let ARG_SPEC = [
 // variants are intentionally absent: re-dispatching them either no-ops or
 // creates duplicate work.
 let RETRYABLE_STATUSES = ["dispatch_failed", "run_failure", "preflight_error", "run_in_progress"]
-
-fn parse_fleet_args(args) {
-  let parsed = parse_args(args, ARG_SPEC)
-  let errors = parsed._errors ?? []
-  if len(parsed._extras) > 0 {
-    throw "unknown flag: " + parsed._extras[0]
-  }
-  if len(errors) > 0 {
-    throw join(errors, "; ")
-  }
-  let retry_raw = to_int(parsed.retry_failed) ?? 0
-  let retry_capped = if retry_raw < 0 {
-    0
-  } else {
-    retry_raw
-  }
-  return {
-    target: parsed.target,
-    dry_run: parsed.dry_run,
-    only: parsed.only,
-    no_chat: parsed.no_chat,
-    chat_only: parsed.chat_only,
-    chat_run: parsed.chat_run,
-    chat_timeout_s: to_int(parsed.chat_timeout_s) ?? 60,
-    retry_failed: retry_capped,
-    harn_repo: parsed.harn_repo,
-  }
-}
-
-let BUMP_CHAT_ARGV_PREFIXES = [
-  ["git", "status"],
-  ["git", "diff"],
-  ["git", "log"],
-  ["git", "show"],
-  ["git", "branch"],
-  ["git", "rev-parse"],
-  ["gh", "pr", "list"],
-  ["gh", "pr", "view"],
-  ["gh", "pr", "checks"],
-  ["gh", "run", "list"],
-  ["gh", "run", "view"],
-  ["gh", "workflow", "list"],
-  ["gh", "workflow", "view"],
-  ["gh", "release", "list"],
-  ["gh", "release", "view"],
-  ["rg"],
-  ["grep"],
-  ["head"],
-  ["tail"],
-  ["cat"],
-  ["ls"],
-  ["test"],
-]
-
-fn bump_chat_tools() {
-  return agent_host_tools(
-    nil,
-    {
-      root: cwd(),
-      cwd: cwd(),
-      max_inline_bytes: 12000,
-      read_bytes: 12000,
-      tail_bytes: 12000,
-      search_max_matches: 120,
-      exclude_globs: [".git/**", "target/**"],
-      allow_argv_prefixes: BUMP_CHAT_ARGV_PREFIXES,
-      names: {
-        read_file: "fleet_read",
-        read_file_tail: "fleet_read_tail",
-        search_files: "fleet_search",
-        git_inspect: "fleet_git",
-        run_command: "fleet_run",
-        read_command_output: "fleet_run_output",
-        read_command_output_tail: "fleet_run_tail",
-        edit_file: "fleet_edit_file",
-        write_file: "fleet_write_file",
-      },
-      descriptions: {
-        read_file: "Read a UTF-8 file under the harn-bump-fleet repo by repo-relative path. Prefer bounded reads with limit_bytes.",
-        search_files: "Search harn-bump-fleet repo contents. Provide a pattern; use path/glob only to narrow the search.",
-        git_inspect: "Inspect git status, diff, log, show, blame, branches, or remotes without mutating the repo.",
-        run_command: "Run one bounded read-only inspection command from the harn-bump-fleet repo. Pass argv as an array of strings.",
-        edit_file: "Apply an exact-text edit to a tracked file in harn-bump-fleet. The operator authorized chat-side edits.",
-        write_file: "Overwrite a tracked file in harn-bump-fleet. Prefer edit_file for small edits.",
-      },
-      output_format: "json",
-    },
-  )
-}
 
 fn skipped_run_session_view_gate(target, reason) {
   return {
@@ -239,44 +129,6 @@ fn skipped_run_session_view_gate(target, reason) {
     target_version: strip_v(target ?? ""),
     target_change: {known: false, changed: false, paths: [], detail: reason},
   }
-}
-
-fn bump_chat_only(harness: Harness, parsed) {
-  if !chat_enabled(parsed) {
-    harness.stdio.eprintln("--chat-only requires an interactive terminal (and HARN_CHAT != 0)")
-    return 2
-  }
-  let kind = "bump-fleet"
-  let target_dir = if trim(parsed.chat_run ?? "") != "" {
-    resolve_chat_run_path(harness, kind, parsed.chat_run)
-  } else {
-    let pick = pick_recent_run(harness, kind, 12)
-    if pick == nil {
-      nil
-    } else {
-      pick.dir
-    }
-  }
-  if target_dir == nil {
-    harness.stdio.println("(no run selected; exiting)")
-    return 0
-  }
-  let chat_cfg = chat_cfg_from_run_dir(
-    harness,
-    {
-      provider: SUMMARY_PROVIDER,
-      model: SUMMARY_MODEL,
-      repo: cwd(),
-      mock: false,
-      timeout_s: parsed.chat_timeout_s,
-      tools: bump_chat_tools(),
-      no_chat: parsed.no_chat,
-    },
-    kind,
-    target_dir,
-  )
-  run_chat_loop(harness, chat_cfg)
-  return 0
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1163,9 +1015,9 @@ pipeline main() {
   if preflight != nil {
     return preflight
   }
-  let parsed = parse_fleet_args(argv)
+  let parsed = parse_bump_fleet_args(argv)
   if parsed.chat_only {
-    return bump_chat_only(harness, parsed)
+    return bump_chat_only(harness, parsed, {provider: SUMMARY_PROVIDER, model: SUMMARY_MODEL})
   }
   let target = parsed.target ?? timed("bump.resolve_target", {}, { -> return resolve_latest_release() }).result
   if !is_v_semver(target) {
@@ -1384,29 +1236,17 @@ pipeline main() {
   } else {
     0
   }
-  if chat_enabled(parsed) {
-    let run_dir = path_join(cwd(), ".harn-runs/bump-fleet", run_id)
-    let chat_cfg = {
-      harness_kind: "bump-fleet",
+  run_bump_post_run_chat(
+    harness,
+    parsed,
+    {provider: SUMMARY_PROVIDER, model: SUMMARY_MODEL},
+    {
       run_id: run_id,
-      run_dir: run_dir,
       audit_md_path: written.md_path,
       audit_json_path: written.json_path,
-      llm_transcript_path: nil,
-      provider: SUMMARY_PROVIDER,
-      model: SUMMARY_MODEL,
-      repo: cwd(),
-      mode_hint: mode_label,
-      outcome: if any_error {
-        "FAILED"
-      } else {
-        "ok"
-      },
-      tools: bump_chat_tools(),
-      timeout_s: parsed.chat_timeout_s,
-      no_chat: parsed.no_chat,
-    }
-    run_chat_loop(harness, chat_cfg)
-  }
+      mode: mode_label,
+      failed: any_error,
+    },
+  )
   return exit_code
 }
