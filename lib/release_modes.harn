@@ -20,12 +20,14 @@ import {
   last_failed_step,
   recorded_step,
   recovery_step_ref,
+  release_commit_verify_args,
 } from "./release_execution"
 import { ensure_release_notes_with_run_id, prepared_release_analysis } from "./release_notes"
 import { execute_fixup_cherry_pick, release_prepare_audit_plan } from "./release_prepare"
 import {
   publish_release_publication,
   release_publication,
+  release_publication_pr_decision,
   superseded_release_attempts,
 } from "./release_publication"
 import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
@@ -237,17 +239,6 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
       },
     ]
   }
-  commands = commands
-    + [
-    {
-      name: "verify-release-commit-signature",
-      argv: [
-        "sh",
-        "-c",
-        "sig=$(git log -1 --format=%G? HEAD); case \"$sig\" in N|B) echo \"release commit signature is not valid (%G?=$sig); configure commit signing or amend the release commit before publishing\" >&2; exit 1;; *) echo \"release commit signature state: $sig\";; esac",
-      ],
-    },
-  ]
   // No `git rebase` here — pinning the release branch's parent is the
   // whole point of `cfg.pin_sha`. Rebasing onto origin/<base> would fold
   // commits that landed on main after this run started into the release.
@@ -278,6 +269,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
         argv: [
           "git",
           "merge",
+          "-S",
           "--no-ff",
           "-s",
           "ours",
@@ -317,6 +309,18 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
     return steps
   }
   const publication = release_publication(version, trim(head.stdout ?? ""))
+  const verified_publication = logged_command_step(
+    harness,
+    cfg,
+    steps,
+    "verify-release-commit-signature",
+    release_commit_verify_args(publication.head_oid),
+    run_id,
+  )
+  steps = verified_publication.steps
+  if !verified_publication.success {
+    return steps
+  }
   release_log_event(
     harness,
     run_id,
@@ -333,7 +337,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
     + [
     recorded_step(
       "publish-immutable-release-attempt",
-      "std/git push origin HEAD:refs/heads/${publication.remote_ref}",
+      "std/git push origin ${publication.head_oid}:refs/heads/${publication.remote_ref}",
       publish_result,
     )
       + {publication: publication, git_receipt: published.receipt},
@@ -363,7 +367,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
   // Exercise Harn's real Linux release build + size ratchet without publishing
   // anything, and block signed tag creation unless that exact SHA is green.
   if !(cfg.skip_tag ?? false) {
-    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, publication.remote_ref, steps, run_id)
+    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, publication, steps, run_id)
     steps = binary_gate.steps
     if !binary_gate.success {
       return steps
@@ -375,7 +379,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
   // Cargo.toml/CHANGELOG bump on main) and doesn't influence what was
   // shipped. If the tag push fails, abort early so we don't open a PR
   // for a release that hasn't been published.
-  steps = ensure_release_tag_pushed(harness, cfg, version, steps, run_id)
+  steps = ensure_release_tag_pushed(harness, cfg, version, publication, steps, run_id)
   if execution_failed(steps) {
     return steps
   }
@@ -395,13 +399,10 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
   if !existing_pr.success {
     return steps
   }
-  let pr_url = if existing_pr.value.found {
-    existing_pr.value.pull_request.url
-  } else {
-    ""
-  }
+  const existing_found = existing_pr.value.found
+  let pull_request = existing_pr.value.pull_request
   const body = harness.fs.read_text(body_path)
-  if pr_url == "" {
+  if !existing_found {
     const created = logged_github_operation_step(
       harness,
       steps,
@@ -414,20 +415,33 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
     if !created.success {
       return steps
     }
-    pr_url = created.value.url
-  } else {
+    pull_request = created.value
+  }
+  const publication_decision = release_publication_pr_decision(publication, pull_request)
+  steps = steps
+    + [
+    recorded_step(
+      "verify-release-pr-publication",
+      "verify release PR targets ${publication.remote_ref} at ${publication.head_oid}",
+      if publication_decision.action == "accept" {
+        ok(publication_decision.reason + "\n")
+      } else {
+        fail(2, publication_decision.reason)
+      },
+    ),
+  ]
+  if publication_decision.action != "accept" {
+    return steps
+  }
+  const pr_url = pull_request.url
+  if existing_found {
     const edited = logged_github_operation_step(
       harness,
       steps,
       "refresh-existing-pr-body",
       "refresh Release v${version} PR metadata",
       run_id,
-      fn() { return release_github_pr_edit(
-        cfg,
-        pr_url,
-        {title: "Release v${version}", body: body},
-        publication.remote_ref,
-      ) },
+      fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: body}) },
     )
     steps = edited.steps
     if !edited.success {
@@ -464,7 +478,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
       return steps
     }
   }
-  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication.remote_ref)
+  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication)
   steps = merge_handoff.steps
   if !merge_handoff.success {
     return steps
@@ -477,12 +491,7 @@ pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run
     "refresh-pr-body-final",
     "write final Release v${version} PR receipt",
     run_id,
-    fn() { return release_github_pr_edit(
-      cfg,
-      pr_url,
-      {title: "Release v${version}", body: final_body},
-      publication.remote_ref,
-    ) },
+    fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: final_body}) },
   )
   steps = final_edit.steps
   if !final_edit.success {
