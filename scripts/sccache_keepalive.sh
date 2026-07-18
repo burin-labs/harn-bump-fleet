@@ -25,6 +25,11 @@ set -euo pipefail
 SCCACHE_BIN="$(command -v sccache 2>/dev/null || echo /opt/homebrew/bin/sccache)"
 [ -x "$SCCACHE_BIN" ] || exit 0
 
+# Keep a machine-wide compilation cache bounded so it cannot crowd out active
+# release targets and worktrees. Operators may raise or lower this per host.
+DEFAULT_SCCACHE_CACHE_SIZE="24G"
+export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-$DEFAULT_SCCACHE_CACHE_SIZE}"
+
 # A server we start should never idle out — staying alive means a sandboxed
 # build never has to spawn (and confine) a replacement.
 export SCCACHE_IDLE_TIMEOUT=0
