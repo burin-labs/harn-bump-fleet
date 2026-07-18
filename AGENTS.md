@@ -48,9 +48,9 @@ Use the pinned Harn version from `.harn-version`.
 
 ```sh
 harn install --locked
-harn check $(git ls-files '*.harn')
+harn check --strict-types $(git ls-files '*.harn')
 harn fmt --check $(git ls-files '*.harn')
-harn lint $(git ls-files '*.harn')
+harn lint --strict $(git ls-files '*.harn')
 harn test tests/ --verbose
 ```
 
