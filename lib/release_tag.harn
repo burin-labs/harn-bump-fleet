@@ -15,7 +15,8 @@ import {
   release_tag_push_args,
   release_tag_verify_args,
 } from "./release_execution"
-import { harn_crate_published, missing_release_assets } from "./release_readiness"
+import { ReleasePublication } from "./release_publication"
+import { missing_release_assets } from "./release_readiness"
 import {
   local_release_tag_decision,
   release_cutoff_decision,
@@ -24,8 +25,8 @@ import {
   remote_release_tag_decision,
   remote_tag_sha,
   remote_tag_target_sha,
-  repin_tocttou_decision,
 } from "./release_repin"
+import { release_tag_identity_verification } from "./release_tag_identity"
 import {
   release_watch_receipt,
   release_watch_receipt_path,
@@ -34,8 +35,6 @@ import {
 import { command_output, fail, ok } from "./shell_util"
 import { logged_command_step } from "release_agent"
 import {
-  append_command_step,
-  argv_label,
   log_step_finished,
   log_step_started,
   recorded_remote_refs_step,
@@ -60,7 +59,7 @@ import {
  */
 fn release_cutoff_gate(harness: Harness, cfg, tag: string, phase: string, steps, run_id) {
   const explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
-  if cfg.mock || (cfg.repin_mode ?? false) || explicit_pin || (cfg.allow_base_drift ?? false) {
+  if cfg.mock || explicit_pin || (cfg.allow_base_drift ?? false) {
     return {steps: steps, proceed: true}
   }
   const step = "pre-${phase}-cutoff-check"
@@ -89,7 +88,6 @@ fn release_cutoff_gate(harness: Harness, cfg, tag: string, phase: string, steps,
       pin_is_base_ancestor: cutoff.pin_is_base_ancestor,
       base: cfg.base,
       tag: tag,
-      repin_latest: false,
       explicit_pin: false,
       allow_drift: false,
     },
@@ -139,7 +137,15 @@ pub fn pre_prepare_cutoff_gate(harness: Harness, cfg, analysis, steps, run_id) {
 }
 
 /** Persist the handoff that lets post-tag monitoring resume in another process. */
-pub fn persist_release_watch_receipt(harness: Harness, cfg, version, steps, run_id, pr_url) {
+pub fn persist_release_watch_receipt(
+  harness: Harness,
+  cfg,
+  version,
+  publication: ReleasePublication,
+  steps,
+  run_id,
+  pr_url,
+) {
   if cfg.mock {
     return steps
   }
@@ -147,7 +153,14 @@ pub fn persist_release_watch_receipt(harness: Harness, cfg, version, steps, run_
   const slug = release_repo_slug(cfg)
   const path = release_watch_receipt_path(release_run_root(), tag)
   const receipt = release_watch_receipt(
-    {tag: tag, slug: slug, pin_sha: cfg.pin_sha, pr_url: pr_url, created_at: date_now_iso()},
+    {
+      tag: tag,
+      slug: slug,
+      pin_sha: cfg.pin_sha,
+      publication: publication,
+      pr_url: pr_url,
+      created_at: date_now_iso(),
+    },
   )
   const written = try {
     release_watch_receipt_write(path, receipt)
@@ -161,27 +174,28 @@ pub fn persist_release_watch_receipt(harness: Harness, cfg, version, steps, run_
     harness,
     run_id,
     "release_watch_receipt_written",
-    {tag: tag, path: path, success: result.success, pr_url: pr_url},
+    {tag: tag, path: path, success: result.success, pr_url: pr_url, remote_ref: publication.remote_ref},
   )
   return steps
     + [recorded_step("persist-release-watch", "persist resumable post-tag watch receipt", result)]
 }
 
-pub fn run_pre_tag_binary_size_gate(harness: Harness, cfg, branch, steps, run_id) {
-  const head_probe = run_git(cfg, ["rev-parse", "HEAD"])
+pub fn run_pre_tag_binary_size_gate(
+  harness: Harness,
+  cfg,
+  publication: ReleasePublication,
+  steps,
+  run_id,
+) {
   const slug = if cfg.mock {
     "burin-labs/harn"
   } else {
     release_repo_slug(cfg)
   }
-  const result = if !head_probe.success {
-    pre_tag_size_gate_failure(
-      "could not resolve the intended release commit: " + trim(command_output(head_probe)),
-    )
-  } else if slug == "" {
+  const result = if slug == "" {
     pre_tag_size_gate_failure("could not resolve the GitHub repository slug")
   } else {
-    const config = pre_tag_binary_size_gate_config(branch, trim(head_probe.stdout))
+    const config = pre_tag_binary_size_gate_config(publication.remote_ref, publication.head_oid)
     const adapter = if cfg.mock {
       mock_pre_tag_size_gate_adapter(config)
     } else {
@@ -243,19 +257,26 @@ pub fn run_pre_tag_binary_size_gate(harness: Harness, cfg, branch, steps, run_id
 }
 
 /**
- * Tag the release commit at HEAD as `vX.Y.Z` and push the tag.
+ * Tag the exact immutable publication commit as `vX.Y.Z` and push the tag.
  *
  * The tag is the source of truth for what gets published: Harn's
  * publish-release workflow fires on tag push and ships from that tag, so a
  * merge-queue rebase cannot change the published commit. The operation is
- * idempotent for a tag already at the release HEAD and fails rather than
+ * idempotent for a tag already at the publication OID and fails rather than
  * silently overwriting a tag that points elsewhere.
  *
  * In post-publish fixup mode (`cfg.skip_tag`), the original tag already
  * published the artifact. This fixup only lands Cargo/CHANGELOG paperwork on
  * `<base>`, so it must not re-tag or trigger the publish workflow again.
  */
-pub fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) {
+pub fn ensure_release_tag_pushed(
+  harness: Harness,
+  cfg,
+  version,
+  publication: ReleasePublication,
+  steps,
+  run_id,
+) {
   const tag = "v${version}"
   if cfg.skip_tag ?? false {
     release_log_event(
@@ -279,11 +300,7 @@ pub fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) 
     )
     return steps + [skip_step]
   }
-  const head_probe = run_git(cfg, ["rev-parse", "HEAD"])
-  if !head_probe.success {
-    return steps + [recorded_step("create-release-tag", "git rev-parse HEAD", head_probe)]
-  }
-  const head = trim(head_probe.stdout)
+  const head = publication.head_oid
   let pre_steps = steps
   const remote_tag_probe = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
   if !remote_tag_probe.success {
@@ -299,14 +316,15 @@ pub fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) 
   const remote_target = remote_tag_target_sha(remote_tag_probe.refs)
   const remote_decision = remote_release_tag_decision({tag: tag, head_sha: head, remote_target_sha: remote_target})
   if remote_decision.action == "reuse" {
-    return pre_steps
-      + [
-      recorded_step(
-        "push-release-tag",
-        "remote tag ${tag} already targets release HEAD",
-        ok("idempotent remote tag reuse: ${remote_decision.reason}; skipping tag push\n"),
-      ),
-    ]
+    return verify_existing_remote_release_tag(
+      harness,
+      cfg,
+      pre_steps,
+      tag,
+      publication,
+      remote_tag_probe.refs,
+      run_id,
+    ).steps
   }
   if remote_decision.action == "abort" {
     return pre_steps
@@ -366,31 +384,188 @@ pub fn ensure_release_tag_pushed(harness: Harness, cfg, version, steps, run_id) 
       ),
     ]
   } else {
-    const create_argv = release_tag_create_args(tag, version)
+    const create_argv = release_tag_create_args(tag, version, publication.head_oid)
     const create = logged_command_step(harness, cfg, pre_steps, "create-release-tag", create_argv, run_id)
     pre_steps = create.steps
     if !create.success {
       return pre_steps
     }
   }
-  // Never publish a tag that Git cannot verify with the configured signing trust.
+  const tag_object = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "resolve-release-tag-object",
+    ["git", "rev-parse", "refs/tags/${tag}"],
+    run_id,
+  )
+  pre_steps = tag_object.steps
+  if !tag_object.success {
+    return pre_steps
+  }
+  const tag_oid = lowercase(trim(tag_object.stdout ?? ""))
+  // Verify the captured tag object, never the mutable local tag name.
   const verify_tag = logged_command_step(
     harness,
     cfg,
     pre_steps,
     "verify-release-tag-signature",
-    release_tag_verify_args(tag),
+    release_tag_verify_args(tag_oid),
     run_id,
   )
   pre_steps = verify_tag.steps
-  if !verify_tag.success {
+  const tag_target = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "resolve-release-tag-target",
+    ["git", "rev-parse", "${tag_oid}^{}"],
+    run_id,
+  )
+  pre_steps = tag_target.steps
+  if !tag_target.success {
     return pre_steps
   }
-  return reconciled_release_tag_push(harness, cfg, pre_steps, tag, head, run_id)
+  const tag_contents = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "inspect-release-tag-identity",
+    ["git", "cat-file", "tag", tag_oid],
+    run_id,
+  )
+  pre_steps = tag_contents.steps
+  if !tag_contents.success {
+    return pre_steps
+  }
+  const identity = release_tag_identity_verification(
+    tag,
+    tag_oid,
+    publication.head_oid,
+    tag_oid,
+    tag_target.stdout ?? "",
+    tag_contents.stdout ?? "",
+    verify_tag.success,
+  )
+  if !identity.success {
+    return pre_steps
+      + [
+      recorded_step(
+        "verify-release-tag-identity",
+        "verify captured tag identity",
+        fail(2, identity.reason),
+      ),
+    ]
+  }
+  return reconciled_release_tag_push(harness, cfg, pre_steps, tag, tag_oid, head, run_id)
 }
 
-fn reconciled_release_tag_push(harness: Harness, cfg, steps, tag, head, run_id) {
-  const command = release_tag_push_args(tag)
+fn verify_existing_remote_release_tag(
+  harness: Harness,
+  cfg,
+  steps,
+  tag: string,
+  publication: ReleasePublication,
+  remote_refs,
+  run_id,
+) {
+  let out = steps
+  const fetched = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "fetch-existing-release-tag",
+    ["git", "fetch", "--quiet", "origin", "refs/tags/${tag}"],
+    run_id,
+  )
+  out = fetched.steps
+  if !fetched.success {
+    return {steps: out, success: false}
+  }
+  const tag_object = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "resolve-existing-release-tag-object",
+    ["git", "rev-parse", "FETCH_HEAD"],
+    run_id,
+  )
+  out = tag_object.steps
+  if !tag_object.success {
+    return {steps: out, success: false}
+  }
+  const tag_oid = lowercase(trim(tag_object.stdout ?? ""))
+  const verified = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "verify-existing-release-tag-signature",
+    release_tag_verify_args(tag_oid),
+    run_id,
+  )
+  out = verified.steps
+  const target = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "resolve-existing-release-tag-target",
+    ["git", "rev-parse", "${tag_oid}^{}"],
+    run_id,
+  )
+  out = target.steps
+  if !target.success {
+    return {steps: out, success: false}
+  }
+  const tag_contents = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "inspect-existing-release-tag-identity",
+    ["git", "cat-file", "tag", tag_oid],
+    run_id,
+  )
+  out = tag_contents.steps
+  if !tag_contents.success {
+    return {steps: out, success: false}
+  }
+  const expected_tag_oid = lowercase(trim(remote_tag_sha(remote_refs)))
+  const identity = release_tag_identity_verification(
+    tag,
+    expected_tag_oid,
+    publication.head_oid,
+    tag_oid,
+    target.stdout ?? "",
+    tag_contents.stdout ?? "",
+    verified.success,
+  )
+  if !identity.success {
+    return {
+      steps: out
+        + [
+        recorded_step(
+          "verify-existing-release-tag",
+          "verify remote signed tag identity",
+          fail(2, identity.reason),
+        ),
+      ],
+      success: false,
+    }
+  }
+  return {
+    steps: out
+      + [
+      recorded_step(
+        "push-release-tag",
+        "remote tag ${tag} already contains exact verified release object",
+        ok("idempotent remote tag reuse: ${identity.reason}\n"),
+      ),
+    ],
+    success: true,
+  }
+}
+
+fn reconciled_release_tag_push(harness: Harness, cfg, steps, tag, tag_oid, head, run_id) {
+  const command = release_tag_push_args(tag, tag_oid)
   log_step_started(harness, run_id, "push-release-tag", command)
   const pushed = run_git(cfg, command[1:len(command)], {env: hook_light_env()})
   const push_result = if pushed.success {
@@ -398,44 +573,43 @@ fn reconciled_release_tag_push(harness: Harness, cfg, steps, tag, head, run_id) 
   } else {
     fail(pushed.exit_code ?? 1, pushed.stderr)
   }
-  if pushed.success {
-    log_step_finished(
-      harness,
-      run_id,
-      "push-release-tag",
-      push_result,
-      {reconciliation_action: "not_needed", push_git_receipt: pushed},
-    )
-    return steps
-      + [
-      {
-        ...recorded_step("push-release-tag", command, push_result),
-        reconciliation_action: "not_needed",
-        push_git_receipt: pushed,
-      },
-    ]
+  if cfg.mock {
+    const evidence = {
+      reconciliation_action: "mock_exact_publication",
+      remote_tag_oid: tag_oid,
+      remote_target_sha: head,
+      push_git_receipt: pushed,
+      remote_git_receipt: nil,
+      remote_refs: [],
+    }
+    log_step_finished(harness, run_id, "push-release-tag", push_result, evidence)
+    return steps + [{...recorded_step("push-release-tag", command, push_result), ...evidence}]
   }
   const remote = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
   const decision = release_tag_push_reconciliation(
     {
       tag: tag,
+      tag_oid: tag_oid,
       head_sha: head,
       remote_probe_success: remote.success,
       remote_probe_error: remote.stderr,
       remote_refs: remote.refs,
     },
   )
-  const original_failure = command_output(pushed)
-  const result = if decision.success {
-    ok(decision.reason + "\n\noriginal git push output:\n" + original_failure + "\n")
+  const original_output = command_output(pushed)
+  const failure_status = if pushed.success {
+    2
   } else {
-    fail(
-      pushed.exit_code ?? 1,
-      decision.reason + "\n\noriginal git push output:\n" + original_failure + "\n",
-    )
+    pushed.exit_code ?? 1
+  }
+  const result = if decision.success {
+    ok(decision.reason + "\n\ngit push output:\n" + original_output + "\n")
+  } else {
+    fail(failure_status, decision.reason + "\n\ngit push output:\n" + original_output + "\n")
   }
   const evidence = {
     reconciliation_action: decision.action,
+    remote_tag_oid: decision.remote_tag_oid,
     remote_target_sha: decision.remote_target_sha,
     push_git_receipt: pushed,
     remote_git_receipt: remote.receipt,
@@ -443,55 +617,6 @@ fn reconciled_release_tag_push(harness: Harness, cfg, steps, tag, head, run_id) 
   }
   log_step_finished(harness, run_id, "push-release-tag", result, evidence)
   return steps + [{...recorded_step("push-release-tag", command, result), ...evidence}]
-}
-
-/**
- * Repin mode: clean up stale `v$next` tags before re-tagging at the new
- * pin. `fetch-base --tags` rehydrates the local tag from origin (when
- * present), and `ensure_release_tag_pushed` refuses to overwrite a stale
- * local tag pointing somewhere other than the release HEAD. Always
- * delete locally; delete on origin only when the TOCTTOU re-check
- * confirmed the remote tag was present at `repin_initial_remote_tag_sha`.
- */
-pub fn maybe_delete_stale_repin_tag(harness: Harness, cfg, version, steps, run_id) {
-  if !(cfg.repin_mode ?? false) {
-    return {steps: steps, success: true}
-  }
-  const tag = "v${version}"
-  // `git tag -d` returns non-zero when the tag is absent; treat that as a
-  // no-op rather than a failure (this step runs as part of repin tear-down
-  // and the local tag may already have been pruned).
-  const local_del_argv = ["git", "tag", "-d", tag]
-  const local_del_label = argv_label(local_del_argv)
-  release_log_event(
-    harness,
-    run_id,
-    "step_started",
-    {step: "repin-delete-local-tag", command: local_del_label},
-  )
-  const local_del = run_git(cfg, local_del_argv[1:len(local_del_argv)])
-  let out = steps
-    + [recorded_step("repin-delete-local-tag", local_del_label, ok("ok: ${trim(local_del.stdout)}\n"))]
-  release_log_event(harness, run_id, "step_finished", {step: "repin-delete-local-tag", success: true})
-  if trim(cfg.repin_initial_remote_tag_sha ?? "") == "" {
-    return {steps: out, success: true}
-  }
-  const remote_del_argv = ["git", "push", "origin", "--delete", tag]
-  release_log_event(
-    harness,
-    run_id,
-    "step_started",
-    {step: "repin-delete-remote-tag", command: argv_label(remote_del_argv)},
-  )
-  const remote_del = append_command_step(harness, cfg, out, "repin-delete-remote-tag", remote_del_argv)
-  out = remote_del.steps
-  release_log_event(
-    harness,
-    run_id,
-    "step_finished",
-    {step: "repin-delete-remote-tag", success: remote_del.success, status: remote_del.status},
-  )
-  return {steps: out, success: remote_del.success}
 }
 
 pub fn release_asset_snapshot(cfg, tag) {
@@ -518,59 +643,4 @@ pub fn release_asset_snapshot(cfg, tag) {
     found: lookup.found,
     error: nil,
   }
-}
-
-/**
- * TOCTTOU re-check executed immediately before the repin branch reset.
- *
- * `detect_repin_state` ran at startup and captured `initial_remote_tag_sha`.
- * Between then and now the operator's environment continued to drift — other
- * sessions may have published the release, moved the tag, or landed more
- * commits on `<base>`. Re-fetch origin, re-probe every gate, and only then
- * return the freshly-locked pin SHA the caller may safely reset to.
- *
- * Returns `{success, message, new_pin_sha}`. On `success=false` the caller
- * must surface `message` and abort the mutation.
- */
-pub fn run_repin_tocttou_recheck(cfg, analysis) {
-  const tag = "v${analysis.next_version}"
-  const fetch = run_git(cfg, ["fetch", "origin", "--tags", "--prune", "--quiet"])
-  if !fetch.success {
-    return {
-      success: false,
-      message: "repin: failed to re-fetch origin before TOCTTOU recheck: ${trim(fetch.stderr)}",
-      new_pin_sha: "",
-    }
-  }
-  const release_assets = release_asset_snapshot(cfg, tag)
-  const release_exists = release_assets.ready || harn_crate_published(analysis.next_version)
-  const ls = release_git_remote_refs(cfg, ["refs/tags/" + tag])
-  if !ls.success {
-    return {
-      success: false,
-      message: "repin: failed to re-list remote tag ${tag}: ${trim(ls.stderr)}",
-      new_pin_sha: "",
-    }
-  }
-  const pin_probe = run_git(cfg, ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"])
-  if !pin_probe.success {
-    return {
-      success: false,
-      message: "repin: failed to re-resolve origin/${cfg.base}: ${trim(pin_probe.stderr)}",
-      new_pin_sha: "",
-    }
-  }
-  const decision = repin_tocttou_decision(
-    {
-      release_exists: release_exists,
-      initial_remote_tag_sha: cfg.repin_initial_remote_tag_sha ?? "",
-      current_remote_tag_sha: remote_tag_sha(ls.refs),
-      new_pin_sha: trim(pin_probe.stdout),
-      tag: tag,
-    },
-  )
-  if decision.action == "abort" {
-    return {success: false, message: "repin: aborting — ${decision.reason}", new_pin_sha: ""}
-  }
-  return {success: true, message: "", new_pin_sha: decision.new_pin_sha}
 }

@@ -1,5 +1,5 @@
 // Extracted release-harness stage. See AGENTS.md for ownership.
-import { git_merge_base } from "std/git"
+import { GitRemoteRef, git_merge_base } from "std/git"
 import {
   assemble_fragments_section,
   changelog_bullet_count,
@@ -15,8 +15,10 @@ import {
 } from "./changelog"
 import { agent_result_text } from "./release_audit"
 import { recorded_step } from "./release_execution"
+import { ReleasePublication, release_recovery_source } from "./release_publication"
 import { harn_crate_published } from "./release_readiness"
-import { remote_tag_sha } from "./release_repin"
+import { remote_tag_sha, remote_tag_target_sha } from "./release_repin"
+import { release_tag_identity_verification } from "./release_tag_identity"
 import {
   run_session_view_gate,
   run_session_view_mock_gate,
@@ -30,16 +32,30 @@ import {
   prompt_asset,
   read_repo_file,
   release_git_remote_refs,
-  release_github_enable_auto_merge,
   release_github_mergeability,
   release_github_open_pr,
   release_github_pr_create,
-  release_github_release,
+  release_github_pr_list,
   release_log_event,
   release_run_dir,
   run_git,
 } from "release_runtime"
 import { release_asset_snapshot } from "release_tag"
+
+/**
+ * Changelog facts read from immutable Git refs after release availability and
+ * open-PR gates have already passed. Keeping this boundary typed makes the
+ * published-tag authority rule executable against a disposable real remote.
+ */
+pub type ReleasePostMergeDriftEvidence = {
+  tag: string,
+  version: string,
+  original_pin: string,
+  pin_unreleased: string,
+  current_section: string,
+  published_tag_section: string,
+  paperwork_branch: string,
+}
 
 fn read_agent_notes(harness: Harness, notes_path) {
   if notes_path == nil || notes_path == "" || !harness.fs.exists(notes_path) {
@@ -94,6 +110,63 @@ fn assemble_repo_fragments(harness: Harness, cfg) {
     paths = paths.push(full)
   }
   return {section: assemble_fragments_section(fragments), paths: paths, fragments: fragments}
+}
+
+pub type ReleaseRecoveryVerification = {immutable_ref: string, tag_object_oid: string}
+
+/** Fetch and cryptographically prove every Git identity selected for recovery. */
+pub fn verify_release_recovery_source(
+  cfg,
+  tag: string,
+  publication: ReleasePublication,
+  tag_refs: list<GitRemoteRef>,
+) -> ReleaseRecoveryVerification {
+  const immutable_ref = "refs/heads/${publication.remote_ref}"
+  const fetched = run_git(cfg, ["fetch", "--quiet", "origin", immutable_ref])
+  if !fetched.success {
+    throw "could not fetch release recovery source ${immutable_ref}: ${trim(fetched.stderr ?? "")}"
+  }
+  const fetched_head = run_git(cfg, ["rev-parse", "FETCH_HEAD^{}"])
+  if !fetched_head.success || lowercase(trim(fetched_head.stdout ?? "")) != publication.head_oid {
+    throw "fetched release recovery source ${immutable_ref} does not resolve to ${publication.head_oid}"
+  }
+  if len(tag_refs) == 0 {
+    return {immutable_ref: immutable_ref, tag_object_oid: ""}
+  }
+  const fetched_tag = run_git(cfg, ["fetch", "--quiet", "origin", "refs/tags/${tag}"])
+  if !fetched_tag.success {
+    throw "could not fetch release recovery tag ${tag}: ${trim(fetched_tag.stderr ?? "")}"
+  }
+  const fetched_tag_object = run_git(cfg, ["rev-parse", "FETCH_HEAD"])
+  const fetched_tag_target = run_git(cfg, ["rev-parse", "FETCH_HEAD^{}"])
+  const tag_object_oid = lowercase(trim(fetched_tag_object.stdout ?? ""))
+  const tag_contents = run_git(cfg, ["cat-file", "tag", tag_object_oid])
+  const verified_tag = run_git(cfg, ["verify-tag", "--raw", tag_object_oid])
+  const identity = release_tag_identity_verification(
+    tag,
+    remote_tag_sha(tag_refs),
+    publication.head_oid,
+    if fetched_tag_object.success {
+      tag_object_oid
+    } else {
+      ""
+    },
+    if fetched_tag_target.success {
+      fetched_tag_target.stdout ?? ""
+    } else {
+      ""
+    },
+    if tag_contents.success {
+      tag_contents.stdout ?? ""
+    } else {
+      ""
+    },
+    verified_tag.success,
+  )
+  if !identity.success {
+    throw "remote release tag ${tag} failed immutable identity verification: ${identity.reason}"
+  }
+  return {immutable_ref: immutable_ref, tag_object_oid: tag_object_oid}
 }
 
 /**
@@ -266,8 +339,8 @@ fn run_changelog_massage_recovery(
 }
 
 /**
- * Repair / fixup CHANGELOG path. Used when an open release/v${next_version}
- * PR is detected at startup — either a re-run on a not-yet-shipped PR
+ * Repair / fixup CHANGELOG path. Used when an open immutable-attempt PR
+ * is detected at startup — either a re-run on a not-yet-shipped PR
  * (the previous run made it partway through) or a post-publish paperwork
  * pass after the artifact already shipped.
  *
@@ -319,21 +392,22 @@ fn apply_fixup_release_notes(harness: Harness, cfg, analysis) {
  * Detect repair / fixup state for `analysis.next_version`.
  *
  * Returns `nil` when this is a normal first-time release. Returns
- * `{tag, pr_url, original_pin, pin_unreleased, release_body_source, tag_exists, release_exists, missing_assets}`
- * when an open release/v${next_version} PR exists on `<base>`.
+ * `{publication, tag, pr_url, original_pin, pin_unreleased, release_body_source,
+ * tag_exists, release_exists, missing_assets}` when an open immutable attempt
+ * PR or already-published release tag exists for `next_version`.
  *
  * Two flavors collapse into one detection path:
  *   - Re-run on a still-open release PR (artifact may or may not have
  *     shipped). The previous run got partway and left the PR open;
  *     we need to recreate the branch, fix any content regressions,
- *     and force-push.
+ *     and publish a new immutable attempt.
  *   - Documented post-publish drift: required release assets shipped,
  *     operator added more bullets to Unreleased that describe the NEXT
  *     release; the re-run should land the v${next_version} paperwork
  *     without clobbering those drift bullets.
  *
  * Both share the same recovery: recover the original pin SHA via
- * `git merge-base origin/release/v$ver origin/<base>`, then read
+ * `git merge-base <attempt-oid> origin/<base>`, then read
  * pin-time `## Unreleased` from that commit. That gives us the bullets
  * the operator INTENDED to ship — the source of truth regardless of
  * what was actually published (in case the original ship truncated
@@ -355,54 +429,72 @@ pub fn detect_fixup_state(cfg, analysis) {
     return nil
   }
   const tag = "v${version}"
-  const branch = "release/" + tag
-  const pr = release_github_open_pr(cfg, branch)
-  if pr == nil {
+  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
+  if !tag_check.success {
+    throw "could not inspect remote release tag ${tag}: ${tag_check.stderr}"
+  }
+  const tag_exists = len(tag_check.refs) > 0
+  const tag_target = remote_tag_target_sha(tag_check.refs)
+  if tag_exists && tag_target == "" {
+    throw "remote release tag ${tag} exists but its commit target could not be resolved"
+  }
+  const attempt_refs = release_git_remote_refs(cfg, ["refs/heads/release-attempt/v${version}/*"])
+  if !attempt_refs.success {
+    throw "could not inspect immutable release attempts for v${version}: ${attempt_refs.stderr}"
+  }
+  let pull_requests = release_github_pr_list(cfg, {base: cfg.base, state: "open", limit: 100})
+  // The bounded general listing is only a convenience for immutable-attempt
+  // metadata. Probe the retired mutable head exactly so an old PR can never
+  // age beyond a page and evade the fail-loud cutover.
+  const legacy_pr = release_github_open_pr(cfg, "release/v${version}")
+  if legacy_pr != nil {
+    pull_requests = [legacy_pr] + pull_requests
+  }
+  const recovery = release_recovery_source(version, pull_requests, attempt_refs.refs, tag_target)
+  if recovery == nil {
     return nil
   }
-  const pr_url = pr.url
+  const publication = recovery.publication
+  const pr_url = recovery.pull_request?.url ?? ""
+  verify_release_recovery_source(cfg, tag, publication, tag_check.refs)
   // Recover the original pin SHA: the common ancestor of the existing
-  // release branch and the current base. That commit was `<base>` HEAD
+  // immutable attempt and the current base. That commit was `<base>` HEAD
   // when the original run started, and is the point we want pin-time
   // Unreleased read from.
-  const merge_base = git_merge_base("origin/" + branch, "origin/" + cfg.base, cfg.repo)
+  const merge_base = git_merge_base(publication.head_oid, "origin/" + cfg.base, cfg.repo)
   if !merge_base.success {
-    return nil
+    throw "could not recover release pin from immutable attempt ${publication.remote_ref}: ${merge_base.stderr.inline}"
   }
   const original_pin = merge_base.data.oid
   if original_pin == "" {
-    return nil
+    throw "immutable release attempt ${publication.remote_ref} has no merge base with origin/${cfg.base}"
   }
   const pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
   if !pin_show.success {
-    return nil
+    throw "could not read pin-time CHANGELOG.md at ${original_pin}: ${trim(pin_show.stderr ?? "")}"
   }
-  // Optional informational signals — control which gates we skip but do
-  // not gate detection itself.
-  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag])
-  const tag_exists = tag_check.success && len(tag_check.refs) > 0
   let release_body_ref = if tag_exists {
     tag
   } else {
-    "origin/" + branch
+    publication.head_oid
   }
   let release_show = run_git(cfg, ["show", release_body_ref + ":CHANGELOG.md"])
   if !release_show.success && tag_exists {
-    release_body_ref = "origin/" + branch
+    release_body_ref = publication.head_oid
     release_show = run_git(cfg, ["show", release_body_ref + ":CHANGELOG.md"])
   }
   if !release_show.success {
-    return nil
+    throw "could not read prepared CHANGELOG.md from immutable attempt ${publication.remote_ref}"
   }
   const release_body = changelog_fixup_release_body(pin_show.stdout, release_show.stdout, version)
   if !release_body.success {
-    return nil
+    throw "could not recover release notes from immutable attempt ${publication.remote_ref}"
   }
   const release_body_source = if release_body.source == "release-section" {
     if release_body_ref == tag {
       "tag-release-section"
     } else {
-      "branch-release-section"
+      "attempt-release-section"
     }
   } else {
     release_body.source
@@ -410,14 +502,18 @@ pub fn detect_fixup_state(cfg, analysis) {
   const release_assets = release_asset_snapshot(cfg, tag)
   const release_exists = release_assets.ready
   // Conflict state on the existing PR. After other PRs land on `<base>`
-  // and touch CHANGELOG.md, release/v$ver collides at the top of
-  // CHANGELOG. The repair pass resolves this implicitly by recreating
-  // the branch on fresh `<base>` and smart-subtracting pin-time
+  // and touch CHANGELOG.md, the immutable attempt collides at the top of
+  // CHANGELOG. The repair pass resolves this by recreating the local branch
+  // on fresh `<base>` and smart-subtracting pin-time
   // bullets — surface the conflict explicitly so the operator can see
   // the rerun is doing conflict-resolution work.
-  const mergeability = release_github_mergeability(cfg, pr_url)
-  const conflicting = !is_err(mergeability) && mergeability.is_conflict
+  let conflicting = false
+  if pr_url != "" {
+    const mergeability = release_github_mergeability(cfg, pr_url)
+    conflicting = !is_err(mergeability) && mergeability.is_conflict
+  }
   return {
+    publication: publication,
     tag: tag,
     pr_url: pr_url,
     original_pin: original_pin,
@@ -440,6 +536,7 @@ pub fn with_fixup_state(cfg, fixup) {
     skip_tag: fixup.tag_exists,
     fixup_tag: fixup.tag,
     fixup_pr_url: fixup.pr_url,
+    fixup_publication: fixup.publication,
     fixup_pin_unreleased: fixup.pin_unreleased,
     fixup_release_body_source: fixup.release_body_source ?? "",
   }
@@ -452,6 +549,7 @@ pub fn analysis_with_fixup_state(raw, fixup) {
       fixup_mode: false,
       fixup_tag: "",
       fixup_pr_url: "",
+      fixup_publication: nil,
       fixup_release_exists: false,
       fixup_missing_assets: [],
     }
@@ -461,6 +559,7 @@ pub fn analysis_with_fixup_state(raw, fixup) {
     fixup_mode: true,
     fixup_tag: fixup.tag,
     fixup_pr_url: fixup.pr_url,
+    fixup_publication: fixup.publication,
     fixup_release_exists: fixup.release_exists,
     fixup_missing_assets: fixup.missing_assets ?? [],
   }
@@ -481,6 +580,116 @@ pub fn post_merge_paperwork_push_args(paperwork_branch, remote_branch_exists) {
 fn remote_branch_exists(cfg, branch) {
   const refs = release_git_remote_refs(cfg, ["refs/heads/" + branch])
   return refs.success && len(refs.refs) > 0
+}
+
+/** Fetch one observed remote tag and return its verified commit target. */
+fn fetch_observed_remote_tag_target(cfg, tag: string, refs: list<GitRemoteRef>) -> string {
+  const observed_object = lowercase(trim(remote_tag_sha(refs)))
+  const observed_target = lowercase(trim(remote_tag_target_sha(refs)))
+  if observed_object == "" || observed_target == "" {
+    return ""
+  }
+  const fetched = run_git(cfg, ["fetch", "--quiet", "origin", "refs/tags/" + tag])
+  if !fetched.success {
+    return ""
+  }
+  const fetched_object = run_git(cfg, ["rev-parse", "FETCH_HEAD"])
+  const fetched_target = run_git(cfg, ["rev-parse", "FETCH_HEAD^{}"])
+  if !fetched_object.success || !fetched_target.success {
+    return ""
+  }
+  if lowercase(trim(fetched_object.stdout ?? "")) != observed_object
+    || lowercase(trim(fetched_target.stdout ?? "")) != observed_target {
+    return ""
+  }
+  return observed_target
+}
+
+/**
+ * Gather the Git-only evidence for post-merge drift. The outer detector owns
+ * release availability and GitHub PR gates; this helper owns immutable tag,
+ * merge-base, and changelog facts and is deliberately usable by a real Git
+ * fixture without provider credentials.
+ */
+pub fn post_merge_drift_evidence_from_git(cfg, version: string) -> ReleasePostMergeDriftEvidence? {
+  const tag = "v${version}"
+  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
+  if !tag_check.success || len(tag_check.refs) == 0 {
+    return nil
+  }
+  const tag_target = fetch_observed_remote_tag_target(cfg, tag, tag_check.refs)
+  if tag_target == "" {
+    return nil
+  }
+  const merge_base = git_merge_base(tag_target, "origin/" + cfg.base, cfg.repo)
+  if !merge_base.success || merge_base.data.oid == "" {
+    return nil
+  }
+  const original_pin = merge_base.data.oid
+  const pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
+  if !pin_show.success {
+    return nil
+  }
+  const pin_unreleased = changelog_named_section_from_text(pin_show.stdout, "## Unreleased")
+  if trim(pin_unreleased) == "" {
+    return nil
+  }
+  const main_show = run_git(cfg, ["show", "origin/" + cfg.base + ":CHANGELOG.md"])
+  if !main_show.success {
+    return nil
+  }
+  const current_section = changelog_named_section_from_text(main_show.stdout, "## v" + version)
+  if trim(current_section) == "" {
+    return nil
+  }
+  const tag_show = run_git(cfg, ["show", tag_target + ":CHANGELOG.md"])
+  const published_tag_section = if tag_show.success {
+    changelog_named_section_from_text(tag_show.stdout, "## v" + version)
+  } else {
+    ""
+  }
+  return {
+    tag: tag,
+    version: version,
+    original_pin: original_pin,
+    pin_unreleased: pin_unreleased,
+    current_section: current_section,
+    published_tag_section: published_tag_section,
+    paperwork_branch: "paperwork/v${version}-changelog-fix",
+  }
+}
+
+/** Reduce typed Git facts into a conservative paperwork decision. */
+pub fn post_merge_drift_decision(evidence: ReleasePostMergeDriftEvidence) {
+  if trim(evidence.current_section) == trim(evidence.pin_unreleased) {
+    return {action: "no_drift", reason: "main already matches the pin-time release body", drift: nil}
+  }
+  if trim(evidence.published_tag_section) != ""
+    && trim(evidence.current_section) == trim(evidence.published_tag_section) {
+    return {action: "no_drift", reason: "main matches the published tag's release section", drift: nil}
+  }
+  return {
+    action: "drift",
+    reason: "main differs from both the pin-time and published release sections",
+    drift: {
+      kind: "drift",
+      tag: evidence.tag,
+      version: evidence.version,
+      original_pin: evidence.original_pin,
+      pin_unreleased: evidence.pin_unreleased,
+      current_section: evidence.current_section,
+      paperwork_branch: evidence.paperwork_branch,
+    },
+  }
+}
+
+/** Evaluate only the production Git evidence and policy portion of drift detection. */
+pub fn detect_post_merge_drift_from_git(cfg, version: string) {
+  const evidence = post_merge_drift_evidence_from_git(cfg, version)
+  if evidence == nil {
+    return nil
+  }
+  return post_merge_drift_decision(evidence).drift
 }
 
 /**
@@ -543,62 +752,7 @@ pub fn detect_post_merge_drift(cfg, analysis) {
   if paperwork_pr != nil {
     return {kind: "paperwork_pr_open", pr_url: paperwork_pr.url, paperwork_branch: paperwork_branch}
   }
-  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag])
-  if !tag_check.success || len(tag_check.refs) == 0 {
-    return nil
-  }
-  const tag_sha = remote_tag_sha(tag_check.refs)
-  if tag_sha == "" {
-    return nil
-  }
-  const merge_base = git_merge_base(tag_sha, "origin/" + cfg.base, cfg.repo)
-  if !merge_base.success {
-    return nil
-  }
-  const original_pin = merge_base.data.oid
-  if original_pin == "" {
-    return nil
-  }
-  const pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
-  if !pin_show.success {
-    return nil
-  }
-  const pin_unreleased = changelog_named_section_from_text(pin_show.stdout, "## Unreleased")
-  if trim(pin_unreleased) == "" {
-    return nil
-  }
-  const main_show = run_git(cfg, ["show", "origin/" + cfg.base + ":CHANGELOG.md"])
-  if !main_show.success {
-    return nil
-  }
-  const current_section = changelog_named_section_from_text(main_show.stdout, "## v" + version)
-  if trim(current_section) == "" {
-    return nil
-  }
-  if trim(current_section) == trim(pin_unreleased) {
-    return nil
-  }
-  // The published tag's own changelog section is the authoritative record of
-  // what shipped. If main's section matches the tag byte-for-byte there is no
-  // drift: the pin-time-Unreleased comparison assumes the fragment fold landed
-  // on main before the pin, which a recreated fold (harn#5027) legitimately
-  // violates while still being correct.
-  const tag_show = run_git(cfg, ["show", tag + ":CHANGELOG.md"])
-  if tag_show.success {
-    const tag_section = changelog_named_section_from_text(tag_show.stdout, "## v" + version)
-    if trim(tag_section) != "" && trim(current_section) == trim(tag_section) {
-      return nil
-    }
-  }
-  return {
-    kind: "drift",
-    tag: tag,
-    version: version,
-    original_pin: original_pin,
-    pin_unreleased: pin_unreleased,
-    current_section: current_section,
-    paperwork_branch: paperwork_branch,
-  }
+  return detect_post_merge_drift_from_git(cfg, version)
 }
 
 /**
@@ -621,7 +775,7 @@ pub fn run_post_merge_paperwork_pr(harness: Harness, cfg, drift, run_id) {
   harness.stdio.println("   branch    : ${paperwork_branch}")
   harness.stdio
     .println(
-    "   plan      : restore `## ${tag}` to pin-time Unreleased; move drift bullets back into `## Unreleased`; publish paperwork branch; open PR with auto-merge.",
+    "   plan      : restore `## ${tag}` to pin-time Unreleased; move drift bullets back into `## Unreleased`; publish a paperwork PR for manual review.",
   )
   release_log_event(
     harness,
@@ -681,11 +835,8 @@ pub fn run_post_merge_paperwork_pr(harness: Harness, cfg, drift, run_id) {
   }
   const pr_url = pr_create.url
   harness.stdio.println("== paperwork PR opened: ${pr_url}")
-  const auto_merge = release_github_enable_auto_merge(cfg, pr_create)
-  if is_err(auto_merge) {
-    harness.stdio
-      .println("!! could not enable auto-merge on ${pr_url}: " + to_string(unwrap_err(auto_merge)))
-  }
+  // Retroactive changelog edits are never auto-merged. The operator must
+  // review the published-tag evidence before this corrective paperwork lands.
   release_log_event(
     harness,
     run_id,
@@ -695,78 +846,7 @@ pub fn run_post_merge_paperwork_pr(harness: Harness, cfg, drift, run_id) {
   return 0
 }
 
-// Don't fail the whole run — the PR is open and reviewable.
-/**
- * Detect `--repin-latest` state for `analysis.next_version`.
- *
- * Returns `nil` unless the operator passed `--repin-latest` AND this is a
- * live ship-pr run. Throws (with an actionable message) when the operator
- * asked for repin but the preconditions aren't met:
- *   - The v$next release already shipped. crates.io is immutable — the
- *     pin cannot be advanced for a published release. The operator must
- *     bump to v$next+1 instead.
- *   - No open `release/v$next` PR exists. `--repin-latest` is a "second
- *     take" — for a first-time release the operator uses normal prepare.
- *
- * On success returns `{tag, pr_url, initial_remote_tag_sha}`. The
- * `initial_remote_tag_sha` is captured for a TOCTTOU re-check right
- * before the destructive branch reset.
- */
-pub fn detect_repin_state(cfg, analysis) {
-  if !(cfg.repin_latest ?? false) {
-    return nil
-  }
-  if cfg.mock {
-    return nil
-  }
-  if cfg.mode != "ship-pr" || !(cfg.yes_live_release ?? false) {
-    throw "--repin-latest requires --mode ship-pr --yes-live-release"
-  }
-  const version = trim(analysis.next_version ?? "")
-  if version == "" {
-    throw "--repin-latest could not resolve next version from CHANGELOG/Cargo state"
-  }
-  const tag = "v${version}"
-  const release = release_github_release(cfg, tag)
-  if is_err(release) {
-    throw "--repin-latest could not query release ${tag}: " + to_string(unwrap_err(release))
-  }
-  if release.found {
-    throw "--repin-latest refused: release ${tag} already exists on origin. Re-shipping a published version is impossible (crates.io is immutable); bump to v$next+1 instead."
-  }
-  const branch = "release/" + tag
-  const pr = release_github_open_pr(cfg, branch)
-  if pr == nil {
-    throw "--repin-latest refused: no open release/${tag} PR found. --repin-latest advances an in-flight PR's pin; for a first-time release use --mode ship-pr without --repin-latest."
-  }
-  const pr_url = pr.url
-  const ls = release_git_remote_refs(cfg, ["refs/tags/" + tag])
-  if !ls.success {
-    throw "--repin-latest could not list remote tag ${tag}: ${trim(ls.stderr)}"
-  }
-  return {tag: tag, pr_url: pr_url, initial_remote_tag_sha: remote_tag_sha(ls.refs)}
-}
-
-pub fn with_repin_state(cfg, repin) {
-  if repin == nil {
-    return cfg
-  }
-  return {
-    ...cfg,
-    repin_mode: true,
-    repin_tag: repin.tag,
-    repin_pr_url: repin.pr_url,
-    repin_initial_remote_tag_sha: repin.initial_remote_tag_sha,
-  }
-}
-
-pub fn analysis_with_repin_state(raw, repin) {
-  if repin == nil {
-    return {...raw, repin_mode: false, repin_tag: "", repin_pr_url: ""}
-  }
-  return {...raw, repin_mode: true, repin_tag: repin.tag, repin_pr_url: repin.pr_url}
-}
-
+/** Don't fail the whole run: the PR is open and reviewable. */
 fn release_commit_title(line) {
   const cleaned = trim(line ?? "")
   if cleaned == "" {
@@ -969,8 +1049,5 @@ pub fn prepared_release_analysis(raw, original) {
     fixup_mode: original.fixup_mode ?? raw.fixup_mode ?? false,
     fixup_tag: original.fixup_tag ?? raw.fixup_tag ?? "",
     fixup_pr_url: original.fixup_pr_url ?? raw.fixup_pr_url ?? "",
-    repin_mode: original.repin_mode ?? raw.repin_mode ?? false,
-    repin_tag: original.repin_tag ?? raw.repin_tag ?? "",
-    repin_pr_url: original.repin_pr_url ?? raw.repin_pr_url ?? "",
   }
 }

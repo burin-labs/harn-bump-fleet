@@ -1,0 +1,372 @@
+/**
+ * Immutable remote publication for release artifacts.
+ *
+ * A local `release/vX.Y.Z` branch is only a workspace convenience. Durable
+ * publication always uses an OID-qualified, write-once remote ref so a retry
+ * can prove exactly what it is resuming without force-updating shared state.
+ */
+import { GitRemoteRef, git_ls_remote, git_push } from "std/git"
+
+pub type ReleasePublication = {
+  version: string,
+  local_branch: string,
+  remote_ref: string,
+  head_oid: string,
+}
+
+pub type ReleasePublicationDecision = {action: string, reason: string}
+
+pub type ReleasePublicationPushReconciliation = {success: bool, action: string, reason: string}
+
+pub type ReleasePullRequestIdentity = {number: int, url: string, head: {ref: string, sha: string}}
+
+pub type ReleaseAttempt = {
+  publication: ReleasePublication,
+  pull_request: ReleasePullRequestIdentity,
+}
+
+pub type ReleaseRecoverySource = {
+  publication: ReleasePublication,
+  pull_request: ReleasePullRequestIdentity?,
+}
+
+fn valid_version(version: string) -> bool {
+  return len(regex_captures("^[0-9]+[.][0-9]+[.][0-9]+$", version)) == 1
+}
+
+fn valid_oid(oid: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", oid)) == 1
+}
+
+/** Construct the one remote ref a prepared release commit may publish to. */
+pub fn release_publication(version: string, head_oid: string) -> ReleasePublication {
+  const clean_version = trim(version)
+  const clean_oid = lowercase(trim(head_oid))
+  if !valid_version(clean_version) {
+    throw "release publication version must be X.Y.Z, got: " + clean_version
+  }
+  if !valid_oid(clean_oid) {
+    throw "release publication HEAD must be a full 40-hex OID, got: " + clean_oid
+  }
+  return {
+    version: clean_version,
+    local_branch: "release/v${clean_version}",
+    remote_ref: "release-attempt/v${clean_version}/${clean_oid}",
+    head_oid: clean_oid,
+  }
+}
+
+/**
+ * Select only open PRs for earlier content-addressed attempts of this exact
+ * release version. The current attempt is deliberately excluded by full ref,
+ * never by a mutable branch convention.
+ */
+fn release_attempt_from_pull_request(version: string, pull_request: ReleasePullRequestIdentity) -> ReleaseAttempt? {
+  const prefix = "release-attempt/v${version}/"
+  const head_ref = trim(pull_request.head.ref)
+  if head_ref == "release/v${version}" {
+    throw "legacy mutable release PR ${pull_request.url} still uses ${head_ref}; close it before retrying with an immutable release attempt"
+  }
+  if !starts_with(head_ref, prefix) {
+    return nil
+  }
+  const publication = release_publication(version, head_ref.substring(len(prefix)))
+  if head_ref != publication.remote_ref {
+    throw "release attempt PR ${pull_request.url} uses non-canonical immutable ref ${head_ref}"
+  }
+  const observed_oid = lowercase(trim(pull_request.head.sha))
+  if observed_oid != publication.head_oid {
+    throw "release attempt PR ${pull_request.url} head ${observed_oid} does not match immutable ref ${publication.remote_ref}"
+  }
+  return {publication: publication, pull_request: pull_request}
+}
+
+/** Decode and validate the immutable attempt refs that actually exist on origin. */
+pub fn release_publications_from_remote_refs(version: string, refs: list<GitRemoteRef>) -> list<ReleasePublication> {
+  const clean_version = trim(version)
+  if !valid_version(clean_version) {
+    throw "release attempt version must be X.Y.Z, got: " + clean_version
+  }
+  const prefix = "refs/heads/release-attempt/v${clean_version}/"
+  let publications: list<ReleasePublication> = []
+  for ref in refs {
+    if !starts_with(ref.ref, prefix) {
+      continue
+    }
+    if ref.peeled {
+      throw "immutable release attempt ref must not be peeled: ${ref.ref}"
+    }
+    const publication = release_publication(clean_version, ref.ref.substring(len(prefix)))
+    if ref.ref != "refs/heads/${publication.remote_ref}" {
+      throw "remote release attempt uses non-canonical immutable ref ${ref.ref}"
+    }
+    const observed_oid = lowercase(trim(ref.oid))
+    if observed_oid != publication.head_oid {
+      throw "remote immutable ref ${ref.ref} targets ${observed_oid}, not its content-addressed OID ${publication.head_oid}"
+    }
+    publications = publications + [publication]
+  }
+  return publications
+}
+
+/**
+ * Select the unique open immutable attempt for a release version. A malformed,
+ * drifting, or ambiguous attempt blocks recovery instead of starting a second
+ * release from incomplete state.
+ */
+pub fn release_attempt_for_version(version: string, pull_requests: list<ReleasePullRequestIdentity>) -> ReleaseAttempt? {
+  const clean_version = trim(version)
+  if !valid_version(clean_version) {
+    throw "release attempt version must be X.Y.Z, got: " + clean_version
+  }
+  let matches: list<ReleaseAttempt> = []
+  for pull_request in pull_requests {
+    const attempt = release_attempt_from_pull_request(clean_version, pull_request)
+    if attempt != nil {
+      matches = matches + [attempt]
+    }
+  }
+  if len(matches) > 1 {
+    throw "multiple open immutable release attempts exist for v${clean_version}; close superseded attempts before retrying"
+  }
+  return if len(matches) == 0 {
+    nil
+  } else {
+    matches[0]
+  }
+}
+
+/**
+ * Reconcile the durable identities a crashed release may leave behind. Origin's
+ * immutable attempt ref is authoritative; PR and tag observations may select
+ * one such ref, but can never authorize recovery without it.
+ */
+pub fn release_recovery_source(
+  version: string,
+  pull_requests: list<ReleasePullRequestIdentity>,
+  remote_refs: list<GitRemoteRef>,
+  tag_target_oid: string,
+) -> ReleaseRecoverySource? {
+  const attempt = release_attempt_for_version(version, pull_requests)
+  const publications = release_publications_from_remote_refs(version, remote_refs)
+  const tag_oid = lowercase(trim(tag_target_oid))
+  if attempt == nil && tag_oid == "" && len(publications) == 0 {
+    return nil
+  }
+  let selected_oid = tag_oid
+  if attempt != nil {
+    if tag_oid != "" && tag_oid != attempt.publication.head_oid {
+      throw "release tag v${version} targets ${tag_oid}, but open immutable attempt ${attempt.publication.remote_ref} targets ${attempt.publication.head_oid}"
+    }
+    selected_oid = attempt.publication.head_oid
+  }
+  if selected_oid == "" {
+    if len(publications) > 1 {
+      throw "multiple unclaimed immutable release attempts exist for v${version}; an exact PR or signed tag must select one"
+    }
+    for publication in publications {
+      selected_oid = publication.head_oid
+    }
+  }
+  let selected: ReleasePublication? = nil
+  for publication in publications {
+    if publication.head_oid == selected_oid {
+      selected = publication
+    }
+  }
+  if selected == nil {
+    throw "release recovery identity ${selected_oid} has no matching immutable origin ref for v${version}"
+  }
+  return {
+    publication: selected,
+    pull_request: if attempt == nil {
+      nil
+    } else {
+      attempt.pull_request
+    },
+  }
+}
+
+pub fn superseded_release_attempts(
+  publication: ReleasePublication,
+  pull_requests: list<ReleasePullRequestIdentity>,
+) -> list<ReleasePullRequestIdentity> {
+  let superseded: list<ReleasePullRequestIdentity> = []
+  for pull_request in pull_requests {
+    const attempt = release_attempt_from_pull_request(publication.version, pull_request)
+    if attempt != nil && attempt.publication.remote_ref != publication.remote_ref {
+      superseded = superseded + [attempt.pull_request]
+    }
+  }
+  return superseded
+}
+
+/** Prove a PR still represents the exact immutable publication being handed off. */
+pub fn release_publication_pr_decision(
+  publication: ReleasePublication,
+  pull_request: ReleasePullRequestIdentity,
+) -> ReleasePublicationDecision {
+  const observed_ref = trim(pull_request.head.ref)
+  const observed_oid = lowercase(trim(pull_request.head.sha))
+  if observed_ref != publication.remote_ref {
+    return {
+      action: "fail",
+      reason: "release PR head ref ${observed_ref} does not match immutable publication ${publication.remote_ref}",
+    }
+  }
+  if observed_oid != publication.head_oid {
+    return {
+      action: "fail",
+      reason: "release PR head ${observed_oid} does not match immutable publication HEAD ${publication.head_oid}",
+    }
+  }
+  return {action: "accept", reason: "release PR matches immutable publication ref and HEAD"}
+}
+
+fn remote_ref_oid(refs: list<GitRemoteRef>, remote_ref: string) -> string {
+  const expected = "refs/heads/${remote_ref}"
+  for ref in refs {
+    if !ref.peeled && ref.ref == expected {
+      return lowercase(trim(ref.oid))
+    }
+  }
+  return ""
+}
+
+/**
+ * Classify a remote immutable-ref observation. An existing exact ref is a
+ * resume; a conflicting one is a hard error rather than a force update.
+ */
+pub fn release_publication_decision(publication: ReleasePublication, observed_oid: string) -> ReleasePublicationDecision {
+  const observed = lowercase(trim(observed_oid))
+  if observed == "" {
+    return {action: "publish", reason: "remote immutable publication ref is absent"}
+  }
+  if observed == publication.head_oid {
+    return {action: "resume", reason: "remote immutable publication ref already targets prepared HEAD"}
+  }
+  return {
+    action: "fail",
+    reason: "remote immutable publication ref ${publication.remote_ref} targets ${observed}, not prepared HEAD ${publication.head_oid}; refusing to overwrite it",
+  }
+}
+
+/** Reconcile an attempted push from the authoritative post-push remote read. */
+pub fn release_publication_push_reconciliation(
+  publication: ReleasePublication,
+  push_succeeded: bool,
+  observed_oid: string,
+) -> ReleasePublicationPushReconciliation {
+  const observed = lowercase(trim(observed_oid))
+  if observed == publication.head_oid {
+    return {
+      success: true,
+      action: if push_succeeded {
+        "published"
+      } else {
+        "reconciled"
+      },
+      reason: if push_succeeded {
+        "published immutable ref ${publication.remote_ref} at ${publication.head_oid}"
+      } else {
+        "push transport failed after origin accepted immutable ref ${publication.remote_ref} at ${publication.head_oid}"
+      },
+    }
+  }
+  if observed == "" {
+    return {
+      success: false,
+      action: if push_succeeded {
+        "confirmation_missing"
+      } else {
+        "push_failed"
+      },
+      reason: "origin does not contain immutable ref ${publication.remote_ref} after push attempt",
+    }
+  }
+  return {
+    success: false,
+    action: "confirmation_mismatch",
+    reason: "immutable publication ref ${publication.remote_ref} resolved to ${observed}, not prepared HEAD ${publication.head_oid}",
+  }
+}
+
+/**
+ * Publish or prove an immutable remote attempt ref. The post-push read is the
+ * receipt of record: a transport acknowledgement alone is not sufficient.
+ */
+pub fn publish_release_publication(cfg, publication: ReleasePublication) {
+  if cfg.mock {
+    return {
+      success: true,
+      action: "mock",
+      publication: publication,
+      push_git_receipt: nil,
+      remote_git_receipt: nil,
+      reason: "mock immutable publication",
+    }
+  }
+  const ref = "refs/heads/${publication.remote_ref}"
+  const initial = git_ls_remote("origin", {repo: cfg.repo, refs: [ref], heads: true})
+  if !initial.success {
+    return {
+      success: false,
+      action: "probe_failed",
+      publication: publication,
+      push_git_receipt: nil,
+      remote_git_receipt: initial,
+      reason: "could not inspect immutable publication ref ${publication.remote_ref}: "
+        + initial.stderr.inline,
+    }
+  }
+  const decision = release_publication_decision(publication, remote_ref_oid(initial.data.refs, publication.remote_ref))
+  if decision.action == "fail" {
+    return {
+      success: false,
+      action: decision.action,
+      publication: publication,
+      push_git_receipt: nil,
+      remote_git_receipt: initial,
+      reason: decision.reason,
+    }
+  }
+  if decision.action == "resume" {
+    return {
+      success: true,
+      action: decision.action,
+      publication: publication,
+      push_git_receipt: nil,
+      remote_git_receipt: initial,
+      reason: decision.reason,
+    }
+  }
+  const pushed = git_push("origin", "${publication.head_oid}:${ref}", cfg.repo)
+  const confirmed = git_ls_remote("origin", {repo: cfg.repo, refs: [ref], heads: true})
+  const push_failure_detail = if pushed.success {
+    ""
+  } else {
+    "; push transport also failed: " + pushed.stderr.inline
+  }
+  if !confirmed.success {
+    return {
+      success: false,
+      action: "confirmation_failed",
+      publication: publication,
+      push_git_receipt: pushed,
+      remote_git_receipt: confirmed,
+      reason: "could not confirm immutable publication ref ${publication.remote_ref} after push attempt: "
+        + confirmed.stderr.inline
+        + push_failure_detail,
+    }
+  }
+  const confirmed_oid = remote_ref_oid(confirmed.data.refs, publication.remote_ref)
+  const reconciliation = release_publication_push_reconciliation(publication, pushed.success, confirmed_oid)
+  return {
+    success: reconciliation.success,
+    action: reconciliation.action,
+    publication: publication,
+    push_git_receipt: pushed,
+    remote_git_receipt: confirmed,
+    reason: reconciliation.reason + push_failure_detail,
+  }
+}

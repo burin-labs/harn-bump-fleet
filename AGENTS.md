@@ -32,7 +32,7 @@ Release implementation changes belong in the stage that owns the behavior:
   validation, artifacts, and recovery
 - `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
   reconciliation, branch setup, and checkout state
-- `release_notes`: fragments, release notes, and fixup/repin/drift state
+- `release_notes`: fragments, release notes, and fixup/drift state
 - `release_reporting`: PR rendering, execution summaries, and crystallization
   fixtures
 - `release_modes` / `release_preflight`: prepare/ship execution, cleanup,
@@ -48,9 +48,9 @@ Use the pinned Harn version from `.harn-version`.
 
 ```sh
 harn install --locked
-harn check $(git ls-files '*.harn')
+harn check --strict-types $(git ls-files '*.harn')
 harn fmt --check $(git ls-files '*.harn')
-harn lint $(git ls-files '*.harn')
+harn lint --strict $(git ls-files '*.harn')
 harn test tests/ --verbose
 ```
 
@@ -113,19 +113,19 @@ ignored and must not be committed.
 ## Release policy
 
 `release_harn.harn` pins each live release at startup from `--at-sha`,
-`HARN_RELEASE_PIN_SHA`, or `origin/<base>`. The release branch is parented at
-that SHA and is not rebased before push. The pushed `vX.Y.Z` tag is the source
-for publish/build workflows, so later base-branch commits cannot leak into the
-published artifact.
+`HARN_RELEASE_PIN_SHA`, or `origin/<base>`. Its local release branch is
+parented at that SHA and is never published; the harness publishes a single
+OID-qualified immutable `release-attempt/...` ref before creating the tag and
+PR. The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
+base-branch commits cannot leak into the published artifact.
 
 If release assets already exist and an open `release/vX.Y.Z` PR remains,
 post-publish fixup mode is paperwork only: recreate the branch on fresh base,
 preserve the shipped release body from the tag, leave post-publish
 `## Unreleased` entries in place, skip retagging, and refresh the PR.
 
-Use `--repin-latest` only before a release ships. It advances an open release
-PR to fresh `origin/<base>`, reruns the full checks, deletes the stale remote
-tag after the TOCTTOU guard passes, and pushes the new pin.
+Changed prepared content creates a new immutable attempt ref and PR; a retry
+only resumes when the recorded ref still resolves to the exact prepared OID.
 
 ## Repo hygiene
 
