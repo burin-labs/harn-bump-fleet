@@ -71,7 +71,11 @@ merge-queue evidence through `harn-github-connector`, then prints whether each
 selected PR can be rewritten. Live mode refuses queued PRs, missing head
 branches/OIDs, and already-signed PRs.
 It also refuses forks and non-bot authors unless the corresponding override is
-passed. A live rewrite verifies the local checkout's origin matches `--repo`,
+passed. The volume of PRs this helper has to handle is set by how much
+Dependabot coverage the fleet carries; see
+[docs/dependabot-fleet-template.md](docs/dependabot-fleet-template.md) for the
+canonical per-repo config and its grouping rules.
+A live rewrite verifies the local checkout's origin matches `--repo`,
 uses a fsmonitor-disabled temp worktree, soft-resets the PR tree to
 `origin/main`, creates one signed commit with the configured trailer, pushes
 with an exact `--force-with-lease=refs/heads/<branch>:<oldHeadOid>`, verifies
