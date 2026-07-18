@@ -30,11 +30,16 @@ schedule:
   timezone: "America/Los_Angeles"
 cooldown:
   default-days: 7
-open-pull-requests-limit: 5
 ```
 
 `cooldown` defers freshly-published versions so a compromised release has time
 to be yanked or flagged before Dependabot ever proposes it.
+
+`open-pull-requests-limit: 5` is set on package-ecosystem blocks only. It is
+also Dependabot's default, so stating it on a `github-actions` block is inert
+noise: that block covers a handful of actions and the grouping rule below
+collapses them into a single PR. Package blocks can genuinely reach the cap, so
+there the limit is worth stating where a reader will look for it.
 
 ## Grouping rule
 
@@ -82,7 +87,6 @@ updates:
       timezone: "America/Los_Angeles"
     cooldown:
       default-days: 7
-    open-pull-requests-limit: 5
     groups:
       actions:
         patterns:
@@ -122,6 +126,14 @@ Only two, and both need a comment saying why:
 
 Large multi-package repos (`burin-code`, `harn`, `harn-cloud`) exercise both.
 Everything else should be a verbatim instance of the template.
+
+## Conformance, 2026-07-18
+
+The `github-actions` block above is byte-identical to what the eleven
+connector-style repos already carried, so codifying it made them conformant
+without a single cosmetic PR. Repos that had no file at all received the
+template; `harn-sdk-python`, `harn-sdk-typescript`, and `tree-sitter-harn-spm`
+additionally received the package-ecosystem block for the manifest they ship.
 
 ## Required signatures caveat
 
