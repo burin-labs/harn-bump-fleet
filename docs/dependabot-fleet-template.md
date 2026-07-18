@@ -132,8 +132,14 @@ Everything else should be a verbatim instance of the template.
 The `github-actions` block above is byte-identical to what the eleven
 connector-style repos already carried, so codifying it made them conformant
 without a single cosmetic PR. Repos that had no file at all received the
-template; `harn-sdk-python`, `harn-sdk-typescript`, and `tree-sitter-harn-spm`
-additionally received the package-ecosystem block for the manifest they ship.
+template; `harn-sdk-python` and `harn-sdk-typescript` additionally received the
+package-ecosystem block for the manifest they ship.
+
+Shipping a manifest is not by itself a reason for a block. `tree-sitter-harn-spm`
+has a `Package.swift` with an empty `dependencies` list — the grammar is
+vendored and updated by hand under supply-chain review — so a `swift` block
+there would monitor nothing. Rule 1 says cover every ecosystem the repo *has*;
+an ecosystem with no external dependencies is not one.
 
 ## Required signatures caveat
 
