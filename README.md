@@ -398,7 +398,7 @@ harn run --no-sandbox release_harn.harn -- --mock
 # Mocked agent/tool loop using Harn's mock LLM provider.
 harn run --no-sandbox release_harn.harn -- --mock --agent
 
-# Mock the full command sequence: prepare, commit, rebase, push, PR,
+# Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
 harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 
@@ -493,19 +493,12 @@ Options:
 - `--bump patch|minor|major` controls the expected next version; default is
   `patch`.
 - `--at-sha SHA` overrides the auto-resolved pin (`origin/<base>` HEAD
-  at run start). The release branch is parented at this commit, the
-  tag is pushed pointing here, and `latest_tag..<pin>` bounds every
+  at run start). The local release branch is parented at this commit, an
+  OID-qualified immutable `release-attempt/...` ref is published from the
+  prepared head, the tag is pushed pointing here, and `latest_tag..<pin>` bounds every
   changelog/audit walk. Use to ship an older known-good commit while
   newer commits sit on the base. Honors `HARN_RELEASE_PIN_SHA` env var
   as a fallback.
-- `--repin-latest` advances an existing open `release/v$next` PR's pin
-  to current `origin/<base>` HEAD so commits that landed during the PR
-  window fold into the same release rather than splitting into a future
-  `v$next+1`. Requires `--mode ship-pr --yes-live-release`; refuses if
-  the `v$next` release already shipped (crates.io is immutable). Runs
-  the full audit + dry-run + bump, deletes the stale tag on origin, and
-  re-pushes at the new pin. TOCTTOU re-checks the release/tag state one
-  final time immediately before resetting the release branch.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
   `HARN_RELEASE_*`, then shared planner env, then the OpenRouter cloud cell in
@@ -582,12 +575,9 @@ requires both signals (the required release assets + open PR) so it cannot
 misfire on a tag or empty GitHub release page that exists without the
 corresponding shipped artifacts.
 
-To advance the pin on an open release PR that has NOT yet shipped (so the
-release is not yet immutable on crates.io), use `--repin-latest`
-instead. It is the opt-in inverse of fixup mode that folds post-pin
-commits into the same `v$next` rather than splitting them into a future
-release. See the flag description above. Side-effecting failures are preserved
-in the run report; with `--agent`, the failed command, stdout/stderr,
+Changed prepared content publishes a fresh immutable attempt ref and opens a
+new PR; the prior attempt stays inspectable and is never force-updated.
+Side-effecting failures are preserved in the run report; with `--agent`, the failed command, stdout/stderr,
 classification, and execution transcript are fed back through a recovery
 `agent_loop` sidecar with its own JSONL transcript under `recovery/`. After the
 full release audit and generated-content checks pass, the canonical release

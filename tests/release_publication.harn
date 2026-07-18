@@ -1,0 +1,338 @@
+import { GitRemoteRef, git_ls_remote } from "std/git"
+import { verify_release_recovery_source } from "../lib/release_notes"
+import {
+  publish_release_publication,
+  release_attempt_for_version,
+  release_publication,
+  release_publication_decision,
+  release_publication_pr_decision,
+  release_publication_push_reconciliation,
+  release_publications_from_remote_refs,
+  release_recovery_source,
+  superseded_release_attempts,
+} from "../lib/release_publication"
+import { remote_tag_target_sha } from "../lib/release_repin"
+
+fn sh(command) {
+  const result = shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+fn fixture() {
+  const root = path_join(harness.fs.temp_dir(), "immutable-release-publication-" + uuid_v7())
+  const origin = path_join(root, "origin.git")
+  const work = path_join(root, "work")
+  sh("git init --bare -q '" + origin + "'")
+  sh("git init -q '" + work + "'")
+  sh("git -C '" + work + "' config user.email test@example.com")
+  sh("git -C '" + work + "' config user.name test")
+  sh("git -C '" + work + "' checkout -q -b main")
+  harness.fs.write_text(path_join(work, "fixture.txt"), "first\n")
+  sh("git -C '" + work + "' add fixture.txt && git -C '" + work + "' commit -q -m first")
+  sh("git -C '" + work + "' remote add origin '" + origin + "'")
+  return {root: root, origin: origin, work: work}
+}
+
+fn head(work: string) -> string {
+  return trim(sh("git -C '" + work + "' rev-parse HEAD").stdout)
+}
+
+fn remote_attempt_ref(publication) -> GitRemoteRef {
+  return {
+    oid: publication.head_oid,
+    ref: "refs/heads/${publication.remote_ref}",
+    name: "refs/heads/${publication.remote_ref}",
+    peeled: false,
+  }
+}
+
+pipeline test_release_publication_contract_is_immutable(task) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  assert_eq(publication.local_branch, "release/v1.2.3")
+  assert_eq(publication.remote_ref, "release-attempt/v1.2.3/${oid}")
+  assert_eq(release_publication_decision(publication, "").action, "publish")
+  assert_eq(release_publication_decision(publication, oid).action, "resume")
+  assert_eq(
+    release_publication_decision(publication, "fedcba9876543210fedcba9876543210fedcba98").action,
+    "fail",
+  )
+}
+
+pipeline test_release_publication_reconciles_ambiguous_push_from_origin(task) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const accepted = release_publication_push_reconciliation(publication, false, oid)
+  assert_eq(accepted.success, true)
+  assert_eq(accepted.action, "reconciled")
+  const absent = release_publication_push_reconciliation(publication, false, "")
+  assert_eq(absent.success, false)
+  assert_eq(absent.action, "push_failed")
+  const conflict = release_publication_push_reconciliation(
+    publication,
+    false,
+    "fedcba9876543210fedcba9876543210fedcba98",
+  )
+  assert_eq(conflict.success, false)
+  assert_eq(conflict.action, "confirmation_mismatch")
+}
+
+pipeline test_release_publication_selects_only_prior_attempt_prs(task) {
+  const publication = release_publication("1.2.3", "0123456789abcdef0123456789abcdef01234567")
+  const prior_oid = "fedcba9876543210fedcba9876543210fedcba98"
+  const prior = superseded_release_attempts(
+    publication,
+    [
+      {
+        number: 1,
+        url: "https://example.test/pull/1",
+        head: {ref: publication.remote_ref, sha: publication.head_oid},
+      },
+      {
+        number: 2,
+        url: "https://example.test/pull/2",
+        head: {ref: "release-attempt/v1.2.3/${prior_oid}", sha: prior_oid},
+      },
+      {
+        number: 3,
+        url: "https://example.test/pull/3",
+        head: {ref: "release-attempt/v1.2.4/${prior_oid}", sha: prior_oid},
+      },
+    ],
+  )
+  assert_eq(len(prior), 1)
+  assert_eq(prior[0]?.number, 2)
+}
+
+pipeline test_legacy_mutable_release_pr_fails_loud(task) {
+  const error = try {
+    release_attempt_for_version(
+      "1.2.3",
+      [
+        {
+          number: 4,
+          url: "https://example.test/pull/4",
+          head: {ref: "release/v1.2.3", sha: "fedcba9876543210fedcba9876543210fedcba98"},
+        },
+      ],
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(error, "legacy mutable release PR"), true)
+}
+
+pipeline test_release_attempt_discovery_requires_one_exact_ref_and_head(task) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const pull_request = {number: 7, url: "https://example.test/pull/7", head: {ref: publication.remote_ref, sha: oid}}
+  const attempt = release_attempt_for_version("1.2.3", [pull_request])
+  assert_eq(attempt.publication, publication)
+  assert_eq(attempt.pull_request, pull_request)
+  assert_eq(release_attempt_for_version("1.2.4", [pull_request]), nil)
+  assert_eq(release_publication_pr_decision(publication, pull_request).action, "accept")
+  assert_eq(
+    release_publication_pr_decision(
+      publication,
+      pull_request + {head: pull_request.head + {sha: "fedcba9876543210fedcba9876543210fedcba98"}},
+    ).action,
+    "fail",
+  )
+}
+
+pipeline test_release_attempt_discovery_fails_loud_on_drift_or_ambiguity(task) {
+  const first_oid = "0123456789abcdef0123456789abcdef01234567"
+  const second_oid = "fedcba9876543210fedcba9876543210fedcba98"
+  const first = {
+    number: 7,
+    url: "https://example.test/pull/7",
+    head: {ref: "release-attempt/v1.2.3/${first_oid}", sha: first_oid},
+  }
+  const second = {
+    number: 8,
+    url: "https://example.test/pull/8",
+    head: {ref: "release-attempt/v1.2.3/${second_oid}", sha: second_oid},
+  }
+  const drift_error = try {
+    release_attempt_for_version("1.2.3", [first + {head: first.head + {sha: second_oid}}])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(drift_error, "does not match immutable ref"), true)
+  const malformed_error = try {
+    release_attempt_for_version(
+      "1.2.3",
+      [
+        {
+          number: 9,
+          url: "https://example.test/pull/9",
+          head: {ref: "release-attempt/v1.2.3/not-an-oid", sha: first_oid},
+        },
+      ],
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(malformed_error, "full 40-hex OID"), true)
+  const ambiguous_error = try {
+    release_attempt_for_version("1.2.3", [first, second])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(ambiguous_error, "multiple open immutable release attempts"), true)
+}
+
+pipeline test_release_recovery_source_handles_tag_only_crash_and_reconciles_pr(task) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const pull_request = {number: 7, url: "https://example.test/pull/7", head: {ref: publication.remote_ref, sha: oid}}
+  const remote_refs = [remote_attempt_ref(publication)]
+  const pre_tag_crash = release_recovery_source("1.2.3", [], remote_refs, "")
+  assert_eq(pre_tag_crash?.publication, publication)
+  assert_eq(pre_tag_crash?.pull_request, nil)
+  const tag_only = release_recovery_source("1.2.3", [], remote_refs, oid)
+  assert_eq(tag_only?.publication, publication)
+  assert_eq(tag_only?.pull_request, nil)
+  const reconciled = release_recovery_source("1.2.3", [pull_request], remote_refs, oid)
+  assert_eq(reconciled?.publication, publication)
+  assert_eq(reconciled?.pull_request, pull_request)
+  const mismatch = try {
+    release_recovery_source(
+      "1.2.3",
+      [pull_request],
+      remote_refs,
+      "fedcba9876543210fedcba9876543210fedcba98",
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(mismatch, "but open immutable attempt"), true)
+}
+
+pipeline test_release_recovery_requires_and_validates_remote_immutable_ref(task) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const missing = try {
+    release_recovery_source("1.2.3", [], [], oid)
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(missing, "no matching immutable origin ref"), true)
+  const drifting_ref = remote_attempt_ref(publication) + {oid: "fedcba9876543210fedcba9876543210fedcba98"}
+  const drifting = try {
+    release_publications_from_remote_refs("1.2.3", [drifting_ref])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(drifting, "not its content-addressed OID"), true)
+}
+
+pipeline test_release_publication_pushes_once_and_resumes_exact_ref(task) {
+  const f = fixture()
+  const publication = release_publication("1.2.3", head(f.work))
+  const first = publish_release_publication({repo: f.work, mock: false}, publication)
+  assert_eq(first.success, true)
+  assert_eq(first.action, "published")
+  assert_eq(first.push_git_receipt.success, true)
+  assert_eq(first.remote_git_receipt.success, true)
+  const remote = git_ls_remote("origin", {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true})
+  assert_eq(remote.success, true)
+  assert_eq(remote.data.refs[0].oid, publication.head_oid)
+  const discovered = git_ls_remote("origin", {repo: f.work, refs: ["refs/heads/release-attempt/v1.2.3/*"], heads: true})
+  assert_eq(discovered.success, true)
+  assert_eq(len(discovered.data.refs), 1)
+  assert_eq(release_recovery_source("1.2.3", [], discovered.data.refs, "")?.publication, publication)
+  const resumed = publish_release_publication({repo: f.work, mock: false}, publication)
+  assert_eq(resumed.success, true)
+  assert_eq(resumed.action, "resume")
+  assert_eq(resumed.push_git_receipt, nil)
+  assert_eq(resumed.remote_git_receipt.success, true)
+  sh("rm -rf '" + f.root + "'")
+}
+
+pipeline test_release_publication_pushes_captured_oid_when_local_head_advances(task) {
+  const f = fixture()
+  const captured_oid = head(f.work)
+  const publication = release_publication("1.2.3", captured_oid)
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "advanced\n")
+  sh("git -C '" + f.work + "' commit -q -am advanced")
+  assert_ne(head(f.work), captured_oid)
+  const result = publish_release_publication({repo: f.work, mock: false}, publication)
+  assert_eq(result.success, true)
+  const remote = git_ls_remote("origin", {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true})
+  assert_eq(remote.data.refs[0].oid, captured_oid)
+  sh("rm -rf '" + f.root + "'")
+}
+
+pipeline test_unsigned_remote_tag_is_not_a_verified_recovery_source(task) {
+  const f = fixture()
+  const captured_oid = head(f.work)
+  const publication = release_publication("1.2.3", captured_oid)
+  assert_eq(publish_release_publication({repo: f.work, mock: false}, publication).success, true)
+  sh("git -C '" + f.work + "' tag -a v1.2.3 -m release " + captured_oid)
+  sh("git -C '" + f.work + "' push -q origin refs/tags/v1.2.3")
+  sh("git -C '" + f.work + "' tag -d v1.2.3 >/dev/null")
+  const refs = git_ls_remote("origin", {repo: f.work, refs: ["refs/tags/v1.2.3", "refs/tags/v1.2.3^{}"]})
+  assert_eq(refs.success, true)
+  assert_eq(remote_tag_target_sha(refs.data.refs), captured_oid)
+  const attempts = git_ls_remote("origin", {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true})
+  const recovery = release_recovery_source("1.2.3", [], attempts.data.refs, remote_tag_target_sha(refs.data.refs))
+  assert_eq(recovery?.publication?.head_oid, captured_oid)
+  const verification_error = try {
+    verify_release_recovery_source({repo: f.work, mock: false}, "v1.2.3", publication, refs.data.refs)
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(verification_error, "failed signature verification"), true)
+  sh("rm -rf '" + f.root + "'")
+}
+
+pipeline test_release_publication_new_head_never_rewrites_prior_attempt(task) {
+  const f = fixture()
+  const first_publication = release_publication("1.2.3", head(f.work))
+  assert_eq(publish_release_publication({repo: f.work, mock: false}, first_publication).success, true)
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "second\n")
+  sh("git -C '" + f.work + "' commit -q -am second")
+  const second_publication = release_publication("1.2.3", head(f.work))
+  assert_ne(second_publication.remote_ref, first_publication.remote_ref)
+  assert_eq(
+    publish_release_publication({repo: f.work, mock: false}, second_publication).success,
+    true,
+  )
+  const prior = git_ls_remote(
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${first_publication.remote_ref}"], heads: true},
+  )
+  assert_eq(prior.data.refs[0].oid, first_publication.head_oid)
+  sh("rm -rf '" + f.root + "'")
+}
+
+pipeline test_release_publication_ref_mismatch_fails_before_any_mutation(task) {
+  const f = fixture()
+  const publication = release_publication("1.2.3", head(f.work))
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "conflicting\n")
+  sh("git -C '" + f.work + "' commit -q -am conflicting")
+  const conflicting_oid = head(f.work)
+  sh("git -C '" + f.work + "' push -q origin HEAD:refs/heads/scratch")
+  sh(
+    "git --git-dir='" + f.origin + "' update-ref refs/heads/" + publication.remote_ref + " "
+      + conflicting_oid,
+  )
+  const result = publish_release_publication({repo: f.work, mock: false}, publication)
+  assert_eq(result.success, false)
+  assert_eq(result.action, "fail")
+  const remote = git_ls_remote("origin", {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true})
+  assert_eq(remote.data.refs[0].oid, conflicting_oid)
+  sh("rm -rf '" + f.root + "'")
+}
