@@ -51,7 +51,7 @@ harn install --locked
 harn check --strict-types $(git ls-files '*.harn')
 harn fmt --check $(git ls-files '*.harn')
 harn lint --strict $(git ls-files '*.harn')
-harn test tests/ --verbose
+harn test tests/ --parallel --verbose
 ```
 
 Use `harn fmt $(git ls-files '*.harn')` for Harn formatting fixes.

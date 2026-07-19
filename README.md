@@ -264,8 +264,9 @@ HARN_PLANNER_PROVIDER=ollama harn run --no-sandbox release_harn.harn
 
 GitHub Actions runs `harn check --strict-types`, `harn fmt --check`, and
 `harn lint --strict` across all tracked `*.harn` files, then runs
-`harn test tests/` when local tests are present. CI installs the published
-`harn-cli` version pinned by `.harn-version` through `scripts/install_harn.sh`.
+`harn test tests/ --parallel` when local tests are present. CI installs the
+published `harn-cli` version pinned by `.harn-version` through
+`scripts/install_harn.sh`.
 
 This repo also ships `.github/workflows/bump-harn.yml`, so future fleet runs
 can update `harn-bump-fleet` itself through the same
