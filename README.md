@@ -520,6 +520,17 @@ generated from a fresh post-prepare snapshot instead of the initial audit text.
 If the PR already exists on the release branch, the harness refreshes its
 title/body before enabling auto-merge.
 
+Before any live prepare or ship side effect, the harness also audits the most
+recent published GitHub release description against the release notes recovered
+from the immutable tag's pin-time changelog. Exact matches and a previously
+applied deterministic correction are no-ops. Drift is repaired with one
+connector-owned body-only edit guarded by the observed release id, tag object,
+and peeled tag target; tags, assets, and package contents remain immutable.
+Audit mode reports the plan without editing. Every run records the closed state
+and before/after SHA-256 digests in `release-body-integrity.json`; body-only
+drift never creates a source commit or PR, while independent changelog drift
+continues through the paperwork-PR path below.
+
 ### Post-publish fixup mode
 
 If a live `--mode ship-pr` run starts and the harness detects:

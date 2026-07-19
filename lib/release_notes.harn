@@ -44,6 +44,8 @@ import {
   release_github_open_pr,
   release_github_pr_create,
   release_github_pr_list,
+  release_github_release,
+  release_github_release_body_edit,
   release_log_event,
   release_run_dir,
   run_git,
@@ -112,6 +114,42 @@ pub type ReleasePostMergeDecision = ReleasePostMergeNoDriftDecision | ReleasePos
 
 pub type ReleaseRunSessionViewGate = RunSessionViewGate \
   & {release_note: RunSessionViewReleaseNoteStatus, findings: list<string>}
+
+pub type ReleasePublishedBodySource = {
+  tag: string,
+  version: string,
+  original_pin: string,
+  body: string,
+  tag_ref_oid: string,
+  tag_target_oid: string,
+}
+
+pub type ReleaseBodyIntegrityStatus = "not_applicable" \
+  | "source_unavailable" \
+  | "clean" \
+  | "drifted" \
+  | "already_corrected" \
+  | "repaired" \
+  | "stale_lease" \
+  | "connector_failure"
+
+pub type ReleaseBodyIntegrityPlan = {
+  schema_version: string,
+  tag: string,
+  status: ReleaseBodyIntegrityStatus,
+  reason: string,
+  expected_body: string,
+  observed_body: string,
+  desired_body: string,
+  before_sha256: string,
+  after_sha256: string,
+  lease: dict?,
+  error: dict?,
+}
+
+const RELEASE_BODY_CORRECTION_START = "<!-- harn-release-body-correction:v1 -->"
+
+const RELEASE_BODY_CORRECTION_END = "<!-- /harn-release-body-correction -->"
 
 const RELEASE_CHANGELOG_CATEGORIES: list<ChangelogCategory> = [
   {slug: "breaking", heading: "Breaking"},
@@ -456,20 +494,8 @@ fn run_changelog_massage_recovery(
 }
 
 /**
- * Repair / fixup CHANGELOG path. Used when an open immutable-attempt PR
- * is detected at startup — either a re-run on a not-yet-shipped PR
- * (the previous run made it partway through) or a post-publish paperwork
- * pass after the artifact already shipped.
- *
- * Treats recovered release notes as the authoritative description of
- * v${next_version}. Normally that is pin-time `## Unreleased`; for
- * fragment-based releases it is the already-prepared `## v${next_version}`
- * section from the release branch or shipped tag. The promotion helper
- * smart-subtracts that body from current Unreleased when it is present so
- * post-pin drift on `<base>` is preserved as future-release work.
- *
- * The model is not invoked here. Pin-time Unreleased was authored by the
- * operator; the harness just promotes it deterministically.
+ * Promote recovered pin/attempt notes without a model, smart-subtracting them
+ * from current Unreleased so post-pin base changes remain future-release work.
  */
 fn apply_fixup_release_notes(harness: Harness, cfg, analysis) {
   const changelog_path = path_join(cfg.repo, "CHANGELOG.md")
@@ -509,33 +535,10 @@ fn apply_fixup_release_notes(harness: Harness, cfg, analysis) {
 }
 
 /**
- * Detect repair / fixup state for `analysis.next_version`.
- *
- * Returns `nil` when this is a normal first-time release. Returns
- * `{publication, tag, pr_url, original_pin, pin_unreleased, release_body_source,
- * tag_exists, release_exists, missing_assets}` when an open immutable attempt
- * PR or already-published release tag exists for `next_version`.
- *
- * Two flavors collapse into one detection path:
- *   - Re-run on a still-open release PR (artifact may or may not have
- *     shipped). The previous run got partway and left the PR open;
- *     we need to recreate the branch, fix any content regressions,
- *     and publish a new immutable attempt.
- *   - Documented post-publish drift: required release assets shipped,
- *     operator added more bullets to Unreleased that describe the NEXT
- *     release; the re-run should land the v${next_version} paperwork
- *     without clobbering those drift bullets.
- *
- * Both share the same recovery: recover the original pin SHA via
- * `git merge-base <attempt-oid> origin/<base>`, then read
- * pin-time `## Unreleased` from that commit. That gives us the bullets
- * the operator INTENDED to ship — the source of truth regardless of
- * what was actually published (in case the original ship truncated
- * the changelog).
- *
- * Conservative gating:
- *   - mock/audit/non-live runs never auto-detect.
- *   - Pin-time CHANGELOG must be readable, otherwise we can't recover.
+ * Detect live recovery of an open immutable attempt or its shipped tag.
+ * Both cases recover pin-time `## Unreleased` through the attempt/base merge
+ * base, so later base-branch notes remain future-release work. Mock, audit,
+ * non-live, and unreadable-pin cases never enter fixup mode.
  */
 pub fn detect_fixup_state(cfg: ReleaseConfig, analysis: ReleaseAnalysis) -> ReleaseFixupState? {
   if cfg.mock {
@@ -731,6 +734,285 @@ fn fetch_observed_remote_tag_target(cfg, tag: string, refs: list<GitRemoteRef>) 
   return observed_target
 }
 
+/** Derive the published description from the immutable tag's pin-time input. */
+pub fn published_release_body_source_from_git(
+  cfg: ReleaseGitBaseConfig,
+  version: string,
+) -> ReleasePublishedBodySource? {
+  const tag = "v${version}"
+  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
+  if !tag_check.success || len(tag_check.refs) == 0 {
+    return nil
+  }
+  const tag_ref_oid = remote_tag_sha(tag_check.refs)
+  const tag_target_oid = fetch_observed_remote_tag_target(cfg, tag, tag_check.refs)
+  if tag_ref_oid == "" || tag_target_oid == "" {
+    return nil
+  }
+  const merge_base = git_merge_base(tag_target_oid, "origin/" + cfg.base, cfg.repo)
+  if !merge_base.success || merge_base.data.oid == "" {
+    return nil
+  }
+  const original_pin = merge_base.data.oid
+  const pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
+  if !pin_show.success {
+    return nil
+  }
+  const body = changelog_section_body(pin_show.stdout, "Unreleased")
+  if body == "" {
+    return nil
+  }
+  return {
+    tag: tag,
+    version: version,
+    original_pin: original_pin,
+    body: body,
+    tag_ref_oid: tag_ref_oid,
+    tag_target_oid: tag_target_oid,
+  }
+}
+
+pub fn release_body_correction_footer(source: ReleasePublishedBodySource) -> string {
+  return RELEASE_BODY_CORRECTION_START
+    + "\n\n> Correction: This description was restored from release notes captured at `"
+    + source
+    .original_pin
+    + "`. The immutable `"
+    + source.tag
+    + "` tag remains authoritative.\n\n"
+    + RELEASE_BODY_CORRECTION_END
+}
+
+pub fn release_body_without_correction(body: string) -> string {
+  const delimiter = "\n\n" + RELEASE_BODY_CORRECTION_START
+  const marker = body.index_of(delimiter)
+  return if marker < 0 {
+    body
+  } else {
+    body[0:marker]
+  }
+}
+
+pub fn release_body_corrected(source: ReleasePublishedBodySource) -> string {
+  return source.body + "\n\n" + release_body_correction_footer(source)
+}
+
+fn release_body_integrity_base(
+  source: ReleasePublishedBodySource,
+  status: ReleaseBodyIntegrityStatus,
+  reason: string,
+) -> ReleaseBodyIntegrityPlan {
+  return {
+    schema_version: "harn.release_body_integrity.v1",
+    tag: source.tag,
+    status: status,
+    reason: reason,
+    expected_body: source.body,
+    observed_body: "",
+    desired_body: source.body,
+    before_sha256: "",
+    after_sha256: sha256(source.body),
+    lease: nil,
+    error: nil,
+  }
+}
+
+/** Classify exact release-body bytes without performing a mutation. */
+pub fn release_body_integrity_plan(
+  source: ReleasePublishedBodySource,
+  lookup,
+) -> ReleaseBodyIntegrityPlan {
+  if is_err(lookup) {
+    return release_body_integrity_base(
+      source,
+      "connector_failure",
+      "the release metadata lookup failed",
+    )
+      + {error: unwrap_err(lookup)}
+  }
+  if !(lookup?.found ?? false) {
+    return release_body_integrity_base(
+      source,
+      "connector_failure",
+      "the published release is not visible at the exact tag",
+    )
+      + {error: {code: "release_not_found", message: "release not found"}}
+  }
+  const lease = lookup?.lease
+  if lease == nil || lease?.release_id == nil
+    || trim(to_string(lease?.tag_ref_oid ?? "")) == ""
+    || trim(to_string(lease?.tag_target_oid ?? ""))
+    == "" {
+    return release_body_integrity_base(
+      source,
+      "connector_failure",
+      "the release lookup omitted its mutation lease",
+    )
+      + {error: {code: "invalid_response", message: "release lease missing"}}
+  }
+  const observed = to_string(lookup?.release?.body ?? "")
+  const observed_without_correction = release_body_without_correction(observed)
+  const before = sha256(observed)
+  if lease.tag_ref_oid != source.tag_ref_oid || lease.tag_target_oid != source.tag_target_oid {
+    return release_body_integrity_base(
+      source,
+      "stale_lease",
+      "the provider tag identity differs from the immutable Git observation",
+    )
+      + {
+      observed_body: observed,
+      desired_body: release_body_corrected(source),
+      before_sha256: before,
+      after_sha256: sha256(release_body_corrected(source)),
+      lease: lease,
+    }
+  }
+  if observed == source.body {
+    return release_body_integrity_base(
+      source,
+      "clean",
+      "the published description matches the pin-time release notes",
+    )
+      + {
+      observed_body: observed,
+      desired_body: observed,
+      before_sha256: before,
+      after_sha256: before,
+      lease: lease,
+    }
+  }
+  const desired = release_body_corrected(source)
+  if observed == desired {
+    return release_body_integrity_base(
+      source,
+      "already_corrected",
+      "the published description already contains the deterministic correction",
+    )
+      + {
+      observed_body: observed,
+      desired_body: desired,
+      before_sha256: before,
+      after_sha256: before,
+      lease: lease,
+    }
+  }
+  return release_body_integrity_base(
+    source,
+    "drifted",
+    if observed_without_correction == source.body {
+      "the existing correction footer is not canonical and must be recomputed"
+    } else {
+      "the published description differs from the pin-time release notes"
+    },
+  )
+    + {
+    observed_body: observed,
+    desired_body: desired,
+    before_sha256: before,
+    after_sha256: sha256(desired),
+    lease: lease,
+  }
+}
+
+/** Apply only a drifted plan; every other state is already a closed receipt. */
+pub fn execute_release_body_integrity_plan(plan: ReleaseBodyIntegrityPlan, mutate: bool, editor) {
+  if plan.status != "drifted" || !mutate {
+    return plan
+  }
+  const edited = editor(plan.tag, plan.desired_body, plan.lease)
+  if is_err(edited) {
+    const error = unwrap_err(edited)
+    const status: ReleaseBodyIntegrityStatus = if error?.code == "stale_release"
+      || error?.code
+      == "stale_tag" {
+      "stale_lease"
+    } else {
+      "connector_failure"
+    }
+    return plan
+      + {status: status, reason: "the guarded release metadata edit failed", error: error}
+  }
+  const edited_body = to_string(edited?.body ?? "")
+  if edited_body != plan.desired_body {
+    return plan
+      + {
+      status: "connector_failure",
+      reason: "the release metadata edit did not confirm the exact replacement body",
+      error: {code: "invalid_response", message: "release edit body mismatch"},
+    }
+  }
+  return plan
+    + {
+    status: "repaired",
+    reason: "the published description was restored without changing tag or asset state",
+    observed_body: edited_body,
+    after_sha256: sha256(edited_body),
+    error: nil,
+  }
+}
+
+pub fn release_body_integrity_gate(harness: Harness, cfg, version: string, run_id: string) {
+  const skipped = cfg.mock || trim(version) == ""
+  const source = if skipped {
+    nil
+  } else {
+    published_release_body_source_from_git(cfg, version)
+  }
+  const live = cfg.mode != "audit" && (cfg.yes_live_release ?? false)
+  const receipt = if skipped {
+    release_body_empty_plan(
+      version,
+      "not_applicable",
+      "no published release body requires inspection",
+    )
+  } else if source == nil {
+    release_body_empty_plan(
+      version,
+      "source_unavailable",
+      "the immutable pin-time release notes could not be derived",
+    )
+      + {error: {code: "source_unavailable", message: "immutable release notes unavailable"}}
+  } else {
+    const plan = release_body_integrity_plan(source, release_github_release(cfg, source.tag))
+    execute_release_body_integrity_plan(
+      plan,
+      live,
+      { tag, body, lease -> return release_github_release_body_edit(cfg, tag, body, lease) },
+    )
+  }
+  const artifact_path = path_join(release_run_dir(run_id), "release-body-integrity.json")
+  harness.fs.write_text(artifact_path, json_stringify(receipt) + "\n")
+  release_log_event(harness, run_id, "release_body_integrity", receipt)
+  harness.stdio.println("== release body : ${receipt.tag} ${receipt.status}")
+  harness.stdio.println("   ${receipt.reason}")
+  if receipt.before_sha256 != "" {
+    harness.stdio.println("   before SHA-256: ${receipt.before_sha256}")
+    harness.stdio.println("   after SHA-256 : ${receipt.after_sha256}")
+  }
+  const safe = ["clean", "already_corrected", "repaired", "not_applicable"].contains(receipt.status)
+  return {proceed: safe || !live, receipt: receipt, artifact_path: artifact_path}
+}
+
+fn release_body_empty_plan(version, status, reason) {
+  return {
+    schema_version: "harn.release_body_integrity.v1",
+    tag: if trim(version) == "" {
+      ""
+    } else {
+      "v${version}"
+    },
+    status: status,
+    reason: reason,
+    expected_body: "",
+    observed_body: "",
+    desired_body: "",
+    before_sha256: "",
+    after_sha256: "",
+    lease: nil,
+    error: nil,
+  }
+}
+
 /**
  * Gather the Git-only evidence for post-merge drift. The outer detector owns
  * release availability and GitHub PR gates; this helper owns immutable tag,
@@ -741,26 +1023,8 @@ pub fn post_merge_drift_evidence_from_git(
   cfg: ReleaseGitBaseConfig,
   version: string,
 ) -> ReleasePostMergeDriftEvidence? {
-  const tag = "v${version}"
-  const tag_check = release_git_remote_refs(cfg, ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"])
-  if !tag_check.success || len(tag_check.refs) == 0 {
-    return nil
-  }
-  const tag_target = fetch_observed_remote_tag_target(cfg, tag, tag_check.refs)
-  if tag_target == "" {
-    return nil
-  }
-  const merge_base = git_merge_base(tag_target, "origin/" + cfg.base, cfg.repo)
-  if !merge_base.success || merge_base.data.oid == "" {
-    return nil
-  }
-  const original_pin = merge_base.data.oid
-  const pin_show = run_git(cfg, ["show", original_pin + ":CHANGELOG.md"])
-  if !pin_show.success {
-    return nil
-  }
-  const pin_unreleased = changelog_section_body(pin_show.stdout, "Unreleased")
-  if trim(pin_unreleased) == "" {
+  const source = published_release_body_source_from_git(cfg, version)
+  if source == nil {
     return nil
   }
   const main_show = run_git(cfg, ["show", "origin/" + cfg.base + ":CHANGELOG.md"])
@@ -771,24 +1035,23 @@ pub fn post_merge_drift_evidence_from_git(
   if trim(current_section) == "" {
     return nil
   }
-  const tag_show = run_git(cfg, ["show", tag_target + ":CHANGELOG.md"])
+  const tag_show = run_git(cfg, ["show", source.tag_target_oid + ":CHANGELOG.md"])
   const published_tag_section = if tag_show.success {
     changelog_section_body(tag_show.stdout, "v" + version)
   } else {
     ""
   }
   return {
-    tag: tag,
+    tag: source.tag,
     version: version,
-    original_pin: original_pin,
-    pin_unreleased: pin_unreleased,
+    original_pin: source.original_pin,
+    pin_unreleased: source.body,
     current_section: current_section,
     published_tag_section: published_tag_section,
     paperwork_branch: "paperwork/v${version}-changelog-fix",
   }
 }
 
-/** Reduce typed Git facts into a conservative paperwork decision. */
 pub fn post_merge_drift_decision(
   evidence: ReleasePostMergeDriftEvidence,
 ) -> ReleasePostMergeDecision {
@@ -838,32 +1101,10 @@ pub fn detect_post_merge_drift_from_git(
 }
 
 /**
- * Post-merge drift detection — third auto-mode (after fixup, before normal release).
- *
- * Fires when a previous ship-pr cycle completed (release/v$ver PR merged, binary
- * shipped) but GitHub's 3-way merge absorbed post-pin Unreleased bullets into
- * `## v$ver` on `<base>`. The published binary doesn't contain those bullets;
- * the CHANGELOG entry on `<base>` lies about what shipped. `release-pr-drift-check`
- * warns about this on the release PR, but if the check wasn't required, auto-merge
- * fires anyway and only the CHANGELOG ends up wrong. This detection lets the next
- * `release_harn` re-run open a paperwork-only PR that restores `## v$ver` to
- * pin-time content and moves the absorbed drift into `## Unreleased`.
- *
- * Conservative gating — `nil` unless ALL hold:
- *   - live ship-pr (`--mode ship-pr --yes-live-release`, not mock/audit)
- *   - working tree has no candidate release content (no in-flight release work)
- *   - latest published version (`analysis.current_version`) is FULLY published:
- *     crates.io + every required GitHub release asset.
- *   - no open `release/v$current` PR (existing fixup_state handles that)
- *   - pin-time `## Unreleased` (read from `git merge-base v$current origin/<base>`)
- *     differs from current `## v$current` body on `<base>`.
- *
- * Returns `{kind: "drift", tag, version, original_pin, pin_unreleased,
- *   current_section, paperwork_branch}` when drift is detected and the
- *   paperwork PR should be opened.
- *
- * Returns `{kind: "paperwork_pr_open", pr_url, paperwork_branch}` when a
- *   paperwork PR for this version is already open (idempotent re-run).
+ * Detect a fully published release whose merged changelog absorbed post-pin
+ * notes. Only a clean live ship-pr run with complete assets and no recovery PR
+ * may open the paperwork repair; an existing paperwork PR is returned as the
+ * idempotent terminal state.
  */
 pub fn detect_post_merge_drift(
   cfg: ReleaseConfig,
@@ -903,16 +1144,7 @@ pub fn detect_post_merge_drift(
   return detect_post_merge_drift_from_git(cfg, version)
 }
 
-/**
- * Open a paperwork-only PR that restores `## v${version}` to pin-time content
- * and moves drift bullets into `## Unreleased`. Called when
- * `detect_post_merge_drift` returns `kind: "drift"`. Sets `Allow-Retroactive-Changelog`
- * commit trailer + the matching env var on push to bypass the harn-repo's
- * retroactive-edit guard.
- *
- * Returns the exit code (0 success, non-zero failure). The caller short-circuits
- * the normal release flow when this is invoked.
- */
+/** Restore shipped notes and return later drift to Unreleased in a review-only paperwork PR. */
 pub fn run_post_merge_paperwork_pr(
   harness: Harness,
   cfg: ReleaseConfig,
