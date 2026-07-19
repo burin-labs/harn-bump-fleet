@@ -263,7 +263,8 @@ HARN_PLANNER_PROVIDER=ollama harn run --no-sandbox release_harn.harn
 ## CI
 
 GitHub Actions runs `harn check --strict-types`, `harn fmt --check`, and
-`harn lint --strict` across all tracked `*.harn` files, then runs
+`harn lint --strict` across all tracked `*.harn` files with explicit public API
+types required by `harn.toml`, then runs
 `harn test tests/ --parallel` when local tests are present. CI installs the
 published `harn-cli` version pinned by `.harn-version` through
 `scripts/install_harn.sh`.
