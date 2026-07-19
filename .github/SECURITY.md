@@ -29,8 +29,8 @@ We aim to:
 In scope:
 
 - `scripts/install_harn.sh` and its integrity-verification logic
-- `.github/workflows/bump-harn.yml` (auto-bump cron) and the App identity it
-  pushes under
+- `.github/workflows/bump-harn.yml` (auto-bump cron), its immutable Harn setup
+  action pin, and the App identity it pushes under
 - the pinned `harn-github-connector` dependency and the lockfile
 - any vector that lets an attacker forge a Harn version bump PR or push
   unsigned code into downstream repos via this fleet

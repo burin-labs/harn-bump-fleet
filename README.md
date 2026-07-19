@@ -266,8 +266,9 @@ GitHub Actions runs `harn check --strict-types`, `harn fmt --check`, and
 `harn lint --strict` across all tracked `*.harn` files with explicit public API
 types required by `harn.toml`, then runs
 `harn test tests/ --parallel` when local tests are present. CI installs the
-published `harn-cli` version pinned by `.harn-version` through
-`scripts/install_harn.sh`.
+published `harn-cli` version pinned by `.harn-version` through Harn's
+checksum-verifying setup action. `scripts/install_harn.sh` remains the local
+developer bootstrap.
 
 This repo also ships `.github/workflows/bump-harn.yml`, so future fleet runs
 can update `harn-bump-fleet` itself through the same

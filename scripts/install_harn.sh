@@ -3,11 +3,10 @@ set -euo pipefail
 
 # Install a pinned harn-cli release. Prefers the prebuilt binary tarball
 # from `gh release download` (~seconds) and falls back to
-# `cargo install --locked` (~5-10 min on a cold runner) only when the
-# asset doesn't exist for this OS/arch — alpha builds, brand-new
-# targets, or a release whose `build-release-binaries.yml` cascade is
-# still in flight. Set HARN_INSTALL_FROM_SOURCE=1 to skip the prebuilt
-# path entirely (debugging / reproducing source builds).
+# `cargo install --locked` only when the asset doesn't exist for this
+# OS/arch. CI uses Harn's first-party setup action; this script remains the
+# local developer bootstrap. Set HARN_INSTALL_FROM_SOURCE=1 to skip the
+# prebuilt path when debugging a source install.
 
 version="${1:-}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
