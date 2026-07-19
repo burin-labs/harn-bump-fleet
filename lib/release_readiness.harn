@@ -1,126 +1,201 @@
-import { command_run } from "std/command"
+import { connector_http_request } from "std/connectors/shared"
+import { poll_until } from "std/poll"
 import { strip_v } from "std/semver"
-import { github_release_asset_names } from "./github"
+import { github_release_at_tag } from "./github"
 
 pub type HarnReleaseArtifact = {target: string, archive: string, workflow_job: string}
 
-/** One canonical catalog for release archives and the matrix jobs that produce them. */
+pub type CrateVisibility = {published: bool, state: string}
+
+pub type GitHubReleaseState = {
+  found: bool,
+  draft: bool,
+  prerelease: bool,
+  finalized: bool,
+  asset_names: list<string>,
+}
+
+pub type HarnReleaseReadiness = {crate_published: bool, missing_assets: list<string>, release_finalized: bool, ready: bool, ...rest}
+
+pub type ReleaseReadinessPollOptions = {max_attempts?: int, interval_ms?: int, timeout_ms?: int}
+
+/** One catalog owns both release archives and their producing matrix jobs. */
+fn release_artifact(target, extension = "tar.gz") -> HarnReleaseArtifact {
+  return {target: target, archive: "harn-${target}.${extension}", workflow_job: "Build ${target}"}
+}
+
 pub fn harn_release_artifacts() -> list<HarnReleaseArtifact> {
   return [
-    {
-      target: "aarch64-apple-darwin",
-      archive: "harn-aarch64-apple-darwin.tar.gz",
-      workflow_job: "Build aarch64-apple-darwin",
-    },
-    {
-      target: "aarch64-unknown-linux-gnu",
-      archive: "harn-aarch64-unknown-linux-gnu.tar.gz",
-      workflow_job: "Build aarch64-unknown-linux-gnu",
-    },
-    {
-      target: "x86_64-apple-darwin",
-      archive: "harn-x86_64-apple-darwin.tar.gz",
-      workflow_job: "Build x86_64-apple-darwin",
-    },
-    {
-      target: "x86_64-pc-windows-msvc",
-      archive: "harn-x86_64-pc-windows-msvc.zip",
-      workflow_job: "Build x86_64-pc-windows-msvc",
-    },
-    {
-      target: "x86_64-unknown-linux-gnu",
-      archive: "harn-x86_64-unknown-linux-gnu.tar.gz",
-      workflow_job: "Build x86_64-unknown-linux-gnu",
-    },
+    release_artifact("aarch64-apple-darwin"),
+    release_artifact("aarch64-unknown-linux-gnu"),
+    release_artifact("x86_64-apple-darwin"),
+    release_artifact("x86_64-pc-windows-msvc", "zip"),
+    release_artifact("x86_64-unknown-linux-gnu"),
   ]
 }
 
-/** Return the exact matrix job names required to prove a complete cache warm. */
 pub fn required_harn_release_build_jobs() -> list<string> {
   return harn_release_artifacts().map({ artifact -> artifact.workflow_job }).to_list()
 }
 
-/**
- * Return the release assets required before fleet workflows may dispatch.
- *
- * harn now uploads each architecture's archive to the release as that build
- * leg finishes (incremental per-arch publish), and writes SHA256SUMS + the
- * release-assets.json manifest only at the finalize step (which also flips the
- * release from prerelease to "latest"). So the five archives alone no longer
- * imply a complete release — they appear minutes before finalize. Requiring
- * SHA256SUMS + release-assets.json gates readiness on finalize, so dependents
- * are only bumped once the manifest every consumer verifies against exists.
- */
-pub fn required_harn_release_assets() {
+/** Finalization writes these sidecars, so archives alone never prove a complete release. */
+pub fn required_harn_release_assets() -> list<string> {
   return harn_release_artifacts().map({ artifact -> artifact.archive }).to_list()
     + ["SHA256SUMS", "release-assets.json"]
 }
 
-/** Return required release assets that are not present in the supplied asset list. */
 pub fn missing_release_assets(asset_names, required_assets = nil) {
   const required = required_assets ?? required_harn_release_assets()
   return required.filter({ name -> !asset_names.any({ asset -> asset == name }) })
 }
 
-/** Render a concise operator-facing readiness summary. */
-pub fn release_readiness_detail(snapshot) {
-  const crate_detail = if snapshot.crate_published {
-    "harn-cli ${snapshot.version_no_v} published"
-  } else {
-    "harn-cli ${snapshot.version_no_v} not visible on crates.io"
-  }
-  const asset_detail = if len(snapshot.missing_assets) == 0 {
-    "required release assets present"
-  } else {
-    "missing release assets: " + join(snapshot.missing_assets, ", ")
-  }
-  return crate_detail + "; " + asset_detail
-}
-
-/** Return the crates.io API URL for one crate version. */
 pub fn crates_io_version_url(crate_name, version_no_v) {
   return "https://crates.io/api/v1/crates/${crate_name}/${version_no_v}"
 }
 
-/** Return true when the target crate version is visible on crates.io. */
-pub fn crate_version_published(crate_name, version_no_v) {
-  return command_run(
-    [
-      "curl",
-      "-fsSL",
-      "-o",
-      "/dev/null",
-      "-A",
-      "burin-labs/harn-bump-fleet release-readiness",
-      "-H",
-      "Accept: application/json",
-      crates_io_version_url(crate_name, version_no_v),
-    ],
-  ).success
+pub fn crate_visibility_from_response(response) -> CrateVisibility {
+  if response?.ok ?? false {
+    return {published: true, state: "published"}
+  }
+  if to_int(response?.status) == 404 {
+    return {published: false, state: "not_found"}
+  }
+  return {published: false, state: "unknown"}
 }
 
-/** Return true when the target harn-cli crate is visible on crates.io. */
+pub fn crate_version_visibility(crate_name, version_no_v) -> CrateVisibility {
+  return crate_visibility_from_response(
+    connector_http_request(
+      "GET",
+      crates_io_version_url(crate_name, version_no_v),
+      {
+        provider: "crates.io",
+        operation: "crate_version_visibility",
+        headers: {Accept: "application/json", "User-Agent": "harn-bump-fleet release-readiness"},
+        retry: {max_attempts: 1},
+      },
+    ),
+  )
+}
+
+pub fn crate_version_published(crate_name, version_no_v) {
+  return crate_version_visibility(crate_name, version_no_v).published
+}
+
 pub fn harn_crate_published(version_no_v) {
   return crate_version_published("harn-cli", version_no_v)
 }
 
-/** Snapshot crates.io and GitHub release-asset readiness for a Harn tag. */
-pub fn harn_release_readiness(target) {
-  const version_no_v = strip_v(target)
-  const asset_names = try {
-    github_release_asset_names("burin-labs/harn", target)
-  } catch (e) {
-    []
+/** Normalize the connector result once; unknown provider state fails closed. */
+pub fn github_release_state(lookup) -> GitHubReleaseState {
+  if is_err(lookup) || !(lookup?.found ?? false) {
+    return {found: false, draft: false, prerelease: false, finalized: false, asset_names: []}
   }
-  const missing_assets = missing_release_assets(asset_names)
-  const crate_ready = harn_crate_published(version_no_v)
+  const release = lookup.release
+  const draft = release?.draft ?? false
+  const prerelease = release?.prerelease ?? false
+  return {
+    found: true,
+    draft: draft,
+    prerelease: prerelease,
+    finalized: !draft && !prerelease,
+    asset_names: (release?.assets ?? []).map({ asset -> asset.name }).to_list(),
+  }
+}
+
+pub fn harn_release_readiness_from(
+  target: string,
+  crate: CrateVisibility,
+  release: GitHubReleaseState,
+) -> HarnReleaseReadiness {
+  const required = required_harn_release_assets()
+  const missing = missing_release_assets(release.asset_names, required)
   return {
     target: target,
-    version_no_v: version_no_v,
-    crate_published: crate_ready,
-    required_assets: required_harn_release_assets(),
-    asset_names: asset_names,
-    missing_assets: missing_assets,
-    ready: crate_ready && len(missing_assets) == 0,
+    version_no_v: strip_v(target),
+    crate_published: crate.published,
+    required_assets: required,
+    asset_names: release.asset_names,
+    missing_assets: missing,
+    release_draft: release.draft,
+    release_prerelease: release.prerelease,
+    release_finalized: release.finalized,
+    ready: crate.published && len(missing) == 0 && release.finalized,
   }
+}
+
+pub fn release_readiness_detail(snapshot) {
+  const crate = if snapshot.crate_published {
+    "harn-cli ${snapshot.version_no_v} published"
+  } else {
+    "harn-cli ${snapshot.version_no_v} not visible on crates.io"
+  }
+  const assets = if len(snapshot.missing_assets) == 0 {
+    "required release assets present"
+  } else {
+    "missing release assets: " + join(snapshot.missing_assets, ", ")
+  }
+  const release = if snapshot.release_finalized {
+    "GitHub release finalized"
+  } else if snapshot.release_prerelease {
+    "GitHub release still marked prerelease"
+  } else if snapshot.release_draft {
+    "GitHub release still a draft"
+  } else {
+    "GitHub release finalization unknown"
+  }
+  return "${crate}; ${assets}; ${release}"
+}
+
+pub fn live_release_readiness_adapter(repo: string = "burin-labs/harn") {
+  return {
+    crate_visibility: fn(version) { return crate_version_visibility("harn-cli", version) },
+    github_release: fn(tag) { return github_release_state(github_release_at_tag(repo, tag)) },
+  }
+}
+
+pub fn harn_release_readiness(target) -> HarnReleaseReadiness {
+  const adapter = live_release_readiness_adapter()
+  return harn_release_readiness_from(
+    target,
+    adapter.crate_visibility(strip_v(target)),
+    adapter.github_release(target),
+  )
+}
+
+/** Poll injected observations through std/poll, bounded by attempts and time. */
+pub fn wait_for_harn_release(target: string, adapter, options: ReleaseReadinessPollOptions = {}) {
+  const max = options.max_attempts ?? 180
+  const interval = options.interval_ms ?? 20000
+  const practical = max > 0 && max <= 1000000 && interval > 0 && interval <= 86400000
+  const timeout = if practical {
+    options.timeout_ms ?? max * interval * 2
+  } else {
+    0
+  }
+  if timeout < 1 {
+    throw "release readiness polling requires positive practical bounds"
+  }
+  let attempts = 0
+  let last = nil
+  let lines = []
+  const ready = poll_until(
+    { ->
+      attempts = attempts + 1
+      last = harn_release_readiness_from(
+        target,
+        adapter.crate_visibility(strip_v(target)),
+        adapter.github_release(target),
+      )
+      lines = lines + ["attempt ${attempts}/${max}: ${release_readiness_detail(last)}"]
+      return if last.ready {
+        last
+      } else {
+        nil
+      }
+    },
+    {max_attempts: max, interval_ms: interval, timeout_ms: timeout},
+  )
+  const snapshot = ready ?? last
+  return {ready: snapshot.ready, attempts: attempts, snapshot: snapshot, attempt_lines: lines}
 }
