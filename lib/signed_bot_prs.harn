@@ -1,11 +1,86 @@
 import { command_run } from "std/command"
 import { remote_url_to_slug } from "./git"
-import { github_enable_auto_merge } from "./github"
+import { GithubConnectorError, github_enable_auto_merge } from "./github"
 import { call, github_pr_commits } from "harn-github-connector/default"
 
 const DEFAULT_BASE = "main"
 
 const DEFAULT_TRAILER = "Co-Authored-By: Codex <codex@openai.com>"
+
+pub type SignedBotCommit = {
+  oid: string,
+  message: string,
+  signature_verified: bool,
+  signature_reason: string,
+}
+
+pub type SignedBotPullRequest = {
+  slug: string,
+  number: int,
+  title: string,
+  url: string,
+  state: string,
+  base_ref_name: string,
+  head_ref_name: string,
+  head_oid: string,
+  head_repo: string,
+  head_owner: string,
+  author_login: string,
+  author_type: string,
+  merge_state_status: string,
+  auto_merge_enabled: bool,
+  cross_repository: bool,
+  commits: list<SignedBotCommit>,
+}
+
+pub type SignedBotDecisionAction = "refuse" | "already_signed" | "rewrite"
+
+pub type SignedBotDecision = {
+  eligible: bool,
+  action: SignedBotDecisionAction,
+  errors: list<string>,
+  unsigned_count: int,
+  detail: string,
+}
+
+pub type SignedBotRewriteOptions = {
+  allow_fork?: bool,
+  allow_non_bot?: bool,
+  base?: string,
+  home?: string,
+  checkout?: string,
+  temp_root?: string,
+  temp_path?: string,
+  trailer?: string,
+}
+
+pub type SignedBotRewriteCommand = {name: string, argv: list<string>}
+
+pub type SignedBotRewritePlan = {
+  checkout: string,
+  temp_path: string,
+  branch: string,
+  old_head: string,
+  commands: list<SignedBotRewriteCommand>,
+}
+
+pub type SignedBotCommandResult = {success: bool, stdout: string, stderr: string, ...rest}
+
+pub type SignedBotCommandRunner = fn(list<string>) -> SignedBotCommandResult
+
+pub type SignedBotCheckoutOriginCheck = {ok: bool, detail: string}
+
+pub type SignedBotRewriteStep = {name: string, command: string, result: SignedBotCommandResult}
+
+pub type SignedBotRewriteResult = {
+  success: bool,
+  failed_step: string,
+  steps: list<SignedBotRewriteStep>,
+}
+
+pub type SignedBotAutoMergeState = {state: string}
+
+pub type SignedBotAutoMergeResult = Result<SignedBotAutoMergeState, GithubConnectorError>
 
 fn slug_parts(slug) {
   const parts = split(to_string(slug ?? ""), "/")
@@ -36,7 +111,7 @@ fn text_option(options, name, fallback) {
 }
 
 /** Parse a comma-separated PR list, rejecting empty or non-positive entries. */
-pub fn parse_pr_numbers(raw) {
+pub fn parse_pr_numbers(raw: string) -> list<int> {
   let out = []
   for part in split(to_string(raw ?? ""), ",") {
     const trimmed = trim(part)
@@ -52,7 +127,7 @@ pub fn parse_pr_numbers(raw) {
   return out
 }
 
-pub fn load_pr_signature_metadata(slug, pr_number) {
+pub fn load_pr_signature_metadata(slug: string, pr_number: int) -> SignedBotPullRequest {
   const auth = {allow_gh_auth_fallback: true}
   const parts = slug_parts(slug)
   if parts == nil {
@@ -101,7 +176,7 @@ pub fn load_pr_signature_metadata(slug, pr_number) {
   }
 }
 
-pub fn load_queued_pr_numbers(slug, base = DEFAULT_BASE) {
+pub fn load_queued_pr_numbers(slug: string, base: string = DEFAULT_BASE) -> list<int> {
   const queue = call(
     "github.merge_queue.entries",
     {allow_gh_auth_fallback: true, repo: slug, branch: base, limit: 100},
@@ -109,10 +184,10 @@ pub fn load_queued_pr_numbers(slug, base = DEFAULT_BASE) {
   if is_err(queue) {
     throw "GitHub merge queue lookup failed: " + to_string(unwrap_err(queue))
   }
-  return queue.entries.map({ entry -> entry.pull_number })
+  return queue.entries.map({ entry -> entry.pull_number }).to_list()
 }
 
-pub fn is_bot_pr_author(pr) {
+pub fn is_bot_pr_author(pr: SignedBotPullRequest?) -> bool {
   const login = lowercase(pr?.author_login ?? "")
   const typ = pr?.author_type ?? ""
   return typ == "Bot"
@@ -122,11 +197,15 @@ pub fn is_bot_pr_author(pr) {
     || login == "renovate"
 }
 
-pub fn unsigned_commits(pr) {
-  return (pr?.commits ?? []).filter({ commit -> !commit.signature_verified })
+pub fn unsigned_commits(pr: SignedBotPullRequest?) -> list<SignedBotCommit> {
+  return (pr?.commits ?? []).filter({ commit -> !commit.signature_verified }).to_list()
 }
 
-pub fn signed_bot_pr_decision(pr, queued_numbers = [], options = {}) {
+pub fn signed_bot_pr_decision(
+  pr: SignedBotPullRequest?,
+  queued_numbers: list<int> = [],
+  options: SignedBotRewriteOptions = {},
+) -> SignedBotDecision {
   if pr == nil {
     return {
       eligible: false,
@@ -188,17 +267,30 @@ fn default_checkout_path(slug, home) {
   return path_join(home, "projects/" + parts.repo)
 }
 
-pub fn default_temp_path(slug, pr_number, head_oid, temp_root = "/tmp/harn-signed-bot-prs") {
+/** Keep concurrent rewrites isolated while retaining the PR and observed head in recovery paths. */
+pub fn default_temp_path(
+  slug: string,
+  pr_number: int,
+  head_oid: string,
+  temp_root: string = "/tmp/harn-signed-bot-prs",
+) -> string {
   const suffix = if trim(head_oid ?? "") == "" {
     to_string(pr_number)
   } else {
     substring(head_oid, 0, 12)
   }
-  return path_join(temp_root, compact_slug(slug) + "-pr-" + to_string(pr_number) + "-" + suffix)
+  return path_join(
+    temp_root,
+    compact_slug(slug) + "-pr-" + to_string(pr_number) + "-" + suffix + "-" + uuid_v7(),
+  )
 }
 
-pub fn rewrite_command_plan(slug, pr, options = {}) {
-  const base = text_option(options, "base", pr?.base_ref_name ?? DEFAULT_BASE)
+pub fn rewrite_command_plan(
+  slug: string,
+  pr: SignedBotPullRequest,
+  options: SignedBotRewriteOptions = {},
+) -> SignedBotRewritePlan {
+  const base = text_option(options, "base", pr.base_ref_name)
   const home = text_option(options, "home", "")
   const checkout = text_option(options, "checkout", default_checkout_path(slug, home))
   const temp_root = text_option(options, "temp_root", "/tmp/harn-signed-bot-prs")
@@ -282,7 +374,11 @@ pub fn rewrite_command_plan(slug, pr, options = {}) {
   }
 }
 
-pub fn checkout_origin_check(checkout, expected_slug, runner) {
+pub fn checkout_origin_check(
+  checkout: string,
+  expected_slug: string,
+  runner: SignedBotCommandRunner,
+) -> SignedBotCheckoutOriginCheck {
   const result = runner(["git", "-C", checkout, "remote", "get-url", "origin"])
   if !(result.success ?? false) {
     return {ok: false, detail: "could not read checkout origin: " + trim(result.stderr ?? "")}
@@ -297,15 +393,22 @@ pub fn checkout_origin_check(checkout, expected_slug, runner) {
   return {ok: true, detail: "checkout origin matches ${expected_slug}"}
 }
 
-pub fn live_checkout_origin_check(checkout, expected_slug) {
-  return checkout_origin_check(checkout, expected_slug, { argv -> command_run(argv) })
+fn live_command_runner(argv: list<string>) -> SignedBotCommandResult {
+  return command_run(argv)
+}
+
+pub fn live_checkout_origin_check(
+  checkout: string,
+  expected_slug: string,
+) -> SignedBotCheckoutOriginCheck {
+  return checkout_origin_check(checkout, expected_slug, live_command_runner)
 }
 
 fn command_label(argv) {
   return join(argv.map({ a -> to_string(a) }), " ")
 }
 
-pub fn run_rewrite_commands(plan) {
+pub fn run_rewrite_commands(plan: SignedBotRewritePlan) -> SignedBotRewriteResult {
   let steps = []
   for command in plan.commands {
     const result = command_run(command.argv)
@@ -320,14 +423,19 @@ pub fn run_rewrite_commands(plan) {
   return {success: true, failed_step: "", steps: steps}
 }
 
-pub fn maybe_enable_auto_merge(slug, pr_number, expected_head_oid, enabled = true) {
+pub fn maybe_enable_auto_merge(
+  slug: string,
+  pr_number: int,
+  expected_head_oid: string,
+  enabled: bool = true,
+) -> SignedBotAutoMergeResult {
   if !enabled {
-    return {state: "skipped"}
+    return Ok({state: "skipped"})
   }
   const result = github_enable_auto_merge(slug, pr_number, expected_head_oid, "squash")
   return if is_err(result) {
     result
   } else {
-    unwrap(result)
+    Ok({state: unwrap(result).state})
   }
 }
