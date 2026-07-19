@@ -33,8 +33,9 @@ Release implementation changes belong in the stage that owns the behavior:
 - `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
   reconciliation, branch setup, and checkout state
 - `release_notes`: fragments, release notes, and fixup/drift state
-- `release_reporting`: PR rendering, execution summaries, and crystallization
-  fixtures
+- `release_reporting`: PR rendering and execution summaries
+- `release_crystallization`: deterministic, agent, and tool fixture streams
+  plus their manifest and artifact writer
 - `release_modes` / `release_preflight`: prepare/ship execution, cleanup,
   interactive flags, planner/fleet/sccache checks, and build-lock lifecycle
 
