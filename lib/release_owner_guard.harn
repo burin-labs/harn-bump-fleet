@@ -1,382 +1,8 @@
-import { command_run } from "std/command"
-import {
-  coord_acquire_dir_lock,
-  coord_dir_lock_path,
-  coord_release_dir_lock,
-} from "std/coordination"
-import { read_json_result, write_json } from "std/fs"
-import { process_result_success, process_shell } from "std/runtime"
-import { remote_url_to_slug } from "./git"
-import { github_release } from "harn-github-connector/default"
+import { host_lease_acquire, host_lease_release, host_lease_update_metadata } from "std/host_lease"
 
-const DEFAULT_OWNER_TTL_MS = 12 * 60 * 60 * 1000
+const RELEASE_OWNER_DOMAIN = "release-owner"
 
-const DEFAULT_OWNER_LOCK_TTL_MS = 10 * 60 * 1000
-
-fn owner_env_bool(harness: Harness, name) {
-  const raw = lowercase(trim(harness.env.get_or(name, "")))
-  return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
-
-fn positive_int(value, fallback) {
-  const parsed = to_int(value ?? "")
-  if parsed == nil || parsed <= 0 {
-    return fallback
-  }
-  return parsed
-}
-
-fn owner_ttl_ms(harness: Harness, cfg) {
-  const configured = positive_int(cfg?.owner_guard_ttl_ms ?? "", 0)
-  if configured > 0 {
-    return configured
-  }
-  const seconds = positive_int(harness.env.get_or("HARN_RELEASE_OWNER_TTL_SECONDS", ""), 0)
-  if seconds > 0 {
-    return seconds * 1000
-  }
-  return DEFAULT_OWNER_TTL_MS
-}
-
-fn owner_lock_ttl_ms(harness: Harness, cfg) {
-  const configured = positive_int(cfg?.owner_guard_lock_ttl_ms ?? "", 0)
-  if configured > 0 {
-    return configured
-  }
-  const seconds = positive_int(harness.env.get_or("HARN_RELEASE_OWNER_LOCK_TTL_SECONDS", ""), 0)
-  if seconds > 0 {
-    return seconds * 1000
-  }
-  return DEFAULT_OWNER_LOCK_TTL_MS
-}
-
-fn owner_takeover_requested(harness: Harness, cfg) {
-  return (cfg?.owner_guard_takeover ?? false)
-    || owner_env_bool(harness, "HARN_RELEASE_OWNER_TAKEOVER")
-}
-
-fn owner_started_ms(record) {
-  return positive_int(record?.started_ms ?? "", 0)
-}
-
-fn owner_pid(harness: Harness, cfg) {
-  const configured = positive_int(cfg?.owner_guard_pid ?? "", 0)
-  if configured > 0 {
-    return configured
-  }
-  const from_env = positive_int(harness.env.get_or("HARN_RELEASE_OWNER_PID", ""), 0)
-  if from_env > 0 {
-    return from_env
-  }
-  // Record the real process id so a crashed run leaves a probeable owner. A
-  // 0 here is the reason a dead run cannot be told apart from a live one, so
-  // the owner record must always carry a genuine pid unless a test/env pins it.
-  return pid()
-}
-
-fn owner_process_alive(pid) {
-  const n = positive_int(pid ?? "", 0)
-  if n <= 0 {
-    return nil
-  }
-  const probe = try {
-    process_shell("kill -0 " + to_string(n) + " >/dev/null 2>&1", {timeout_ms: 2000})
-  } catch (_e) {
-    nil
-  }
-  if probe == nil {
-    return nil
-  }
-  return process_result_success(probe)
-}
-
-/**
- * Whether any live `release_harn` process other than this one exists on the
- * host. Used as a last resort for an owner record that carries no pid
- * (owner_pid==0): we cannot probe a specific process, but a host scan still
- * refuses to reclaim while a concurrent live run exists and only frees a
- * genuinely crashed run's orphaned lock. Returns nil when the scan itself
- * cannot answer, so an ambiguous result blocks rather than reclaims.
- */
-fn host_release_process_alive(harness: Harness, cfg) {
-  if cfg?.owner_guard_host_process_alive != nil {
-    return cfg.owner_guard_host_process_alive ? true : false
-  }
-  const self_pid = pid()
-  const probe = try {
-    process_shell("pgrep -f release_harn.harn", {timeout_ms: 3000})
-  } catch (_e) {
-    nil
-  }
-  if probe == nil {
-    return nil
-  }
-  const code = probe.exit_code ?? probe.exit_status ?? -1
-  // pgrep: exit 1 means nothing matched (no live harness -> orphaned lock),
-  // exit 0 means at least one match, exit >=2 is an operational error.
-  if code == 1 {
-    return false
-  }
-  if code != 0 {
-    return nil
-  }
-  for line in split(probe.stdout ?? "", "\n") {
-    const other = positive_int(trim(line), 0)
-    if other > 0 && other != self_pid {
-      return true
-    }
-  }
-  return false
-}
-
-fn existing_owner_process_alive(harness: Harness, cfg, record) {
-  // Explicit override wins so the decision matrix stays pure and testable.
-  if cfg?.owner_guard_existing_owner_alive != nil {
-    return cfg.owner_guard_existing_owner_alive ? true : false
-  }
-  // Liveness only means something for a record written on this host; a pid from
-  // another machine says nothing about a local process.
-  if trim(record?.host ?? "") != hostname() {
-    return nil
-  }
-  const pid = positive_int(record?.owner_pid ?? "", 0)
-  if pid > 0 {
-    return owner_process_alive(pid)
-  }
-  // A record with no recorded pid cannot be probed for a specific process.
-  // Liveness stays unknown here so precise signals (published release, stale
-  // TTL) decide first; the coarse host scan is a last resort in the acquire
-  // path, consulted only when the decision would otherwise block.
-  return nil
-}
-
-fn owner_record_repo_slug(cfg, record) {
-  const configured = trim(cfg?.owner_guard_repo_slug ?? "")
-  if configured != "" {
-    return configured
-  }
-  const repo = trim(record?.repo ?? cfg?.repo ?? "")
-  if repo == "" {
-    return ""
-  }
-  const remote = try {
-    command_run(["git", "-C", repo, "config", "--get", "remote.origin.url"])
-  } catch (_e) {
-    nil
-  }
-  if remote == nil || !remote.success {
-    return ""
-  }
-  return remote_url_to_slug(trim(remote.stdout)) ?? ""
-}
-
-fn existing_owner_release_completed(cfg, record) {
-  if cfg?.owner_guard_existing_owner_completed != nil {
-    return cfg.owner_guard_existing_owner_completed ? true : false
-  }
-  const tag = trim(record?.tag ?? "")
-  if tag == "" {
-    return false
-  }
-  const slug = owner_record_repo_slug(cfg, record)
-  if slug == "" {
-    return false
-  }
-  const parts = split(slug, "/")
-  if len(parts) != 2 {
-    return false
-  }
-  const lookup = github_release(parts[0], parts[1], tag, {allow_gh_auth_fallback: true})
-  if is_err(lookup) || !lookup.found {
-    return false
-  }
-  return !lookup.release.draft
-    && !lookup.release.prerelease
-    && trim(lookup.release.published_at ?? "") != ""
-}
-
-fn owner_updated_ms(record) {
-  const updated = positive_int(record?.updated_ms ?? "", 0)
-  if updated > 0 {
-    return updated
-  }
-  return owner_started_ms(record)
-}
-
-fn owner_status(record) {
-  return lowercase(trim(record?.status ?? ""))
-}
-
-fn release_owner_done_status(status) {
-  return status == "" || status == "finished" || status == "failed" || status == "aborted"
-}
-
-fn release_owner_elapsed_seconds(now_ms, since_ms) {
-  if since_ms <= 0 || now_ms <= since_ms {
-    return "unknown"
-  }
-  return to_string((now_ms - since_ms) / 1000) + "s"
-}
-
-fn release_owner_line(label, value) {
-  const text = trim(to_string(value ?? ""))
-  if text == "" {
-    return ""
-  }
-  return "- " + label + ": " + text
-}
-
-fn release_owner_label(record) {
-  const operator = trim(record?.operator ?? "")
-  const host = trim(record?.host ?? "")
-  if operator == "" {
-    return host
-  }
-  if host == "" {
-    return operator
-  }
-  return operator + "@" + host
-}
-
-fn compact_owner_lines(record, now_ms) {
-  const updated = owner_updated_ms(record)
-  const ttl = positive_int(record?.ttl_ms ?? "", DEFAULT_OWNER_TTL_MS)
-  return [
-    release_owner_line("run", record?.run_id ?? ""),
-    release_owner_line("owner", release_owner_label(record)),
-    release_owner_line("repo", record?.repo ?? ""),
-    release_owner_line("mode", record?.mode ?? ""),
-    release_owner_line("version", record?.next_version ?? ""),
-    release_owner_line("tag", record?.tag ?? ""),
-    release_owner_line("pin", record?.pin_sha ?? ""),
-    release_owner_line("pid", record?.owner_pid ?? ""),
-    release_owner_line("status", record?.status ?? ""),
-    release_owner_line("started", record?.started_iso ?? ""),
-    "- last update age: " + release_owner_elapsed_seconds(now_ms, updated),
-    "- stale after: " + to_string(ttl / 1000) + "s",
-  ]
-    .filter({ line -> trim(line) != "" })
-}
-
-/** Atomic lock directory path used to serialize owner read/decision/write. */
-pub fn release_owner_lock_path(owner_path) {
-  return coord_dir_lock_path(trim(owner_path ?? ""))
-}
-
-fn release_owner_lock_owner(harness: Harness, cfg, owner_path, run_id) {
-  return {
-    id: run_id,
-    run_id: run_id,
-    owner_path: owner_path,
-    repo: cfg?.repo ?? "",
-    mode: cfg?.mode ?? "",
-    operator: username(),
-    host: hostname(),
-    owner_pid: owner_pid(harness, cfg),
-  }
-}
-
-fn release_owner_lock_message(lock_path, conflict, now_ms, takeover_hint = true) {
-  const hint = if takeover_hint {
-    "\nIf this lock is genuinely stale, rerun with HARN_RELEASE_OWNER_TAKEOVER=1 after checking the coordination log."
-  } else {
-    ""
-  }
-  if conflict.holder != nil {
-    const holder = conflict.holder
-    const owner = holder?.owner ?? {}
-    const display_record = {
-      ...owner,
-      status: holder?.status ?? conflict?.reason ?? "active",
-      updated_ms: holder?.updated_at_ms ?? holder?.acquired_at_ms ?? now_ms,
-      ttl_ms: holder?.ttl_ms ?? DEFAULT_OWNER_LOCK_TTL_MS,
-    }
-    return "error: release owner guard lock is held: ${lock_path}\n"
-      + join(
-      compact_owner_lines(display_record, now_ms),
-      "\n",
-    )
-      + hint
-  }
-  if conflict.reason == "malformed" {
-    return "error: release owner guard lock metadata is malformed: ${conflict.record_path}\n"
-      + "Refusing to remove the lock automatically."
-      + hint
-  }
-  return "error: release owner guard lock is held without metadata: ${lock_path}" + hint
-}
-
-fn release_owner_lock_acquire(harness: Harness, cfg, owner_path, run_id, now_ms) {
-  const lock_path = release_owner_lock_path(owner_path)
-  const ttl_ms = owner_lock_ttl_ms(harness, cfg)
-  const takeover = owner_takeover_requested(harness, cfg)
-  const owner = release_owner_lock_owner(harness, cfg, owner_path, run_id)
-  const lock = coord_acquire_dir_lock(
-    owner_path,
-    owner,
-    {
-      lock_path: lock_path,
-      ttl_ms: ttl_ms,
-      reason: "release_owner_guard",
-      throw_on_conflict: false,
-      take_stale: true,
-    },
-  )
-  if lock.acquired {
-    return {acquired: true, path: lock_path, record: lock.record, lease: lock}
-  }
-  if takeover {
-    const released = try {
-      coord_release_dir_lock(lock_path, {strict: false})
-    } catch (_e) {
-      nil
-    }
-    if released == nil {
-      throw "error: could not remove release owner lock during takeover: ${lock_path}"
-    }
-    const reacquired = coord_acquire_dir_lock(
-      owner_path,
-      owner,
-      {
-        lock_path: lock_path,
-        ttl_ms: ttl_ms,
-        reason: "release_owner_guard",
-        throw_on_conflict: false,
-        take_stale: true,
-      },
-    )
-    if reacquired.acquired {
-      return {acquired: true, path: lock_path, record: reacquired.record, lease: reacquired}
-    }
-    throw release_owner_lock_message(lock_path, reacquired, now_ms, false)
-  }
-  throw release_owner_lock_message(lock_path, lock, now_ms)
-}
-
-fn release_owner_lock_release(lock) {
-  if !(lock?.acquired ?? false) {
-    return nil
-  }
-  const path = trim(lock?.path ?? "")
-  if path == "" {
-    return nil
-  }
-  return coord_release_dir_lock(lock.lease ?? lock)
-}
-
-fn with_release_owner_lock(harness: Harness, cfg, owner_path, run_id, body) {
-  const lock = release_owner_lock_acquire(harness, cfg, owner_path, run_id, harness.clock.now_ms())
-  return try {
-    const value = body()
-    release_owner_lock_release(lock)
-    value
-  } catch (e) {
-    release_owner_lock_release(lock)
-    throw e
-  }
-}
-
-/** True when release_harn should acquire the cross-process live-release owner guard. */
+/** True when a run may mutate shared release refs, tags, or branches. */
 pub fn release_owner_guard_required(cfg) {
   if cfg?.mock ?? false {
     return false
@@ -388,342 +14,138 @@ pub fn release_owner_guard_required(cfg) {
   return mode == "prepare" || mode == "ship-pr"
 }
 
-/**
- * True when this run reclaimed a *provably dead* owner (a probed-dead pid via
- * `replace_dead_process`, or a host scan proving no live process via
- * `replace_orphaned_lock`) whose recorded target was exactly `version`. This is
- * the only owner signal strong enough to authorize discarding that crashed
- * run's dirty release branch: a stale-TTL, taken-over, or published reclaim is
- * NOT proof the previous process is gone, so those never qualify.
- */
-pub fn owner_reclaimed_dead_for_version(owner, version) {
-  if !(owner?.enabled ?? false) {
-    return false
-  }
-  const action = trim(owner?.decision?.action ?? "")
-  if action != "replace_dead_process" && action != "replace_orphaned_lock" {
-    return false
-  }
-  const prior = owner?.record?.reclaimed_prior
-  if prior == nil {
-    return false
-  }
-  const want = trim(version ?? "")
-  return want != "" && trim(prior?.next_version ?? "") == want
-}
-
-/** Stable owner-file path for release_harn. Tests may pass cfg.owner_guard_path. */
-pub fn release_owner_guard_path(harness: Harness, cfg) {
-  const explicit_cfg = trim(cfg?.owner_guard_path ?? "")
-  if explicit_cfg != "" {
-    return explicit_cfg
-  }
-  const explicit_env = trim(harness.env.get_or("HARN_RELEASE_OWNER_PATH", ""))
-  if explicit_env != "" {
-    return explicit_env
-  }
-  const home = trim(harness.env.get_or("HOME", harness.env.get_or("USERPROFILE", "")))
-  const root = if home == "" {
-    path_join(cwd(), ".harn-runs", "release-owners")
-  } else {
-    path_join(home, ".burin", "release-owners")
-  }
-  return path_join(root, "harn-release-owner.json")
-}
-
-/** Decide whether a requested live release may acquire/replace an owner record. */
-pub fn release_owner_guard_decision(
-  existing,
-  requested,
-  now_ms,
-  ttl_ms,
-  takeover = false,
-  existing_owner_alive = nil,
-  existing_owner_completed = false,
-) {
-  if existing == nil {
-    return {action: "acquire", reason: "no existing release owner"}
-  }
-  const status = owner_status(existing)
-  if release_owner_done_status(status) {
-    const done_status = if status == "" {
-      "complete"
-    } else {
-      status
-    }
-    return {action: "acquire", reason: "previous owner is " + done_status}
-  }
-  if trim(existing?.run_id ?? "") != ""
-    && trim(existing?.run_id ?? "")
-    == trim(requested?.run_id ?? "") {
-    return {action: "refresh", reason: "same release run"}
-  }
-  if existing_owner_alive != nil && !existing_owner_alive {
-    return {action: "replace_dead_process", reason: "existing owner process is no longer alive"}
-  }
-  if existing_owner_completed && !(existing_owner_alive ?? false) {
-    return {
-      action: "replace_completed_release",
-      reason: "existing owner release is already published",
-    }
-  }
-  if takeover {
-    return {action: "replace", reason: "takeover requested"}
-  }
-  const updated = owner_updated_ms(existing)
-  if ttl_ms > 0 && updated > 0 && now_ms - updated > ttl_ms {
-    return {action: "replace_stale", reason: "existing owner is stale"}
-  }
-  return {
-    action: "block",
-    reason: "error: another live Harn release appears active.\n"
-      + "Refusing to start a second live release lane because two sessions can otherwise push/force-push the same release branch or tag.\n"
-      + join(
-      compact_owner_lines(existing, now_ms),
-      "\n",
-    )
-      + "\nRequested:\n"
-      + join(compact_owner_lines(requested, now_ms), "\n")
-      + "\nIf the recorded owner is genuinely stale, rerun with HARN_RELEASE_OWNER_TAKEOVER=1 after checking the coordination log.",
-  }
-}
-
-fn release_owner_requested_record(cfg, analysis, run_id, path, now_ms, ttl_ms, pid) {
+fn owner_metadata(cfg, analysis, run_id) -> dict<string, string> {
   const next = trim(analysis?.next_version ?? "")
   return {
-    schema_version: 1,
-    status: "active",
-    run_id: run_id,
-    repo: cfg?.repo ?? "",
-    base: cfg?.base ?? "",
-    mode: cfg?.mode ?? "",
-    bump: cfg?.bump ?? "",
-    current_version: analysis?.current_version ?? "",
+    run_id: trim(run_id ?? ""),
+    repo: trim(cfg?.repo ?? ""),
+    base: trim(cfg?.base ?? ""),
+    mode: trim(cfg?.mode ?? ""),
+    bump: trim(cfg?.bump ?? ""),
+    current_version: trim(analysis?.current_version ?? ""),
     next_version: next,
     tag: if next == "" {
       ""
     } else {
       "v" + next
     },
-    pin_sha: cfg?.pin_sha ?? "",
-    operator: username(),
-    host: hostname(),
-    owner_pid: pid,
-    started_iso: date_now_iso(),
-    started_ms: now_ms,
-    updated_ms: now_ms,
-    ttl_ms: ttl_ms,
-    path: path,
+    pin_sha: trim(cfg?.pin_sha ?? ""),
   }
 }
 
-fn read_owner_record(harness: Harness, path) {
-  if path == "" || !harness.fs.exists(path) {
-    return {record: nil, malformed: ""}
+pub fn release_owner_lease_options(cfg, analysis, run_id) {
+  return {
+    owner: "release-harn.${run_id}",
+    resource_class: "whole-machine",
+    domain: trim(cfg?.owner_guard_domain ?? RELEASE_OWNER_DOMAIN),
+    priority_class: "interactive",
+    wait_timeout_ms: 0,
+    reason: "serialize live release ownership",
+    metadata: owner_metadata(cfg, analysis, run_id),
   }
-  const parsed = read_json_result(path)
-  if is_ok(parsed) {
-    return {record: unwrap(parsed), malformed: ""}
-  }
-  return {record: nil, malformed: trim(harness.fs.read_text(path))}
 }
 
-/**
- * Last resort before blocking a same-host owner record that carries no
- * probeable pid (owner_pid==0). A precise signal (published release, stale TTL,
- * dead pid) already had its chance in the pure decision; only when it would
- * otherwise block do we consult the coarse host scan. If no other live
- * release_harn process remains, the recorded owner crashed without releasing
- * its lock, so reclaim it. Any live process, a foreign host, or an inconclusive
- * scan leaves the block in place.
- */
-fn reclaim_orphaned_owner_if_dead(harness: Harness, cfg, record, decision) {
-  if decision.action != "block" {
-    return decision
+fn record_from_handle(handle, reclaimed_prior = nil) {
+  const metadata = handle.metadata ?? {}
+  return {
+    run_id: metadata.run_id ?? "",
+    repo: metadata.repo ?? "",
+    base: metadata.base ?? "",
+    mode: metadata.mode ?? "",
+    bump: metadata.bump ?? "",
+    current_version: metadata.current_version ?? "",
+    next_version: metadata.next_version ?? "",
+    tag: metadata.tag ?? "",
+    pin_sha: metadata.pin_sha ?? "",
+    owner: handle.owner,
+    host: handle.host,
+    owner_pid: handle.owner_pid ?? 0,
+    lease_id: handle.lease_id,
+    domain: handle.domain,
+    reclaimed_prior: reclaimed_prior,
   }
-  if positive_int(record?.owner_pid ?? "", 0) > 0 {
-    return decision
-  }
-  if trim(record?.host ?? "") != hostname() {
-    return decision
-  }
-  if !host_release_process_alive(harness, cfg) {
-    return {
-      action: "replace_orphaned_lock",
-      reason:
-        "existing owner recorded no pid and no live release_harn process remains on this host",
-    }
-  }
-  return decision
 }
 
-/** Acquire the live-release owner guard, or throw a collision/malformed-owner error. */
-pub fn release_owner_guard_acquire(harness: Harness, cfg, analysis, run_id) {
+fn reclaimed_record(handle) {
+  if handle == nil {
+    return nil
+  }
+  return record_from_handle(handle)
+}
+
+/** Acquire one process-owned, cancellation-safe live-release lease. */
+pub fn release_owner_guard_acquire(_harness: Harness, cfg, analysis, run_id) {
   if !release_owner_guard_required(cfg) {
     return {enabled: false}
   }
-  const path = release_owner_guard_path(harness, cfg)
-  const now_ms = harness.clock.now_ms()
-  const ttl_ms = owner_ttl_ms(harness, cfg)
-  const pid = owner_pid(harness, cfg)
-  const requested = release_owner_requested_record(cfg, analysis, run_id, path, now_ms, ttl_ms, pid)
-  return with_release_owner_lock(
-    harness,
-    cfg,
-    path,
-    run_id,
-    { ->
-      const existing = read_owner_record(harness, path)
-      const takeover = owner_takeover_requested(harness, cfg)
-      let error = nil
-      if existing.malformed != "" && !takeover {
-        error = "error: release owner guard file is malformed: ${path}\n"
-          + "Refusing live release until the stale owner record is inspected. "
-          + "Rerun with HARN_RELEASE_OWNER_TAKEOVER=1 only after confirming no live release is active."
-      }
-      const decision0 = if error != nil {
-        {action: "error", reason: error}
-      } else if existing.malformed != "" && takeover {
-        {action: "replace_malformed", reason: "takeover of malformed owner record requested"}
-      } else {
-        const existing_alive = existing_owner_process_alive(harness, cfg, existing.record)
-        release_owner_guard_decision(
-          existing.record,
-          requested,
-          now_ms,
-          ttl_ms,
-          takeover,
-          existing_alive,
-          existing_owner_release_completed(cfg, existing.record),
-        )
-      }
-      const decision = reclaim_orphaned_owner_if_dead(harness, cfg, existing.record, decision0)
-      if decision.action == "block" {
-        error = decision.reason + "\nGuard file: " + path
-      }
-      if error != nil {
-        throw error
-      }
-      const reclaimed_prior = if existing.record != nil
-        && decision.action != "acquire"
-        && decision.action != "refresh" {
-        {
-          run_id: existing.record?.run_id ?? "",
-          owner_pid: existing.record?.owner_pid ?? 0,
-          status: owner_status(existing.record),
-          operator: existing.record?.operator ?? "",
-          host: existing.record?.host ?? "",
-          next_version: existing.record?.next_version ?? "",
-        }
-      } else {
-        nil
-      }
-      const record = {
-        ...requested,
-        acquire_action: decision.action,
-        acquire_reason: decision.reason,
-        reclaimed_prior: reclaimed_prior,
-      }
-      write_json(path, record)
-      return {enabled: true, path: path, record: record, decision: decision}
-    },
-  )
+  const acquire = host_lease_acquire(release_owner_lease_options(cfg, analysis, run_id))
+  if acquire.status == "deferred" {
+    const active = acquire.defer?.active
+    const owner = active?.owner ?? "another process"
+    const run = active?.metadata?.run_id ?? "unknown"
+    throw "error: another live Harn release owns ${active?.domain ?? RELEASE_OWNER_DOMAIN}: ${owner} (run ${run})"
+  }
+  const handle = acquire.handle
+  if handle == nil || acquire.guard == nil {
+    throw "release owner lease acquired without authority"
+  }
+  const reclaimed_prior = reclaimed_record(acquire.recovered)
+  const action = if reclaimed_prior == nil {
+    "acquired"
+  } else {
+    "recovered_dead_owner"
+  }
+  return {
+    enabled: true,
+    acquire: acquire,
+    handle: handle,
+    record: record_from_handle(handle, reclaimed_prior),
+    decision: {action: action, reason: "host lease ${action}"},
+  }
 }
 
-/** Refresh the current run's owner record with analysis-derived version context. */
-pub fn release_owner_guard_update(harness: Harness, owner, cfg, analysis) {
+/** Persist discovery-derived labels without releasing or reacquiring ownership. */
+pub fn release_owner_guard_update(_harness: Harness, owner, cfg, analysis) {
   if !(owner?.enabled ?? false) {
     return owner
   }
-  const path = trim(owner?.path ?? "")
-  if path == "" {
-    return owner
+  const update = host_lease_update_metadata(owner.handle, owner_metadata(cfg, analysis, owner.record.run_id))
+  if !update.updated || update.handle == nil {
+    throw "release owner lease was replaced before its metadata update"
   }
-  const run_id = trim(owner?.record?.run_id ?? "")
-  return with_release_owner_lock(
-    harness,
-    cfg,
-    path,
-    run_id,
-    { ->
-      if !harness.fs.exists(path) {
-        return owner
-      }
-      const current = read_owner_record(harness, path)
-      if current.record == nil || trim(current.record?.run_id ?? "") != run_id {
-        return owner
-      }
-      const now_ms = harness.clock.now_ms()
-      const ttl_ms = positive_int(current.record?.ttl_ms ?? "", owner_ttl_ms(harness, cfg))
-      const context = release_owner_requested_record(
-        cfg,
-        analysis,
-        run_id,
-        path,
-        now_ms,
-        ttl_ms,
-        owner_pid(harness, cfg),
-      )
-      const updated = {
-        ...current.record,
-        repo: context.repo,
-        base: context.base,
-        mode: context.mode,
-        bump: context.bump,
-        current_version: context.current_version,
-        next_version: context.next_version,
-        tag: context.tag,
-        pin_sha: context.pin_sha,
-        owner_pid: context.owner_pid,
-        updated_iso: date_now_iso(),
-        updated_ms: now_ms,
-        ttl_ms: ttl_ms,
-      }
-      write_json(path, updated)
-      return {...owner, record: updated}
-    },
-  )
+  return {
+    ...owner,
+    handle: update.handle,
+    record: record_from_handle(update.handle, owner.record.reclaimed_prior),
+    update: update,
+  }
 }
 
-/** Mark the owner record complete iff it still belongs to this run. */
-pub fn release_owner_guard_finish(harness: Harness, owner, outcome, success, cfg = nil) {
+/** Release ownership. The acquire receipt retains the opaque cleanup guard. */
+pub fn release_owner_guard_finish(_harness: Harness, owner, outcome, success, _cfg = nil) {
   if !(owner?.enabled ?? false) {
     return nil
   }
-  const path = trim(owner?.path ?? "")
-  if path == "" {
-    return nil
-  }
-  const run_id = trim(owner?.record?.run_id ?? "")
-  return with_release_owner_lock(
-    harness,
-    cfg,
-    path,
-    run_id,
-    { ->
-      if !harness.fs.exists(path) {
-        return nil
-      }
-      const current = read_owner_record(harness, path)
-      if current.record == nil || trim(current.record?.run_id ?? "") != run_id {
-        return nil
-      }
-      const now_ms = harness.clock.now_ms()
-      const finished = {
-        ...current.record,
-        status: if success {
-          "finished"
-        } else {
-          "failed"
-        },
-        outcome: outcome,
-        success: success,
-        finished_iso: date_now_iso(),
-        finished_ms: now_ms,
-        updated_ms: now_ms,
-      }
-      write_json(path, finished)
-      return finished
+  const release = host_lease_release(owner.acquire)
+  return {
+    ...owner.record,
+    status: if success {
+      "finished"
+    } else {
+      "failed"
     },
-  )
+    outcome: outcome,
+    success: success,
+    released: release.released,
+  }
+}
+
+/** A non-expiring lease is recovered only after its recorded process dies. */
+pub fn owner_reclaimed_dead_for_version(owner, version) {
+  if !(owner?.enabled ?? false) {
+    return false
+  }
+  const prior = owner?.acquire?.recovered
+  const want = trim(version ?? "")
+  return want != "" && trim(prior?.metadata?.next_version ?? "") == want
 }

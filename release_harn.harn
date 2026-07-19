@@ -58,12 +58,11 @@ import {
 } from "lib/release_owner_guard"
 import {
   preflight_release_planner,
-  release_acquire_build_lock,
   release_chat_only,
   release_fleet_self_check,
   release_preflight_autoremediate,
-  release_release_build_lock,
   release_sccache_preflight,
+  release_with_build_lease,
   resolve_release_flags_interactively,
 } from "lib/release_preflight"
 pub import { release_prepare_audit_plan } from "lib/release_prepare"
@@ -177,12 +176,12 @@ pipeline main() {
   let owner_guard = release_owner_guard_acquire(harness, cfg, {}, run_id)
   if owner_guard.enabled ?? false {
     harness.stdio.println(
-      "   owner guard    : ${owner_guard.path} (${owner_guard.decision.action})",
+      "   owner lease    : ${owner_guard.handle.domain} (${owner_guard.decision.action})",
     )
     const reclaimed_prior = owner_guard.record.reclaimed_prior
     if reclaimed_prior != nil {
       harness.stdio.println(
-        "   ↻ reclaimed lock from ${reclaimed_prior.operator}@${reclaimed_prior.host} run ${reclaimed_prior.run_id} (pid ${reclaimed_prior.owner_pid}, status ${reclaimed_prior.status})",
+        "   ↻ recovered dead owner ${reclaimed_prior.owner} run ${reclaimed_prior.run_id} (pid ${reclaimed_prior.owner_pid})",
       )
     }
     release_log_event(
@@ -190,7 +189,8 @@ pipeline main() {
       run_id,
       "owner_guard_acquired",
       {
-        path: owner_guard.path,
+        domain: owner_guard.handle.domain,
+        lease_id: owner_guard.handle.lease_id,
         action: owner_guard.decision.action,
         reason: owner_guard.decision.reason,
         reclaimed_prior: reclaimed_prior,
@@ -253,14 +253,15 @@ pipeline main() {
     owner_guard = release_owner_guard_update(harness, owner_guard, derived_cfg, raw_analysis)
     if owner_guard.enabled ?? false {
       harness.stdio.println(
-        "   owner guard    : ${owner_guard.path} (v${owner_guard.record.next_version})",
+        "   owner lease    : ${owner_guard.handle.domain} (v${owner_guard.record.next_version})",
       )
       release_log_event(
         harness,
         run_id,
         "owner_guard_updated",
         {
-          path: owner_guard.path,
+          domain: owner_guard.handle.domain,
+          lease_id: owner_guard.handle.lease_id,
           version: owner_guard.record.next_version,
           pin_sha: owner_guard.record.pin_sha,
         },
@@ -299,14 +300,15 @@ pipeline main() {
   owner_guard = release_owner_guard_update(harness, owner_guard, effective_cfg, base_analysis)
   if owner_guard.enabled ?? false {
     harness.stdio.println(
-      "   owner guard    : ${owner_guard.path} (v${owner_guard.record.next_version})",
+      "   owner lease    : ${owner_guard.handle.domain} (v${owner_guard.record.next_version})",
     )
     release_log_event(
       harness,
       run_id,
       "owner_guard_updated",
       {
-        path: owner_guard.path,
+        domain: owner_guard.handle.domain,
+        lease_id: owner_guard.handle.lease_id,
         version: owner_guard.record.next_version,
         pin_sha: owner_guard.record.pin_sha,
       },
@@ -536,57 +538,67 @@ pipeline main() {
     }
     release_log_event(harness, run_id, "pre_release_gate_approved", {reason: gate.reason})
   }
-  const build_lock_path = release_acquire_build_lock(harness, effective_cfg, run_id)
-  let execution = nil
-  const view_blocker = run_session_view_release_blocker(effective_cfg, view_gate)
-  if view_blocker != nil {
-    execution = [view_blocker]
-  } else if cfg.agent && cfg.mode != "audit" && len(agent_review_result.validation_findings) > 0 {
-    execution = [
-      recorded_step(
-        "agent-review-validation",
-        "validate local-model release audit before live release side effects",
-        command_result_fail(
-          2,
-          "agent review failed validation:\n" + agent_review_result.validation_findings.join("\n"),
-        ),
-      ),
-    ]
-  } else if live_release_notes_blocker(harness, effective_cfg, analysis) != nil {
-    execution = [live_release_notes_blocker(harness, effective_cfg, analysis)]
-  } else if cfg.mode == "prepare" {
-    require_release_repo_path(harness, effective_cfg, "prepare execution")
-    harness.stdio.println("== running prepare ...")
-    release_log_event(harness, run_id, "mode_execution_started", {mode: "prepare"})
-    execution = timed_release_steps(
-      "release.mode_execution",
-      {mode: "prepare", mock: effective_cfg.mock},
-      { -> return execute_prepare(harness, effective_cfg, analysis, agent_review_result, run_id) },
-    )
-  } else if cfg.mode == "ship-pr" {
-    require_release_repo_path(harness, effective_cfg, "ship-pr execution")
-    harness.stdio.println("== running prepare + PR handoff ...")
-    release_log_event(harness, run_id, "mode_execution_started", {mode: "ship-pr"})
-    execution = timed_release_steps(
-      "release.mode_execution",
-      {mode: "ship-pr", mock: effective_cfg.mock},
-      { -> return execute_ship_pr(harness, effective_cfg, analysis, agent_review_result, run_id) },
-    )
-  }
-  const cleanup = timed(
-    "release.checkout_cleanup",
-    {mode: effective_cfg.mode, mock: effective_cfg.mock},
-    { -> return restore_release_checkout_to_base(harness, effective_cfg, execution, run_id) },
-  ).result
-  if cleanup != nil {
-    harness.stdio.println("== checkout cleanup")
-    if trim(cleanup.warning ?? "") != "" {
-      harness.stdio.println("   warning: ${cleanup.warning}")
-    } else {
-      harness.stdio.println("   ${cleanup.detail}")
-    }
-  }
-  release_release_build_lock(harness, build_lock_path, run_id)
+  const build_scope = release_with_build_lease(
+    harness,
+    effective_cfg,
+    run_id,
+    { ->
+      let execution = nil
+      const view_blocker = run_session_view_release_blocker(effective_cfg, view_gate)
+      if view_blocker != nil {
+        execution = [view_blocker]
+      } else if cfg.agent && cfg.mode != "audit"
+        && len(agent_review_result.validation_findings) > 0 {
+        execution = [
+          recorded_step(
+            "agent-review-validation",
+            "validate local-model release audit before live release side effects",
+            command_result_fail(
+              2,
+              "agent review failed validation:\n"
+                + agent_review_result.validation_findings.join("\n"),
+            ),
+          ),
+        ]
+      } else if live_release_notes_blocker(harness, effective_cfg, analysis) != nil {
+        execution = [live_release_notes_blocker(harness, effective_cfg, analysis)]
+      } else if cfg.mode == "prepare" {
+        require_release_repo_path(harness, effective_cfg, "prepare execution")
+        harness.stdio.println("== running prepare ...")
+        release_log_event(harness, run_id, "mode_execution_started", {mode: "prepare"})
+        execution = timed_release_steps(
+          "release.mode_execution",
+          {mode: "prepare", mock: effective_cfg.mock},
+          { -> return execute_prepare(harness, effective_cfg, analysis, agent_review_result, run_id) },
+        )
+      } else if cfg.mode == "ship-pr" {
+        require_release_repo_path(harness, effective_cfg, "ship-pr execution")
+        harness.stdio.println("== running prepare + PR handoff ...")
+        release_log_event(harness, run_id, "mode_execution_started", {mode: "ship-pr"})
+        execution = timed_release_steps(
+          "release.mode_execution",
+          {mode: "ship-pr", mock: effective_cfg.mock},
+          { -> return execute_ship_pr(harness, effective_cfg, analysis, agent_review_result, run_id) },
+        )
+      }
+      const cleanup = timed(
+        "release.checkout_cleanup",
+        {mode: effective_cfg.mode, mock: effective_cfg.mock},
+        { -> return restore_release_checkout_to_base(harness, effective_cfg, execution, run_id) },
+      ).result
+      if cleanup != nil {
+        harness.stdio.println("== checkout cleanup")
+        if trim(cleanup.warning ?? "") != "" {
+          harness.stdio.println("   warning: ${cleanup.warning}")
+        } else {
+          harness.stdio.println("   ${cleanup.detail}")
+        }
+      }
+      return {execution: execution, cleanup: cleanup}
+    },
+  )
+  const execution = build_scope.execution
+  const cleanup = build_scope.cleanup
   const outcome = if execution_failed(execution) {
     "FAILED"
   } else {
