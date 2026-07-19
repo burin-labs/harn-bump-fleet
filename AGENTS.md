@@ -36,8 +36,12 @@ Release implementation changes belong in the stage that owns the behavior:
 - `release_reporting`: PR rendering and execution summaries
 - `release_crystallization`: deterministic, agent, and tool fixture streams
   plus their manifest and artifact writer
-- `release_modes` / `release_preflight`: prepare/ship execution, cleanup,
-  interactive flags, planner/fleet/sccache checks, and build-lock lifecycle
+- `release_modes`: prepare execution, thin ship-phase composition, and cleanup
+- `release_ship_prepare`: prepared commit and immutable attempt publication
+- `release_ship_tag`: cutoff, binary, and signed-tag gates
+- `release_ship_pr`: PR publication and watch-receipt handoff
+- `release_preflight`: interactive flags, planner/fleet/sccache checks, and
+  build-lock lifecycle
 
 Do not put stage policy back in the entrypoint or add a second implementation
 behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line

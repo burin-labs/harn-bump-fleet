@@ -1,0 +1,179 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { logged_github_operation_step } from "./release_agent"
+import { execution_failed, recorded_step } from "./release_execution"
+import { release_publication_pr_decision, superseded_release_attempts } from "./release_publication"
+import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
+import {
+  release_github_open_pr,
+  release_github_pr_close,
+  release_github_pr_create,
+  release_github_pr_edit,
+  release_github_pr_list,
+} from "./release_runtime"
+import { ReleaseShipTagReady } from "./release_ship_tag"
+import { persist_release_watch_receipt } from "./release_tag"
+
+pub type ReleaseShipPrResult = {steps: list<dict>, handed_off: bool, pr_url: string}
+
+@complexity(allow)
+pub fn release_ship_pr_phase(
+  harness: Harness,
+  cfg: dict,
+  tagged: ReleaseShipTagReady,
+  agent_review_result: dict,
+  run_id: string,
+) -> ReleaseShipPrResult {
+  let steps = tagged.steps
+  const version = tagged.version
+  const publication = tagged.publication
+  const body_path = write_pr_body(
+    harness,
+    run_id,
+    tagged.analysis,
+    agent_review_result,
+    steps,
+    publication,
+  )
+  const existing_pr = logged_github_operation_step(
+    harness,
+    steps,
+    "find-existing-pr",
+    "find open release PR for " + publication.remote_ref,
+    run_id,
+    fn() {
+      const pr = release_github_open_pr(cfg, publication.remote_ref)
+      return {found: pr != nil, pull_request: pr}
+    },
+  )
+  steps = existing_pr.steps
+  if !existing_pr.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const existing_found = existing_pr.value.found
+  let pull_request = existing_pr.value.pull_request
+  const body = harness.fs.read_text(body_path)
+  if !existing_found {
+    const created = logged_github_operation_step(
+      harness,
+      steps,
+      "create-pr",
+      "create Release v${version} PR from " + publication.remote_ref,
+      run_id,
+      fn() { return release_github_pr_create(
+        cfg,
+        "Release v${version}",
+        publication.remote_ref,
+        cfg.base,
+        body,
+      ) },
+    )
+    steps = created.steps
+    if !created.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+    pull_request = created.value
+  }
+  const publication_decision = release_publication_pr_decision(publication, pull_request)
+  steps = steps
+    + [
+    recorded_step(
+      "verify-release-pr-publication",
+      "verify release PR targets ${publication.remote_ref} at ${publication.head_oid}",
+      if publication_decision.action == "accept" {
+        command_result_ok(publication_decision.reason + "\n")
+      } else {
+        command_result_fail(2, publication_decision.reason)
+      },
+    ),
+  ]
+  if publication_decision.action != "accept" {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const pr_url = pull_request.url
+  if existing_found {
+    const edited = logged_github_operation_step(
+      harness,
+      steps,
+      "refresh-existing-pr-body",
+      "refresh Release v${version} PR metadata",
+      run_id,
+      fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: body}) },
+    )
+    steps = edited.steps
+    if !edited.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+  }
+  const prior_attempts = logged_github_operation_step(
+    harness,
+    steps,
+    "find-superseded-release-attempt-prs",
+    "find older immutable release attempts for v${version}",
+    run_id,
+    fn() { return release_github_pr_list(cfg, {base: cfg.base, state: "open", limit: 100}) },
+  )
+  steps = prior_attempts.steps
+  if !prior_attempts.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  for prior in superseded_release_attempts(publication, prior_attempts.value) {
+    const closed = logged_github_operation_step(
+      harness,
+      steps,
+      "supersede-release-attempt-pr-" + to_string(prior.number),
+      "close obsolete immutable release attempt " + prior.url,
+      run_id,
+      fn() { return release_github_pr_close(
+        cfg,
+        prior.number,
+        "Superseded by ${pr_url}. This immutable attempt remains an audit record; the current release content is ${publication.remote_ref} at ${publication.head_oid}.",
+      ) },
+    )
+    steps = closed.steps
+    if !closed.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+  }
+  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication)
+  steps = merge_handoff.steps
+  if !merge_handoff.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const final_body_path = write_pr_body(
+    harness,
+    run_id,
+    tagged.analysis,
+    agent_review_result,
+    steps,
+    publication,
+  )
+  const final_body = harness.fs.read_text(final_body_path)
+  const final_edit = logged_github_operation_step(
+    harness,
+    steps,
+    "refresh-pr-body-final",
+    "write final Release v${version} PR receipt",
+    run_id,
+    fn() { return release_github_pr_edit(
+      cfg,
+      pr_url,
+      {title: "Release v${version}", body: final_body},
+    ) },
+  )
+  steps = final_edit.steps
+  if !final_edit.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  // Tag + immutable attempt ref + PR are durable. Persist the independent monitor handoff and
+  // return immediately; `watch_harn_release.harn` resumes from this receipt.
+  const final_steps = persist_release_watch_receipt(
+    harness,
+    cfg,
+    version,
+    publication,
+    steps,
+    run_id,
+    pr_url,
+  )
+  return {steps: final_steps, handed_off: !execution_failed(final_steps), pr_url: pr_url}
+}

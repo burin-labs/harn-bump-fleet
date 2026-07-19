@@ -1,0 +1,254 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import {
+  logged_command_step,
+  logged_github_operation_step,
+  maybe_recovery_advice_step,
+  retry_commands_after_agent_repair,
+  run_release_generated_content_checks,
+  run_retry_commands_after_agent_repair,
+} from "./release_agent"
+import { analyze_release } from "./release_analysis"
+import {
+  execution_failed,
+  hook_light_env,
+  recorded_step,
+  release_commit_verify_args,
+} from "./release_execution"
+import { prepared_release_analysis } from "./release_notes"
+import {
+  ReleasePublication,
+  publish_release_publication,
+  release_attempt_for_version,
+  release_publication,
+} from "./release_publication"
+import { append_command_step, release_github_open_pr, release_log_event } from "./release_runtime"
+import { pre_prepare_cutoff_gate } from "./release_tag"
+
+pub type ReleaseShipPrepareStopped = {proceed: bool, steps: list<dict>}
+
+pub type ReleaseShipPrepareReady = {
+  proceed: bool,
+  steps: list<dict>,
+  analysis: dict,
+  version: string,
+  publication: ReleasePublication,
+}
+
+pub type ReleaseShipPrepareResult = ReleaseShipPrepareStopped | ReleaseShipPrepareReady
+
+pub type ReleaseCommitPlan = {already_complete: bool, commands: list<dict>}
+
+/** Build the deterministic commit/fetch sequence before any side effects run. */
+pub fn release_commit_plan(cfg: dict, analysis: dict, version: string) -> ReleaseCommitPlan {
+  const local_branch = "release/v${version}"
+  const already_complete = trim(analysis.status ?? "") == ""
+    && trim(analysis.diff_names ?? "")
+    != ""
+    && analysis.branch == local_branch
+  let commands = []
+  if !already_complete {
+    commands = commands + [{name: "stage-tracked-release-content", argv: ["git", "add", "-u"]}]
+    // Earlier gates already ran the expensive checks. Keep hooks enabled while
+    // preventing those same local builds from running again for this commit.
+    commands = commands
+      + [
+      {
+        name: "commit",
+        argv: {argv: ["git", "commit", "-m", "Release v${version}"], env: hook_light_env()},
+      },
+    ]
+  }
+  // Fetch tags without rebasing: the release branch must remain parented at
+  // cfg.pin_sha so later base-branch commits cannot enter the tagged artifact.
+  commands = commands + [{name: "fetch-base", argv: ["git", "fetch", "origin", "--tags", cfg.base]}]
+  // A shipped fixup uses the tag only as ancestry evidence. The ours merge
+  // preserves the canonical tree prepared on fresh main.
+  if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false) && trim(cfg.fixup_tag ?? "") != "" {
+    commands = commands
+      + [
+      {
+        name: "merge-shipped-tag-ours",
+        argv: [
+          "git",
+          "merge",
+          "-S",
+          "--no-ff",
+          "-s",
+          "ours",
+          cfg.fixup_tag,
+          "-m",
+          "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
+        ],
+      },
+    ]
+  }
+  return {already_complete: already_complete, commands: commands}
+}
+
+@complexity(allow)
+pub fn release_ship_prepare_phase(
+  harness: Harness,
+  cfg: dict,
+  analysis: dict,
+  agent_review_result: dict,
+  run_id: string,
+  initial_steps: list<dict>,
+  prepare: any,
+) -> ReleaseShipPrepareResult {
+  let steps = initial_steps
+  const pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
+  steps = pre_prepare_gate.steps
+  if !pre_prepare_gate.proceed {
+    return {proceed: false, steps: steps}
+  }
+  steps = steps + prepare(harness, cfg, analysis, agent_review_result, run_id)
+  if execution_failed(steps) {
+    return {proceed: false, steps: steps}
+  }
+  const validation_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const validation = run_release_generated_content_checks(
+    harness,
+    cfg,
+    validation_analysis,
+    steps,
+    run_id,
+  )
+  steps = validation.steps
+  if !validation.success {
+    return {proceed: false, steps: steps}
+  }
+  const post_prepare_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const version = post_prepare_analysis.next_version
+  const local_branch = "release/v${version}"
+  const commit_plan = release_commit_plan(cfg, post_prepare_analysis, version)
+  if commit_plan.already_complete {
+    steps = steps
+      + [
+      recorded_step(
+        "commit-already-complete",
+        "release branch already has v${version} commit content",
+        command_result_ok(
+          "skipped commit because the working tree is clean and ${local_branch} already differs from pin ${cfg.pin_sha}",
+        ),
+      ),
+    ]
+  }
+  for step in commit_plan.commands {
+    const result = logged_command_step(harness, cfg, steps, step.name, step.argv, run_id)
+    steps = result.steps
+    if !result.success {
+      const failed_step = steps[len(steps) - 1]
+      steps = maybe_recovery_advice_step(
+        harness,
+        cfg,
+        post_prepare_analysis,
+        steps,
+        failed_step,
+        run_id,
+      )
+      const retry_commands = retry_commands_after_agent_repair(step)
+      if len(retry_commands) > 0 {
+        const repair_retry = run_retry_commands_after_agent_repair(
+          harness,
+          cfg,
+          steps,
+          retry_commands,
+          run_id,
+        )
+        steps = repair_retry.steps
+        if repair_retry.success {
+          continue
+        }
+      }
+      return {proceed: false, steps: steps}
+    }
+  }
+  const head = append_command_step(
+    harness,
+    cfg,
+    steps,
+    "resolve-release-publication-head",
+    ["git", "rev-parse", "HEAD"],
+  )
+  steps = head.steps
+  if !head.success {
+    return {proceed: false, steps: steps}
+  }
+  const publication = release_publication(version, trim(head.stdout ?? ""))
+  const verified_publication = logged_command_step(
+    harness,
+    cfg,
+    steps,
+    "verify-release-commit-signature",
+    release_commit_verify_args(publication.head_oid),
+    run_id,
+  )
+  steps = verified_publication.steps
+  if !verified_publication.success {
+    return {proceed: false, steps: steps}
+  }
+  const legacy_pr = logged_github_operation_step(
+    harness,
+    steps,
+    "reject-legacy-release-pr",
+    "prove no open mutable release/v${version} PR remains",
+    run_id,
+    fn() {
+      const pull_request = release_github_open_pr(cfg, "release/v${version}")
+      if pull_request != nil {
+        release_attempt_for_version(version, [pull_request])
+      }
+      return {found: false}
+    },
+  )
+  steps = legacy_pr.steps
+  if !legacy_pr.success {
+    return {proceed: false, steps: steps}
+  }
+  release_log_event(
+    harness,
+    run_id,
+    "immutable_publication_started",
+    {remote_ref: publication.remote_ref, head_oid: publication.head_oid},
+  )
+  const published = publish_release_publication(cfg, publication)
+  const publish_result = if published.success {
+    command_result_ok(published.reason + "\n")
+  } else {
+    command_result_fail(2, published.reason)
+  }
+  steps = steps
+    + [
+    recorded_step(
+      "publish-immutable-release-attempt",
+      "std/git push origin ${publication.head_oid}:refs/heads/${publication.remote_ref}",
+      publish_result,
+    )
+      + {
+      publication: publication,
+      push_git_receipt: published.push_git_receipt,
+      remote_git_receipt: published.remote_git_receipt,
+    },
+  ]
+  release_log_event(
+    harness,
+    run_id,
+    "immutable_publication_finished",
+    {
+      remote_ref: publication.remote_ref,
+      head_oid: publication.head_oid,
+      success: published.success,
+      action: published.action,
+    },
+  )
+  if !published.success {
+    return {proceed: false, steps: steps}
+  }
+  return {
+    proceed: true,
+    steps: steps,
+    analysis: post_prepare_analysis,
+    version: version,
+    publication: publication,
+  }
+}
