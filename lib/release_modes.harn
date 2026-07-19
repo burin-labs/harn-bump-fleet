@@ -1,58 +1,34 @@
-import { command_result_fail, command_result_ok } from "std/command"
+import { command_result_ok } from "std/command"
 // Extracted release-harness stage. See AGENTS.md for ownership.
 import { checkout_cleanup } from "./checkout_cleanup"
 import {
-  logged_command_step,
-  logged_github_operation_step,
   logged_live_shell_command_step,
   maybe_recovery_advice_step,
   prepare_repair_changed,
   release_repair_fingerprint,
-  retry_commands_after_agent_repair,
   retry_prepare_after_agent_repair,
-  run_release_generated_content_checks,
-  run_retry_commands_after_agent_repair,
 } from "./release_agent"
-import { analyze_release } from "./release_analysis"
 import { setup_release_branch, target_release_checkout_state } from "./release_checkout"
 import {
   execution_failed,
-  hook_light_env,
   last_failed_step,
   recorded_step,
   recovery_step_ref,
-  release_commit_verify_args,
 } from "./release_execution"
-import { ensure_release_notes_with_run_id, prepared_release_analysis } from "./release_notes"
+import { ensure_release_notes_with_run_id } from "./release_notes"
 import { execute_fixup_reconciliation, release_prepare_audit_plan } from "./release_prepare"
-import {
-  publish_release_publication,
-  release_attempt_for_version,
-  release_publication,
-  release_publication_pr_decision,
-  superseded_release_attempts,
-} from "./release_publication"
-import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
 import {
   append_command_step,
   prompt_asset,
-  release_github_open_pr,
-  release_github_pr_close,
-  release_github_pr_create,
-  release_github_pr_edit,
-  release_github_pr_list,
   release_log_event,
   release_run_dir,
   require_live_confirmation,
   run_cmd,
 } from "./release_runtime"
-import {
-  ensure_release_tag_pushed,
-  persist_release_watch_receipt,
-  pre_prepare_cutoff_gate,
-  pre_tag_cutoff_gate,
-  run_pre_tag_binary_size_gate,
-} from "./release_tag"
+import { release_ship_pipeline } from "./release_ship"
+import { release_ship_pr_phase } from "./release_ship_pr"
+import { release_ship_prepare_phase } from "./release_ship_prepare"
+import { release_ship_tag_phase } from "./release_ship_tag"
 import { ReleaseAuditReceipt, release_audit_receipt_write } from "./run_receipts"
 
 pub fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run_id) {
@@ -198,384 +174,33 @@ pub fn execute_prepare(harness: Harness, cfg, analysis, agent_review_result, run
   return steps
 }
 
-@complexity(allow)
 pub fn execute_ship_pr(harness: Harness, cfg, analysis, agent_review_result, run_id) {
   require_live_confirmation(cfg)
-  let steps = []
-  const pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
-  steps = pre_prepare_gate.steps
-  if !pre_prepare_gate.proceed {
-    return steps
-  }
-  steps = steps + execute_prepare(harness, cfg, analysis, agent_review_result, run_id)
-  if execution_failed(steps) {
-    return steps
-  }
-  const validation_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
-  const validation = run_release_generated_content_checks(
+  const prepare = fn(h, c, a, review, id) { return execute_prepare(h, c, a, review, id) }
+  const tag = fn(prepared) { return release_ship_tag_phase(harness, cfg, prepared, run_id) }
+  const publish_pr = fn(tagged) { return release_ship_pr_phase(
     harness,
     cfg,
-    validation_analysis,
-    steps,
+    tagged,
+    agent_review_result,
     run_id,
-  )
-  steps = validation.steps
-  if !validation.success {
-    return steps
-  }
-  const post_prepare_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
-  const version = post_prepare_analysis.next_version
-  const local_branch = "release/v${version}"
-  let commands = []
-  let committed_release_content = false
-  if trim(post_prepare_analysis.status ?? "") == ""
-    && trim(post_prepare_analysis.diff_names ?? "")
-    != ""
-    && post_prepare_analysis.branch == local_branch {
-    committed_release_content = true
-    steps = steps
-      + [
-      recorded_step(
-        "commit-already-complete",
-        "release branch already has v${version} commit content",
-        command_result_ok(
-          "skipped commit because the working tree is clean and ${local_branch} already differs from pin ${cfg.pin_sha}",
-        ),
-      ),
-    ]
-  } else {
-    commands = commands + [{name: "stage-tracked-release-content", argv: ["git", "add", "-u"]}]
-    // The release gate has already run the expensive audit, generated-content
-    // checks, and markdown lint before this canonical generated commit. Keep
-    // hooks enabled, but skip duplicated harn-side local builds.
-    commands = commands
-      + [
-      {
-        name: "commit",
-        argv: {argv: ["git", "commit", "-m", "Release v${version}"], env: hook_light_env()},
-      },
-    ]
-  }
-  // No `git rebase` here — pinning the release branch's parent is the
-  // whole point of `cfg.pin_sha`. Rebasing onto origin/<base> would fold
-  // commits that landed on main after this run started into the release.
-  // We still fetch tags so the upcoming tag step sees existing remote tags.
-  commands = commands + [{name: "fetch-base", argv: ["git", "fetch", "origin", "--tags", cfg.base]}]
-  // Fixup mode: the originally-shipped release commit (the v$tag target)
-  // is an ancestor of the published tag but NOT of fresh `<base>`, because
-  // the original Release PR never merged. The harn-side
-  // `verify_release_metadata.py` audit refuses to run when Cargo.toml
-  // claims version X but HEAD doesn't include the X tag's commit, since
-  // that means the tagged tree and the about-to-be-merged tree disagree.
-  // Merge the tag with `-s ours` to bring it into HEAD's ancestry without
-  // changing the tree — the harness has already laid down the
-  // canonically-shipped CHANGELOG body and version bump on top of fresh
-  // main, and that's the tree we want the fixup PR to land. The merge
-  // commit gives the audit a path from HEAD back to the tag, so the
-  // ancestry check passes; on squash-merge the merge commit is collapsed
-  // away and main ends up with a single commit applying the bump.
-  // Only ours-merge when the tag actually exists on origin (cfg.skip_tag
-  // implies the tag is already pushed and shipped). When fixup_mode is on
-  // because the PR exists but the tag was never pushed, there is no
-  // shipped tag to merge in.
-  if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false) && trim(cfg.fixup_tag ?? "") != "" {
-    commands = commands
-      + [
-      {
-        name: "merge-shipped-tag-ours",
-        argv: [
-          "git",
-          "merge",
-          "-S",
-          "--no-ff",
-          "-s",
-          "ours",
-          cfg.fixup_tag,
-          "-m",
-          "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
-        ],
-      },
-    ]
-  }
-  for step in commands {
-    const result = logged_command_step(harness, cfg, steps, step.name, step.argv, run_id)
-    steps = result.steps
-    if !result.success {
-      const failed_step = steps[len(steps) - 1]
-      steps = maybe_recovery_advice_step(
+  ) }
+  return release_ship_pipeline(
+    [],
+    {
+      prepare: fn(steps) { return release_ship_prepare_phase(
         harness,
         cfg,
-        post_prepare_analysis,
-        steps,
-        failed_step,
+        analysis,
+        agent_review_result,
         run_id,
-      )
-      const retry_commands = retry_commands_after_agent_repair(step)
-      if len(retry_commands) > 0 {
-        const repair_retry = run_retry_commands_after_agent_repair(
-          harness,
-          cfg,
-          steps,
-          retry_commands,
-          run_id,
-        )
-        steps = repair_retry.steps
-        if repair_retry.success {
-          continue
-        }
-      }
-      return steps
-    }
-  }
-  const head = append_command_step(
-    harness,
-    cfg,
-    steps,
-    "resolve-release-publication-head",
-    ["git", "rev-parse", "HEAD"],
-  )
-  steps = head.steps
-  if !head.success {
-    return steps
-  }
-  const publication = release_publication(version, trim(head.stdout ?? ""))
-  const verified_publication = logged_command_step(
-    harness,
-    cfg,
-    steps,
-    "verify-release-commit-signature",
-    release_commit_verify_args(publication.head_oid),
-    run_id,
-  )
-  steps = verified_publication.steps
-  if !verified_publication.success {
-    return steps
-  }
-  const legacy_pr = logged_github_operation_step(
-    harness,
-    steps,
-    "reject-legacy-release-pr",
-    "prove no open mutable release/v${version} PR remains",
-    run_id,
-    fn() {
-      const pull_request = release_github_open_pr(cfg, "release/v${version}")
-      if pull_request != nil {
-        release_attempt_for_version(version, [pull_request])
-      }
-      return {found: false}
-    },
-  )
-  steps = legacy_pr.steps
-  if !legacy_pr.success {
-    return steps
-  }
-  release_log_event(
-    harness,
-    run_id,
-    "immutable_publication_started",
-    {remote_ref: publication.remote_ref, head_oid: publication.head_oid},
-  )
-  const published = publish_release_publication(cfg, publication)
-  const publish_result = if published.success {
-    command_result_ok(published.reason + "\n")
-  } else {
-    command_result_fail(2, published.reason)
-  }
-  steps = steps
-    + [
-    recorded_step(
-      "publish-immutable-release-attempt",
-      "std/git push origin ${publication.head_oid}:refs/heads/${publication.remote_ref}",
-      publish_result,
-    )
-      + {
-      publication: publication,
-      push_git_receipt: published.push_git_receipt,
-      remote_git_receipt: published.remote_git_receipt,
-    },
-  ]
-  release_log_event(
-    harness,
-    run_id,
-    "immutable_publication_finished",
-    {
-      remote_ref: publication.remote_ref,
-      head_oid: publication.head_oid,
-      success: published.success,
-      action: published.action,
-    },
-  )
-  if !published.success {
-    return steps
-  }
-  // The tag below fires publish-release.yml from the frozen cutoff. Prove that
-  // cutoff remains in base ancestry; commits that landed later ship next time.
-  const cutoff_gate = pre_tag_cutoff_gate(harness, cfg, version, steps, run_id)
-  steps = cutoff_gate.steps
-  if !cutoff_gate.proceed {
-    return steps
-  }
-  // The immutable remote publication is now durable and names the intended commit.
-  // Exercise Harn's real Linux release build + size ratchet without publishing
-  // anything, and block signed tag creation unless that exact SHA is green.
-  if !(cfg.skip_tag ?? false) {
-    const binary_gate = run_pre_tag_binary_size_gate(harness, cfg, publication, steps, run_id)
-    steps = binary_gate.steps
-    if !binary_gate.success {
-      return steps
-    }
-  }
-  // Push vX.Y.Z to origin BEFORE creating the PR. publish-release.yml
-  // fires on this tag push and ships crates.io + the GitHub release
-  // from the pinned commit; the PR that follows is paperwork (lands the
-  // Cargo.toml/CHANGELOG bump on main) and doesn't influence what was
-  // shipped. If the tag push fails, abort early so we don't open a PR
-  // for a release that hasn't been published.
-  steps = ensure_release_tag_pushed(harness, cfg, version, publication, steps, run_id)
-  if execution_failed(steps) {
-    return steps
-  }
-  const body_path = write_pr_body(
-    harness,
-    run_id,
-    post_prepare_analysis,
-    agent_review_result,
-    steps,
-    publication,
-  )
-  const existing_pr = logged_github_operation_step(
-    harness,
-    steps,
-    "find-existing-pr",
-    "find open release PR for " + publication.remote_ref,
-    run_id,
-    fn() {
-      const pr = release_github_open_pr(cfg, publication.remote_ref)
-      return {found: pr != nil, pull_request: pr}
-    },
-  )
-  steps = existing_pr.steps
-  if !existing_pr.success {
-    return steps
-  }
-  const existing_found = existing_pr.value.found
-  let pull_request = existing_pr.value.pull_request
-  const body = harness.fs.read_text(body_path)
-  if !existing_found {
-    const created = logged_github_operation_step(
-      harness,
-      steps,
-      "create-pr",
-      "create Release v${version} PR from " + publication.remote_ref,
-      run_id,
-      fn() { return release_github_pr_create(
-        cfg,
-        "Release v${version}",
-        publication.remote_ref,
-        cfg.base,
-        body,
+        steps,
+        prepare,
       ) },
-    )
-    steps = created.steps
-    if !created.success {
-      return steps
-    }
-    pull_request = created.value
-  }
-  const publication_decision = release_publication_pr_decision(publication, pull_request)
-  steps = steps
-    + [
-    recorded_step(
-      "verify-release-pr-publication",
-      "verify release PR targets ${publication.remote_ref} at ${publication.head_oid}",
-      if publication_decision.action == "accept" {
-        command_result_ok(publication_decision.reason + "\n")
-      } else {
-        command_result_fail(2, publication_decision.reason)
-      },
-    ),
-  ]
-  if publication_decision.action != "accept" {
-    return steps
-  }
-  const pr_url = pull_request.url
-  if existing_found {
-    const edited = logged_github_operation_step(
-      harness,
-      steps,
-      "refresh-existing-pr-body",
-      "refresh Release v${version} PR metadata",
-      run_id,
-      fn() { return release_github_pr_edit(cfg, pr_url, {title: "Release v${version}", body: body}) },
-    )
-    steps = edited.steps
-    if !edited.success {
-      return steps
-    }
-  }
-  const prior_attempts = logged_github_operation_step(
-    harness,
-    steps,
-    "find-superseded-release-attempt-prs",
-    "find older immutable release attempts for v${version}",
-    run_id,
-    fn() { return release_github_pr_list(cfg, {base: cfg.base, state: "open", limit: 100}) },
-  )
-  steps = prior_attempts.steps
-  if !prior_attempts.success {
-    return steps
-  }
-  for prior in superseded_release_attempts(publication, prior_attempts.value) {
-    const closed = logged_github_operation_step(
-      harness,
-      steps,
-      "supersede-release-attempt-pr-" + to_string(prior.number),
-      "close obsolete immutable release attempt " + prior.url,
-      run_id,
-      fn() { return release_github_pr_close(
-        cfg,
-        prior.number,
-        "Superseded by ${pr_url}. This immutable attempt remains an audit record; the current release content is ${publication.remote_ref} at ${publication.head_oid}.",
-      ) },
-    )
-    steps = closed.steps
-    if !closed.success {
-      return steps
-    }
-  }
-  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication)
-  steps = merge_handoff.steps
-  if !merge_handoff.success {
-    return steps
-  }
-  const final_body_path = write_pr_body(
-    harness,
-    run_id,
-    post_prepare_analysis,
-    agent_review_result,
-    steps,
-    publication,
-  )
-  const final_body = harness.fs.read_text(final_body_path)
-  const final_edit = logged_github_operation_step(
-    harness,
-    steps,
-    "refresh-pr-body-final",
-    "write final Release v${version} PR receipt",
-    run_id,
-    fn() { return release_github_pr_edit(
-      cfg,
-      pr_url,
-      {title: "Release v${version}", body: final_body},
-    ) },
-  )
-  steps = final_edit.steps
-  if !final_edit.success {
-    return steps
-  }
-  // Tag + immutable attempt ref + PR are durable. Persist the independent monitor handoff and
-  // return immediately; `watch_harn_release.harn` resumes from this receipt.
-  return persist_release_watch_receipt(harness, cfg, version, publication, steps, run_id, pr_url)
+      tag: tag,
+      pr: publish_pr,
+    },
+  ).steps
 }
 
 fn add_recovery_for_last_failure(harness: Harness, cfg, analysis, steps, run_id) {
