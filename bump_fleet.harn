@@ -21,11 +21,13 @@ import { command_run } from "std/command"
 import { env_str } from "std/config"
 import { strip_think_blocks } from "std/llm/safe"
 import { poll_until } from "std/poll"
-import { is_v_semver, strip_v } from "std/semver"
-import { map_settled } from "std/settled"
+import { strip_v } from "std/semver"
 import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
 import { workflow_run_repair } from "std/workflow/repair"
 import { dry_run_predispatch_outcome, local_pin_drift_detail } from "lib/bump_decision"
+import { fleet_execution_phase } from "lib/bump_fleet_execution"
+import { fleet_finalization_phase } from "lib/bump_fleet_finalization"
+import { fleet_pre_dispatch_phase } from "lib/bump_fleet_pre_dispatch"
 import { cargo_harn_pin_probe, harn_version_pin_probe } from "lib/bump_pins"
 import {
   bump_summary_format_ok,
@@ -130,15 +132,6 @@ const ARG_SPEC = {
     {kind: "flag", name: "harn_repo", long: "--harn-repo", default: DEFAULT_HARN_REPO_PATH},
   ],
 }
-
-// Outcome statuses that are transient enough to be worth retrying. Codeload
-// flakes, action-download HTTP 5xx, workflow_dispatch HTTP 500 during a
-// GitHub Actions incident, and per-run race conditions all surface as one of
-// these — none reflect a configuration problem the operator has to fix
-// first. `pr_open*`, `already_current`, `dry_run`, and the closed-stale
-// variants are intentionally absent: re-dispatching them either no-ops or
-// creates duplicate work.
-const RETRYABLE_STATUSES = ["dispatch_failed", "run_failure", "preflight_error", "run_in_progress"]
 
 pub fn parse_fleet_args(args: list<string>) -> FleetOptions {
   let parsed = cli_options<FleetOptions>(ARG_SPEC, args, schema_of(FleetOptions))
@@ -1131,86 +1124,6 @@ fn wait_for_target_release_readiness(harness: Harness, target) {
   return (last ?? harn_release_readiness(target)) + {timed_out: true, attempts: attempt}
 }
 
-/**
- * Re-dispatch every outcome whose status is in `RETRYABLE_STATUSES` up to
- * `max_retries` more times. Each pass calls `bump_one` only on the
- * still-failing slugs and stitches the fresh outcome back into the original
- * list, preserving the original ordering so downstream summary/audit
- * readers can diff status across passes by index. Returns the final
- * outcomes list plus a per-slug `passes` map (1 = original try, 2+ =
- * retry attempts) for the audit trail.
- */
-fn retry_failed_outcomes(
-  harness: Harness,
-  repos,
-  outcomes,
-  target,
-  dry_run,
-  max_retries,
-  view_gate,
-  public_surface_impact,
-) {
-  let current = outcomes
-  let passes_by_slug = {}
-  for o in current {
-    passes_by_slug = passes_by_slug + {[o.slug]: 1}
-  }
-  if max_retries <= 0 || dry_run {
-    return {outcomes: current, passes: passes_by_slug}
-  }
-  const repo_by_slug = {}
-  let idx_map = repo_by_slug
-  for r in repos {
-    idx_map = idx_map + {[r.slug]: r}
-  }
-  let attempt = 1
-  while attempt <= max_retries {
-    const failing = []
-    let pending = failing
-    for o in current {
-      if contains(RETRYABLE_STATUSES, o.status) {
-        pending = pending.push(o.slug)
-      }
-    }
-    if len(pending) == 0 {
-      return {outcomes: current, passes: passes_by_slug}
-    }
-    harness.stdio.println(
-      "\n== retry pass ${attempt}/${max_retries} (re-dispatching ${len(pending)} repo(s) in retryable state) ...",
-    )
-    const retry_repos = pending.map({ slug -> idx_map[slug] })
-    const settled = parallel settle retry_repos with { max_concurrent: PARALLEL_LIMIT } { r ->
-      bump_one(harness, r, target, dry_run, view_gate, public_surface_impact)
-    }
-    const retried = map_settled(
-      settled.results,
-      { value, _index -> value },
-      { msg, index -> error_outcome_for_repo(harness, retry_repos[index], msg) },
-    )
-    const by_slug = {}
-    let slug_map = by_slug
-    for o in retried {
-      slug_map = slug_map + {[o.slug]: o}
-      passes_by_slug = passes_by_slug + {[o.slug]: (passes_by_slug[o.slug] ?? 1) + 1}
-    }
-    const next = []
-    let merged = next
-    for o in current {
-      if slug_map[o.slug] != nil {
-        merged = merged.push(slug_map[o.slug])
-      } else {
-        merged = merged.push(o)
-      }
-    }
-    current = merged
-    for o in retried {
-      harness.stdio.println("   ${o.slug}: ${o.status}")
-    }
-    attempt = attempt + 1
-  }
-  return {outcomes: current, passes: passes_by_slug}
-}
-
 fn restore_local_checkout_to_main(dry_run) {
   if dry_run {
     return nil
@@ -1235,266 +1148,123 @@ pipeline main() {
   if parsed.chat_only {
     return bump_chat_only(harness, parsed)
   }
-  const target = parsed.target
-    ?? timed(
-    "bump.resolve_target",
-    {},
-    { -> return resolve_latest_release() },
-  ).result
-  if !is_v_semver(target) {
-    harness.stdio.eprintln("error: target must look like vX.Y.Z, got '${target}'")
-    return 2
-  }
-  const run_id = uuid_v7()
-  const started_iso = date_now_iso()
-  const mode_label = if parsed.dry_run {
-    "dry-run"
-  } else {
-    "live"
-  }
-  const run_timing = start_timing("bump.run", {mode: mode_label, target: strip_v(target)})
-  harness.stdio.println("== harn-bump-fleet run ${run_id}")
-  harness.stdio.println("   target version : ${target}")
-  harness.stdio.println("   mode           : ${mode_label}")
-  const cost_limit = install_cost_budget("HARN_BUMP_FLEET_COST_LIMIT_USD")
-  harness.stdio.println("   ${cost_budget_audit_line(cost_limit)}")
-  const all_repos = timed("bump.discovery", {}, { -> return discover_repos(harness) }).result
-  const repos = if parsed.only != nil {
-    all_repos.filter({ r -> r.slug == parsed.only })
-  } else {
-    all_repos
-  }
-  harness.stdio.println("   repos discovered: ${len(all_repos)} (running on ${len(repos)})")
-  for r in repos {
-    harness.stdio.println("     - ${r.slug}  (${r.dir})")
-  }
-  if len(repos) == 0 {
-    const only = parsed.only ?? ""
-    harness.stdio.eprintln("no candidate repos matched (only=${only})")
-    end_timing(run_timing, {status: "error", outcome: "no_matching_repos"})
-    return 1
-  }
-  if !parsed.dry_run {
-    harness.stdio.println("\n== waiting for target release readiness ...")
-    const readiness = timed(
-      "bump.release_readiness",
-      {target: strip_v(target)},
-      { -> return wait_for_target_release_readiness(harness, target) },
-    ).result
-    if !readiness.ready {
-      harness.stdio.eprintln(
-        "error: target release ${target} was not ready after ${readiness.attempts} checks: "
-          + release_readiness_detail(
-          readiness,
-        ),
-      )
-      end_timing(run_timing, {status: "error", outcome: "release_not_ready"})
-      return 1
-    }
-    harness.stdio.println("   ready: ${release_readiness_detail(readiness)}")
-  }
-  const view_gate = if parsed.dry_run {
-    const reason = "skipped on dry-run; live bumps run make check-run-view-fixtures before dispatch"
-    harness.stdio.println("\n== run/session view compatibility gate skipped on dry-run")
-    harness.stdio.println("   ${reason}")
-    skipped_run_session_view_gate(target, reason)
-  } else {
-    harness.stdio.println("\n== run/session view compatibility gate ...")
-    const gate = timed(
-      "bump.run_session_view_gate",
-      {target: strip_v(target), harn_repo: parsed.harn_repo},
-      { -> return run_session_view_fleet_gate(harness, parsed.harn_repo, target) },
-    ).result
-    harness.stdio.println("   schemas: ${gate.summary_line}")
-    harness.stdio.println("   check  : ${gate.check.command} -> ${gate.check.status}")
-    harness.stdio.println("   change : ${gate.target_change.detail}")
-    gate
-  }
-  if !view_gate.ok {
-    const public_surface_impact = skipped_public_surface_impact(
-      target,
-      "run/session view compatibility gate failed before dispatch",
-    )
-    harness.stdio.eprintln(
-      "error: run/session view compatibility gate failed: " + trim(view_gate.check.stderr ?? ""),
-    )
-    const failed_report = end_timing(
-      run_timing,
-      {status: "error", outcome: "run_session_view_gate_failed"},
-    )
-    const timing = timing_artifacts()
-    const payload = {
-      schema_version: "harn_bump_fleet.audit.v1",
-      run_id: run_id,
-      started_iso: started_iso,
-      finished_iso: date_now_iso(),
-      duration_ms: failed_report.duration_ms,
-      operator: username(),
-      host: hostname(),
-      target_version: target,
-      mode: mode_label,
-      repos_total: len(repos),
-      repos_dispatched: 0,
-      summary_model: SUMMARY_MODEL,
-      summary_text: "- run/session view compatibility gate failed before dispatch",
-      summary: {
-        source: "deterministic_gate",
-        text: "- run/session view compatibility gate failed before dispatch",
-      },
-      outcomes: [],
-      run_session_view: view_gate,
-      public_surface_impact: public_surface_impact,
-      trace_spans: timing.trace_spans,
-      timing_summary: timing.timing_summary,
-    }
-    const written = write_audit(harness, run_id, payload)
-    harness.stdio.println("   audit : ${written.md_path}")
-    return 1
-  }
-  harness.stdio.println("\n== public surface impact scan ...")
-  const public_surface_impact = timed(
-    "bump.public_surface_impact",
-    {target: strip_v(target), repo_count: len(repos)},
-    { -> return public_surface_impact_scan(target, repos, parsed.harn_repo) },
-  ).result
-  harness.stdio.println(
-    "   source: ${public_surface_impact.source_status}; surfaces: ${public_surface_impact.surface_count}; affected repos: ${public_surface_impact.affected_repo_count}",
-  )
-  harness.stdio.println("\n== dispatching (max_concurrent=${PARALLEL_LIMIT}) ...")
-  const settled = timed(
-    "bump.dispatch_settle",
-    {repo_count: len(repos), max_concurrent: PARALLEL_LIMIT},
-    { ->
-      return parallel settle repos with { max_concurrent: PARALLEL_LIMIT } { repo ->
-        bump_one(harness, repo, target, parsed.dry_run, view_gate, public_surface_impact)
-      }
-    },
-  ).result
-  const initial_outcomes = map_settled(
-    settled.results,
-    { value, _index -> value },
-    { msg, index -> error_outcome_for_repo(harness, repos[index], msg) },
-  )
-  for row in initial_outcomes {
-    harness.stdio.println("   ${row.slug}: ${row.status}")
-  }
-  const retry_result = timed(
-    "bump.retry_failed",
-    {max_retries: parsed.retry_failed, dry_run: parsed.dry_run},
-    { ->
-      return retry_failed_outcomes(
-        harness,
-        repos,
-        initial_outcomes,
-        target,
-        parsed.dry_run,
-        parsed.retry_failed,
-        view_gate,
-        public_surface_impact,
-      )
-    },
-  ).result
-  const outcomes = retry_result.outcomes
-  const core_payload = {
-    schema_version: "harn_bump_fleet.audit.v1",
-    run_id: run_id,
-    started_iso: started_iso,
-    finished_iso: date_now_iso(),
-    duration_ms: elapsed_ms(run_timing),
-    operator: username(),
-    host: hostname(),
-    target_version: target,
-    mode: mode_label,
-    repos_total: len(repos),
-    repos_dispatched: len(outcomes.filter({ o -> dispatched_status(o.status) })),
-    summary_model: SUMMARY_MODEL,
-    summary_text: "",
-    run_session_view: view_gate,
-    public_surface_impact: public_surface_impact,
-    outcomes: outcomes,
-  }
-  harness.stdio.println("\n== summarizing with ${SUMMARY_MODEL} ...")
-  const summary_result = timed(
-    "bump.summary",
-    {mode: mode_label, skipped: parsed.dry_run},
-    { ->
-      return if parsed.dry_run {
-        bump_summary_skipped(core_payload, "(skipped on dry-run)")
-      } else {
-        summarize_with_local_llm(harness, {...core_payload, summary_text: ""})
-      }
-    },
-  ).result
-  const summary_text = summary_result.text
-  const cleanup = timed(
-    "bump.checkout_cleanup",
-    {skipped: parsed.dry_run},
-    { -> return restore_local_checkout_to_main(parsed.dry_run) },
-  ).result
-  if cleanup != nil {
-    harness.stdio.println("\n== local checkout cleanup")
-    harness.stdio.println("   ${cleanup.detail}")
-  }
-  const any_error = outcomes.any({ o -> bump_summary_problem_outcome(o) })
-  const run_report = end_timing(
-    run_timing,
+  const pre = fleet_pre_dispatch_phase(
+    harness,
+    parsed,
+    SUMMARY_MODEL,
     {
-      status: if any_error {
-        "error"
-      } else {
-        "ok"
+      resolve_target: fn() { return timed(
+        "bump.resolve_target",
+        {},
+        { -> return resolve_latest_release() },
+      ).result },
+      start_run: fn(target, mode) { return {
+        run_id: uuid_v7(),
+        started_iso: date_now_iso(),
+        mode: mode,
+        run_timing: start_timing("bump.run", {mode: mode, target: strip_v(target)}),
+      } },
+      install_cost_budget: fn() {
+        const limit = install_cost_budget("HARN_BUMP_FLEET_COST_LIMIT_USD")
+        return cost_budget_audit_line(limit)
       },
-      outcome: if any_error {
-        "failed"
-      } else {
-        "ok"
-      },
+      discover_repos: fn() { return timed("bump.discovery", {}, { -> return discover_repos(harness) })
+        .result },
+      wait_for_readiness: fn(target) { return timed(
+        "bump.release_readiness",
+        {target: strip_v(target)},
+        { -> return wait_for_target_release_readiness(harness, target) },
+      ).result },
+      readiness_detail: fn(readiness) { return release_readiness_detail(readiness) },
+      skipped_view_gate:
+        fn(target, reason) { return skipped_run_session_view_gate(target, reason) },
+      run_view_gate: fn(harn_repo, target) { return timed(
+        "bump.run_session_view_gate",
+        {target: strip_v(target), harn_repo: harn_repo},
+        { -> return run_session_view_fleet_gate(harness, harn_repo, target) },
+      ).result },
+      skipped_public_surface_impact: fn(target, reason) { return skipped_public_surface_impact(
+        target,
+        reason,
+      ) },
+      scan_public_surface: fn(target, repos, harn_repo) { return timed(
+        "bump.public_surface_impact",
+        {target: strip_v(target), repo_count: len(repos)},
+        { -> return public_surface_impact_scan(target, repos, harn_repo) },
+      ).result },
+      finish_run: fn(timing, result) { return end_timing(timing, result) },
+      timing_artifacts: fn() { return timing_artifacts() },
+      now_iso: fn() { return date_now_iso() },
+      operator: fn() { return username() },
+      host: fn() { return hostname() },
+      write_audit: fn(run_id, payload) { return write_audit(harness, run_id, payload) },
     },
   )
-  const timing = timing_artifacts()
-  const payload = {
-    ...core_payload,
-    finished_iso: date_now_iso(),
-    duration_ms: run_report.duration_ms,
-    summary_text: summary_text,
-    summary: summary_result,
-    cleanup: cleanup,
-    trace_spans: timing.trace_spans,
-    timing_summary: timing.timing_summary,
+  if !pre.ready {
+    return pre.exit_code
   }
-  const written = write_audit(harness, run_id, payload)
-  harness.stdio.println("\n== audit written")
-  harness.stdio.println("   json: ${written.json_path}")
-  harness.stdio.println("   md  : ${written.md_path}")
-  harness.stdio.println("\n${summary_text}")
-  const exit_code = if any_error {
-    1
-  } else {
-    0
-  }
-  if chat_enabled(parsed) {
-    const run_dir = path_join(cwd(), ".harn-runs/bump-fleet", run_id)
-    const chat_cfg = {
-      harness_kind: "bump-fleet",
-      run_id: run_id,
-      run_dir: run_dir,
-      audit_md_path: written.md_path,
-      audit_json_path: written.json_path,
-      llm_transcript_path: nil,
-      provider: SUMMARY_PROVIDER,
-      model: SUMMARY_MODEL,
-      repo: cwd(),
-      mode_hint: mode_label,
-      outcome: if any_error {
-        "FAILED"
-      } else {
-        "ok"
-      },
-      tools: bump_chat_tools(),
-      timeout_s: parsed.chat_timeout_s,
-      no_chat: parsed.no_chat,
-    }
-    run_chat_loop(harness, chat_cfg)
-  }
-  return exit_code
+  const context = pre.context
+  const execution = fleet_execution_phase(
+    harness,
+    context,
+    PARALLEL_LIMIT,
+    parsed.retry_failed,
+    {
+      dry_run: parsed.dry_run,
+      run_repo: fn(repo, target, dry_run, view_gate, impact, _retry) { return bump_one(
+        harness,
+        repo,
+        target,
+        dry_run,
+        view_gate,
+        impact,
+      ) },
+      error_outcome: fn(repo, message) { return error_outcome_for_repo(harness, repo, message) },
+      timed_dispatch: fn(attrs, callback) { return timed("bump.dispatch_settle", attrs, callback)
+        .result },
+      timed_retries:
+        fn(attrs, callback) { return timed("bump.retry_failed", attrs, callback).result },
+    },
+  )
+  const finalized = fleet_finalization_phase(
+    harness,
+    context,
+    execution.outcomes,
+    parsed,
+    SUMMARY_MODEL,
+    SUMMARY_PROVIDER,
+    {
+      now_iso: fn() { return date_now_iso() },
+      elapsed_ms: fn(timing) { return elapsed_ms(timing) },
+      operator: fn() { return username() },
+      host: fn() { return hostname() },
+      dispatched: fn(status) { return dispatched_status(status) },
+      summarize: fn(payload, dry_run) { return timed(
+        "bump.summary",
+        {mode: context.mode, skipped: dry_run},
+        { ->
+          return if dry_run {
+            bump_summary_skipped(payload, "(skipped on dry-run)")
+          } else {
+            summarize_with_local_llm(harness, {...payload, summary_text: ""})
+          }
+        },
+      ).result },
+      cleanup: fn(dry_run) { return timed(
+        "bump.checkout_cleanup",
+        {skipped: dry_run},
+        { -> return restore_local_checkout_to_main(dry_run) },
+      ).result },
+      problem: fn(outcome) { return bump_summary_problem_outcome(outcome) },
+      finish_run: fn(timing, result) { return end_timing(timing, result) },
+      timing_artifacts: fn() { return timing_artifacts() },
+      write_audit: fn(run_id, payload) { return write_audit(harness, run_id, payload) },
+      chat_enabled: fn(options) { return chat_enabled(options) },
+      run_dir: fn(run_id) { return path_join(cwd(), ".harn-runs/bump-fleet", run_id) },
+      repo_root: fn() { return cwd() },
+      chat_tools: fn() { return bump_chat_tools() },
+      run_chat: fn(config) { run_chat_loop(harness, config) },
+    },
+  )
+  return finalized.exit_code
 }

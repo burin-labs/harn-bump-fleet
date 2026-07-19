@@ -1,0 +1,302 @@
+import { fleet_execution_phase } from "../lib/bump_fleet_execution"
+import { fleet_finalization_phase } from "../lib/bump_fleet_finalization"
+import { fleet_pre_dispatch_phase } from "../lib/bump_fleet_pre_dispatch"
+import { FleetOutcomeReceipt } from "../lib/run_receipts"
+
+fn repo(slug: string) {
+  return {slug: slug, dir: "/workspace/" + slug}
+}
+
+fn view_gate(ok: bool = true) {
+  return {
+    ok: ok,
+    check: {
+      command: "fixture-check",
+      status: if ok {
+        0
+      } else {
+        1
+      },
+      stderr: "gate failed",
+    },
+    target_change: {detail: "fixture change"},
+    summary_line: "fixture schemas",
+  }
+}
+
+fn impact() {
+  return {source_status: "fixture", surface_count: 2, affected_repo_count: 1}
+}
+
+fn pre_options(overrides = {}) {
+  return {target: "v0.10.27", dry_run: false, only: nil, harn_repo: "/workspace/harn"}
+    + overrides
+}
+
+fn pre_adapter(overrides = {}) {
+  return {
+    resolve_target: fn() { return "v0.10.27" },
+    start_run: fn(_target, mode) { return {
+      run_id: "run-1",
+      started_iso: "2026-07-19T00:00:00Z",
+      mode: mode,
+      run_timing: {id: "timing-1"},
+    } },
+    install_cost_budget: fn() { return "cost budget: fixture" },
+    discover_repos: fn() { return [repo("owner/one"), repo("owner/two")] },
+    wait_for_readiness: fn(_target) { return {ready: true, attempts: 1} },
+    readiness_detail: fn(readiness) { return if readiness.ready {
+      "ready"
+    } else {
+      "not ready"
+    } },
+    skipped_view_gate: fn(_target, _reason) { return view_gate() },
+    run_view_gate: fn(_harn_repo, _target) { return view_gate() },
+    skipped_public_surface_impact: fn(_target, _reason) { return impact() },
+    scan_public_surface: fn(_target, _repos, _harn_repo) { return impact() },
+    finish_run: fn(_timing, _result) { return {duration_ms: 12} },
+    timing_artifacts: fn() { return {trace_spans: [], timing_summary: {}} },
+    now_iso: fn() { return "2026-07-19T00:00:01Z" },
+    operator: fn() { return "operator" },
+    host: fn() { return "host" },
+    write_audit: fn(_run_id, _payload) { return {
+      json_path: "/runs/audit.json",
+      md_path: "/runs/audit.md",
+    } },
+  }
+    + overrides
+}
+
+pipeline test_pre_dispatch_rejects_invalid_target_without_starting_a_run(task) {
+  const result = fleet_pre_dispatch_phase(
+    harness,
+    pre_options({target: "latest"}),
+    "fixture-model",
+    {resolve_target: fn() { return "latest" }},
+  )
+  assert_eq(result, {ready: false, exit_code: 2})
+}
+
+pipeline test_pre_dispatch_stops_when_repo_selection_is_empty(task) {
+  const result = fleet_pre_dispatch_phase(
+    harness,
+    pre_options({only: "owner/missing"}),
+    "fixture-model",
+    pre_adapter(),
+  )
+  assert_eq([result.ready, result.exit_code, result.context], [false, 1, nil])
+}
+
+pipeline test_pre_dispatch_stops_when_release_is_not_ready(task) {
+  const adapter = pre_adapter(
+    {wait_for_readiness: fn(_target) { return {ready: false, attempts: 3} }},
+  )
+  const result = fleet_pre_dispatch_phase(harness, pre_options(), "fixture-model", adapter)
+  assert_eq([result.ready, result.exit_code], [false, 1])
+}
+
+pipeline test_pre_dispatch_gate_failure_writes_audit_and_stops(task) {
+  let audited = false
+  const adapter = pre_adapter(
+    {
+      run_view_gate: fn(_harn_repo, _target) { return view_gate(false) },
+      write_audit: fn(run_id, payload) {
+        audited = run_id == "run-1" && payload.summary.source == "deterministic_gate"
+        return {json_path: "/runs/audit.json", md_path: "/runs/audit.md"}
+      },
+    },
+  )
+  const result = fleet_pre_dispatch_phase(harness, pre_options(), "fixture-model", adapter)
+  assert_eq([result.ready, result.exit_code, audited], [false, 1, true])
+}
+
+pipeline test_pre_dispatch_ready_context_preserves_filtered_repos_and_dry_run_gate(task) {
+  const result = fleet_pre_dispatch_phase(
+    harness,
+    pre_options({dry_run: true, only: "owner/two"}),
+    "fixture-model",
+    pre_adapter(),
+  )
+  assert_eq([result.ready, result.exit_code], [true, 0])
+  const context = result.context
+  assert_eq(context.repos.map({ value -> value.slug }), ["owner/two"])
+  assert_eq([context.mode, context.target], ["dry-run", "v0.10.27"])
+}
+
+fn execution_context(repos) {
+  return {
+    target: "v0.10.27",
+    run_id: "run-1",
+    started_iso: "2026-07-19T00:00:00Z",
+    mode: "live",
+    run_timing: {id: "timing-1"},
+    repos: repos,
+    view_gate: view_gate(),
+    public_surface_impact: impact(),
+  }
+}
+
+fn outcome(slug: string, status: string) -> FleetOutcomeReceipt {
+  return {slug: slug, status: status, detail: status}
+}
+
+fn execution_adapter(overrides = {}) {
+  return {
+    dry_run: false,
+    run_repo: fn(repo, _target, _dry_run, _gate, _impact, is_retry) { return if is_retry {
+      outcome(repo.slug, "already_current")
+    } else {
+      outcome(repo.slug, "dispatch_failed")
+    } },
+    error_outcome: fn(repo, message) { return outcome(repo.slug, "error") + {detail: message} },
+    timed_dispatch: fn(_attrs, callback) { return callback() },
+    timed_retries: fn(_attrs, callback) { return callback() },
+  }
+    + overrides
+}
+
+pipeline test_execution_normalizes_settled_errors_in_input_order(task) {
+  const adapter = execution_adapter(
+    {
+      dry_run: true,
+      run_repo: fn(repo, _target, _dry_run, _gate, _impact, _retry) {
+        if repo.slug == "owner/bad" {
+          throw "fixture failure"
+        }
+        return outcome(repo.slug, "already_current")
+      },
+    },
+  )
+  const result = fleet_execution_phase(
+    harness,
+    execution_context([repo("owner/good"), repo("owner/bad")]),
+    2,
+    0,
+    adapter,
+  )
+  assert_eq(result.outcomes.map({ value -> value.slug }), ["owner/good", "owner/bad"])
+  assert_eq(result.outcomes.map({ value -> value.status }), ["already_current", "error"])
+  assert(contains(result.outcomes[1]?.detail ?? "", "fixture failure"))
+}
+
+pipeline test_execution_retries_only_retryable_outcomes_and_preserves_order(task) {
+  const adapter = execution_adapter(
+    {
+      run_repo: fn(repo, _target, _dry_run, _gate, _impact, is_retry) { return if repo.slug
+        == "owner/stable" {
+        outcome(repo.slug, "already_current")
+      } else if is_retry {
+        outcome(repo.slug, "pr_open")
+      } else {
+        outcome(repo.slug, "dispatch_failed")
+      } },
+    },
+  )
+  const result = fleet_execution_phase(
+    harness,
+    execution_context([repo("owner/retry"), repo("owner/stable")]),
+    2,
+    2,
+    adapter,
+  )
+  assert_eq(result.outcomes.map({ value -> value.slug }), ["owner/retry", "owner/stable"])
+  assert_eq(result.outcomes.map({ value -> value.status }), ["pr_open", "already_current"])
+}
+
+fn final_options(overrides = {}) {
+  return {dry_run: false, no_chat: false, chat_timeout_s: 30} + overrides
+}
+
+fn final_adapter(overrides = {}) {
+  return {
+    now_iso: fn() { return "2026-07-19T00:00:01Z" },
+    elapsed_ms: fn(_timing) { return 10 },
+    operator: fn() { return "operator" },
+    host: fn() { return "host" },
+    dispatched: fn(status) { return starts_with(status, "run_") || status == "pr_open" },
+    summarize: fn(_payload, dry_run) { return {
+      source: if dry_run {
+        "skipped"
+      } else {
+        "model"
+      },
+      text: if dry_run {
+        "(skipped on dry-run)"
+      } else {
+        "- summary"
+      },
+    } },
+    cleanup: fn(dry_run) { return if dry_run {
+      nil
+    } else {
+      {detail: "clean"}
+    } },
+    problem: fn(value) { return value.status == "error" },
+    finish_run: fn(_timing, _result) { return {duration_ms: 11} },
+    timing_artifacts: fn() { return {trace_spans: [], timing_summary: {}} },
+    write_audit: fn(_run_id, _payload) { return {
+      json_path: "/runs/audit.json",
+      md_path: "/runs/audit.md",
+    } },
+    chat_enabled: fn(_options) { return false },
+    run_dir: fn(run_id) { return "/runs/" + run_id },
+    repo_root: fn() { return "/workspace" },
+    chat_tools: fn() { return {} },
+    run_chat: fn(_config) {
+      throw "chat must remain disabled"
+    },
+  }
+    + overrides
+}
+
+pipeline test_finalization_dry_run_skips_cleanup_and_returns_error_status(task) {
+  let audited = nil
+  const adapter = final_adapter(
+    {
+      write_audit: fn(_run_id, payload) {
+        audited = payload
+        return {json_path: "/runs/audit.json", md_path: "/runs/audit.md"}
+      },
+    },
+  )
+  const result = fleet_finalization_phase(
+    harness,
+    execution_context([repo("owner/one")]),
+    [outcome("owner/one", "error")],
+    final_options({dry_run: true}),
+    "fixture-model",
+    "fixture-provider",
+    adapter,
+  )
+  assert_eq(result.exit_code, 1)
+  assert_eq([audited.cleanup, audited.summary.source], [nil, "skipped"])
+}
+
+pipeline test_finalization_writes_audit_before_chat_and_returns_success(task) {
+  let audit_written = false
+  let chat_ran = false
+  const adapter = final_adapter(
+    {
+      write_audit: fn(_run_id, _payload) {
+        audit_written = true
+        return {json_path: "/runs/audit.json", md_path: "/runs/audit.md"}
+      },
+      chat_enabled: fn(_options) { return true },
+      run_chat: fn(config) {
+        assert_eq([audit_written, config.audit_json_path], [true, "/runs/audit.json"])
+        chat_ran = true
+      },
+    },
+  )
+  const result = fleet_finalization_phase(
+    harness,
+    execution_context([repo("owner/one")]),
+    [outcome("owner/one", "pr_open")],
+    final_options(),
+    "fixture-model",
+    "fixture-provider",
+    adapter,
+  )
+  assert_eq([result.exit_code, audit_written, chat_ran], [0, true, true])
+  assert_eq([result.audit_json_path, result.audit_md_path], ["/runs/audit.json", "/runs/audit.md"])
+}
