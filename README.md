@@ -471,7 +471,15 @@ healthy only when crates.io and all five archives plus `SHA256SUMS` and
 `release-assets.json` are present; a cache is warm only after the exact five-job
 release matrix completes successfully.
 
-Live `prepare` and `ship-pr` runs first query the typed GitHub Actions API for
+Before either live mode touches the target checkout, it refreshes
+`origin/<base>` and proves the latest remote release tag has been folded back:
+both the workspace version and the top versioned CHANGELOG section must match
+the tag. A mismatch fails closed and names the matching release PR or immutable
+attempt ref when one is available. Recover by recreating the fold content from
+the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
+release; do not start the next version from an orphaned fold.
+
+Live `prepare` and `ship-pr` runs then query the typed GitHub Actions API for
 the `ci.yml` `merge_group` run at the exact release pin. Required job identities
 come from Harn's checked-in release-audit contract. Exactly one successful run,
 one successful row for every required job, and a complete latest-attempt jobs
