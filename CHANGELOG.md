@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Live release cuts now fail before target-checkout mutation when the latest
+  published tag has not been folded into `origin/<base>` in both the workspace
+  version and CHANGELOG, with the orphaned PR/ref named for recovery.
 - `release_harn` now treats a rerun as successful when the remote release tag
   already targets the intended release commit, while still refusing to move a
   remote tag that targets any other commit.

@@ -3,12 +3,14 @@ import { env_str } from "std/config"
 import { git_run } from "std/git"
 import { HostLeaseOptions, with_host_lease } from "std/host_lease"
 import { read_line } from "std/io"
+import { version_from_tag } from "std/semver"
 import {
   chat_cfg_from_run_dir,
   chat_enabled,
   pick_recent_run,
   resolve_chat_run_path,
 } from "./chat_runs"
+import { base_ref_fetch_args } from "./checkout_cleanup"
 import { fleet_self_check } from "./fleet_selfcheck"
 import { planner_preflight_audit_line, run_planner_preflight } from "./llm_defaults"
 import { run_chat_loop } from "./post_run_chat"
@@ -17,15 +19,40 @@ import {
   preflight_remediate_stale_release_branch,
 } from "./preflight_remediation"
 import { release_repair_tools } from "./release_agent_tools"
+import { changelog_top_from_text, workspace_version_from_manifest } from "./release_analysis"
 import { coerce_flag_choice, release_flag_passed } from "./release_commands"
 import {
   ReleaseConfig,
+  ReleaseGithubPullRequest,
   expand_home,
+  latest_release_tag,
+  release_git_remote_refs,
+  release_github_pr_list,
   release_log_event,
   release_open_pr_count,
   run_git,
 } from "./release_runtime"
 import { ensure_healthy_sccache } from "./sccache_preflight"
+
+pub type PriorReleaseFoldEvidence = {
+  base_ref: string,
+  latest_tag: string,
+  workspace_version: string,
+  changelog_version: string,
+  recovery_ref: string,
+  recovery_pr_number: int?,
+  recovery_pr_url: string,
+}
+
+pub type PriorReleaseFoldDecision = {proceed: bool, reason: string, detail: string}
+
+pub type PriorReleaseFoldConfig = {
+  repo: string,
+  base: string,
+  mode: "audit" | "prepare" | "ship-pr",
+  mock: bool,
+  yes_live_release: bool,
+}
 
 pub fn release_chat_only(harness: Harness, raw_cfg: ReleaseConfig) -> int {
   if !chat_enabled(raw_cfg) {
@@ -209,6 +236,188 @@ pub fn release_fleet_self_check(harness: Harness, cfg: ReleaseConfig, run_id: st
   } else if result.action == "proceed" {
     harness.stdio.println("   ✓ bump-fleet self-check: ${result.reason}")
   }
+}
+
+pub fn prior_release_fold_base_evidence(
+  base_ref: string,
+  latest_tag: string,
+  cargo_toml: string,
+  changelog: string,
+) -> PriorReleaseFoldEvidence {
+  return {
+    base_ref: trim(base_ref),
+    latest_tag: trim(latest_tag),
+    workspace_version: workspace_version_from_manifest(cargo_toml),
+    changelog_version: changelog_top_from_text(changelog),
+    recovery_ref: "",
+    recovery_pr_number: nil,
+    recovery_pr_url: "",
+  }
+}
+
+pub fn prior_release_fold_decision(evidence: PriorReleaseFoldEvidence) -> PriorReleaseFoldDecision {
+  const latest_version = version_from_tag(trim(evidence.latest_tag))
+  if latest_version == "" {
+    return {proceed: true, reason: "no prior release tag exists", detail: ""}
+  }
+  const workspace_matches = trim(evidence.workspace_version) == latest_version
+  const changelog_matches = trim(evidence.changelog_version) == latest_version
+  if workspace_matches && changelog_matches {
+    return {
+      proceed: true,
+      reason: "${evidence.base_ref} contains the ${evidence.latest_tag} release fold",
+      detail: "",
+    }
+  }
+  let mismatches = []
+  if !workspace_matches {
+    mismatches = mismatches
+      + [
+      "workspace version is ${evidence.workspace_version} (expected ${latest_version})",
+    ]
+  }
+  if !changelog_matches {
+    mismatches = mismatches
+      + [
+      "CHANGELOG top is v${evidence.changelog_version} (expected v${latest_version})",
+    ]
+  }
+  const ref = trim(evidence.recovery_ref)
+  const pr_url = trim(evidence.recovery_pr_url)
+  const recovery = if pr_url != "" && evidence.recovery_pr_number != nil {
+    "orphaned fold: PR #${evidence.recovery_pr_number} ${pr_url}"
+      + if ref == "" {
+      ""
+    } else {
+      " (head `${ref}`)"
+    }
+  } else if ref != "" {
+    "orphaned fold branch: `${ref}`"
+  } else {
+    "no matching fold PR or branch was found"
+  }
+  return {
+    proceed: false,
+    reason: join(mismatches, "; "),
+    detail: "latest published tag ${evidence.latest_tag} is not folded into ${evidence.base_ref}: "
+      + join(
+      mismatches,
+      "; ",
+    )
+      + ". ${recovery}. Recreate the fold from ${evidence.latest_tag} on fresh origin base, merge it, then rerun the release.",
+  }
+}
+
+fn release_fold_pr(
+  pull_requests: list<ReleaseGithubPullRequest>,
+  tag: string,
+) -> ReleaseGithubPullRequest? {
+  const release_title = "Release ${tag}"
+  for prefer_open in [true, false] {
+    for pr in pull_requests {
+      const head = pr.head.ref
+      const matches = pr.title == release_title || head == "release/${tag}"
+        || starts_with(
+        head,
+        "release-attempt/${tag}/",
+      )
+        || starts_with(head, "release-fold/${tag}")
+      if matches && pr.github_state == "open" == prefer_open {
+        return pr
+      }
+    }
+  }
+  return nil
+}
+
+fn release_fold_remote_ref(cfg: PriorReleaseFoldConfig, tag: string) -> string {
+  const refs = release_git_remote_refs(
+    cfg,
+    [
+      "refs/heads/release/${tag}",
+      "refs/heads/release-attempt/${tag}/*",
+      "refs/heads/release-fold/${tag}*",
+    ],
+  )
+  if !refs.success {
+    throw "could not inspect remote release-fold branches: ${trim(refs.stderr)}"
+  }
+  if len(refs.refs) == 0 {
+    return ""
+  }
+  return regex_replace("^refs/heads/", "", refs.refs[0].name)
+}
+
+pub fn release_prior_fold_preflight(
+  harness: Harness,
+  cfg: PriorReleaseFoldConfig,
+  run_id: string,
+) -> nil {
+  if cfg.mock || cfg.mode == "audit" || !cfg.yes_live_release {
+    return
+  }
+  const fetched = run_git(cfg, base_ref_fetch_args(cfg.base))
+  if !fetched.success {
+    throw "failed to refresh origin/${cfg.base} for prior-release fold preflight: ${trim(fetched.stderr)}"
+  }
+  const latest_tag = latest_release_tag(cfg)
+  const cargo = run_git(cfg, ["show", "origin/${cfg.base}:Cargo.toml"])
+  const changelog = run_git(cfg, ["show", "origin/${cfg.base}:CHANGELOG.md"])
+  if !cargo.success || !changelog.success {
+    throw "could not read Cargo.toml and CHANGELOG.md from refreshed origin/${cfg.base}; refusing to start a release"
+  }
+  const base_ref = "origin/${cfg.base}"
+  const base = prior_release_fold_base_evidence(
+    base_ref,
+    latest_tag,
+    cargo.stdout,
+    changelog.stdout,
+  )
+  const preliminary = prior_release_fold_decision(base)
+  let recovery_ref = ""
+  let recovery_pr_number: int? = nil
+  let recovery_pr_url = ""
+  if !preliminary.proceed {
+    const pull_requests = release_github_pr_list(cfg, {base: cfg.base, state: "all", limit: 100})
+    const pr = release_fold_pr(pull_requests, latest_tag)
+    recovery_ref = if pr == nil {
+      release_fold_remote_ref(cfg, latest_tag)
+    } else {
+      pr.head.ref
+    }
+    recovery_pr_number = pr?.number
+    recovery_pr_url = pr?.url ?? ""
+  }
+  const evidence: PriorReleaseFoldEvidence = {
+    base_ref: base.base_ref,
+    latest_tag: base.latest_tag,
+    workspace_version: base.workspace_version,
+    changelog_version: base.changelog_version,
+    recovery_ref: recovery_ref,
+    recovery_pr_number: recovery_pr_number,
+    recovery_pr_url: recovery_pr_url,
+  }
+  const decision = prior_release_fold_decision(evidence)
+  release_log_event(
+    harness,
+    run_id,
+    "prior_release_fold_preflight",
+    {
+      proceed: decision.proceed,
+      latest_tag: evidence.latest_tag,
+      workspace_version: evidence.workspace_version,
+      changelog_version: evidence.changelog_version,
+      recovery_ref: evidence.recovery_ref,
+      recovery_pr_url: evidence.recovery_pr_url,
+      reason: decision.reason,
+    },
+  )
+  if !decision.proceed {
+    throw decision.detail
+  }
+  harness.stdio.println(
+    "   ✓ prior release fold: ${evidence.latest_tag} is recorded on origin/${cfg.base}",
+  )
 }
 
 /**
