@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Pre-tag release recovery now reuses the verified immutable commit and any
+  matching successful exact-SHA size run, while two-minute polling and bounded
+  rate-limit waits avoid exhausting GitHub API quota during long builds.
 - Live release cuts now fail before target-checkout mutation when the latest
   published tag has not been folded into `origin/<base>` in both the workspace
   version and CHANGELOG, with the orphaned PR/ref named for recovery.
