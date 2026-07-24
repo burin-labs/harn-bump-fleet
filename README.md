@@ -544,6 +544,22 @@ and before/after SHA-256 digests in `release-body-integrity.json`; body-only
 drift never creates a source commit or PR, while independent changelog drift
 continues through the paperwork-PR path below.
 
+### Pre-tag checkpoint resume
+
+If `ship-pr` stops after publishing its immutable `release-attempt/...` ref but
+before pushing the tag, rerun the same foreground command. The harness fetches
+the unique attempt for that version, restores its original certified pin, and
+re-verifies the remote ref, signed commit, sole parent, cutoff ancestry, and
+exact-SHA Linux size gate. A previous successful gate run is reused only when
+its workflow, event, branch, head SHA, target job, and required size step all
+match. The harness then pushes the tag and creates the PR without rebuilding or
+re-signing the release commit.
+
+Run recovery directly in a terminal or through a supervisor configured for one
+attempt. Do not use `launchctl submit` as a one-shot wrapper: submitted jobs can
+be respawned after exit. The release owner guard rejects concurrent attempts,
+but a respawning launcher still wastes API quota and obscures the first failure.
+
 ### Post-publish fixup mode
 
 If a live `--mode ship-pr` run starts and the harness detects:
