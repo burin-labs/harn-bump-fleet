@@ -1,0 +1,1 @@
+- Keep an exactly identified pre-tag workflow gate alive through bounded GitHub API rate-limit windows instead of aborting a healthy release before tagging.
