@@ -1,0 +1,596 @@
+import { command_output_text } from "std/command"
+import { read_json_result } from "std/fs"
+import { shell_quote } from "std/runtime"
+import { map_settled } from "std/settled"
+import {
+  github_actions_run,
+  github_actions_run_cancel,
+  github_actions_run_jobs,
+  github_workflow_dispatch,
+} from "./github"
+import { run_cmd, run_git } from "./release_runtime"
+
+pub type PlatformCertificationConfig = {
+  repo: string,
+  branch: string,
+  pin_sha: string,
+  workspace: string,
+  harn_bin: string,
+}
+
+pub type PlatformCertificationSpec = {
+  platform: "windows" | "macos",
+  workflow_path: string,
+  required_job: string,
+}
+
+pub type PlatformCertificationDecision = {
+  success: bool,
+  reason: string,
+  receipt?: dict,
+  cancellations: list<dict>,
+}
+
+pub type PlatformCertificationAdapter = {
+  dispatch: fn(PlatformCertificationSpec) -> Result<dict, dict>,
+  run: fn(int) -> Result<dict, dict>,
+  jobs: fn(int) -> Result<dict, dict>,
+  cancel: fn(int) -> Result<dict, dict>,
+  local_source: fn() -> Result<dict, dict>,
+  source_lanes: fn() -> Result<list<string>, dict>,
+  remote_sha: fn() -> Result<string, dict>,
+  now_ms: fn() -> int,
+  wait: fn(int) -> nil,
+}
+
+const PLATFORM_SPECS: list<PlatformCertificationSpec> = [
+  {
+    platform: "windows",
+    workflow_path: ".github/workflows/windows-nightly.yml",
+    required_job: "Workspace nextest (windows-latest)",
+  },
+  {
+    platform: "macos",
+    workflow_path: ".github/workflows/macos-nightly.yml",
+    required_job: "Workspace nextest (macos-latest)",
+  },
+]
+
+fn connector_result(value) {
+  return if is_err(value) {
+    value
+  } else {
+    Ok(unwrap(value))
+  }
+}
+
+/** Exact cancellation boundary; callers retain the returned provider receipt. */
+pub fn github_actions_run_cancel_exact(slug: string, run_id: int) -> Result<dict, dict> {
+  return connector_result(github_actions_run_cancel(slug, run_id))
+}
+
+fn production_adapter(
+  harness: Harness,
+  cfg: PlatformCertificationConfig,
+) -> PlatformCertificationAdapter {
+  return {
+    dispatch: fn(spec) { return connector_result(
+      github_workflow_dispatch(cfg.repo, spec.workflow_path, {}, cfg.branch),
+    ) },
+    run: fn(run_id) { return connector_result(github_actions_run(cfg.repo, run_id)) },
+    jobs:
+      fn(run_id) { return connector_result(github_actions_run_jobs(cfg.repo, run_id, "latest")) },
+    cancel: fn(run_id) { return github_actions_run_cancel_exact(cfg.repo, run_id) },
+    local_source: fn() {
+      const command = "cd "
+        + shell_quote(cfg.workspace)
+        + " && HARN_BIN="
+        + shell_quote(cfg.harn_bin)
+        + " ./scripts/release_gate.sh audit --source-only"
+      const result = run_cmd({repo: cfg.workspace, mock: false}, command)
+      if !result.success {
+        return Err({code: "local_source_failed", message: command_output_text(result)})
+      }
+      return Ok({status: "success"})
+    },
+    source_lanes: fn() {
+      const lanes = contract_source_lanes(
+        path_join(cfg.workspace, "scripts", "release_audit_contract.json"),
+      )
+      if lanes == nil {
+        return Err(
+          {
+            code: "source_lanes_invalid",
+            message: "Harn release-audit contract omitted exact local source lanes",
+          },
+        )
+      }
+      return Ok(lanes)
+    },
+    remote_sha: fn() {
+      const result = run_git(
+        {repo: cfg.workspace, mock: false},
+        ["ls-remote", "origin", "refs/heads/${cfg.branch}"],
+      )
+      if !result.success {
+        return Err({code: "remote_sha_failed", message: command_output_text(result)})
+      }
+      const rows =
+        trim(result.stdout ?? "").split("\n").filter({ row -> trim(row) != "" }).to_list()
+      if len(rows) != 1 {
+        return Err({code: "remote_sha_ambiguous", message: "expected one remote branch row"})
+      }
+      const columns = split(rows[0], "\t")
+      const sha = lowercase(trim(columns[0] ?? ""))
+      if len(regex_captures("^[0-9a-f]{40}$", sha)) == 0 {
+        return Err({code: "remote_sha_invalid", message: "remote branch omitted a commit SHA"})
+      }
+      return Ok(sha)
+    },
+    now_ms: fn() { return to_int(date_parse(date_now_iso())) ?? 0 },
+    wait: fn(ms) { harness.clock.sleep_ms(ms) },
+  }
+}
+
+fn unique_ints(values: list<int>) -> bool {
+  let seen: list<int> = []
+  for value in values {
+    if seen.contains(value) {
+      return false
+    }
+    seen = seen + [value]
+  }
+  return true
+}
+
+fn unique_strings(values: list<string>) -> bool {
+  let seen: list<string> = []
+  for value in values {
+    if seen.contains(value) {
+      return false
+    }
+    seen = seen + [value]
+  }
+  return true
+}
+
+fn platform_error(spec: PlatformCertificationSpec, reason: string) {
+  return Err({code: "platform_proof_failed", message: "${spec.platform}: ${reason}"})
+}
+
+@complexity(allow)
+fn exact_platform_proof(
+  cfg: PlatformCertificationConfig,
+  spec: PlatformCertificationSpec,
+  dispatch,
+  run,
+  jobs,
+  started_at_ms: int,
+  completed_at_ms: int,
+) {
+  if dispatch.run_id != run.id {
+    return platform_error(spec, "returned run id changed")
+  }
+  if dispatch.workflow_path != spec.workflow_path || run.workflow_path != spec.workflow_path {
+    return platform_error(spec, "workflow path changed")
+  }
+  if dispatch.head_sha != cfg.pin_sha || run.head_sha != cfg.pin_sha {
+    return platform_error(spec, "source SHA changed")
+  }
+  if dispatch.head_branch != cfg.branch || run.head_branch != cfg.branch {
+    return platform_error(spec, "source branch changed")
+  }
+  if dispatch.event != "workflow_dispatch" || run.event != "workflow_dispatch" {
+    return platform_error(spec, "unexpected event")
+  }
+  if run.status != "completed" || run.conclusion != "success" {
+    return platform_error(spec, "run was ${run.status}/${run.conclusion ?? ""}")
+  }
+  if run.run_attempt == nil || run.run_attempt < 1 || trim(run.url ?? "") == "" {
+    return platform_error(spec, "run identity was incomplete")
+  }
+  const observed_jobs = jobs.jobs ?? []
+  if jobs.run_id != run.id || jobs.total_count != len(observed_jobs) || len(observed_jobs) == 0 {
+    return platform_error(spec, "jobs page was incomplete")
+  }
+  const ids = observed_jobs.map({ job -> to_int(job.id) ?? 0 }).to_list()
+  const names = observed_jobs.map({ job -> to_string(job.name) }).to_list()
+  if !unique_ints(ids) || !unique_strings(names) {
+    return platform_error(spec, "jobs page contained duplicate identities")
+  }
+  for job in observed_jobs {
+    if job.run_id != run.id || job.status != "completed" || job.conclusion != "success"
+      || trim(
+      job.url ?? "",
+    )
+      == "" {
+      return platform_error(spec, "job `${job.name ?? ""}` was not an exact successful job")
+    }
+  }
+  const required = observed_jobs.filter({ job -> job.name == spec.required_job }).to_list()
+  if len(required) != 1 {
+    return platform_error(spec, "required job was missing or ambiguous")
+  }
+  const projected_jobs = observed_jobs.map(
+    { job ->
+      return {
+        id: job.id,
+        run_id: job.run_id,
+        name: job.name,
+        status: "completed",
+        conclusion: "success",
+        url: job.url,
+      }
+    },
+  )
+    .to_list()
+  return Ok(
+    {
+      platform: spec.platform,
+      workflow_path: spec.workflow_path,
+      required_job: spec.required_job,
+      run: {
+        repo: cfg.repo,
+        id: run.id,
+        workflow_path: run.workflow_path,
+        run_attempt: run.run_attempt,
+        event: "workflow_dispatch",
+        status: "completed",
+        conclusion: "success",
+        head_sha: run.head_sha,
+        url: run.url,
+      },
+      jobs: {
+        repo: cfg.repo,
+        run_id: run.id,
+        total_count: jobs.total_count,
+        jobs: projected_jobs,
+        page: 1,
+        per_page: jobs.per_page ?? 100,
+      },
+      started_at_ms: started_at_ms,
+      completed_at_ms: completed_at_ms,
+      duration_ms: completed_at_ms - started_at_ms,
+    },
+  )
+}
+
+fn await_platform(
+  cfg: PlatformCertificationConfig,
+  spec: PlatformCertificationSpec,
+  dispatch,
+  started_at_ms: int,
+  adapter: PlatformCertificationAdapter,
+) {
+  let poll = 0
+  while poll < 720 {
+    const queried = adapter.run(dispatch.run_id)
+    if is_err(queried) {
+      return platform_error(spec, to_string(unwrap_err(queried)))
+    }
+    const run = unwrap(queried)
+    if run.id != dispatch.run_id {
+      return platform_error(spec, "exact run query returned another id")
+    }
+    if run.status == "completed" {
+      const queried_jobs = adapter.jobs(dispatch.run_id)
+      if is_err(queried_jobs) {
+        return platform_error(spec, to_string(unwrap_err(queried_jobs)))
+      }
+      return exact_platform_proof(
+        cfg,
+        spec,
+        dispatch,
+        run,
+        unwrap(queried_jobs),
+        started_at_ms,
+        adapter.now_ms(),
+      )
+    }
+    if run.status != "queued" && run.status != "in_progress" && run.status != "waiting"
+      && run.status
+      != "pending" {
+      return platform_error(spec, "run entered unknown state `${run.status}`")
+    }
+    poll = poll + 1
+    if poll < 720 {
+      adapter.wait(10000)
+    }
+  }
+  return platform_error(spec, "run did not become terminal within 720 polls")
+}
+
+fn contract_source_lanes(path: string) -> list<string>? {
+  const loaded = read_json_result(path)
+  if !is_ok(loaded) {
+    return nil
+  }
+  const lanes = unwrap(loaded)?.lanes ?? []
+  const names = lanes.filter({ lane -> lane?.proof == "merge_group" }).map(
+    { lane -> trim(lane?.name ?? "") },
+  )
+    .to_list()
+  if len(names) == 0 || names.any({ name -> name == "" }) || !unique_strings(names) {
+    return nil
+  }
+  return names
+}
+
+fn cleanup_runs(adapter: PlatformCertificationAdapter, dispatches: list<dict>) -> list<dict> {
+  let receipts: list<dict> = []
+  for dispatch in dispatches {
+    const cancelled = adapter.cancel(dispatch.run_id)
+    receipts = receipts
+      + [
+      if is_err(cancelled) {
+        {run_id: dispatch.run_id, accepted: false, error: unwrap_err(cancelled)}
+      } else {
+        unwrap(cancelled)
+      },
+    ]
+  }
+  return receipts
+}
+
+fn critical_path(platforms: list<dict>, local_source: dict) -> string {
+  let name = ""
+  let longest = -1
+  for proof in platforms {
+    if proof.duration_ms > longest {
+      longest = proof.duration_ms
+      name = proof.platform
+    }
+  }
+  if local_source.duration_ms > longest {
+    name = "local_source"
+  }
+  return name
+}
+
+/** Compute join wall time from injected lane timings; the critical path is a max, not a sum. */
+pub fn platform_certification_join(platforms: list<dict>, local_source: dict) -> dict {
+  const started_at_ms = min(
+    platforms[0]?.started_at_ms ?? local_source.started_at_ms,
+    min(platforms[1]?.started_at_ms ?? local_source.started_at_ms, local_source.started_at_ms),
+  )
+  const completed_at_ms = max(
+    platforms[0]?.completed_at_ms ?? local_source.completed_at_ms,
+    max(
+      platforms[1]?.completed_at_ms ?? local_source.completed_at_ms,
+      local_source.completed_at_ms,
+    ),
+  )
+  return {
+    started_at_ms: started_at_ms,
+    completed_at_ms: completed_at_ms,
+    duration_ms: completed_at_ms - started_at_ms,
+    critical_path: critical_path(platforms, local_source),
+  }
+}
+
+/**
+ * Dispatch exact hosted runs, overlap both waits with the local source audit,
+ * then close a receipt only after the source branch is re-read unchanged.
+ */
+pub fn resolve_platform_certification(
+  harness: Harness,
+  cfg: PlatformCertificationConfig,
+  binary_sha256: string,
+  query_adapter: PlatformCertificationAdapter? = nil,
+) -> PlatformCertificationDecision {
+  const adapter = query_adapter ?? production_adapter(harness, cfg)
+  const binary_sha = lowercase(trim(binary_sha256))
+  if len(regex_captures("^[0-9a-f]{64}$", binary_sha)) == 0 {
+    return {success: false, reason: "exact-pin Harn CLI hash was invalid", cancellations: []}
+  }
+  let dispatches: list<dict> = []
+  let starts: list<int> = []
+  for spec in PLATFORM_SPECS {
+    const started = adapter.now_ms()
+    const result = adapter.dispatch(spec)
+    if is_err(result) {
+      const cancellations = cleanup_runs(adapter, dispatches)
+      return {
+        success: false,
+        reason: "dispatch failed for ${spec.platform}: " + to_string(unwrap_err(result)),
+        cancellations: cancellations,
+      }
+    }
+    const dispatch = unwrap(result)
+    if dispatch.run_id == nil || dispatch.run_id < 1
+      || dispatch.workflow_path != spec.workflow_path
+      || dispatch.head_sha
+      != cfg.pin_sha
+      || dispatch.head_branch != cfg.branch
+      || dispatch.event != "workflow_dispatch"
+      || dispatch.run_attempt == nil
+      || dispatch.run_attempt < 1
+      || trim(dispatch.url ?? "") == ""
+      || dispatches.any({ prior -> prior.run_id == dispatch.run_id }) {
+      const cancellations = cleanup_runs(adapter, dispatches + [dispatch])
+      return {
+        success: false,
+        reason: "dispatch returned malformed exact identity for ${spec.platform}",
+        cancellations: cancellations,
+      }
+    }
+    dispatches = dispatches + [dispatch]
+    starts = starts + [started]
+  }
+  const local_started = adapter.now_ms()
+  const tasks = [
+    {kind: "platform", index: 0},
+    {kind: "platform", index: 1},
+    {kind: "local_source", index: 2},
+  ]
+  const settled = parallel settle tasks with { max_concurrent: 3 } { task ->
+    if task.kind == "local_source" {
+      const result = adapter.local_source()
+      const completed = adapter.now_ms()
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok(
+        {
+          kind: "local_source",
+          started_at_ms: local_started,
+          completed_at_ms: completed,
+          duration_ms: completed - local_started,
+        },
+      )
+    }
+    const spec = PLATFORM_SPECS[task.index]
+    const dispatch = dispatches[task.index]
+    const started = starts[task.index]
+    if spec == nil || dispatch == nil || started == nil {
+      return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
+    }
+    return await_platform(cfg, spec, dispatch, started, adapter)
+  }
+  const results = map_settled(
+    settled.results,
+    { value, _index -> value },
+    { message, _index -> Err({code: "lane_panicked", message: message}) },
+  )
+  const failures = results.filter({ result -> is_err(result) }).to_list()
+  if len(failures) > 0 {
+    return {
+      success: false,
+      reason: "certification lane failed: " + to_string(unwrap_err(failures[0])),
+      cancellations: cleanup_runs(adapter, dispatches),
+    }
+  }
+  const platforms = [unwrap(results[0]), unwrap(results[1])]
+  const local_timing = unwrap(results[2])
+  const queried_lanes = adapter.source_lanes()
+  if is_err(queried_lanes) {
+    return {
+      success: false,
+      reason: "Harn release-audit contract omitted exact local source lanes",
+      cancellations: cleanup_runs(adapter, dispatches),
+    }
+  }
+  const lane_names = unwrap(queried_lanes)
+  const remote = adapter.remote_sha()
+  if is_err(remote) || unwrap(remote) != cfg.pin_sha {
+    return {
+      success: false,
+      reason: "source branch moved while certification was running",
+      cancellations: cleanup_runs(adapter, dispatches),
+    }
+  }
+  const join = platform_certification_join(platforms, local_timing)
+  const receipt = {
+    schema_version: "harn.release_audit_receipt.v2",
+    proof_kind: "hosted_platform",
+    source: {
+      repo: cfg.repo,
+      branch: cfg.branch,
+      sha: cfg.pin_sha,
+      remote_sha_after: unwrap(remote),
+    },
+    platforms: platforms,
+    local_source: {
+      head_sha: cfg.pin_sha,
+      status: "success",
+      lane_names: lane_names,
+      started_at_ms: local_timing.started_at_ms,
+      completed_at_ms: local_timing.completed_at_ms,
+      duration_ms: local_timing.duration_ms,
+    },
+    join: join,
+    warm: {
+      head_sha: cfg.pin_sha,
+      command: "cargo build -p harn-cli --bin harn --locked",
+      binary_sha256: binary_sha,
+      status: "success",
+    },
+  }
+  return {
+    success: true,
+    reason: "certified exact Windows, macOS, and local source evidence for ${cfg.pin_sha}",
+    receipt: receipt,
+    cancellations: [],
+  }
+}
+
+/** Deterministic adapter used by release-pipeline fixtures. */
+pub fn mock_platform_certification_adapter(
+  cfg: PlatformCertificationConfig,
+) -> PlatformCertificationAdapter {
+  let clock = 100
+  return {
+    dispatch: fn(spec) {
+      const id = if spec.platform == "windows" {
+        6001
+      } else {
+        6002
+      }
+      return Ok(
+        {
+          run_id: id,
+          workflow_path: spec.workflow_path,
+          run_attempt: 1,
+          head_sha: cfg.pin_sha,
+          head_branch: cfg.branch,
+          event: "workflow_dispatch",
+          url: "https://github.com/burin-labs/harn/actions/runs/${id}",
+        },
+      )
+    },
+    run: fn(id) {
+      const spec = if id == 6001 {
+        PLATFORM_SPECS[0]
+      } else {
+        PLATFORM_SPECS[1]
+      }
+      return Ok(
+        {
+          id: id,
+          workflow_path: spec.workflow_path,
+          run_attempt: 1,
+          head_sha: cfg.pin_sha,
+          head_branch: cfg.branch,
+          event: "workflow_dispatch",
+          status: "completed",
+          conclusion: "success",
+          url: "https://github.com/burin-labs/harn/actions/runs/${id}",
+        },
+      )
+    },
+    jobs: fn(id) {
+      const spec = if id == 6001 {
+        PLATFORM_SPECS[0]
+      } else {
+        PLATFORM_SPECS[1]
+      }
+      return Ok(
+        {
+          run_id: id,
+          total_count: 1,
+          per_page: 100,
+          jobs: [
+            {
+              id: id + 100,
+              run_id: id,
+              name: spec.required_job,
+              status: "completed",
+              conclusion: "success",
+              url: "https://github.com/burin-labs/harn/actions/runs/${id}/job/${id + 100}",
+            },
+          ],
+        },
+      )
+    },
+    cancel: fn(id) { return Ok({run_id: id, accepted: true, state: "cancel_requested"}) },
+    local_source: fn() { return Ok({status: "success"}) },
+    source_lanes: fn() { return Ok(["rust-audit", "harn-audit", "package-audit"]) },
+    remote_sha: fn() { return Ok(cfg.pin_sha) },
+    now_ms: fn() {
+      clock = clock + 100
+      return clock
+    },
+    wait: fn(_ms) {
+    },
+  }
+}

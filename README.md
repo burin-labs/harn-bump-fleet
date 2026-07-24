@@ -479,26 +479,29 @@ attempt ref when one is available. Recover by recreating the fold content from
 the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
-Live `prepare` and `ship-pr` runs then query the typed GitHub Actions API for
-the `ci.yml` `merge_group` run at the exact release pin. Required job identities
-come from Harn's checked-in release-audit contract. Exactly one successful run,
-one successful row for every required job, and a complete latest-attempt jobs
-snapshot are required. Missing, ambiguous, skipped, cancelled, failed,
-stale-SHA, query-error, and schema-error evidence deterministically keeps the
-full local audit. Before closing the receipt, the harness builds the exact pin's
-Harn CLI with the contract's canonical locked Cargo command and hashes the
-actual binary bytes through Harn's crypto API. A failed warm or invalid hash
-also keeps the local audit.
+Live `prepare` and `ship-pr` runs first freeze `origin/<base>` at the exact
+release pin. They dispatch `windows-nightly.yml` and `macos-nightly.yml` through
+the typed GitHub Actions connector and retain the exact run IDs returned by
+GitHub. Those two hosted runs execute concurrently with Harn's contract-owned
+local source lanes. No workflow-run listing or timestamp correlation is used.
 
-A reused receipt is immutable at
-`.harn-runs/release-harn/<run-id>/merge-group-audit-receipt.json` and its run
-ID, URL, head SHA, exact successful job evidence, warmed command, and binary
-SHA-256 are copied into run events, the release report, and the release PR body.
-The harness passes only `--audit-receipt` and the exact `HARN_BIN`; Harn validates
-the receipt again and owns the residual lane plan. Generated-content,
-docs/grammar/security/smoke, pre-tag Linux binary-size, and publish checks remain
-mandatory. Use `--local-audit` to force full local execution without a GitHub
-probe. The retired remote-audit/blanket-skip path is no longer exposed.
+Each hosted proof must preserve the expected workflow path, event, source SHA,
+run attempt, run URL, complete jobs page, and one successful required job.
+Missing, duplicate, stale, malformed, queued, cancelled, or failed evidence
+rejects the release. A failed lane requests cancellation of both exact hosted
+runs. The harness then rereads `origin/<base>`; movement discards all evidence
+and requires a fresh certification attempt.
+
+The closed receipt is immutable at
+`.harn-runs/release-harn/<run-id>/platform-certification-receipt.json`. It
+records both hosted proofs, the local source lanes, wall-clock timings and
+critical path, and the SHA-256 of the exact-pin Harn CLI. The harness passes
+only this receipt and binary to Harn, which validates them again and runs the
+residual generated-content, docs, grammar, security, smoke, pre-tag size, and
+publish checks. After the version bump is committed, the fleet proves the
+certified source SHA is the commit's sole parent before publishing the immutable
+attempt. `--local-audit` remains useful for read-only diagnosis but cannot
+bypass hosted certification for live preparation.
 
 Options:
 
