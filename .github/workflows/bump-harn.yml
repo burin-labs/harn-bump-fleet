@@ -1,10 +1,21 @@
+# Bump Harn Runtime — thin caller of the reusable workflow (harn#5299).
+#
+# Replaces the ~292L copied shell/YAML state machine with a trigger wrapper that
+# calls burin-labs/harn's published `workflow_call` workflow. All orchestration
+# (pin resolve, readiness gate, lockfile refresh, signed commit, PR + auto-merge)
+# lives in Harn (`std/bump/runtime`/`std/bump/live`), not here. The only
+# repo-specific parts are the schedule and the single validate-command.
+#
+# `workflow_dispatch:` at exactly two-space indentation is load-bearing:
+# `lib/bump_fleet_pre_dispatch.harn` decides whether a repo is fleet-bumpable
+# with a literal `contains(source, "\n  workflow_dispatch:")` test, so this repo
+# keeps discovering and dispatching itself like any other fleet member.
 name: Bump Harn Runtime
-
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional Harn tag to bump to, for example vX.Y.Z. Defaults to the latest published release."
+        description: "Optional Harn tag (vX.Y.Z). Defaults to latest release."
         required: false
         type: string
   schedule:
@@ -14,279 +25,45 @@ permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: bump-harn-runtime
-  cancel-in-progress: false
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   bump:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Mint GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Install current pinned Harn
-        uses: burin-labs/harn/.github/actions/setup-harn@05e43962cdefae44a511e81942adeebc6fe47675
-
-      - name: Resolve target Harn release
-        id: version
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_VERSION: ${{ inputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${INPUT_VERSION:-}"
-          if [ -z "${VERSION}" ]; then
-            VERSION="$(gh api repos/burin-labs/harn/releases/latest --jq '.tag_name')"
-          fi
-          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Expected tag like vX.Y.Z, got '${VERSION}'" >&2
-            exit 1
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "version_no_v=${VERSION#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for target Harn release readiness
-        id: release-ready
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          VERSION_NO_V: ${{ steps.version.outputs.version_no_v }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          harn run --no-sandbox wait_harn_release_ready.harn -- --tag "${VERSION}" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Stop when release is not ready
-        if: steps.release-ready.outputs.ready != 'true'
-        run: exit 0
-
-      - name: Update .harn-version
-        id: update
-        if: steps.release-ready.outputs.ready == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s\n' "${VERSION}" > .harn-version
-          if git diff --quiet -- .harn-version; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install target Harn
-        if: steps.update.outputs.changed == 'true'
-        uses: burin-labs/harn/.github/actions/setup-harn@05e43962cdefae44a511e81942adeebc6fe47675
-        with:
-          version: ${{ steps.version.outputs.version }}
-
-      - name: Refresh Harn files
-        if: steps.update.outputs.changed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          harn --version
-          # Two-pass install:
-          # 1. `--locked` first so the existing lockfile (with its pinned
-          #    connector rev) is honored byte-for-byte. This is the supply-chain
-          #    gate: if anything resolves differently than what's committed,
-          #    fail loudly rather than silently pulling new code.
-          # 2. If --locked fails it's because the Harn version bump rewrote
-          #    generator_version/protocol_artifact_version in the lock. In
-          #    that case fall back to a non-locked install so the bump can
-          #    proceed; the diff still lands in the PR for review.
-          if ! harn install --locked; then
-            echo "harn install --locked failed (expected when Harn version changes generator_version/protocol_artifact_version); regenerating lockfile."
-            harn install
-          fi
-          mapfile -t harn_files < <(git ls-files '*.harn')
-          if (( ${#harn_files[@]} > 0 )); then
-            harn fmt "${harn_files[@]}"
-            harn check "${harn_files[@]}"
-            harn lint "${harn_files[@]}"
-          fi
-          if [ -d tests ]; then
-            harn test tests/ --parallel --verbose
-          fi
-
-      - name: Stop when repo is already current
-        if: steps.release-ready.outputs.ready == 'true' && steps.update.outputs.changed != 'true'
-        run: |
-          echo "Harn pin already matches ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: Commit bump via signed GraphQL mutation
-        if: steps.update.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          BRANCH="automation/bump-harn-runtime"
-          # Commits created via createCommitOnBranch using the App's installation
-          # token are signed by GitHub, satisfying the org-level required_signatures
-          # ruleset. A local `git commit` + `git push` would land unsigned and block
-          # the PR.
-          BASE_SHA="$(git rev-parse HEAD)"
-
-          EXISTING_PR="$(gh pr list --repo "${REPO}" --head "${BRANCH}" --base main --state open --json number --jq '.[0].number // ""')"
-          if [ -n "${EXISTING_PR}" ]; then
-            # The branch is about to be force-refreshed. Disable auto-merge first
-            # so the stale PR cannot merge midway through the refresh and race a
-            # duplicate no-op PR onto main.
-            gh pr merge "${EXISTING_PR}" --repo "${REPO}" --disable-auto || true
-          fi
-
-          # Reset (or create) the remote branch to BASE_SHA so the mutation can
-          # fast-forward from a known parent. Any prior bump branch is discarded —
-          # same blast radius as the previous `--force-with-lease` push.
-          if gh api "repos/${REPO}/git/refs/heads/${BRANCH}" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${REPO}/git/refs/heads/${BRANCH}" \
-              -f sha="${BASE_SHA}" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/${REPO}/git/refs" \
-              -f ref="refs/heads/${BRANCH}" -f sha="${BASE_SHA}" >/dev/null
-          fi
-
-          # Build additions/deletions as JSONL files. File content goes through
-          # `jq --rawfile` (file -> fd), never through argv, because Linux caps any
-          # single argv element at MAX_ARG_STRLEN (128 KiB); a base64-encoded source
-          # file >96 KiB would otherwise trip E2BIG on execve. The final request uses
-          # `--slurpfile`, which reassembles each JSONL stream into a JSON array via
-          # fd, so the total payload also bypasses ARG_MAX.
-          ADDITIONS_FILE="$(mktemp)"
-          : > "${ADDITIONS_FILE}"
-          while IFS= read -r path; do
-            [ -n "${path}" ] || continue
-            [ -f "${path}" ] || continue
-            B64_FILE="$(mktemp)"
-            base64 -w0 < "${path}" > "${B64_FILE}"
-            # rawfile preserves base64's trailing newline; GitHub's decoder rejects
-            # whitespace, so scrub any embedded newlines in jq.
-            jq -nc --arg p "${path}" --rawfile c "${B64_FILE}" \
-              '{path:$p, contents:($c | gsub("\n";""))}' >> "${ADDITIONS_FILE}"
-            rm -f "${B64_FILE}"
-          done < <(git diff --name-only --diff-filter=ACMRTUXB HEAD)
-
-          DELETIONS_FILE="$(mktemp)"
-          : > "${DELETIONS_FILE}"
-          while IFS= read -r path; do
-            [ -n "${path}" ] || continue
-            jq -nc --arg p "${path}" '{path:$p}' >> "${DELETIONS_FILE}"
-          done < <(git diff --name-only --diff-filter=D HEAD)
-
-          if [ ! -s "${ADDITIONS_FILE}" ] && [ ! -s "${DELETIONS_FILE}" ]; then
-            echo "No file changes detected for bump commit; aborting." >&2
-            exit 1
-          fi
-
-          REQ_FILE="$(mktemp)"
-          jq -n \
-            --arg repo "${REPO}" \
-            --arg branch "${BRANCH}" \
-            --arg headline "chore: bump Harn runtime to ${VERSION}" \
-            --arg oid "${BASE_SHA}" \
-            --slurpfile additions "${ADDITIONS_FILE}" \
-            --slurpfile deletions "${DELETIONS_FILE}" \
-            '{
-              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
-              variables: {
-                input: {
-                  branch: {repositoryNameWithOwner: $repo, branchName: $branch},
-                  message: {headline: $headline},
-                  fileChanges: {additions: $additions, deletions: $deletions},
-                  expectedHeadOid: $oid
-                }
-              }
-            }' > "${REQ_FILE}"
-
-          RESPONSE="$(gh api graphql --input "${REQ_FILE}")"
-          COMMIT_OID="$(jq -r '.data.createCommitOnBranch.commit.oid // empty' <<<"${RESPONSE}")"
-          if [ -z "${COMMIT_OID}" ]; then
-            echo "createCommitOnBranch failed:" >&2
-            echo "${RESPONSE}" >&2
-            exit 1
-          fi
-          echo "Created signed commit ${COMMIT_OID} on ${BRANCH}." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create or refresh PR
-        if: steps.update.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ steps.version.outputs.version }}
-          VERSION_NO_V: ${{ steps.version.outputs.version_no_v }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          BRANCH="automation/bump-harn-runtime"
-          TITLE="Bump Harn runtime to ${VERSION}"
-          BODY_FILE="$(mktemp)"
-          cat > "${BODY_FILE}" <<EOF
-          ## Summary
-          - bump the pinned Harn crate tag in \`.harn-version\` to \`${VERSION}\`
-          - refresh formatter output with \`harn ${VERSION_NO_V}\`
-          - let normal CI rerun the Harn static checks against the published release
-
-          ## Verification
-          - \`harn fmt\`
-          - \`harn check\`
-          - \`harn lint\`
-          - \`harn test tests/ --parallel --verbose\`
-          EOF
-
-          git fetch --quiet origin \
-            "refs/heads/main:refs/remotes/origin/main" \
-            "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
-          MAIN_TREE="$(git rev-parse "origin/main^{tree}")"
-          BRANCH_TREE="$(git rev-parse "origin/${BRANCH}^{tree}")"
-
-          PR_NUMBER="$(gh pr list --repo "${REPO}" --head "${BRANCH}" --base main --json number --jq '.[0].number // ""')"
-          if [ "${MAIN_TREE}" = "${BRANCH_TREE}" ]; then
-            if [ -n "${PR_NUMBER}" ]; then
-              gh pr close "${PR_NUMBER}" --repo "${REPO}" --delete-branch \
-                --comment "Closing because the refreshed Harn bump branch already matches main."
-              echo "Closed no-op #${PR_NUMBER}; bump branch tree already matches main." >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "No bump PR needed; bump branch tree already matches main." >> "$GITHUB_STEP_SUMMARY"
-            fi
-            exit 0
-          fi
-
-          if [ -n "${PR_NUMBER}" ]; then
-            gh pr edit "${PR_NUMBER}" --repo "${REPO}" --title "${TITLE}" --body-file "${BODY_FILE}"
-          else
-            gh pr create \
-              --repo "${REPO}" \
-              --base main \
-              --head "${BRANCH}" \
-              --title "${TITLE}" \
-              --body-file "${BODY_FILE}"
-          fi
-
-          PR_NUMBER="$(gh pr list --repo "${REPO}" --head "${BRANCH}" --base main --json number --jq '.[0].number // ""')"
-          if [ -n "${PR_NUMBER}" ]; then
-            if gh pr merge "${PR_NUMBER}" --repo "${REPO}" --auto --squash; then
-              echo "Enabled auto-merge for #${PR_NUMBER}." >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "Created or refreshed #${PR_NUMBER}, but auto-merge is not enabled for this repository." >> "$GITHUB_STEP_SUMMARY"
-            fi
-          fi
+    # PIN: v0.10.34 release commit of burin-labs/harn.
+    uses: burin-labs/harn/.github/workflows/bump-harn.yml@e9e1ac66009672132267261a47cdcd19705e40f1
+    with:
+      version: ${{ inputs.version }}
+      # This repo's single declared validation entrypoint. Runs after the pin +
+      # lockfile refresh; non-zero exit blocks the commit. POSIX-sh only — the
+      # runtime executes this through the host default shell (std/command shell
+      # mode), which on a runner may resolve to /bin/sh (dash), not bash. No
+      # bash-only builtins or arithmetic-command syntax: keep this portable
+      # regardless of runner shell. The previous hand-rolled workflow used bash
+      # array reads here; this is the POSIX rewrite of the same intent, and
+      # tests/bump_workflow.harn asserts the bashisms stay gone.
+      #
+      # Mirrors `.github/workflows/harn-static.yml`, which is a strictly
+      # stronger gate than the old bump workflow ran: `--strict-types` on check,
+      # `--strict` on lint, and the source-length budget, none of which the
+      # previous bump step applied.
+      #
+      # Deviation from harn-static.yml, deliberate: it runs `harn fmt --check`
+      # because it verifies a PR; here `harn fmt` REWRITES, so a formatter
+      # change in the new runtime lands in the bump commit and the PR's own
+      # harn-static `--check` then passes. Verifying here would instead wedge
+      # the daily bump permanently on any formatter change.
+      validate-command: |
+        set -eu
+        files=$(git ls-files '*.harn')
+        if [ -n "$files" ]; then
+          # Word-splitting on $files is intentional: pass every .harn path as a
+          # separate arg. Fleet .harn paths never contain whitespace.
+          harn fmt $files
+          harn check --strict-types $files
+          harn lint --strict $files
+        fi
+        harn run --no-sandbox check_source_length.harn
+        if [ -d tests ]; then
+          harn test tests/ --parallel --verbose
+        fi
+    secrets:
+      app-client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

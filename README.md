@@ -273,8 +273,11 @@ developer bootstrap.
 This repo also ships `.github/workflows/bump-harn.yml`, so future fleet runs
 can update `harn-bump-fleet` itself through the same
 `automation/bump-harn-runtime` PR flow as the connector repos. This repository
-stores `.harn-version` as the release tag (`vX.Y.Z`) while the installer and
-fleet auditor normalize both `vX.Y.Z` and `X.Y.Z` pins when comparing targets.
+stores `.harn-version` as bare semver (`X.Y.Z`), the form written by Harn's
+reusable bump workflow. Both readers normalize either spelling anyway —
+`scripts/install_harn.sh` strips a leading `v` before building the tag, and
+`lib/bump_pins.harn` runs the pin through `strip_v` — so historical `vX.Y.Z`
+pins keep comparing equal.
 
 ## What it does, in order
 
