@@ -492,8 +492,21 @@ Each hosted proof must preserve the expected workflow path, event, source SHA,
 run attempt, run URL, complete jobs page, and one successful required job.
 Missing, duplicate, stale, malformed, queued, cancelled, or failed evidence
 rejects the release. A failed lane requests cancellation of both exact hosted
-runs. The harness then rereads `origin/<base>`; movement discards all evidence
-and requires a fresh certification attempt.
+runs. The harness then rereads `origin/<base>`. When the pin was captured
+implicitly from `origin/<base>` HEAD at startup, movement discards all evidence
+and requires a fresh certification attempt: the commit being certified drifted
+out from under the run.
+
+An explicit `--at-sha` pin is exempt from that last check only. The operator
+named the commit, the release branch is parented at it and is never rebased, and
+each hosted proof is already bound to it by the per-dispatch
+`head_sha == pin_sha` check — so a base that advanced *after* those runs finished
+refutes nothing the receipt asserts. `release_cutoff_gate` already draws this
+line for the pre-tag drift probe; the certification re-read now matches it, so
+`--at-sha` means one thing across the harness. The moved head is still recorded
+as `remote_sha_after`. Every other proof stays unconditional, and a base that
+cannot be reread at all still fails closed. This is what lets a release certify
+against a `main` that is merging continuously, without freezing the queue.
 
 The closed receipt is immutable at
 `.harn-runs/release-harn/<run-id>/platform-certification-receipt.json`. It

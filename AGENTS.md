@@ -118,7 +118,11 @@ ignored and must not be committed.
 ## Release policy
 
 `release_harn.harn` pins each live release at startup from `--at-sha`,
-`HARN_RELEASE_PIN_SHA`, or `origin/<base>`. Its local release branch is
+`HARN_RELEASE_PIN_SHA`, or `origin/<base>`. An explicit pin is load-bearing:
+it skips the base fast-forward, short-circuits the pre-tag drift probe, and
+exempts the post-lane certification re-read from failing on base movement — so
+a release can certify against a `main` that is merging continuously. Use it
+whenever the queue is active. Its local release branch is
 parented at that SHA and is never published; the harness publishes a single
 OID-qualified immutable `release-attempt/...` ref before creating the tag and
 PR. The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
