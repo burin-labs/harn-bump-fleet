@@ -169,6 +169,92 @@ fn platform_error(spec: PlatformCertificationSpec, reason: string) {
   return Err({code: "platform_proof_failed", message: "${spec.platform}: ${reason}"})
 }
 
+/**
+ * The lane gave up early because a sibling had already failed certification.
+ *
+ * Distinct from `platform_proof_failed` so a receipt reader can tell a lane
+ * that proved something about its platform from one that was abandoned while
+ * still healthy. The join reports a real failure in preference to this.
+ */
+fn platform_abandoned(spec: PlatformCertificationSpec, cause: string) {
+  return Err(
+    {
+      code: "lane_abandoned",
+      message: "${spec.platform}: abandoned after sibling lane failed (${cause})",
+    },
+  )
+}
+
+/**
+ * Run the local audit lane, publishing its failure so the hosted lanes stop.
+ *
+ * This lane is a single blocking call, so it can trip the abort but cannot
+ * observe one -- by the time it could check, it is already done.
+ */
+fn local_source_lane(started_at_ms: int, adapter: PlatformCertificationAdapter, abort) {
+  const result = adapter.local_source()
+  const completed = adapter.now_ms()
+  if is_err(result) {
+    const failure = unwrap_err(result)
+    shared_set(abort, "local source lane: " + to_string(failure))
+    return Err(failure)
+  }
+  return Ok(
+    {
+      kind: "local_source",
+      started_at_ms: started_at_ms,
+      completed_at_ms: completed,
+      duration_ms: completed - started_at_ms,
+    },
+  )
+}
+
+/** Run one hosted platform lane, publishing a real verdict as the abort cause. */
+fn platform_lane(
+  cfg: PlatformCertificationConfig,
+  task,
+  dispatches,
+  starts,
+  adapter: PlatformCertificationAdapter,
+  abort,
+) {
+  const spec = PLATFORM_SPECS[task.index]
+  const dispatch = dispatches[task.index]
+  const started = starts[task.index]
+  if spec == nil || dispatch == nil || started == nil {
+    return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
+  }
+  const proof = await_platform(cfg, spec, dispatch, started, adapter, abort)
+  // Only a lane that reached its own verdict may doom the run. Republishing an
+  // abandonment would let the first abandoned lane abort the lane that is still
+  // the only one able to report a real cause.
+  if is_err(proof) && !is_abandoned(proof) {
+    shared_set(abort, to_string(unwrap_err(proof)))
+  }
+  return proof
+}
+
+/** True when this failure is a lane that stopped waiting, not one with a verdict. */
+fn is_abandoned(result) -> bool {
+  return to_string(unwrap_err(result)?.code ?? "") == "lane_abandoned"
+}
+
+/**
+ * The failure worth reporting: a lane that reached its own verdict, in
+ * preference to one that merely stopped waiting for it.
+ *
+ * Taking `failures[0]` alone would let an abandoned lane become the headline
+ * reason and hide the cause that doomed the run, because `results` is ordered
+ * by task index rather than by who failed first.
+ */
+fn decisive_failure(failures) {
+  const decided = failures.filter({ result -> !is_abandoned(result) }).to_list()
+  if len(decided) > 0 {
+    return decided[0]
+  }
+  return failures[0]
+}
+
 @complexity(allow)
 fn exact_platform_proof(
   cfg: PlatformCertificationConfig,
@@ -272,6 +358,7 @@ fn await_platform(
   dispatch,
   started_at_ms: int,
   adapter: PlatformCertificationAdapter,
+  abort,
 ) {
   let poll = 0
   let transient_run_errors = 0
@@ -323,6 +410,15 @@ fn await_platform(
     }
     poll = poll + 1
     if poll < 720 {
+      // Cooperative abort. `parallel settle` never cancels a sibling, which is
+      // what we want for the receipt -- every lane's outcome is recorded -- but
+      // it also means a lane keeps polling for up to 720 * 10s after another
+      // lane has already doomed the run. Checking the shared cell here bounds
+      // the waste at one poll interval without giving up the settled results.
+      const failure = shared_get(abort)
+      if failure != nil {
+        return platform_abandoned(spec, to_string(failure))
+      }
       adapter.wait(10000)
     }
   }
@@ -468,29 +564,16 @@ pub fn resolve_platform_certification(
     {kind: "platform", index: 1},
     {kind: "local_source", index: 2},
   ]
+  // The first lane to fail publishes its reason here; the hosted lanes read it
+  // between polls and stop early. A cell is the mechanism because `parallel
+  // settle` bodies run in isolated interpreters -- plain values are copied in,
+  // so only an explicit shared handle crosses the boundary.
+  const abort = shared_cell({scope: "task_group", key: "platform_certification_abort"})
   const settled = parallel settle tasks with { max_concurrent: 3 } { task ->
     if task.kind == "local_source" {
-      const result = adapter.local_source()
-      const completed = adapter.now_ms()
-      if is_err(result) {
-        return Err(unwrap_err(result))
-      }
-      return Ok(
-        {
-          kind: "local_source",
-          started_at_ms: local_started,
-          completed_at_ms: completed,
-          duration_ms: completed - local_started,
-        },
-      )
+      return local_source_lane(local_started, adapter, abort)
     }
-    const spec = PLATFORM_SPECS[task.index]
-    const dispatch = dispatches[task.index]
-    const started = starts[task.index]
-    if spec == nil || dispatch == nil || started == nil {
-      return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
-    }
-    return await_platform(cfg, spec, dispatch, started, adapter)
+    return platform_lane(cfg, task, dispatches, starts, adapter, abort)
   }
   const results = map_settled(
     settled.results,
@@ -501,7 +584,7 @@ pub fn resolve_platform_certification(
   if len(failures) > 0 {
     return {
       success: false,
-      reason: "certification lane failed: " + to_string(unwrap_err(failures[0])),
+      reason: "certification lane failed: " + to_string(unwrap_err(decisive_failure(failures))),
       cancellations: cleanup_runs(adapter, dispatches),
     }
   }
