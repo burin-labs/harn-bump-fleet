@@ -11,6 +11,18 @@ This is a Harn-native script (`bump_fleet.harn`): no Python glue, no shell
 wrapper. It exists partly as a useful local tool, partly as a proof that
 Harn the language is viable beyond LLM orchestration.
 
+The companion `sync_agent_guidance.harn` workflow owns one small marked block
+inside each fleet repository's `AGENTS.md` and projects `CLAUDE.md` directly to
+that canonical file. It preserves every repository-specific rule outside the
+markers.
+
+```sh
+harn run --no-sandbox sync_agent_guidance.harn -- --check
+harn run --no-sandbox sync_agent_guidance.harn -- --dry-run
+harn run --no-sandbox sync_agent_guidance.harn -- --apply
+harn run --no-sandbox sync_agent_guidance.harn -- --only harn-cloud
+```
+
 ## Repository scope
 
 This repo is public for transparency and cheap GitHub Actions coverage, but

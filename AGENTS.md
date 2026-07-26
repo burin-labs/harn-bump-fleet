@@ -17,6 +17,8 @@ The entry points are:
   receipt written by `release_harn`. It never repeats preparation or tagging.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
+- `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
+  agent contract and `CLAUDE.md` projection without replacing local rules.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
@@ -70,6 +72,7 @@ harn run --no-sandbox release_harn.harn
 harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
+harn run --no-sandbox sync_agent_guidance.harn -- --check
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
@@ -158,3 +161,20 @@ where they make scanning easier.
 Before opening a PR, rebase on the latest `origin/main`, run the checks above,
 review your own diff for stale comments and duplicated abstractions, then push a
 branch and enable auto-merge when CI is green.
+
+<!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->
+
+## Ecosystem working agreement
+
+- Pursue the ambitious product outcome; make the seams boring with small typed
+  interfaces, explicit invariants, and deterministic projections.
+- Give each behavior one semantic owner. Generate or parity-test other surfaces
+  instead of maintaining competing implementations.
+- Work autonomously inside approved scope. Pause for destructive, production,
+  high-spend, ambiguous, or authority-expanding actions—not routine reversible work.
+- Treat stop, wait, stand down, and pivot as control events for long-lived work.
+- Match evidence to the claim: exercise the canonical user path, state the
+  falsifier, verify liveness and recovery, and record residual blind spots.
+- "Ship" means landed on main with required deploy and post-merge checks complete.
+
+<!-- END HARN SHARED AGENT CONTRACT -->
