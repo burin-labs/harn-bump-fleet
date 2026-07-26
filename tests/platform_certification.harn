@@ -1,7 +1,10 @@
+import { git_ls_remote, git_push } from "std/git"
 import {
   PlatformCertificationAdapter,
   PlatformCertificationConfig,
+  ensure_platform_certification_branch,
   mock_platform_certification_adapter,
+  platform_certification_branch,
   platform_certification_duration_ms,
   platform_certification_join,
   resolve_platform_certification,
@@ -11,19 +14,21 @@ const PIN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 const BINARY_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
-/** A base head that advanced past `PIN` while certification was running. */
+/** A certification-branch head that advanced past `PIN` while lanes were running. */
 const MOVED_SHA = "dddddddddddddddddddddddddddddddddddddddd"
 
 /**
  * The shared certification config.
  *
  * `explicit_pin` is a parameter rather than a second constructor so the movement
- * pair below differs in exactly that one field and nothing else.
+ * pair below differs in exactly that one field and nothing else. Production
+ * prepare publishes `release-certify/<pin>` first; these unit tests keep that
+ * branch name so identity fixtures match the live dispatch ref shape.
  */
 fn config(explicit_pin: bool = false) -> PlatformCertificationConfig {
   return {
     repo: "burin-labs/harn",
-    branch: "main",
+    branch: platform_certification_branch(PIN),
     pin_sha: PIN,
     workspace: "/tmp/harn",
     harn_bin: "/tmp/harn-bin",
@@ -31,7 +36,81 @@ fn config(explicit_pin: bool = false) -> PlatformCertificationConfig {
   }
 }
 
-/** An adapter whose post-lane re-read reports a base that advanced past the pin. */
+fn sh(command) {
+  const result = shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+fn certify_fixture() {
+  const root = path_join(harness.fs.temp_dir(), "release-certify-" + uuid_v7())
+  const origin = path_join(root, "origin.git")
+  const work = path_join(root, "work")
+  sh("git init --bare -q '" + origin + "'")
+  sh("git init -q '" + work + "'")
+  sh("git -C '" + work + "' config user.email test@example.com")
+  sh("git -C '" + work + "' config user.name test")
+  sh("git -C '" + work + "' checkout -q -b main")
+  harness.fs.write_text(path_join(work, "fixture.txt"), "first\n")
+  sh("git -C '" + work + "' add fixture.txt && git -C '" + work + "' commit -q -m first")
+  sh("git -C '" + work + "' remote add origin '" + origin + "'")
+  return {
+    root: root,
+    origin: origin,
+    work: work,
+    pin: trim(sh("git -C '" + work + "' rev-parse HEAD").stdout),
+  }
+}
+
+pipeline test_platform_certification_branch_is_oid_qualified(task) {
+  assert_eq(platform_certification_branch(PIN), "release-certify/${PIN}")
+  const error = try {
+    platform_certification_branch("not-a-sha")
+  } catch (e) {
+    e
+  }
+  assert(contains(to_string(error), "full 40-hex OID"))
+}
+
+pipeline test_ensure_platform_certification_branch_publishes_and_resumes(task) {
+  const f = certify_fixture()
+  const branch = platform_certification_branch(f.pin)
+  const first = ensure_platform_certification_branch(f.work, f.pin, false)
+  assert_eq(first.success, true)
+  assert_eq(first.action, "published")
+  assert_eq(first.branch, branch)
+  const remote = git_ls_remote(
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${branch}"], heads: true},
+  )
+  assert_eq(remote.success, true)
+  assert_eq(remote.data.refs[0]?.oid, f.pin)
+  const resumed = ensure_platform_certification_branch(f.work, f.pin, false)
+  assert_eq(resumed.success, true)
+  assert_eq(resumed.action, "resume")
+  const mock = ensure_platform_certification_branch(f.work, f.pin, true)
+  assert_eq(mock.success, true)
+  assert_eq(mock.action, "mock")
+}
+
+pipeline test_ensure_platform_certification_branch_refuses_conflicting_tip(task) {
+  const f = certify_fixture()
+  const branch = platform_certification_branch(f.pin)
+  assert_eq(ensure_platform_certification_branch(f.work, f.pin, false).success, true)
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "second\n")
+  sh("git -C '" + f.work + "' add fixture.txt && git -C '" + f.work + "' commit -q -m second")
+  const other = trim(sh("git -C '" + f.work + "' rev-parse HEAD").stdout)
+  // Force the OID-named ref onto a different commit to model corruption.
+  assert_eq(git_push("origin", "+${other}:refs/heads/${branch}", f.work).success, true)
+  const conflict = ensure_platform_certification_branch(f.work, f.pin, false)
+  assert_eq(conflict.success, false)
+  assert_eq(conflict.action, "conflict")
+  assert(contains(conflict.reason, "refusing to overwrite"))
+}
+
+/** An adapter whose post-lane re-read reports the certify branch advanced past the pin. */
 fn moved_base_adapter(cfg: PlatformCertificationConfig) -> PlatformCertificationAdapter {
   const base = mock_platform_certification_adapter(cfg)
   return {
@@ -253,14 +332,9 @@ pipeline test_source_movement_discards_all_successful_lane_evidence(task) {
 }
 
 /**
- * An operator-named `--at-sha` pin closes its receipt even when the base moved.
- *
- * The pin was chosen outright rather than captured from `origin/<base>` HEAD, the
- * release branch is parented at it and never rebased, and the hosted proofs are
- * already bound to it by the per-dispatch `head_sha == pin_sha` check. So a base
- * that advanced afterwards refutes nothing. Paired with the test above, which
- * holds everything else equal and only drops `explicit_pin`, this pins the
- * tolerance to that one field instead of to some incidental adapter difference.
+ * An operator-named `--at-sha` pin closes its receipt even when the certify
+ * branch moved. Paired with the test above, which holds everything else equal
+ * and only drops `explicit_pin`, this pins the tolerance to that one field.
  */
 pipeline test_explicit_pin_survives_base_movement(task) {
   const cfg = config(true)
@@ -270,12 +344,12 @@ pipeline test_explicit_pin_survives_base_movement(task) {
   assert_eq(len(decision.cancellations), 0)
   const receipt = decision.receipt ?? {}
   // The pin is what was certified; the moved head is still reported rather than
-  // smoothed over, so the receipt cannot imply the base held still.
+  // smoothed over, so the receipt cannot imply the certify branch held still.
   assert_eq(receipt.source.sha, PIN)
   assert_eq(receipt.source.remote_sha_after, MOVED_SHA)
 }
 
-/** A base that cannot be re-read at all still fails closed, explicit pin or not. */
+/** A certification branch that cannot be re-read still fails closed, explicit pin or not. */
 pipeline test_unreadable_remote_fails_closed_even_with_explicit_pin(task) {
   const cfg = config(true)
   const base = mock_platform_certification_adapter(cfg)
