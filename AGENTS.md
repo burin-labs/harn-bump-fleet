@@ -120,13 +120,16 @@ ignored and must not be committed.
 `release_harn.harn` pins each live release at startup from `--at-sha`,
 `HARN_RELEASE_PIN_SHA`, or `origin/<base>`. An explicit pin is load-bearing:
 it skips the base fast-forward, short-circuits the pre-tag drift probe, and
-exempts the post-lane certification re-read from failing on base movement — so
-a release can certify against a `main` that is merging continuously. Use it
-whenever the queue is active. Its local release branch is
-parented at that SHA and is never published; the harness publishes a single
-OID-qualified immutable `release-attempt/...` ref before creating the tag and
-PR. The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
-base-branch commits cannot leak into the published artifact.
+exempts the post-lane certification re-read from failing on movement — so a
+release can certify against a `main` that is merging continuously. Use it
+whenever the queue is active. Hosted platform certification publishes a
+write-once OID-qualified `release-certify/<pin>` branch at that SHA and
+dispatches Windows/macOS nightlies against it, so a busy base cannot race the
+exact-identity check. The local `release/vX.Y.Z` branch is parented at the pin
+and is never published; the harness publishes a single OID-qualified immutable
+`release-attempt/...` ref before creating the tag and PR. The pushed `vX.Y.Z`
+tag is the source for publish/build workflows, so later base-branch commits
+cannot leak into the published artifact.
 
 If release assets already exist and an open `release/vX.Y.Z` PR remains,
 post-publish fixup mode is paperwork only: recreate the branch on fresh base,

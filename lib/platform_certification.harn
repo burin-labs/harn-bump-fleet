@@ -1,5 +1,6 @@
 import { command_output_text } from "std/command"
 import { read_json_result } from "std/fs"
+import { GitRemoteRef, git_ls_remote, git_push } from "std/git"
 import { shell_quote } from "std/runtime"
 import { map_settled } from "std/settled"
 import {
@@ -12,6 +13,11 @@ import { run_cmd, run_git } from "./release_runtime"
 
 pub type PlatformCertificationConfig = {
   repo: string,
+  /**
+   * Remote branch used for `workflow_dispatch`. Must already resolve to
+   * `pin_sha` — callers publish the OID-qualified `release-certify/<pin>`
+   * ref first so a busy `main` cannot race the exact-identity check.
+   */
   branch: string,
   pin_sha: string,
   workspace: string,
@@ -25,6 +31,13 @@ pub type PlatformCertificationConfig = {
    * because those are what bind the hosted evidence to the pinned commit.
    */
   explicit_pin: bool,
+}
+
+pub type PlatformCertificationBranchResult = {
+  success: bool,
+  branch: string,
+  action: string,
+  reason: string,
 }
 
 pub type PlatformCertificationSpec = {
@@ -64,6 +77,136 @@ const PLATFORM_SPECS: list<PlatformCertificationSpec> = [
     required_job: "Workspace nextest (macos-latest)",
   },
 ]
+
+/**
+ * OID-qualified remote branch used only as the hosted certification
+ * `workflow_dispatch` ref. The pin is in the name so a write-once push keeps
+ * `head_sha == pin_sha` by construction while `main` keeps merging.
+ */
+pub fn platform_certification_branch(pin_sha: string) -> string {
+  const sha = lowercase(trim(pin_sha))
+  if len(regex_captures("^[0-9a-f]{40}$", sha)) == 0 {
+    throw "platform certification pin must be a full 40-hex OID, got: " + pin_sha
+  }
+  return "release-certify/${sha}"
+}
+
+fn certification_remote_ref_oid(refs: list<GitRemoteRef>, branch: string) -> string {
+  const expected = "refs/heads/${branch}"
+  for ref in refs {
+    if !ref.peeled && ref.ref == expected {
+      return lowercase(trim(ref.oid))
+    }
+  }
+  return ""
+}
+
+/**
+ * Publish or resume the write-once certification branch at `pin_sha`.
+ *
+ * GitHub `workflow_dispatch` cannot target a bare SHA, and dispatching on
+ * `main` races merges between pin capture and run creation. This branch is the
+ * stable ref those dispatches need; it is never the release PR head.
+ */
+pub fn ensure_platform_certification_branch(
+  workspace: string,
+  pin_sha: string,
+  mock: bool = false,
+) -> PlatformCertificationBranchResult {
+  const branch = platform_certification_branch(pin_sha)
+  const sha = lowercase(trim(pin_sha))
+  if mock {
+    return {
+      success: true,
+      branch: branch,
+      action: "mock",
+      reason: "mock certification branch ${branch}",
+    }
+  }
+  const ref = "refs/heads/${branch}"
+  const initial = git_ls_remote("origin", {repo: workspace, refs: [ref], heads: true})
+  if !initial.success {
+    return {
+      success: false,
+      branch: branch,
+      action: "probe_failed",
+      reason: "could not inspect certification branch ${branch}: " + initial.stderr.inline,
+    }
+  }
+  const observed = certification_remote_ref_oid(initial.data.refs, branch)
+  if observed == sha {
+    return {
+      success: true,
+      branch: branch,
+      action: "resume",
+      reason: "certification branch ${branch} already targets pin ${sha}",
+    }
+  }
+  if observed != "" {
+    return {
+      success: false,
+      branch: branch,
+      action: "conflict",
+      reason:
+        "certification branch ${branch} targets ${observed}, not pin ${sha}; refusing to overwrite it",
+    }
+  }
+  const pushed = git_push("origin", "${sha}:${ref}", workspace)
+  const confirmed = git_ls_remote("origin", {repo: workspace, refs: [ref], heads: true})
+  const push_detail = if pushed.success {
+    ""
+  } else {
+    "; push transport also failed: " + pushed.stderr.inline
+  }
+  if !confirmed.success {
+    return {
+      success: false,
+      branch: branch,
+      action: "confirmation_failed",
+      reason: "could not confirm certification branch ${branch} after push: "
+        + confirmed.stderr
+        .inline
+        + push_detail,
+    }
+  }
+  const confirmed_oid = certification_remote_ref_oid(confirmed.data.refs, branch)
+  if confirmed_oid == sha {
+    return {
+      success: true,
+      branch: branch,
+      action: if pushed.success {
+        "published"
+      } else {
+        "reconciled"
+      },
+      reason: if pushed.success {
+        "published certification branch ${branch} at ${sha}"
+      } else {
+        "origin accepted certification branch ${branch} at ${sha} despite push transport failure"
+      },
+    }
+  }
+  if confirmed_oid == "" {
+    return {
+      success: false,
+      branch: branch,
+      action: if pushed.success {
+        "confirmation_missing"
+      } else {
+        "push_failed"
+      },
+      reason: "origin does not contain certification branch ${branch} after push attempt"
+        + push_detail,
+    }
+  }
+  return {
+    success: false,
+    branch: branch,
+    action: "confirmation_mismatch",
+    reason: "certification branch ${branch} resolved to ${confirmed_oid}, not pin ${sha}"
+      + push_detail,
+  }
+}
 
 fn connector_result(value) {
   return if is_err(value) {
@@ -511,7 +654,11 @@ pub fn platform_certification_duration_ms(timing: dict) -> int {
 
 /**
  * Dispatch exact hosted runs, overlap both waits with the local source audit,
- * then close a receipt only after the source branch is re-read unchanged.
+ * then close a receipt only after `cfg.branch` is re-read unchanged.
+ *
+ * Callers must publish `platform_certification_branch(pin_sha)` first and pass
+ * that immutable ref as `cfg.branch`. Dispatching on a moving base branch races
+ * merges into the exact-identity check.
  */
 pub fn resolve_platform_certification(
   harness: Harness,
@@ -607,21 +754,11 @@ pub fn resolve_platform_certification(
       cancellations: cleanup_runs(adapter, dispatches),
     }
   }
-  // Movement is only evidence of a problem when the pin was captured implicitly:
-  // then `origin/<base>` HEAD *was* the pin, and a moved head means the commit
-  // this run is certifying drifted out from under it.
-  //
-  // An explicit `--at-sha` names the commit outright. The release branch is
-  // parented at that pin and never rebased, so commits landing afterwards belong
-  // to the next release and cannot reach the artifact; and the hosted proofs are
-  // already bound to the pin by the per-dispatch `head_sha == pin_sha` check
-  // above. A base that advanced after those runs finished therefore refutes
-  // nothing this receipt asserts. `release_cutoff_gate` already draws exactly
-  // this line for the pre-tag drift probe — this keeps `--at-sha` meaning one
-  // thing across the harness instead of two.
-  //
-  // The moved head is still recorded as `remote_sha_after`, so the receipt shows
-  // what the base was doing rather than quietly implying it held still.
+  // Callers dispatch on the write-once `release-certify/<pin>` branch, so this
+  // re-read should still equal the pin. Movement here means the certification
+  // ref was force-updated while lanes ran — fail closed unless the operator
+  // named the pin with `--at-sha`, matching `release_cutoff_gate`'s explicit-pin
+  // exemption. The moved head is still recorded as `remote_sha_after`.
   if unwrap(remote) != cfg.pin_sha && !cfg.explicit_pin {
     return {
       success: false,

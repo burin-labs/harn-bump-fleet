@@ -482,31 +482,37 @@ attempt ref when one is available. Recover by recreating the fold content from
 the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
-Live `prepare` and `ship-pr` runs first freeze `origin/<base>` at the exact
-release pin. They dispatch `windows-nightly.yml` and `macos-nightly.yml` through
-the typed GitHub Actions connector and retain the exact run IDs returned by
-GitHub. Those two hosted runs execute concurrently with Harn's contract-owned
-local source lanes. No workflow-run listing or timestamp correlation is used.
+Live `prepare` and `ship-pr` runs first freeze the release pin
+(`--at-sha` / `HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD). Because GitHub
+`workflow_dispatch` cannot target a bare SHA, they publish a write-once
+OID-qualified `release-certify/<pin>` branch at that commit, then dispatch
+`windows-nightly.yml` and `macos-nightly.yml` against that branch through the
+typed GitHub Actions connector and retain the exact run IDs returned by GitHub.
+Those two hosted runs execute concurrently with Harn's contract-owned local
+source lanes. No workflow-run listing or timestamp correlation is used.
+Dispatching on a moving base branch is deliberately avoided: a busy `main`
+would otherwise race the exact-identity check between pin capture and run
+creation.
 
 Each hosted proof must preserve the expected workflow path, event, source SHA,
 run attempt, run URL, complete jobs page, and one successful required job.
 Missing, duplicate, stale, malformed, queued, cancelled, or failed evidence
 rejects the release. A failed lane requests cancellation of both exact hosted
-runs. The harness then rereads `origin/<base>`. When the pin was captured
-implicitly from `origin/<base>` HEAD at startup, movement discards all evidence
-and requires a fresh certification attempt: the commit being certified drifted
-out from under the run.
+runs. The harness then rereads the certification branch. When the pin was
+captured implicitly and that write-once ref moved, all evidence is discarded
+and a fresh certification attempt is required.
 
 An explicit `--at-sha` pin is exempt from that last check only. The operator
 named the commit, the release branch is parented at it and is never rebased, and
 each hosted proof is already bound to it by the per-dispatch
-`head_sha == pin_sha` check — so a base that advanced *after* those runs finished
-refutes nothing the receipt asserts. `release_cutoff_gate` already draws this
-line for the pre-tag drift probe; the certification re-read now matches it, so
-`--at-sha` means one thing across the harness. The moved head is still recorded
-as `remote_sha_after`. Every other proof stays unconditional, and a base that
-cannot be reread at all still fails closed. This is what lets a release certify
-against a `main` that is merging continuously, without freezing the queue.
+`head_sha == pin_sha` check — so movement of the certification ref after those
+runs finished refutes nothing the receipt asserts. `release_cutoff_gate`
+already draws this line for the pre-tag drift probe; the certification re-read
+matches it, so `--at-sha` means one thing across the harness. The moved head is
+still recorded as `remote_sha_after`. Every other proof stays unconditional, and
+a certification branch that cannot be reread at all still fails closed. Together
+with the write-once dispatch ref, this lets a release certify against a `main`
+that is merging continuously, without freezing the queue.
 
 The closed receipt is immutable at
 `.harn-runs/release-harn/<run-id>/platform-certification-receipt.json`. It
