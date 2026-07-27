@@ -1,0 +1,180 @@
+import "std/schema"
+import { FleetFileProjection, FleetManifest, FleetRepository } from "./fleet_manifest"
+
+pub type FleetPolicyResult = {slug: string, ok: bool, violations: list<string>}
+
+pub type FleetFileProjectionResult = {
+  source: string,
+  target: string,
+  ok: bool,
+  violations: list<string>,
+}
+
+type WorkflowJob = {name: string?, uses: string?, with: dict<any>?, needs?: string | list<string>}
+
+type WorkflowProjection = {triggers: dict<any>, jobs: dict<WorkflowJob>}
+
+type NamedWorkflowJob = {key: string, value: WorkflowJob}
+
+fn workflow_schema() {
+  const job = schema_object(
+    {
+      name: schema_field(schema_string(), false),
+      uses: schema_field(schema_string(), false),
+      with: schema_field(schema_dict(schema_any()), false),
+      needs: schema_field(schema_union([schema_string(), schema_list(schema_string())]), false),
+    },
+    {additional_properties: true},
+  )
+  return schema_object(
+    {
+      on: schema_field(schema_dict(schema_nullable(schema_any()))),
+      jobs: schema_field(schema_dict(job)),
+    },
+    {additional_properties: true},
+  )
+}
+
+/** Decode the GitHub workflow fields owned by fleet policy exactly once. */
+fn decode_workflow(source: string) -> WorkflowProjection {
+  const document = unwrap(schema_check(yaml_parse(source), workflow_schema()))
+  return {triggers: document.get("on"), jobs: document.jobs}
+}
+
+fn reusable_jobs(workflow: WorkflowProjection, expected: string) -> list<NamedWorkflowJob> {
+  let matches = []
+  for job in workflow.jobs {
+    if job.value.uses == expected {
+      matches = matches + [{key: job.key, value: job.value}]
+    }
+  }
+  return matches
+}
+
+fn job_needs(needs: string | list<string> | nil, expected: string) -> bool {
+  if type_of(needs) == "string" {
+    return needs == expected
+  }
+  if type_of(needs) == "list" {
+    return contains(needs, expected)
+  }
+  return false
+}
+
+fn status_job_covers_all_verification_jobs(
+  jobs,
+  status_key: string,
+  status_needs: string | list<string> | nil,
+) -> bool {
+  for job in jobs {
+    if job.key != status_key && !job_needs(status_needs, job.key) {
+      return false
+    }
+  }
+  return true
+}
+
+/** Evaluate one repository projection without performing provider I/O. */
+pub fn evaluate_fleet_policy(
+  manifest: FleetManifest,
+  repo: FleetRepository,
+  package_workflow: string?,
+  bump_workflow: string?,
+) -> FleetPolicyResult {
+  let violations = []
+  if repo.harn_package ?? false {
+    if package_workflow == nil {
+      violations = violations + ["missing .github/workflows/ci.yml"]
+    } else {
+      try {
+        const workflow = decode_workflow(package_workflow ?? "")
+        const package_jobs = reusable_jobs(workflow, manifest.policy.package_workflow)
+        if len(package_jobs) != 1 {
+          violations = violations + ["package CI does not pin the canonical reusable workflow"]
+        } else {
+          const package_job = package_jobs[0] ?? {key: "", value: {}}
+          const poll_tick = package_job.value.with?.get("run-poll-tick") == true
+          if poll_tick != (repo.run_poll_tick ?? false) {
+            violations = violations + ["package CI poll-tick projection disagrees with fleet.toml"]
+          }
+          const test_jobs = to_int(package_job.value.with?.get("test-jobs")) ?? 0
+          if test_jobs != (repo.test_jobs ?? 0) {
+            violations = violations + ["package CI test-job projection disagrees with fleet.toml"]
+          }
+          let status_job_count = 0
+          for job in workflow.jobs {
+            if job.value?.name == "CI status" {
+              if status_job_covers_all_verification_jobs(workflow.jobs, job.key, job.value?.needs) {
+                status_job_count = status_job_count + 1
+              }
+            }
+          }
+          if status_job_count != 1 {
+            violations = violations
+              + [
+              "package CI must have one CI status job that depends on every verification job",
+            ]
+          }
+        }
+      } catch (error) {
+        violations = violations + ["package CI is not a valid workflow projection: ${error}"]
+      }
+    }
+  }
+  if repo.harn_bump ?? false {
+    if bump_workflow == nil {
+      violations = violations + ["missing .github/workflows/bump-harn.yml"]
+    } else {
+      try {
+        const workflow = decode_workflow(bump_workflow ?? "")
+        if !contains(workflow.triggers.keys(), "workflow_dispatch") {
+          violations = violations + ["bump adapter is not manually dispatchable"]
+        }
+        if contains(workflow.triggers.keys(), "schedule") {
+          violations = violations + ["bump adapter retains a repository-local schedule"]
+        }
+        const bump_jobs = reusable_jobs(workflow, manifest.policy.bump_workflow)
+        if len(bump_jobs) != 1 {
+          violations = violations + ["bump adapter does not pin the canonical reusable workflow"]
+        } else {
+          const bump_job = (bump_jobs[0] ?? {key: "", value: {}}).value
+          if len(workflow.jobs) != 1 {
+            violations = violations + ["bump adapter must contain only the canonical reusable job"]
+          }
+          if (repo.harn_package ?? false)
+            && bump_job.with?.get("validate-command")
+            != "harn package verify ." {
+            violations = violations + ["package bump adapter does not use harn package verify"]
+          }
+        }
+      } catch (error) {
+        violations = violations + ["bump adapter is not a valid workflow projection: ${error}"]
+      }
+    }
+  }
+  return {slug: repo.slug, ok: len(violations) == 0, violations: violations}
+}
+
+/** Evaluate one byte-exact generated projection without provider I/O. */
+pub fn evaluate_file_projection(
+  projection: FleetFileProjection,
+  source: string?,
+  target: string?,
+) -> FleetFileProjectionResult {
+  let violations = []
+  if source == nil {
+    violations = violations + ["source file is missing"]
+  }
+  if target == nil {
+    violations = violations + ["target projection is missing"]
+  }
+  if source != nil && target != nil && source != target {
+    violations = violations + ["target bytes drift from the canonical source"]
+  }
+  return {
+    source: projection.source_slug + ":" + projection.source_path,
+    target: projection.target_slug + ":" + projection.target_path,
+    ok: len(violations) == 0,
+    violations: violations,
+  }
+}
