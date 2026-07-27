@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Pre-tag release recovery now preserves an explicit `--at-sha` pin and rejects
+  immutable checkpoints certified from a different source commit instead of
+  silently publishing the stale checkpoint.
 - Pre-tag release recovery now reuses the verified immutable commit and any
   matching successful exact-SHA size run, while two-minute polling and bounded
   rate-limit waits avoid exhausting GitHub API quota during long builds.
