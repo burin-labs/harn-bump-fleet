@@ -22,10 +22,6 @@ pub import { prepare_repair_changed } from "lib/release_agent"
 import { agent_artifact_paths, release_repair_tools } from "lib/release_agent_tools"
 pub import { agent_review_attempt_selection } from "lib/release_agent_tools"
 import { analyze_release } from "lib/release_analysis"
-import {
-  normalize_release_analysis_checkout,
-  pre_release_sync_local_base,
-} from "lib/release_checkout"
 import { write_crystallization_fixture } from "lib/release_crystallization"
 import {
   execution_failed,
@@ -35,12 +31,7 @@ import {
 } from "lib/release_execution"
 import { analysis_with_fixup_state, with_fixup_state } from "lib/release_fixup"
 import { pre_release_gate } from "lib/release_gate_chat"
-import {
-  execute_prepare,
-  execute_ship_pr,
-  restore_release_checkout_to_base,
-  write_report,
-} from "lib/release_modes"
+import { execute_prepare, execute_ship_pr, write_report } from "lib/release_modes"
 import {
   detect_fixup_state,
   detect_post_merge_drift,
@@ -74,6 +65,7 @@ import { require_release_repo_path } from "lib/release_repo_guard"
 import { pre_release_pr_body_text } from "lib/release_reporting"
 import {
   DEFAULT_PLANNER,
+  ReleaseConfig,
   finish_release_run_timing,
   parse_release_args,
   release_log_event,
@@ -84,9 +76,32 @@ import {
   usage,
 } from "lib/release_runtime"
 pub import { prompt_asset, release_harness_root, release_run_root } from "lib/release_runtime"
+import {
+  align_pre_tag_release_workspace,
+  finish_release_workspace,
+  materialize_release_workspace,
+} from "lib/release_workspace"
 import { ReleaseAuditReceipt } from "lib/run_receipts"
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { timing_artifacts, timing_summary_lines } from "lib/timing_report"
+
+fn finish_workspace(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  succeeded: bool,
+  run_id: string,
+) -> dict? {
+  const cleanup = finish_release_workspace(harness, cfg, succeeded, run_id)
+  if cleanup != nil {
+    harness.stdio.println("== release workspace")
+    if trim(cleanup.warning ?? "") != "" {
+      harness.stdio.println("   warning: ${cleanup.warning}")
+    } else {
+      harness.stdio.println("   ${cleanup.detail}")
+    }
+  }
+  return cleanup
+}
 
 pipeline main() {
   const parsed_cfg = parse_release_args(harness, argv)
@@ -144,29 +159,6 @@ pipeline main() {
   harness.stdio.println("   ${cost_budget_audit_line(cost_limit)}")
   release_fleet_self_check(harness, raw_cfg, run_id)
   const preflight_cfg = preflight_release_planner(harness, raw_cfg, run_id)
-  require_release_repo_path(harness, preflight_cfg, "base sync")
-  release_timed_phase(
-    harness,
-    run_id,
-    "prior_release_fold_preflight",
-    "release.prior_release_fold_preflight",
-    {base: preflight_cfg.base, mock: preflight_cfg.mock},
-    { ->
-      release_prior_fold_preflight(harness, preflight_cfg, run_id)
-      return nil
-    },
-  )
-  release_timed_phase(
-    harness,
-    run_id,
-    "base_sync",
-    "release.base_sync",
-    {base: preflight_cfg.base, mock: preflight_cfg.mock},
-    { ->
-      pre_release_sync_local_base(harness, preflight_cfg, run_id)
-      return nil
-    },
-  )
   require_release_repo_path(harness, preflight_cfg, "pin resolution")
   let cfg = preflight_cfg
   cfg["pin_sha"] = resolve_pin_sha(preflight_cfg)
@@ -211,19 +203,24 @@ pipeline main() {
       },
     )
   }
-  release_sccache_preflight(harness, cfg)
-  require_release_repo_path(harness, cfg, "checkout normalization")
+  cfg = materialize_release_workspace(harness, cfg, run_id)
+  if cfg.release_workspace_managed {
+    harness.stdio.println("   workspace: ${cfg.repo}")
+    harness.stdio.println("   source   : ${cfg.source_repo} (left unchanged)")
+  }
+  require_release_repo_path(harness, cfg, "prior release fold preflight")
   release_timed_phase(
     harness,
     run_id,
-    "checkout_normalization",
-    "release.checkout_normalization",
+    "prior_release_fold_preflight",
+    "release.prior_release_fold_preflight",
     {base: cfg.base, mock: cfg.mock},
     { ->
-      normalize_release_analysis_checkout(harness, cfg, run_id)
+      release_prior_fold_preflight(harness, cfg, run_id)
       return nil
     },
   )
+  release_sccache_preflight(harness, cfg)
   require_release_repo_path(harness, cfg, "release analysis")
   release_log_event(harness, run_id, "analysis_started", {})
   const raw_analysis = release_timed_phase(
@@ -252,6 +249,7 @@ pipeline main() {
   )
   if !release_body_gate.proceed {
     harness.stdio.println("!! release body integrity blocked live release side effects")
+    finish_workspace(harness, derived_cfg, false, run_id)
     finish_release_run_timing(run_timing, "release_body_integrity_blocked", false)
     release_owner_guard_finish(owner_guard, "release_body_integrity_blocked", false)
     return 1
@@ -303,6 +301,7 @@ pipeline main() {
     if drift_state.kind == "paperwork_pr_open" {
       harness.stdio.println("== post-merge paperwork PR already open: ${drift_state.pr_url}")
       harness.stdio.println("   no changes needed (the open PR already fixes the drift)")
+      finish_workspace(harness, derived_cfg, true, run_id)
       finish_release_run_timing(run_timing, "post_merge_paperwork_pr_open", true)
       release_owner_guard_finish(owner_guard, "post_merge_paperwork_pr_open", true)
       return 0
@@ -312,11 +311,13 @@ pipeline main() {
       {base: derived_cfg.base, mock: derived_cfg.mock},
       { -> return run_post_merge_paperwork_pr(harness, derived_cfg, drift_state, run_id) },
     ).result
+    finish_workspace(harness, derived_cfg, drift_exit == 0, run_id)
     finish_release_run_timing(run_timing, "post_merge_paperwork_pr", drift_exit == 0)
     release_owner_guard_finish(owner_guard, "post_merge_paperwork_pr", drift_exit == 0)
     return drift_exit
   }
   const effective_cfg = with_fixup_state(derived_cfg, fixup_state)
+  align_pre_tag_release_workspace(harness, effective_cfg, run_id)
   // A pre-tag checkpoint may have been prepared before newer commits reached
   // base. Re-snapshot deterministic facts at the recovered pin so the PR body
   // cannot claim post-pin work that is absent from the immutable release.
@@ -389,6 +390,7 @@ pipeline main() {
     for line in analysis.release_scope_findings {
       harness.stdio.println("   - ${line}")
     }
+    finish_workspace(harness, effective_cfg, false, run_id)
     finish_release_run_timing(run_timing, "release_scope_aborted", false)
     release_owner_guard_finish(owner_guard, "release_scope_aborted", false)
     return 2
@@ -565,6 +567,7 @@ pipeline main() {
     if gate.decision == "abort" {
       release_log_event(harness, run_id, "pre_release_gate_aborted", {reason: gate.reason})
       harness.stdio.println("== chat: aborting before live release side effects (${gate.reason})")
+      finish_workspace(harness, effective_cfg, false, run_id)
       finish_release_run_timing(run_timing, "pre_release_gate_aborted", false)
       release_owner_guard_finish(owner_guard, "pre_release_gate_aborted", false)
       return 2
@@ -622,18 +625,12 @@ pipeline main() {
         )
       }
       const cleanup = timed(
-        "release.checkout_cleanup",
+        "release.workspace_cleanup",
         {mode: effective_cfg.mode, mock: effective_cfg.mock},
-        { -> return restore_release_checkout_to_base(harness, effective_cfg, execution, run_id) },
+        { ->
+          return finish_workspace(harness, effective_cfg, !execution_failed(execution), run_id)
+        },
       ).result
-      if cleanup != nil {
-        harness.stdio.println("== checkout cleanup")
-        if trim(cleanup.warning ?? "") != "" {
-          harness.stdio.println("   warning: ${cleanup.warning}")
-        } else {
-          harness.stdio.println("   ${cleanup.detail}")
-        }
-      }
       return {execution: execution, cleanup: cleanup}
     },
   )
