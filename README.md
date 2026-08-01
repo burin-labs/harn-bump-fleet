@@ -2,10 +2,12 @@
 
 [![Harn static checks](https://github.com/burin-labs/harn-bump-fleet/actions/workflows/harn-static.yml/badge.svg)](https://github.com/burin-labs/harn-bump-fleet/actions/workflows/harn-static.yml)
 
-Local Harn-version bump orchestrator. Auto-discovers every repo under
-`~/projects/{*harn*,*burin*}` that ships a `.github/workflows/bump-harn.yml`
-and drives them all to the latest published Harn release with auto-merge
-enabled in parallel, idempotently, with a self-contained audit trail.
+Local Harn-version bump orchestrator. `fleet.toml` is the typed owner of fleet
+membership and reusable-workflow policy. The orchestrator resolves those
+declared repositories under `~/projects`, rejects a missing checkout, wrong
+remote, or missing dispatch adapter, and drives every `harn_bump = true`
+repository to the latest published Harn release with auto-merge enabled in
+parallel, idempotently, with a self-contained audit trail.
 
 This is a Harn-native script (`bump_fleet.harn`): no Python glue, no shell
 wrapper. It exists partly as a useful local tool, partly as a proof that
@@ -70,6 +72,14 @@ HARN_BUMP_FLEET_PROVIDER=ollama \
 These operation harnesses inspect sibling checkouts under `~/projects`, run
 local Git commands, and call the GitHub connector, so Harn's default run
 sandbox must be disabled.
+
+Before scheduled dispatch, `check_fleet_policy.harn` reads every declared
+repository's default-branch workflows through the GitHub connector. It checks
+thin package and bump adapters against `fleet.toml`, verifies byte-exact file
+projections, and verifies that each canonical reusable-workflow pin still
+publishes the same bytes as the owner's current default branch. A fleet whose
+consumers all agree on a stale canonical pin therefore fails closed instead of
+silently treating internal consistency as freshness.
 
 ### Signed bot PRs
 
