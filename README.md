@@ -435,26 +435,26 @@ Real release cuts should have a green release rehearsal from the previous
 before starting `--mode ship-pr`; real releases stay fail-fast, but rehearsal
 must report every failed leg in one pass.
 
-Live modes require the explicit guard flag. Before resolving the pin SHA, the
-harness fast-forwards the local base branch from `origin/<base>`: if the
-worktree is dirty it stashes the changes under
-`release_harn-auto-stash-<run-id>` (recover with `git stash list` →
-`git stash pop`), switches to `<base>` if the current branch is something
-else, and fast-forwards. The sync is skipped for `--mode audit`, when
-`--at-sha` pins a specific commit, and when the current branch is already a
-`release/v*` branch (those are handled by the downstream normalize step,
-which preserves prepared release content). The harness then normalizes the
-release branch before running the target repo's release script: if it starts
-from `main` or another branch, it stashes dirty tracked/untracked files when
-needed, fetches/syncs the base branch, switches or creates `release/vX.Y.Z`,
-restores the stashed release content there, and inserts a draft `## vX.Y.Z`
-CHANGELOG section from the post-tag delta before handing off to
-`scripts/release_ship.sh`. With `--agent`, the model must produce a
-ready-to-paste changelog block, so the draft notes can be rewritten from local
-evidence instead of copied from commit titles.
+Live modes require the explicit guard flag. The checkout passed through
+`--repo` is only the source Git database: the harness refreshes the exact
+`origin/<base>` ref, freezes its pin, and creates a detached worktree under the
+checkout's sibling `<repo>-worktrees/release-<run-id>` directory. It verifies
+that creating the worktree did not change the source checkout's branch, HEAD,
+index, or working tree, then routes analysis, agent tools, release-branch
+creation, preparation, tagging, and publication through the isolated path.
+Dirty files and arbitrary branches in the operator checkout remain untouched.
+
+The release worktree uses the same external `HARN_RELEASE_CARGO_TARGET_DIR`
+and exact-pin `HARN_BIN` path as before, so compiled artifacts remain warm
+across runs without sharing mutable source or Cargo build-script scratch with
+the operator checkout. Pre-tag recovery aligns only the isolated worktree to
+the immutable candidate before its exact-HEAD warm and certification checks.
+With `--agent`, the model must produce a ready-to-paste changelog block, so the
+draft notes can be rewritten from local evidence instead of copied from commit
+titles.
 
 ```sh
-# Starts from main, an existing release branch, or another branch.
+# The source checkout may be on any branch or dirty; release work is isolated.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
 harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 
@@ -486,7 +486,7 @@ healthy only when crates.io and all five archives plus `SHA256SUMS` and
 `release-assets.json` are present; a cache is warm only after the exact five-job
 release matrix completes successfully.
 
-Before either live mode touches the target checkout, it refreshes
+Before either live mode mutates its isolated worktree, it refreshes
 `origin/<base>` and proves the latest remote release tag has been folded back:
 both the workspace version and the top versioned CHANGELOG section must match
 the tag. A mismatch fails closed and names the matching release PR or immutable
@@ -665,11 +665,11 @@ just recorded. GitHub CI, the merge queue, and the tag-triggered publish/build
 workflows remain the authoritative gates. The older pre-push timeout classifier
 is kept for recovery reports and manual push failures.
 
-After a successful live `ship-pr`, the harness performs the same conservative
-`std/git` checkout cleanup in the target Harn repo: if the release checkout is
-clean, it fetches `origin`, switches to the base branch, and fast-forwards it.
-Dirty worktrees are left in place and recorded as skipped cleanup, so failed or
-manual recovery runs still preserve local evidence.
+After a successful live `ship-pr`, the harness removes the isolated worktree
+only after proving it is clean. Failed runs, standalone `prepare`, and any
+unexpectedly dirty workspace preserve the exact path in events and the audit
+receipt for inspection or recovery. Cleanup never switches, resets, stashes,
+or fast-forwards the source checkout.
 
 The local LLM summary path uses `std/llm/handlers.with_retry` rather than the
 deprecated `llm_retries` option. The release audit handoff likewise avoids the
