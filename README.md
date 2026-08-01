@@ -494,17 +494,23 @@ attempt ref when one is available. Recover by recreating the fold content from
 the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
-Live `prepare` and `ship-pr` runs first freeze the release pin
-(`--at-sha` / `HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD). Because GitHub
-`workflow_dispatch` cannot target a bare SHA, they publish a write-once
-OID-qualified `release-certify/<pin>` branch at that commit, then dispatch
-`windows-nightly.yml` and `macos-nightly.yml` against that branch through the
-typed GitHub Actions connector and retain the exact run IDs returned by GitHub.
-Those two hosted runs execute concurrently with Harn's contract-owned local
-source lanes. No workflow-run listing or timestamp correlation is used.
+Live runs first freeze the release parent (`--at-sha` /
+`HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD). Canonical `ship-pr` then uses
+Harn's harness-only materialization boundary to produce and sign the versioned
+candidate, proves that the frozen parent is its sole parent, and publishes the
+write-once `release-attempt/...` ref. Because GitHub `workflow_dispatch` cannot
+target a bare SHA, certification publishes a second write-once
+`release-certify/<candidate-oid>` branch at that exact prepared commit.
+
+The controller dispatches `windows-nightly.yml` and `macos-nightly.yml` against
+that branch through the typed GitHub Actions connector and retains the exact
+run IDs returned by GitHub. Those hosted runs execute concurrently with Harn's
+contract-owned local source lanes and the exact-candidate Linux release-size
+workflow. No workflow-run listing or timestamp correlation is used.
 Dispatching on a moving base branch is deliberately avoided: a busy `main`
-would otherwise race the exact-identity check between pin capture and run
-creation.
+would otherwise race the identity check between source capture and run
+creation. Standalone `prepare` mode retains the composed prepare audit because
+it does not continue into immutable publication and tag gates.
 
 Each hosted proof must preserve the expected workflow path, event, source SHA,
 run attempt, run URL, complete jobs page, and one successful required job.
@@ -519,15 +525,16 @@ release certify against a `main` that is merging continuously, without freezing
 the queue; `--at-sha` still skips the base fast-forward and the pre-tag drift
 probe when the release must target a specific commit.
 
-The closed receipt is immutable at
+The closed hosted/local receipt is immutable at
 `.harn-runs/release-harn/<run-id>/platform-certification-receipt.json`. It
 records both hosted proofs, the local source lanes, wall-clock timings and
-critical path, and the SHA-256 of the exact-pin Harn CLI. The harness passes
-only this receipt and binary to Harn, which validates them again and runs the
-residual generated-content, docs, grammar, security, smoke, pre-tag size, and
-publish checks. After the version bump is committed, the fleet proves the
-certified source SHA is the commit's sole parent before publishing the immutable
-attempt. `--local-audit` remains useful for read-only diagnosis but cannot
+critical path, and the SHA-256 of the exact-candidate Harn CLI. The joined
+candidate receipt also preserves the independent Linux size-run identity and
+verdict. The harness passes the hosted/local receipt and binary to Harn, which
+validates them again and runs only the residual generated-content, docs,
+grammar, security, smoke, and publish checks. Signed tag creation remains
+impossible until the hosted/local lane, Linux size lane, and residual audit are
+all green. `--local-audit` remains useful for read-only diagnosis but cannot
 bypass hosted certification for live preparation.
 
 Options:
