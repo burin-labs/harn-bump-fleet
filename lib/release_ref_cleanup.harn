@@ -1,0 +1,324 @@
+import { read_json_result, write_json } from "std/fs"
+import { GitRemoteRef } from "std/git"
+import { github_file_text_at_ref } from "./github"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ReleaseWatchReceipt } from "./release_watch_state"
+
+pub type ReleaseRefCleanupState = "pending" | "deleted" | "absent" | "mismatch" | "failed"
+
+pub type ReleaseRefCleanupEntry = {
+  ref: string,
+  expected_oid: string,
+  observed_oid: string,
+  state: ReleaseRefCleanupState,
+  message: string,
+}
+
+pub type ReleaseRefCleanupReceipt = {
+  schema_version: "release_harn.ref_cleanup.v1",
+  tag: string,
+  watch_receipt_path: string,
+  terminal_proof_at: string,
+  state: "pending" | "completed" | "blocked",
+  message: string,
+  refs: list<ReleaseRefCleanupEntry>,
+  updated_at: string,
+}
+
+pub type ReleaseRefCleanupAdapter = {
+  now: fn() -> string,
+  remote_refs: fn(string, list<string>) -> list<GitRemoteRef>,
+  version_at_ref: fn(string, string) -> string?,
+  delete_ref: fn(string, string, string) -> dict,
+}
+
+fn cleanup_receipt_path(watch_receipt_path: string) -> string {
+  return watch_receipt_path + ".ref-cleanup.json"
+}
+
+fn workspace_version(cargo_toml: string) -> string? {
+  const captures = regex_captures(
+    "(?s)\\[workspace[.]package\\].*?version[[:space:]]*=[[:space:]]*\"([0-9]+[.][0-9]+[.][0-9]+)\"",
+    cargo_toml,
+  )
+  if len(captures) == 0 {
+    return nil
+  }
+  return captures[0].groups[0]
+}
+
+fn default_adapter() -> ReleaseRefCleanupAdapter {
+  return {
+    now: fn() { return date_now_iso() },
+    remote_refs: fn(repo, refs) {
+      const observed = release_git_remote_refs({repo: repo, mock: false}, refs)
+      if !observed.success {
+        throw "could not inspect transient release refs: " + trim(observed.stderr)
+      }
+      return observed.refs
+    },
+    version_at_ref: fn(slug, ref) {
+      const cargo_toml = github_file_text_at_ref(slug, "Cargo.toml", ref)
+      if cargo_toml == nil {
+        return nil
+      }
+      return workspace_version(cargo_toml)
+    },
+    delete_ref: fn(repo, ref, expected_oid) {
+      const deleted = run_git(
+        {repo: repo, mock: false},
+        ["push", "--porcelain", "--force-with-lease=${ref}:${expected_oid}", "origin", ":${ref}"],
+      )
+      return {
+        success: deleted.success,
+        message: trim(
+          if deleted.success {
+            deleted.stdout
+          } else {
+            deleted.stderr
+          },
+        ),
+      }
+    },
+  }
+}
+
+fn entry(ref: string, expected_oid: string, observed_oid: string) -> ReleaseRefCleanupEntry {
+  return {
+    ref: ref,
+    expected_oid: expected_oid,
+    observed_oid: observed_oid,
+    state: if expected_oid == observed_oid {
+      "pending"
+    } else {
+      "mismatch"
+    },
+    message: if expected_oid == observed_oid {
+      "exact transient ref is pending cleanup"
+    } else {
+      "ref target ${observed_oid} does not match content-addressed OID ${expected_oid}"
+    },
+  }
+}
+
+fn expected_oid_from_ref(ref: string, prefix: string) -> string? {
+  if !starts_with(ref, prefix) {
+    return nil
+  }
+  const oid = lowercase(trim(ref.substring(len(prefix))))
+  if len(regex_captures("^[0-9a-f]{40}$", oid)) == 0 {
+    return nil
+  }
+  return oid
+}
+
+/** Discover only content-addressed refs proven to belong to the released version. */
+pub fn release_ref_cleanup_candidates(
+  receipt: ReleaseWatchReceipt,
+  refs: list<GitRemoteRef>,
+  version_at_ref: fn(string, string) -> string?,
+) -> list<ReleaseRefCleanupEntry> {
+  const version = receipt.publication.version
+  const attempt_prefix = "refs/heads/release-attempt/v${version}/"
+  const certify_prefix = "refs/heads/release-certify/"
+  let candidates: list<ReleaseRefCleanupEntry> = []
+  for remote in refs {
+    const ref = trim(remote.ref)
+    const observed_oid = lowercase(trim(remote.oid))
+    const attempt_oid = expected_oid_from_ref(ref, attempt_prefix)
+    if attempt_oid != nil {
+      candidates = candidates + [entry(ref, attempt_oid, observed_oid)]
+      continue
+    }
+    const certify_oid = expected_oid_from_ref(ref, certify_prefix)
+    if certify_oid == nil {
+      continue
+    }
+    const short_ref = ref.substring(len("refs/heads/"))
+    if version_at_ref(receipt.slug, short_ref) == version {
+      candidates = candidates + [entry(ref, certify_oid, observed_oid)]
+    }
+  }
+  return candidates.sort_by({ candidate -> candidate.ref })
+}
+
+fn parse_prior_receipt(path: string, tag: string) -> ReleaseRefCleanupReceipt? {
+  const loaded = read_json_result(path)
+  if !is_ok(loaded) {
+    return nil
+  }
+  const value = unwrap(loaded)
+  if value?.schema_version != "release_harn.ref_cleanup.v1" || value?.tag != tag {
+    throw "invalid release ref cleanup receipt: " + path
+  }
+  return value
+}
+
+fn merge_prior_targets(
+  discovered: list<ReleaseRefCleanupEntry>,
+  prior: ReleaseRefCleanupReceipt?,
+) -> list<ReleaseRefCleanupEntry> {
+  let merged = discovered
+  for old in prior?.refs ?? [] {
+    if !merged.any({ current -> current.ref == old.ref }) {
+      merged = merged
+        + [
+        {
+          ref: old.ref,
+          expected_oid: old.expected_oid,
+          observed_oid: "",
+          state: "absent",
+          message: "exact transient ref is already absent",
+        },
+      ]
+    }
+  }
+  return merged.sort_by({ candidate -> candidate.ref })
+}
+
+fn cleanup_state(refs: list<ReleaseRefCleanupEntry>) -> "pending" | "completed" | "blocked" {
+  if refs.any({ ref -> ref.state == "mismatch" || ref.state == "failed" }) {
+    return "blocked"
+  }
+  if refs.any({ ref -> ref.state == "pending" }) {
+    return "pending"
+  }
+  return "completed"
+}
+
+fn cleanup_message(state: "pending" | "completed" | "blocked") -> string {
+  if state == "completed" {
+    return "exact transient release refs are absent"
+  }
+  if state == "blocked" {
+    return "one or more transient release refs could not be deleted safely"
+  }
+  return "exact transient release refs are pending cleanup"
+}
+
+fn write_cleanup_receipt(path: string, receipt: ReleaseRefCleanupReceipt) {
+  const temporary = path + ".tmp-" + uuid_v7()
+  write_json(temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+}
+
+fn cleanup_receipt_with_refs(
+  receipt: ReleaseRefCleanupReceipt,
+  refs: list<ReleaseRefCleanupEntry>,
+  updated_at: string,
+) -> ReleaseRefCleanupReceipt {
+  const state = cleanup_state(refs)
+  return {
+    schema_version: "release_harn.ref_cleanup.v1",
+    tag: receipt.tag,
+    watch_receipt_path: receipt.watch_receipt_path,
+    terminal_proof_at: receipt.terminal_proof_at,
+    state: state,
+    message: cleanup_message(state),
+    refs: refs,
+    updated_at: updated_at,
+  }
+}
+
+/** Delete exact transient refs only after the watch receipt carries terminal hosted proof. */
+pub fn run_release_ref_cleanup(
+  receipt: ReleaseWatchReceipt,
+  watch_receipt_path: string,
+  repo: string,
+  injected_adapter: ReleaseRefCleanupAdapter? = nil,
+) -> ReleaseRefCleanupReceipt {
+  const adapter = injected_adapter ?? default_adapter()
+  const path = cleanup_receipt_path(watch_receipt_path)
+  if receipt.state != "healthy" || receipt.warm_cache.state != "completed" {
+    const blocked: ReleaseRefCleanupReceipt = {
+      schema_version: "release_harn.ref_cleanup.v1",
+      tag: receipt.tag,
+      watch_receipt_path: watch_receipt_path,
+      terminal_proof_at: "",
+      state: "blocked",
+      message: "transient release refs remain protected until hosted release proof is terminal",
+      refs: [],
+      updated_at: adapter.now(),
+    }
+    write_cleanup_receipt(path, blocked)
+    return blocked
+  }
+  const prior = parse_prior_receipt(path, receipt.tag)
+  const remote_refs = adapter.remote_refs(
+    repo,
+    ["refs/heads/release-attempt/${receipt.tag}/*", "refs/heads/release-certify/*"],
+  )
+  let refs = merge_prior_targets(
+    release_ref_cleanup_candidates(receipt, remote_refs, adapter.version_at_ref),
+    prior,
+  )
+  const now = adapter.now()
+  const initial_state = cleanup_state(refs)
+  let cleanup: ReleaseRefCleanupReceipt = {
+    schema_version: "release_harn.ref_cleanup.v1",
+    tag: receipt.tag,
+    watch_receipt_path: watch_receipt_path,
+    terminal_proof_at: receipt.warm_cache.finished_at,
+    state: initial_state,
+    message: cleanup_message(initial_state),
+    refs: refs,
+    updated_at: now,
+  }
+  write_cleanup_receipt(path, cleanup)
+  for index in range(0, len(refs)) {
+    const target = refs[index]
+    if target.state != "pending" {
+      continue
+    }
+    const deleted = adapter.delete_ref(repo, target.ref, target.expected_oid)
+    refs[index] = {
+      ...target,
+      state: if deleted.success {
+        "deleted"
+      } else {
+        "failed"
+      },
+      message: if trim(deleted.message ?? "") != "" {
+        trim(deleted.message)
+      } else if deleted.success {
+        "deleted exact transient ref"
+      } else {
+        "exact transient ref deletion failed"
+      },
+    }
+    cleanup = cleanup_receipt_with_refs(cleanup, refs, adapter.now())
+    write_cleanup_receipt(path, cleanup)
+  }
+  return cleanup
+}
+
+pub fn release_ref_cleanup_receipt_path(watch_receipt_path: string) -> string {
+  return cleanup_receipt_path(watch_receipt_path)
+}
+
+/** Deterministic terminal-cleanup rehearsal for the watcher CLI. */
+pub fn mock_release_ref_cleanup_adapter(receipt: ReleaseWatchReceipt) -> ReleaseRefCleanupAdapter {
+  let refs = [
+    {
+      oid: receipt.publication.head_oid,
+      ref: "refs/heads/${receipt.publication.remote_ref}",
+      name: "refs/heads/${receipt.publication.remote_ref}",
+      peeled: false,
+    },
+    {
+      oid: receipt.publication.head_oid,
+      ref: "refs/heads/release-certify/${receipt.publication.head_oid}",
+      name: "refs/heads/release-certify/${receipt.publication.head_oid}",
+      peeled: false,
+    },
+  ]
+  return {
+    now: fn() { return "2026-07-13T00:04:00Z" },
+    remote_refs: fn(_repo, _patterns) { return refs },
+    version_at_ref: fn(_slug, _ref) { return receipt.publication.version },
+    delete_ref: fn(_repo, ref, _expected_oid) {
+      refs = refs.filter({ candidate -> candidate.ref != ref }).to_list()
+      return {success: true, message: "deleted mock exact transient ref"}
+    },
+  }
+}
