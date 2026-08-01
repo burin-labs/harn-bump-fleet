@@ -486,7 +486,14 @@ it through rename-into-place after every snapshot, and may be restarted without
 repeating release preparation, tag creation, binary recovery dispatch, or an
 accepted warm-cache run. A normal invocation continues after release health is
 proven until the release PR merges and the warm matrix completes or fails. The
-warm dispatch runs on `main`; its receipt stores the source SHA observed by
+watcher prints semantic workflow/job transitions plus a five-minute heartbeat,
+including the active job step and receipt path, so a slow platform build remains
+visibly live without repeating identical state every 30 seconds. After terminal
+hosted proof, it discovers version-matched content-addressed `release-attempt/`
+and `release-certify/` refs, deletes each through an exact target lease, and
+persists an idempotent `.ref-cleanup.json` receipt. A moved ref blocks cleanup;
+`--no-ref-cleanup` explicitly retains recovery refs. The warm dispatch runs on
+`main`; its receipt stores the source SHA observed by
 GitHub, which may differ from the release commit after squash merge or later
 mainline changes. Hitting `--max-polls` returns a durable pending receipt;
 rerunning the command resumes the exact run ID. An all-skipped warm is recorded

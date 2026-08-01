@@ -1,9 +1,23 @@
 #!/usr/bin/env harn
 // Resume post-tag Harn release monitoring from a durable typed receipt.
 import { help_requested } from "std/cli/argparse"
+import { env_str } from "std/config"
 import { cli_options } from "lib/cli_options"
-import { release_watch_progress_lines } from "lib/release_watch_progress"
-import { mock_release_watch_adapter, run_release_watch } from "lib/release_watch_runtime"
+import {
+  mock_release_ref_cleanup_adapter,
+  release_ref_cleanup_receipt_path,
+  run_release_ref_cleanup,
+} from "lib/release_ref_cleanup"
+import {
+  release_watch_progress_key,
+  release_watch_progress_lines,
+  release_watch_progress_should_emit,
+} from "lib/release_watch_progress"
+import {
+  ReleaseWatchProgressSink,
+  mock_release_watch_adapter,
+  run_release_watch,
+} from "lib/release_watch_runtime"
 import {
   release_watch_receipt,
   release_watch_receipt_path,
@@ -22,6 +36,8 @@ pub type ReleaseWatchOptions = {
   no_recovery: bool,
   no_warm_cache: bool,
   no_pr_watchdog: bool,
+  no_ref_cleanup: bool,
+  repo: string,
   mock: bool,
   json: bool,
 }
@@ -38,6 +54,8 @@ const WATCH_ARG_SPEC = {
     {kind: "switch", name: "no_recovery", long: "--no-recovery"},
     {kind: "switch", name: "no_warm_cache", long: "--no-warm-cache"},
     {kind: "switch", name: "no_pr_watchdog", long: "--no-pr-watchdog"},
+    {kind: "switch", name: "no_ref_cleanup", long: "--no-ref-cleanup"},
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
     {kind: "switch", name: "mock", long: "--mock"},
     {kind: "switch", name: "json", long: "--json"},
   ],
@@ -79,6 +97,8 @@ Flags:
   --no-recovery         Observe only; do not dispatch binary recovery.
   --no-warm-cache       Do not dispatch the post-publish main-cache warm.
   --no-pr-watchdog      Do not re-arm the release pull request while polling.
+  --no-ref-cleanup      Retain transient release refs after terminal proof.
+  --repo PATH           Local Harn checkout used for exact leased ref cleanup.
   --mock                Rehearse release readiness and a successful five-job warm.
   --json                Print one machine-readable result.
 """
@@ -120,11 +140,19 @@ pipeline main() {
   }
   let receipt = release_watch_receipt_read(receipt_path)
   if receipt == nil && parsed.mock {
+    const mock_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    const mock_version = tag.substring(1)
     receipt = release_watch_receipt(
       {
         tag: tag,
         slug: "burin-labs/harn",
-        pin_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pin_sha: mock_head,
+        publication: {
+          version: mock_version,
+          local_branch: "release/${tag}",
+          remote_ref: "release-attempt/${tag}/${mock_head}",
+          head_oid: mock_head,
+        },
         pr_url: "https://github.com/burin-labs/harn/pull/1",
         created_at: "2026-07-13T00:00:00Z",
       },
@@ -141,6 +169,7 @@ pipeline main() {
   const no_recovery = observe_only || (parsed.no_recovery ?? false)
   const no_warm_cache = observe_only || (parsed.no_warm_cache ?? false)
   const no_pr_watchdog = observe_only || (parsed.no_pr_watchdog ?? false)
+  const no_ref_cleanup = observe_only || (parsed.no_ref_cleanup ?? false)
   if !parsed.json {
     harness.stdio.println("== watching ${tag}")
     harness.stdio.println("   receipt: ${receipt_path}")
@@ -151,25 +180,82 @@ pipeline main() {
   } else {
     nil
   }
-  const result = run_release_watch(
-    harness,
-    receipt,
-    receipt_path,
+  let last_progress_key = ""
+  let last_progress_poll = 0
+  const progress_sink: ReleaseWatchProgressSink? = if parsed.json {
+    nil
+  } else {
+    { progress, path, poll ->
+      if !release_watch_progress_should_emit(
+        last_progress_key,
+        progress,
+        poll,
+        last_progress_poll,
+      ) {
+        return nil
+      }
+      harness.stdio.println("== progress poll ${poll} at ${progress.observed_at}; receipt: ${path}")
+      for line in release_watch_progress_lines(progress) {
+        harness.stdio.println("   " + line)
+      }
+      last_progress_key = release_watch_progress_key(progress)
+      last_progress_poll = poll
+      return nil
+    }
+  }
+  const interval_ms = if parsed.mock {
+    0
+  } else {
+    interval_seconds * 1000
+  }
+  const runtime_options = if progress_sink != nil {
     {
       max_polls: max_polls,
-      interval_ms: if parsed.mock {
-        0
-      } else {
-        interval_seconds * 1000
-      },
+      interval_ms: interval_ms,
       dispatch_recovery: !no_recovery,
       dispatch_warm_cache: !no_warm_cache,
       keep_pr_armed: !no_pr_watchdog,
-    },
-    adapter,
-  )
+      on_progress: progress_sink,
+    }
+  } else {
+    {
+      max_polls: max_polls,
+      interval_ms: interval_ms,
+      dispatch_recovery: !no_recovery,
+      dispatch_warm_cache: !no_warm_cache,
+      keep_pr_armed: !no_pr_watchdog,
+    }
+  }
+  const result = run_release_watch(harness, receipt, receipt_path, runtime_options, adapter)
+  const repo = if trim(parsed.repo) != "" {
+    parsed.repo
+  } else {
+    path_join(env_str("HOME") ?? "", "projects/harn")
+  }
+  const cleanup = if result.status == 0
+    && result.receipt.warm_cache.state
+    == "completed"
+    && !no_ref_cleanup {
+    run_release_ref_cleanup(
+      result.receipt,
+      receipt_path,
+      repo,
+      if parsed.mock {
+        mock_release_ref_cleanup_adapter(result.receipt)
+      } else {
+        nil
+      },
+    )
+  } else {
+    nil
+  }
+  const final_status = if cleanup?.state == "blocked" {
+    2
+  } else {
+    result.status
+  }
   if parsed.json {
-    harness.stdio.println(json_stringify(result))
+    harness.stdio.println(json_stringify(result + {ref_cleanup: cleanup}))
   } else {
     harness.stdio.println("== ${result.state} after ${result.polls} poll(s)")
     harness.stdio.println("   warm    : ${result.receipt.warm_cache.state}")
@@ -179,9 +265,17 @@ pipeline main() {
       }
     }
     harness.stdio.println("   receipt: ${receipt_path}")
+    if cleanup != nil {
+      harness.stdio.println(
+        "   cleanup : ${cleanup.state} (${len(cleanup.refs)} exact ref(s)); receipt: "
+          + release_ref_cleanup_receipt_path(
+          receipt_path,
+        ),
+      )
+    }
     if trim(result.reason ?? "") != "" {
       harness.stdio.println("   reason : ${result.reason}")
     }
   }
-  return result.status
+  return final_status
 }
