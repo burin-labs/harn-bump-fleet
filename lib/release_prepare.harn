@@ -65,6 +65,15 @@ pub type ReleaseVersionPair = {current_version: string, next_version: string}
 
 pub type ReleaseFixupPrepareCommits = {success: bool, commits: list<string>, stderr: string}
 
+pub type ReleaseFixupConflictAction = "not_needed" | "resolved" | "fail"
+
+pub type ReleaseFixupConflictResolution = {
+  success: bool,
+  action: ReleaseFixupConflictAction,
+  paths: list<string>,
+  reason: string,
+}
+
 pub type ReleaseFixupBinaryRequest = {
   harness: Harness,
   config: ReleasePrepareAuditConfig,
@@ -465,6 +474,124 @@ fn fixup_cherry_pick_argv(commits: list<string>) -> list<string> {
   return ["git", "cherry-pick", "--no-commit", "--strategy-option=ours"] + commits
 }
 
+fn safe_release_fragment_path(path: string) -> bool {
+  if !starts_with(path, "changelog.d/") || contains(path, "\0") {
+    return false
+  }
+  for component in split(path, "/") {
+    if component == "" || component == "." || component == ".." {
+      return false
+    }
+  }
+  return true
+}
+
+/** True only for an ours-side modification and incoming deletion of a release fragment. */
+pub fn release_fixup_fragment_delete_conflict_allowed(path: string, stages: list<string>) -> bool {
+  return safe_release_fragment_path(path) && stages == ["1", "2"]
+}
+
+fn unmerged_release_fragment_paths(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseFixupConfig,
+) -> ReleaseFixupConflictResolution {
+  const unmerged = run_git(harness, cfg, ["diff", "--name-only", "--diff-filter=U", "-z"])
+  if !unmerged.success {
+    return {success: false, action: "fail", paths: [], reason: "could not inspect conflicts"}
+  }
+  const paths = split(unmerged.stdout ?? "", "\0").filter({ path -> path != "" }).to_list()
+  if len(paths) == 0 {
+    return {
+      success: false,
+      action: "fail",
+      paths: [],
+      reason: "cherry-pick failed without an unmerged path",
+    }
+  }
+  for path in paths {
+    if !safe_release_fragment_path(path) {
+      return {
+        success: false,
+        action: "fail",
+        paths: paths,
+        reason: "refusing non-fragment or unsafe conflict path: ${path}",
+      }
+    }
+    const entries = run_git(harness, cfg, ["ls-files", "-u", "-z", "--", path])
+    if !entries.success {
+      return {
+        success: false,
+        action: "fail",
+        paths: paths,
+        reason: "could not inspect conflict stages for ${path}",
+      }
+    }
+    let stages: list<string> = []
+    for entry in split(entries.stdout ?? "", "\0").filter({ row -> row != "" }) {
+      const columns = split(entry, "\t")
+      const metadata = split(columns[0] ?? "", " ")
+      if len(columns) != 2 || columns[1] != path || len(metadata) != 3 {
+        return {
+          success: false,
+          action: "fail",
+          paths: paths,
+          reason: "malformed conflict stage for ${path}",
+        }
+      }
+      stages = stages + [metadata[2] ?? ""]
+    }
+    if !release_fixup_fragment_delete_conflict_allowed(path, stages) {
+      return {
+        success: false,
+        action: "fail",
+        paths: paths,
+        reason: "${path} is not an exact incoming-deletion conflict (stages=${stages})",
+      }
+    }
+  }
+  return {
+    success: true,
+    action: "resolved",
+    paths: paths,
+    reason: "accepted immutable release deletions for ${len(paths)} shipped fragment conflict(s)",
+  }
+}
+
+fn resolve_release_fragment_delete_conflicts(
+  git_tools: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseFixupConfig,
+) -> ReleaseFixupConflictResolution {
+  const probe = unmerged_release_fragment_paths(git_tools, cfg)
+  if !probe.success {
+    return probe
+  }
+  for path in probe.paths {
+    const removed = run_git(git_tools, cfg, ["rm", "--", path])
+    if !removed.success {
+      return {
+        success: false,
+        action: "fail",
+        paths: probe.paths,
+        reason: "could not stage deletion: ${path}",
+      }
+    }
+  }
+  const residual = run_git(git_tools, cfg, ["diff", "--name-only", "--diff-filter=U", "-z"])
+  if !residual.success || trim(replace(residual.stdout ?? "", "\0", "")) != "" {
+    return {success: false, action: "fail", paths: probe.paths, reason: "unmerged paths remain"}
+  }
+  const quit = run_git(git_tools, cfg, ["cherry-pick", "--quit"])
+  if !quit.success {
+    return {
+      success: false,
+      action: "fail",
+      paths: probe.paths,
+      reason: "could not finalize no-commit replay",
+    }
+  }
+  return probe
+}
+
 /**
  * Reconcile the fresh base through Harn's canonical version-preparation owner
  * before replaying an older immutable release attempt.
@@ -550,27 +677,49 @@ fn execute_fixup_cherry_pick_commits(
       commit_count: len(commits),
     },
   )
-  const result = append_command_step(
-    harness,
-    cfg,
-    steps,
-    "fixup-cherry-pick-prepare-commits",
-    cherry_argv,
-  )
+  const cherry = run_git({env: harness.env, process: harness.process}, cfg, cherry_argv)
+  let reconciliation: ReleaseFixupConflictResolution = {
+    success: true,
+    action: "not_needed",
+    paths: [],
+    reason: "cherry-pick applied without conflicts",
+  }
+  if !cherry.success {
+    reconciliation = resolve_release_fragment_delete_conflicts(
+      {env: harness.env, process: harness.process},
+      cfg,
+    )
+  }
+  const final_result = if cherry.success || reconciliation.success {
+    command_result_ok(reconciliation.reason)
+  } else {
+    command_result_fail(
+      cherry.exit_code ?? 1,
+      trim(cherry.stderr ?? "") + "\n" + reconciliation.reason,
+    )
+  }
+  const result_steps = steps
+    + [
+    {
+      ...recorded_step("fixup-cherry-pick-prepare-commits", cherry_argv, final_result),
+      reconciliation: reconciliation,
+    },
+  ]
   release_log_event(
     {clock: harness.clock, fs: harness.fs},
     run_id,
     "step_finished",
     {
       step: "fixup-cherry-pick-prepare-commits",
-      success: result.success,
-      status: result.status,
-      exit_code: result.exit_code,
+      success: final_result.success,
+      status: final_result.status,
+      exit_code: final_result.exit_code,
       commit_count: len(commits),
+      reconciliation: reconciliation,
     },
   )
-  if result.success {
-    return result.steps
+  if final_result.success {
+    return result_steps
   }
   // Failure leaves CHERRY_PICK_HEAD set, which would block the next run.
   // Abort defensively; `|| true` keeps the cleanup itself from masking
@@ -578,7 +727,7 @@ fn execute_fixup_cherry_pick_commits(
   const abort = append_command_step(
     harness,
     cfg,
-    result.steps,
+    result_steps,
     "fixup-cherry-pick-abort",
     "git cherry-pick --abort 2>/dev/null || true",
   )
