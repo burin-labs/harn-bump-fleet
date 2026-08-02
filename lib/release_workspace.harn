@@ -1,6 +1,12 @@
 import { command_result_fail, command_result_ok } from "std/command"
 import { recorded_step } from "./release_execution"
-import { ReleaseConfig, checked_git, release_log_event, run_git } from "./release_runtime"
+import {
+  ReleaseAnalysisSnapshot,
+  ReleaseConfig,
+  checked_git,
+  release_log_event,
+  run_git,
+} from "./release_runtime"
 
 pub type ReleaseSourceSnapshot = {
   branch: string,
@@ -51,7 +57,57 @@ pub fn release_post_cleanup_config(
 }
 
 pub fn release_workspace_required(cfg: dict) -> bool {
-  return !(cfg.mock ?? false) && cfg.mode != "audit" && (cfg.yes_live_release ?? false)
+  return !(cfg.mock ?? false)
+}
+
+/**
+ * Return the closed identity consumed by release analysis.
+ *
+ * Non-mock analysis is invalid until the exact resolved commit has been
+ * materialized in a detached managed worktree. This runtime assertion keeps a
+ * future caller from silently feeding analysis the operator's mutable checkout.
+ */
+pub fn release_analysis_snapshot(cfg: ReleaseConfig) -> ReleaseAnalysisSnapshot {
+  let snapshot = cfg.analysis_snapshot
+  if cfg.mock {
+    if snapshot.kind != "mock"
+      || snapshot.resolved_sha
+      != cfg.pin_sha
+      || snapshot.analysis_root
+      != cfg.repo {
+      throw "mock release analysis is missing its resolved snapshot identity"
+    }
+    snapshot["analysis_head"] = cfg.pin_sha
+    return snapshot
+  }
+  if snapshot.kind != "detached_worktree"
+    || !(cfg.release_workspace_managed ?? false)
+    || snapshot.analysis_root
+    != cfg.repo
+    || snapshot.analysis_root
+    != cfg.release_workspace
+    || snapshot.source_repo
+    != cfg.source_repo {
+    throw "release analysis requires one detached worktree at the resolved pin"
+  }
+  const expected_head = if cfg.pre_tag_resume ?? false {
+    trim(cfg.fixup_publication?.head_oid ?? "")
+  } else {
+    cfg.pin_sha
+  }
+  const analysis_head = checked_git(cfg, ["rev-parse", "HEAD"])
+  if expected_head == ""
+    || lowercase(analysis_head)
+    != lowercase(expected_head)
+    || (!(cfg.pre_tag_resume ?? false)
+    && lowercase(snapshot.resolved_sha)
+    != lowercase(
+    cfg.pin_sha,
+  )) {
+    throw "release analysis worktree does not match its immutable snapshot identity"
+  }
+  snapshot["analysis_head"] = analysis_head
+  return snapshot
 }
 
 fn source_cfg(cfg: dict, repo: string) -> dict {
@@ -118,10 +174,20 @@ pub fn materialize_release_workspace(
   cfg: ReleaseConfig,
   run_id: string,
 ) -> ReleaseConfig {
-  if !release_workspace_required(cfg) {
-    return cfg
+  if cfg.mock {
+    let mock_cfg = cfg
+    mock_cfg["analysis_snapshot"] = {
+      kind: "mock",
+      requested_sha: cfg.pin_sha_input,
+      resolved_sha: cfg.pin_sha,
+      analysis_head: cfg.pin_sha,
+      analysis_root: cfg.repo,
+      source_repo: cfg.repo,
+    }
+    return mock_cfg
   }
   if cfg.release_workspace_managed ?? false {
+    release_analysis_snapshot(cfg)
     return cfg
   }
   const source_repo = checked_git(cfg, ["rev-parse", "--show-toplevel"])
@@ -138,34 +204,57 @@ pub fn materialize_release_workspace(
   if !added.success {
     throw "failed to create isolated release workspace at ${workspace}:\n${trim(added.stderr)}"
   }
-  const after = source_snapshot(cfg, source_repo)
-  assert_source_unchanged(before, after, workspace)
-  const workspace_cfg = source_cfg(cfg, workspace)
-  const workspace_head = checked_git(workspace_cfg, ["rev-parse", "HEAD"])
-  const workspace_branch = checked_git(workspace_cfg, ["branch", "--show-current"])
-  if lowercase(workspace_head) != lowercase(cfg.pin_sha) || workspace_branch != "" {
-    throw "isolated release workspace did not materialize detached at frozen pin ${cfg.pin_sha}: ${workspace}"
-  }
-  let out = cfg
-  out["source_repo"] = source_repo
-  out["repo"] = workspace
-  out["release_workspace"] = workspace
-  out["release_workspace_managed"] = true
-  release_log_event(
-    harness,
-    run_id,
-    "release_workspace_created",
-    {
+  try {
+    const after = source_snapshot(cfg, source_repo)
+    assert_source_unchanged(before, after, workspace)
+    const workspace_cfg = source_cfg(cfg, workspace)
+    const workspace_head = checked_git(workspace_cfg, ["rev-parse", "HEAD"])
+    const workspace_branch = checked_git(workspace_cfg, ["branch", "--show-current"])
+    if lowercase(workspace_head) != lowercase(cfg.pin_sha) || workspace_branch != "" {
+      throw "isolated release workspace did not materialize detached at frozen pin ${cfg.pin_sha}: ${workspace}"
+    }
+    let out = cfg
+    out["source_repo"] = source_repo
+    out["repo"] = workspace
+    out["release_workspace"] = workspace
+    out["release_workspace_managed"] = true
+    out["analysis_snapshot"] = {
+      kind: "detached_worktree",
+      requested_sha: cfg.pin_sha_input,
+      resolved_sha: cfg.pin_sha,
+      analysis_head: cfg.pin_sha,
+      analysis_root: workspace,
       source_repo: source_repo,
-      workspace: workspace,
-      pin_sha: cfg.pin_sha,
-      source_branch: before.branch,
-      source_head: before.head,
-      source_dirty: trim(before.status) != "",
-      cargo_target_dir: cfg.release_cargo_target_dir,
-    },
-  )
-  return out
+    }
+    release_log_event(
+      harness,
+      run_id,
+      "release_workspace_created",
+      {
+        source_repo: source_repo,
+        workspace: workspace,
+        pin_sha: cfg.pin_sha,
+        source_branch: before.branch,
+        source_head: before.head,
+        source_dirty: trim(before.status) != "",
+        cargo_target_dir: cfg.release_cargo_target_dir,
+      },
+    )
+    return out
+  } catch (e) {
+    const removed = run_git(
+      source_cfg(cfg, source_repo),
+      ["worktree", "remove", "--force", workspace],
+    )
+    if !removed.success || harness.fs.exists(workspace) {
+      throw to_string(e)
+        + "\nfailed to remove partially materialized release workspace ${workspace}: "
+        + trim(
+        removed.stderr,
+      )
+    }
+    throw e
+  }
 }
 
 /** Candidate certification warms and audits the immutable attempt at HEAD. */
@@ -220,7 +309,105 @@ fn preservation_cleanup(
   }
 }
 
-/** Remove only a clean, successfully shipped disposable worktree. */
+fn assert_release_workspace_target(cfg: ReleaseConfig, run_id: string) -> nil {
+  const workspace = cfg.release_workspace
+  if trim(cfg.source_repo) == "" || cfg.repo != workspace {
+    throw "managed release workspace identity is incomplete"
+  }
+  const expected = release_workspace_path(cfg, cfg.source_repo, run_id)
+  if workspace != expected {
+    throw "refusing to remove a release workspace not owned by run ${run_id}: ${workspace}"
+  }
+  return nil
+}
+
+fn removal_cleanup(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+  branch: string,
+  force: bool,
+) -> ReleaseWorkspaceCleanup {
+  assert_release_workspace_target(cfg, run_id)
+  const workspace = cfg.release_workspace
+  if !harness.fs.exists(workspace) {
+    const detail = "isolated release workspace already removed: ${workspace}"
+    const cleanup: ReleaseWorkspaceCleanup = {
+      success: true,
+      skipped: true,
+      branch: branch,
+      detail: detail,
+      warning: "",
+      fatal: false,
+      steps: [
+        recorded_step(
+          "release-workspace-already-removed",
+          "verify absent " + workspace,
+          command_result_ok(detail),
+        ),
+      ],
+      path: workspace,
+      preserved: false,
+    }
+    release_log_event(harness, run_id, "release_workspace_already_removed", cleanup)
+    return cleanup
+  }
+  const remove_args = ["worktree", "remove"]
+    + if force {
+    ["--force"]
+  } else {
+    []
+  }
+    + [workspace]
+  const removed = run_git(source_cfg(cfg, cfg.source_repo), remove_args)
+  const removed_cleanly = removed.success && !harness.fs.exists(workspace)
+  const detail = if removed_cleanly {
+    "removed isolated release workspace ${workspace}"
+  } else {
+    "failed to remove isolated release workspace; preserved for recovery: ${workspace}"
+  }
+  const cleanup: ReleaseWorkspaceCleanup = {
+    success: removed_cleanly,
+    skipped: !removed_cleanly,
+    branch: branch,
+    detail: detail,
+    warning: if removed_cleanly {
+      ""
+    } else {
+      "non-fatal release workspace cleanup warning: " + detail
+    },
+    fatal: false,
+    steps: [
+      recorded_step(
+        "remove-release-workspace",
+        "git worktree remove " + workspace,
+        if removed_cleanly {
+          command_result_ok(detail)
+        } else {
+          command_result_fail(removed.exit_code ?? 1, removed.stderr)
+        },
+      ),
+    ],
+    path: workspace,
+    preserved: !removed_cleanly,
+  }
+  release_log_event(
+    harness,
+    run_id,
+    if removed_cleanly {
+      "release_workspace_removed"
+    } else {
+      "release_workspace_preserved"
+    },
+    cleanup,
+  )
+  return cleanup
+}
+
+/**
+ * Remove audit snapshots on every terminal path. Preserve live workspaces when
+ * they contain recovery state; remove only a clean, successfully shipped one.
+ */
 pub fn finish_release_workspace(
   harness: Harness,
   cfg: ReleaseConfig,
@@ -231,8 +418,15 @@ pub fn finish_release_workspace(
     return nil
   }
   const workspace = cfg.release_workspace
-  const branch_result = run_git(cfg, ["branch", "--show-current"])
-  const branch = trim(branch_result.stdout ?? "")
+  assert_release_workspace_target(cfg, run_id)
+  const branch = if harness.fs.exists(workspace) {
+    trim(run_git(cfg, ["branch", "--show-current"]).stdout ?? "")
+  } else {
+    ""
+  }
+  if cfg.mode == "audit" {
+    return removal_cleanup(harness, cfg, run_id, branch, true)
+  }
   if !ship_succeeded || cfg.mode != "ship-pr" {
     const reason = if cfg.mode == "prepare" && ship_succeeded {
       "prepared release workspace preserved for inspection and continuation: ${workspace}"
@@ -283,47 +477,5 @@ pub fn finish_release_workspace(
     release_log_event(harness, run_id, "release_workspace_preserved", cleanup)
     return cleanup
   }
-  const removed = run_git(source_cfg(cfg, cfg.source_repo), ["worktree", "remove", workspace])
-  const removed_cleanly = removed.success && !harness.fs.exists(workspace)
-  const detail = if removed_cleanly {
-    "removed clean isolated release workspace ${workspace}"
-  } else {
-    "failed to remove isolated release workspace; preserved for recovery: ${workspace}"
-  }
-  const cleanup: ReleaseWorkspaceCleanup = {
-    success: removed_cleanly,
-    skipped: !removed_cleanly,
-    branch: branch,
-    detail: detail,
-    warning: if removed_cleanly {
-      ""
-    } else {
-      "non-fatal release workspace cleanup warning: " + detail
-    },
-    fatal: false,
-    steps: [
-      recorded_step(
-        "remove-release-workspace",
-        "git worktree remove " + workspace,
-        if removed_cleanly {
-          command_result_ok(detail)
-        } else {
-          command_result_fail(removed.exit_code ?? 1, removed.stderr)
-        },
-      ),
-    ],
-    path: workspace,
-    preserved: !removed_cleanly,
-  }
-  release_log_event(
-    harness,
-    run_id,
-    if removed_cleanly {
-      "release_workspace_removed"
-    } else {
-      "release_workspace_preserved"
-    },
-    cleanup,
-  )
-  return cleanup
+  return removal_cleanup(harness, cfg, run_id, branch, false)
 }
