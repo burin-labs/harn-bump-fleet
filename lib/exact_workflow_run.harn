@@ -1,0 +1,434 @@
+/** Exact provider identity for one idempotently acquired workflow run. */
+pub type ExactWorkflowRunRequest = {
+  repo: string,
+  workflow_path: string,
+  ref: string,
+  head_sha: string,
+}
+
+pub type ExactWorkflowRunAction = "reuse_success" | "reuse_active" | "rerun_failed" | "dispatch_new"
+
+pub type ExactWorkflowRunSelectionReason = "successful_exact_run" \
+  | "active_exact_run" \
+  | "retryable_failed_run" \
+  | "no_reusable_exact_run" \
+  | "nonretryable_terminal_run" \
+  | "concurrent_exact_run"
+
+pub type ExactWorkflowRunErrorCode = "run_list_failed" \
+  | "run_attempt_missing" \
+  | "duplicate_cancel_failed" \
+  | "rerun_failed" \
+  | "rerun_identity_invalid" \
+  | "dispatch_failed" \
+  | "dispatch_identity_invalid" \
+  | "dispatch_reconciliation_failed"
+
+/**
+ * Dispatch-shaped receipt consumed by the certification proof. `run_attempt`
+ * is the exact attempt that must become visible before the proof may close.
+ */
+pub type ExactWorkflowRunAcquisition = {
+  action: ExactWorkflowRunAction,
+  selection_reason: ExactWorkflowRunSelectionReason,
+  reused: bool,
+  run_id: int,
+  workflow_path: string,
+  run_attempt: int,
+  ref: string,
+  head_sha: string,
+  event: "workflow_dispatch",
+  url: string,
+  cancellations: list<dict>,
+}
+
+pub type ExactWorkflowRunProvider = {
+  list: fn(ExactWorkflowRunRequest) -> Result<dict, dict>,
+  dispatch: fn(ExactWorkflowRunRequest) -> Result<dict, dict>,
+  rerun: fn(int) -> Result<dict, dict>,
+  cancel: fn(int) -> Result<dict, dict>,
+  wait: fn(int) -> nil,
+}
+
+const ACTIVE_STATUSES = ["queued", "in_progress", "waiting", "pending", "requested"]
+
+const RETRYABLE_CONCLUSIONS = ["failure", "cancelled", "timed_out", "startup_failure", "stale"]
+
+fn acquisition_error(code: ExactWorkflowRunErrorCode, message: string, details: dict = {}) {
+  return Err({code: code, message: message} + details)
+}
+
+fn exact_run(request: ExactWorkflowRunRequest, run) -> bool {
+  return run.workflow_path == request.workflow_path
+    && run.event == "workflow_dispatch"
+    && run.head_sha == request.head_sha
+    && run.head_branch == request.ref
+    && to_int(run.id) != nil
+    && (to_int(run.id) ?? 0) > 0
+    && trim(run.url ?? "") != ""
+}
+
+fn exact_runs(request: ExactWorkflowRunRequest, response) -> list<dict> {
+  return (response?.runs ?? []).filter({ run -> exact_run(request, run) }).sort_by(
+    { run -> to_int(run.id) ?? 0 },
+  )
+    .to_list()
+}
+
+fn successful_runs(runs: list<dict>) -> list<dict> {
+  return runs.filter({ run -> run.status == "completed" && run.conclusion == "success" }).to_list()
+}
+
+fn active_runs(runs: list<dict>) -> list<dict> {
+  return runs.filter({ run -> ACTIVE_STATUSES.contains(run.status) }).to_list()
+}
+
+fn retryable_runs(runs: list<dict>) -> list<dict> {
+  return runs.filter(
+    { run -> run.status == "completed" && RETRYABLE_CONCLUSIONS.contains(run.conclusion ?? "") },
+  )
+    .to_list()
+}
+
+fn has_nonretryable_terminal_run(runs: list<dict>) -> bool {
+  return runs.any(
+    { run ->
+      run.status == "completed" && run.conclusion != "success"
+        && !RETRYABLE_CONCLUSIONS.contains(
+        run.conclusion ?? "",
+      )
+    },
+  )
+}
+
+fn acquisition_from_run(
+  request: ExactWorkflowRunRequest,
+  action: ExactWorkflowRunAction,
+  selection_reason: ExactWorkflowRunSelectionReason,
+  run,
+  run_attempt: int,
+  cancellations: list<dict>,
+) -> ExactWorkflowRunAcquisition {
+  return {
+    action: action,
+    selection_reason: selection_reason,
+    reused: action != "dispatch_new",
+    run_id: run.id,
+    workflow_path: request.workflow_path,
+    run_attempt: run_attempt,
+    ref: request.ref,
+    head_sha: request.head_sha,
+    event: "workflow_dispatch",
+    url: run.url,
+    cancellations: cancellations,
+  }
+}
+
+fn cancel_others(
+  provider: ExactWorkflowRunProvider,
+  runs: list<dict>,
+  selected_run_id: int,
+) -> Result<list<dict>, dict> {
+  let receipts: list<dict> = []
+  for run in runs {
+    if run.id == selected_run_id {
+      continue
+    }
+    const cancelled = provider.cancel(run.id)
+    if is_err(cancelled) {
+      return acquisition_error(
+        "duplicate_cancel_failed",
+        "could not cancel duplicate exact workflow run",
+        {selected_run_id: selected_run_id, duplicate_run_id: run.id, cause: unwrap_err(cancelled)},
+      )
+    }
+    receipts = receipts + [unwrap(cancelled)]
+  }
+  return Ok(receipts)
+}
+
+fn list_exact(
+  request: ExactWorkflowRunRequest,
+  provider: ExactWorkflowRunProvider,
+) -> Result<list<dict>, dict> {
+  const listed = provider.list(request)
+  if is_err(listed) {
+    return acquisition_error(
+      "run_list_failed",
+      "could not list exact workflow runs",
+      {cause: unwrap_err(listed)},
+    )
+  }
+  return Ok(exact_runs(request, unwrap(listed)))
+}
+
+fn reuse_existing(
+  request: ExactWorkflowRunRequest,
+  provider: ExactWorkflowRunProvider,
+  runs: list<dict>,
+) -> Result<ExactWorkflowRunAcquisition?, dict> {
+  const successes = successful_runs(runs)
+  if len(successes) > 0 {
+    const selected = successes[len(successes) - 1]
+    const attempt = to_int(selected.run_attempt)
+    if attempt == nil || attempt < 1 {
+      return acquisition_error(
+        "run_attempt_missing",
+        "successful exact workflow run omitted run_attempt",
+        {run_id: selected.id},
+      )
+    }
+    const cancelled = cancel_others(provider, active_runs(runs), selected.id)
+    if is_err(cancelled) {
+      return Err(unwrap_err(cancelled))
+    }
+    return Ok(
+      acquisition_from_run(
+        request,
+        "reuse_success",
+        "successful_exact_run",
+        selected,
+        attempt,
+        unwrap(cancelled),
+      ),
+    )
+  }
+  const active = active_runs(runs)
+  if len(active) > 0 {
+    // The oldest active exact run is the deterministic winner across callers.
+    const selected = active[0]
+    const attempt = to_int(selected.run_attempt)
+    if attempt == nil || attempt < 1 {
+      return acquisition_error(
+        "run_attempt_missing",
+        "active exact workflow run omitted run_attempt",
+        {run_id: selected.id},
+      )
+    }
+    const cancelled = cancel_others(provider, active, selected.id)
+    if is_err(cancelled) {
+      return Err(unwrap_err(cancelled))
+    }
+    return Ok(
+      acquisition_from_run(
+        request,
+        "reuse_active",
+        "active_exact_run",
+        selected,
+        attempt,
+        unwrap(cancelled),
+      ),
+    )
+  }
+  const retryable = retryable_runs(runs)
+  if len(retryable) == 0 {
+    return Ok(nil)
+  }
+  const selected = retryable[len(retryable) - 1]
+  const prior_attempt = to_int(selected.run_attempt)
+  if prior_attempt == nil || prior_attempt < 1 {
+    return acquisition_error(
+      "run_attempt_missing",
+      "retryable exact workflow run omitted run_attempt",
+      {run_id: selected.id},
+    )
+  }
+  const rerun = provider.rerun(selected.id)
+  if is_err(rerun) {
+    return acquisition_error(
+      "rerun_failed",
+      "could not rerun exact failed workflow attempt",
+      {run_id: selected.id, cause: unwrap_err(rerun)},
+    )
+  }
+  const receipt = unwrap(rerun)
+  if receipt.run_id != selected.id || !(receipt.accepted ?? false) {
+    return acquisition_error(
+      "rerun_identity_invalid",
+      "rerun receipt did not bind the selected exact run",
+      {run_id: selected.id, receipt: receipt},
+    )
+  }
+  return Ok(
+    acquisition_from_run(
+      request,
+      "rerun_failed",
+      "retryable_failed_run",
+      selected,
+      prior_attempt + 1,
+      [],
+    ),
+  )
+}
+
+fn cancellation_evidence(provider: ExactWorkflowRunProvider, run_id: int) -> dict {
+  const cancelled = provider.cancel(run_id)
+  if is_err(cancelled) {
+    return {run_id: run_id, accepted: false, error: unwrap_err(cancelled)}
+  }
+  return unwrap(cancelled)
+}
+
+fn reconcile_dispatch(
+  request: ExactWorkflowRunRequest,
+  provider: ExactWorkflowRunProvider,
+  dispatched,
+  dispatch_reason: ExactWorkflowRunSelectionReason,
+) -> Result<ExactWorkflowRunAcquisition, dict> {
+  // Give concurrently dispatched runs a bounded provider-visibility window,
+  // then elect the oldest active exact run and cancel every sibling.
+  provider.wait(1000)
+  const listed = list_exact(request, provider)
+  if is_err(listed) {
+    return acquisition_error(
+      "dispatch_reconciliation_failed",
+      "could not reconcile concurrently dispatched exact runs",
+      {
+        run_id: dispatched.run_id,
+        cleanup: cancellation_evidence(provider, dispatched.run_id),
+        cause: unwrap_err(listed),
+      },
+    )
+  }
+  let active = active_runs(unwrap(listed))
+  const successes = successful_runs(unwrap(listed))
+  if !active.any({ run -> run.id == dispatched.run_id })
+    && !successes.any(
+    { run -> run.id == dispatched.run_id },
+  ) {
+    active = active
+      + [
+      {
+        id: dispatched.run_id,
+        run_attempt: dispatched.run_attempt,
+        workflow_path: request.workflow_path,
+        event: "workflow_dispatch",
+        status: "queued",
+        conclusion: nil,
+        head_branch: request.ref,
+        head_sha: request.head_sha,
+        url: dispatched.url,
+      },
+    ]
+    active = active.sort_by({ run -> to_int(run.id) ?? 0 }).to_list()
+  }
+  if len(successes) > 0 {
+    const selected = successes[len(successes) - 1]
+    const selected_attempt = to_int(selected.run_attempt)
+    if selected_attempt == nil || selected_attempt < 1 {
+      return acquisition_error(
+        "run_attempt_missing",
+        "reconciled successful workflow run omitted run_attempt",
+        {run_id: selected.id},
+      )
+    }
+    const cancelled = cancel_others(provider, active, selected.id)
+    if is_err(cancelled) {
+      return Err(unwrap_err(cancelled))
+    }
+    return Ok(
+      acquisition_from_run(
+        request,
+        "reuse_success",
+        "concurrent_exact_run",
+        selected,
+        selected_attempt,
+        unwrap(cancelled),
+      ),
+    )
+  }
+  const selected = active[0]
+  const selected_attempt = to_int(selected.run_attempt)
+  if selected_attempt == nil || selected_attempt < 1 {
+    return acquisition_error(
+      "run_attempt_missing",
+      "reconciled exact workflow run omitted run_attempt",
+      {run_id: selected.id},
+    )
+  }
+  const cancelled = cancel_others(provider, active, selected.id)
+  if is_err(cancelled) {
+    return Err(unwrap_err(cancelled))
+  }
+  let selected_reason: ExactWorkflowRunSelectionReason = dispatch_reason
+  if selected.id != dispatched.run_id {
+    selected_reason = "concurrent_exact_run"
+  }
+  return Ok(
+    acquisition_from_run(
+      request,
+      if selected.id == dispatched.run_id {
+        "dispatch_new"
+      } else {
+        "reuse_active"
+      },
+      selected_reason,
+      selected,
+      selected_attempt,
+      unwrap(cancelled),
+    ),
+  )
+}
+
+/**
+ * Acquire one exact workflow run. Repeated and concurrent callers converge on
+ * the same active run; failed attempts rerun the same run ID.
+ */
+pub fn acquire_exact_workflow_run(
+  request: ExactWorkflowRunRequest,
+  provider: ExactWorkflowRunProvider,
+) -> Result<ExactWorkflowRunAcquisition, dict> {
+  const listed = list_exact(request, provider)
+  if is_err(listed) {
+    return Err(unwrap_err(listed))
+  }
+  const initial_runs = unwrap(listed)
+  const reused = reuse_existing(request, provider, initial_runs)
+  if is_err(reused) {
+    return Err(unwrap_err(reused))
+  }
+  if unwrap(reused) != nil {
+    return Ok(unwrap(reused))
+  }
+  const dispatched = provider.dispatch(request)
+  if is_err(dispatched) {
+    return acquisition_error(
+      "dispatch_failed",
+      "could not dispatch exact workflow run",
+      {cause: unwrap_err(dispatched)},
+    )
+  }
+  const receipt = unwrap(dispatched)
+  if receipt.run_id == nil || receipt.run_id < 1 || receipt.workflow_path != request.workflow_path
+    || receipt
+    .ref
+    != request.ref
+    || receipt.head_sha
+    != request.head_sha
+    || receipt.event
+    != "workflow_dispatch"
+    || receipt.run_attempt
+    == nil
+    || receipt.run_attempt
+    < 1
+    || trim(receipt.url ?? "")
+    == "" {
+    return acquisition_error(
+      "dispatch_identity_invalid",
+      "dispatch receipt omitted exact workflow identity",
+      {
+        receipt: receipt,
+        cleanup: if (to_int(receipt.run_id) ?? 0) > 0 {
+          cancellation_evidence(provider, to_int(receipt.run_id) ?? 0)
+        } else {
+          nil
+        },
+      },
+    )
+  }
+  let dispatch_reason: ExactWorkflowRunSelectionReason = "no_reusable_exact_run"
+  if has_nonretryable_terminal_run(initial_runs) {
+    dispatch_reason = "nonretryable_terminal_run"
+  }
+  return reconcile_dispatch(request, provider, receipt, dispatch_reason)
+}
