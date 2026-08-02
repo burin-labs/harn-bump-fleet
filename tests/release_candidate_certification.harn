@@ -1,0 +1,146 @@
+import { command_run } from "std/command"
+import { PlatformCertificationCancellationReceipt } from "../lib/platform_certification"
+import {
+  CandidateCertificationLaneName,
+  CertificationCleanup,
+  run_candidate_certification_lanes,
+} from "../lib/release_candidate_certification"
+
+fn wall_clock_ms(clock: HarnessClock) -> int {
+  return (to_int(date_parse(clock.date_iso())) ?? 0) * 1000
+}
+
+fn process_exists(tools: HarnessTools, pid: string) -> bool {
+  return command_run(tools, ["kill", "-0", pid]).success
+}
+
+fn mock_cleanup(lane: CandidateCertificationLaneName) -> CertificationCleanup {
+  if lane != "platform" {
+    return []
+  }
+  const receipt: PlatformCertificationCancellationReceipt = {
+    platform: "windows",
+    run_id: 42,
+    success: true,
+    provider: "mock",
+    receipt: nil,
+    error: nil,
+  }
+  return [receipt]
+}
+
+pipeline test_candidate_failure_cancels_running_sibling_process_group(harness: Harness, task) {
+  const fixture_id = harness.random.uuid_v7()
+  const pids_path = path_join(harness.fs.temp_dir(), "candidate-lanes-${fixture_id}.pids")
+  const leaked_path = path_join(harness.fs.temp_dir(), "candidate-lanes-${fixture_id}.leaked")
+  const started_at_ms = wall_clock_ms(harness.clock)
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    { name ->
+      if name == "binary_size" {
+        const deadline_ms = wall_clock_ms(harness.clock) + 5000
+        while !harness.fs.exists(pids_path) && wall_clock_ms(harness.clock) < deadline_ms {
+          harness.clock.sleep_ms(10)
+        }
+        if !harness.fs.exists(pids_path) {
+          throw "platform fixture did not start"
+        }
+        return {success: false, steps: [], evidence: nil, error: "terminal binary-size failure"}
+      }
+      const command = command_run(
+        harness.tools,
+        [
+          "sh",
+          "-c",
+          "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > \"$1\"; wait \"$child\"; printf leaked > \"$2\"",
+          "candidate-platform-fixture",
+          pids_path,
+          leaked_path,
+        ],
+        {timeout_ms: 35000},
+      )
+      return {
+        success: command.success,
+        steps: [],
+        evidence: nil,
+        error: "platform fixture unexpectedly completed",
+      }
+    },
+    fn() { return wall_clock_ms(harness.clock) },
+    fn(request) { return mock_cleanup(request.lane) },
+  )
+  const elapsed_ms = wall_clock_ms(harness.clock) - started_at_ms
+  assert_eq(
+    run.abort_reason,
+    {kind: "lane_failed", lane: "binary_size", cause: "terminal binary-size failure"},
+  )
+  assert_eq(run.lanes.map({ lane -> lane.status }).to_list(), ["cancelled", "failed"])
+  assert_eq(
+    run.lanes[0]?.cancellation,
+    {kind: "sibling_failure", cause: "terminal binary-size failure"},
+  )
+  assert_eq(
+    run.lanes[0]?.cleanup,
+    [{platform: "windows", run_id: 42, success: true, provider: "mock", receipt: nil, error: nil}],
+  )
+  assert_eq(run.lanes[1]?.error, "terminal binary-size failure")
+  assert(elapsed_ms < 5000, "sibling cancellation took ${elapsed_ms}ms")
+  assert_eq(harness.fs.exists(leaked_path), false)
+  const pids = split(trim(harness.fs.read_text(pids_path)), " ")
+  assert_eq(len(pids), 2)
+  harness.clock.sleep_ms(100)
+  assert_eq(process_exists(harness.tools, pids[0]), false)
+  assert_eq(process_exists(harness.tools, pids[1]), false)
+}
+
+pipeline test_candidate_lane_success_receipts_preserve_input_order(harness: Harness, task) {
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    fn(_name) { return {success: true, steps: [], evidence: nil, error: nil} },
+    fn() { return 42 },
+  )
+  assert_eq(run.abort_reason, nil)
+  assert_eq(
+    run.lanes.map({ lane -> {name: lane.name, status: lane.status, success: lane.success} })
+      .to_list(),
+    [
+      {name: "platform", status: "success", success: true},
+      {name: "binary_size", status: "success", success: true},
+    ],
+  )
+}
+
+pipeline test_candidate_user_interruption_is_not_reported_as_sibling_failure(
+  harness: Harness,
+  task,
+) {
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    fn(_name) {
+      throw "interrupted wait"
+    },
+    fn() { return 42 },
+    fn(request) { return mock_cleanup(request.lane) },
+    fn() { return true },
+  )
+  assert_eq(
+    run.abort_reason,
+    {kind: "user_interruption", cause: "release certification interrupted by operator"},
+  )
+  assert_eq(run.lanes.map({ lane -> lane.status }).to_list(), ["interrupted", "interrupted"])
+  for lane in run.lanes {
+    assert_eq(
+      lane.cancellation,
+      {kind: "user_interruption", cause: "release certification interrupted by operator"},
+    )
+    assert_eq(lane.error, nil)
+    if lane.name == "platform" {
+      assert_eq(lane.cleanup[0]?.provider, "mock")
+    } else {
+      assert_eq(lane.cleanup, [])
+    }
+  }
+}
