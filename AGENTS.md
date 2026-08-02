@@ -59,6 +59,7 @@ Use the pinned Harn version from `.harn-version`.
 harn install --locked
 scripts/harn-project.sh verify
 harn test tests/ --parallel --verbose
+harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push --verbose
 ```
 
 `scripts/harn-project.sh verify` includes tracked and non-ignored untracked Harn
