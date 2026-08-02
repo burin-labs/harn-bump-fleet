@@ -54,6 +54,9 @@ harn run --no-sandbox bump_fleet.harn -- --dry-run
 # Run on one repo only.
 harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
+# Check fleet-owned connector CI adapters without writing them.
+harn run --no-sandbox sync_package_ci.harn -- --check
+
 # Inspect unsigned bot dependency PRs that are blocked by required signatures.
 harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
 
