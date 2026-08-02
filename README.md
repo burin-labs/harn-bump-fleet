@@ -287,11 +287,12 @@ HARN_PLANNER_PROVIDER=ollama harn run --no-sandbox release_harn.harn
 Run `scripts/harn-project.sh verify` locally to check, lint, and format-check
 tracked plus non-ignored untracked `*.harn` files. The same script handles paths
 without shell word-splitting; use `scripts/harn-project.sh format` for fixes.
-GitHub Actions passes `--tracked-only` to verify the exact committed tree with
-the explicit public API types required by `harn.toml`, then runs
-`harn test tests/ --parallel` when local tests are present. Risky structured-Git
-contracts run separately with
-`harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push`;
+Use `scripts/harn-project.sh test` for the full local suite so source gates and
+tests resolve the same repo-pinned binary. GitHub Actions passes `--tracked-only`
+to verify the exact committed tree with the explicit public API types required
+by `harn.toml`; its setup action installs the same exact release before invoking
+Harn directly. Risky structured-Git contracts run separately with
+`.harn/bin/harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push`;
 the Harn sandbox still blocks network egress. CI installs the
 published `harn-cli` version pinned by `.harn-version` through Harn's
 checksum-verifying setup action. `scripts/install_harn.sh` remains the local

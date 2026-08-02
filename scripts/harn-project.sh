@@ -3,10 +3,11 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: scripts/harn-project.sh [--tracked-only] <verify|check|lint|fmt-check|format>
+Usage: scripts/harn-project.sh [--tracked-only] <verify|check|lint|fmt-check|format|test>
 
 By default, verification includes tracked and non-ignored untracked *.harn
-sources. CI and committed-tree automation pass --tracked-only.
+sources. CI and committed-tree automation pass --tracked-only. The test action
+runs the canonical suite with the same repo-pinned Harn binary.
 EOF
   exit 2
 }
@@ -20,7 +21,7 @@ action="${1:-}"
 [ "$#" -eq 1 ] || usage
 
 case "$action" in
-  verify|check|lint|fmt-check|format) ;;
+  verify|check|lint|fmt-check|format|test) ;;
   *) usage ;;
 esac
 
@@ -32,6 +33,11 @@ fi
 if [ -z "$harn_bin" ]; then
   echo "harn-project: harn is not installed; run scripts/install_harn.sh" >&2
   exit 127
+fi
+
+if [ "$action" = "test" ]; then
+  cd "$repo_root"
+  exec "$harn_bin" test tests/ --parallel --verbose
 fi
 
 inventory="$(mktemp "${TMPDIR:-/tmp}/harn-project-sources.XXXXXX")"
