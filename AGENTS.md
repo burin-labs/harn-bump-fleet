@@ -57,10 +57,11 @@ ceiling for every maintained handwritten source file.
 Use the pinned Harn version from `.harn-version`.
 
 ```sh
-harn install --locked
+scripts/install_harn.sh
+.harn/bin/harn install --locked
 scripts/harn-project.sh verify
-harn test tests/ --parallel --verbose
-harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push --verbose
+scripts/harn-project.sh test
+.harn/bin/harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push --verbose
 ```
 
 `scripts/harn-project.sh verify` includes tracked and non-ignored untracked Harn
