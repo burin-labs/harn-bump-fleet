@@ -1,0 +1,613 @@
+import { read_json_result, write_json } from "std/fs"
+import { GitRemoteRef } from "std/git"
+import { harn_release_readiness, release_readiness_detail } from "./release_readiness"
+import { release_ref_deletion_decision } from "./release_ref_cleanup"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { release_tag_identity_verification } from "./release_tag_identity"
+
+pub type ReleaseRefSweepMode = "dry_run" | "apply"
+
+pub type ReleaseRefSweepResource = "remote_ref" | "local_branch"
+
+pub type ReleaseRefSweepAction = "delete" | "retain"
+
+pub type ReleaseRefSweepOutcome = "planned" | "deleted" | "retained" | "absent" | "failed"
+
+pub type ReleaseRefRecoveryProof = {
+  version: string,
+  tag: string,
+  ref_oid: string,
+  tag_target_oid: string,
+  signed_tag: bool,
+  hosted_terminal: bool,
+  message: string,
+}
+
+pub type ReleaseRefSweepEntry = {
+  resource: ReleaseRefSweepResource,
+  name: string,
+  version: string,
+  expected_oid: string,
+  observed_oid: string,
+  action: ReleaseRefSweepAction,
+  outcome: ReleaseRefSweepOutcome,
+  reason_code: string,
+  message: string,
+}
+
+pub type ReleaseRefSweepReceipt = {
+  schema_version: "release_harn.ref_sweep.v1",
+  mode: ReleaseRefSweepMode,
+  slug: string,
+  repo: string,
+  state: "planned" | "completed" | "blocked",
+  message: string,
+  refs: list<ReleaseRefSweepEntry>,
+  updated_at: string,
+}
+
+pub type ReleaseRefSweepAdapter = {
+  now: fn() -> string,
+  remote_refs: fn(string) -> list<GitRemoteRef>,
+  local_refs: fn(string) -> list<GitRemoteRef>,
+  version_at_ref: fn(string, string) -> string?,
+  recovery_proof: fn(string, string, string) -> ReleaseRefRecoveryProof,
+  worktree_branch: fn(string, string) -> string,
+  local_commits_recoverable: fn(string, string, string) -> bool,
+  delete_remote_ref: fn(string, string, string) -> dict,
+  delete_local_branch: fn(string, string, string) -> dict,
+}
+
+pub type ReleaseRefSweepOptions = {
+  repo: string,
+  slug?: string,
+  mode?: ReleaseRefSweepMode,
+  receipt_path: string,
+}
+
+fn valid_oid(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", lowercase(trim(value)))) == 1
+}
+
+fn retained(
+  resource: ReleaseRefSweepResource,
+  name: string,
+  version: string,
+  expected_oid: string,
+  observed_oid: string,
+  code: string,
+  message: string,
+) -> ReleaseRefSweepEntry {
+  return {
+    resource: resource,
+    name: name,
+    version: version,
+    expected_oid: expected_oid,
+    observed_oid: observed_oid,
+    action: "retain",
+    outcome: "retained",
+    reason_code: code,
+    message: message,
+  }
+}
+
+fn deletion(
+  resource: ReleaseRefSweepResource,
+  name: string,
+  version: string,
+  expected_oid: string,
+  observed_oid: string,
+  message: string,
+) -> ReleaseRefSweepEntry {
+  return {
+    resource: resource,
+    name: name,
+    version: version,
+    expected_oid: expected_oid,
+    observed_oid: observed_oid,
+    action: "delete",
+    outcome: "planned",
+    reason_code: "tag_backed_terminal_release",
+    message: message,
+  }
+}
+
+fn remote_identity(ref: string) -> dict? {
+  const attempt = regex_captures(
+    "^refs/heads/release-attempt/v([0-9]+[.][0-9]+[.][0-9]+)/([0-9a-f]{40})$",
+    ref,
+  )
+  if len(attempt) == 1 {
+    return {version: attempt[0].groups[0], expected_oid: attempt[0].groups[1]}
+  }
+  const certify = regex_captures("^refs/heads/release-certify/([0-9a-f]{40})$", ref)
+  if len(certify) == 1 {
+    return {version: "", expected_oid: certify[0].groups[0]}
+  }
+  const failed = regex_captures(
+    "^refs/heads/release-failed/v([0-9]+[.][0-9]+[.][0-9]+)/([0-9a-f]{40})-[a-z0-9-]+$",
+    ref,
+  )
+  if len(failed) == 1 {
+    return {version: failed[0].groups[0], expected_oid: failed[0].groups[1]}
+  }
+  return nil
+}
+
+/**
+ * Classify one remote release ref through the same exact-OID and terminal-proof
+ * invariant used by the release-local cleanup owner.
+ */
+pub fn release_remote_ref_sweep_entry(
+  slug: string,
+  remote: GitRemoteRef,
+  version_at_ref: fn(string, string) -> string?,
+  recovery_proof: fn(string, string, string) -> ReleaseRefRecoveryProof,
+) -> ReleaseRefSweepEntry {
+  const name = trim(remote.ref)
+  const observed_oid = lowercase(trim(remote.oid))
+  const identity = remote_identity(name)
+  if identity == nil {
+    return retained(
+      "remote_ref",
+      name,
+      "",
+      "",
+      observed_oid,
+      "malformed_or_unowned_ref",
+      "release-prefixed remote ref is not a canonical attempt, certification, or failed-recovery ref",
+    )
+  }
+  const expected_oid = lowercase(trim(identity.expected_oid))
+  if !valid_oid(observed_oid) || observed_oid != expected_oid {
+    return retained(
+      "remote_ref",
+      name,
+      identity.version,
+      expected_oid,
+      observed_oid,
+      "moved_ref",
+      "remote ref target does not match its content-addressed OID",
+    )
+  }
+  const version = if trim(identity.version) != "" {
+    identity.version
+  } else {
+    version_at_ref(slug, name.substring(len("refs/heads/"))) ?? ""
+  }
+  if len(regex_captures("^[0-9]+[.][0-9]+[.][0-9]+$", version)) != 1 {
+    return retained(
+      "remote_ref",
+      name,
+      version,
+      expected_oid,
+      observed_oid,
+      "version_unproven",
+      "could not prove a canonical workspace version at the exact remote ref",
+    )
+  }
+  const proof = recovery_proof(version, expected_oid, slug)
+  const decision = release_ref_deletion_decision(
+    {
+      expected_oid: expected_oid,
+      observed_oid: observed_oid,
+      tag_target_oid: proof.tag_target_oid,
+      signed_tag: proof.signed_tag,
+      hosted_terminal: proof.hosted_terminal,
+    },
+  )
+  if !decision.delete {
+    return retained(
+      "remote_ref",
+      name,
+      version,
+      expected_oid,
+      observed_oid,
+      decision.reason_code,
+      decision.message + "; " + proof.message,
+    )
+  }
+  return deletion("remote_ref", name, version, expected_oid, observed_oid, proof.message)
+}
+
+/** Classify one local release branch without moving or deleting it. */
+pub fn release_local_branch_sweep_entry(
+  repo: string,
+  slug: string,
+  local: GitRemoteRef,
+  adapter: ReleaseRefSweepAdapter,
+) -> ReleaseRefSweepEntry {
+  const full_name = trim(local.ref)
+  const branch = if starts_with(full_name, "refs/heads/") {
+    full_name.substring(len("refs/heads/"))
+  } else {
+    full_name
+  }
+  const observed_oid = lowercase(trim(local.oid))
+  const matched = regex_captures("^release/v([0-9]+[.][0-9]+[.][0-9]+)$", branch)
+  if len(matched) != 1 || !valid_oid(observed_oid) {
+    return retained(
+      "local_branch",
+      branch,
+      "",
+      observed_oid,
+      observed_oid,
+      "malformed_or_unowned_ref",
+      "release-prefixed local branch is not a canonical release/vX.Y.Z branch",
+    )
+  }
+  const version = matched[0].groups[0]
+  const owner = adapter.worktree_branch(repo, branch)
+  if trim(owner) != "" {
+    return retained(
+      "local_branch",
+      branch,
+      version,
+      observed_oid,
+      observed_oid,
+      "worktree_owned",
+      "branch remains checked out by worktree ${owner}",
+    )
+  }
+  const proof = adapter.recovery_proof(version, observed_oid, slug)
+  if !proof.signed_tag || !proof.hosted_terminal {
+    return retained(
+      "local_branch",
+      branch,
+      version,
+      observed_oid,
+      observed_oid,
+      "release_not_recoverable",
+      proof.message,
+    )
+  }
+  if !adapter.local_commits_recoverable(repo, branch, proof.tag) {
+    return retained(
+      "local_branch",
+      branch,
+      version,
+      observed_oid,
+      observed_oid,
+      "unique_local_commits",
+      "branch contains commits not recoverable from ${proof.tag} or origin/main",
+    )
+  }
+  return deletion(
+    "local_branch",
+    branch,
+    version,
+    observed_oid,
+    observed_oid,
+    proof.message + "; every branch commit is recoverable from ${proof.tag} or origin/main",
+  )
+}
+
+fn parse_ref_lines(output: string) -> list<GitRemoteRef> {
+  let refs: list<GitRemoteRef> = []
+  for line in output.split("\n") {
+    const fields = split(trim(line), " ").filter({ field -> trim(field) != "" }).to_list()
+    if len(fields) == 2 {
+      refs = refs + [{ref: fields[0], name: fields[0], oid: fields[1], peeled: false}]
+    }
+  }
+  return refs
+}
+
+fn worktree_owner(output: string, branch: string) -> string {
+  let current = ""
+  for line in output.split("\n") {
+    if starts_with(line, "worktree ") {
+      current = trim(line.substring(len("worktree ")))
+    } else if trim(line) == "branch refs/heads/${branch}" {
+      return current
+    }
+  }
+  return ""
+}
+
+fn default_adapter(repo: string) -> ReleaseRefSweepAdapter {
+  let proof_cache = {}
+  let version_by_tag_target = {}
+  let tag_targets_loaded = false
+  let tags_fetched = false
+  let tags_fetch_success = false
+  return {
+    now: fn() { return date_now_iso() },
+    remote_refs: fn(checkout) {
+      const observed = release_git_remote_refs(
+        {repo: checkout, mock: false},
+        ["refs/heads/release*"],
+      )
+      if !observed.success {
+        throw "could not inventory remote release refs: " + trim(observed.stderr)
+      }
+      return observed.refs
+    },
+    local_refs: fn(checkout) {
+      const observed = run_git(
+        {repo: checkout, mock: false},
+        ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/release"],
+      )
+      if !observed.success {
+        throw "could not inventory local release refs: " + trim(observed.stderr)
+      }
+      return parse_ref_lines(observed.stdout)
+    },
+    version_at_ref: fn(_slug, ref) {
+      if !tag_targets_loaded {
+        const observed = run_git(
+          {repo: repo, mock: false},
+          ["ls-remote", "--tags", "origin", "refs/tags/v*"],
+        )
+        if observed.success {
+          for line in observed.stdout.split("\n") {
+            const matched = regex_captures(
+              "^([0-9a-f]{40})[[:space:]]+refs/tags/v([0-9]+[.][0-9]+[.][0-9]+)[\\^][{][}]$",
+              trim(line),
+            )
+            if len(matched) == 1 {
+              version_by_tag_target[lowercase(trim(matched[0].groups[0]))] = matched[0].groups[1]
+            }
+          }
+        }
+        tag_targets_loaded = true
+      }
+      const identity = remote_identity("refs/heads/" + ref)
+      return version_by_tag_target[lowercase(trim(identity?.expected_oid ?? ""))]
+    },
+    recovery_proof: fn(version, ref_oid, _slug) {
+      const cache_key = version
+      const cached = proof_cache[cache_key]
+      if cached != nil {
+        const reused: ReleaseRefRecoveryProof = {
+          version: cached.version,
+          tag: cached.tag,
+          ref_oid: lowercase(trim(ref_oid)),
+          tag_target_oid: cached.tag_target_oid,
+          signed_tag: cached.signed_tag,
+          hosted_terminal: cached.hosted_terminal,
+          message: cached.message,
+        }
+        return reused
+      }
+      const tag = "v${version}"
+      const cfg = {repo: repo, mock: false}
+      if !tags_fetched {
+        tags_fetch_success = run_git(cfg, ["fetch", "--quiet", "--tags", "origin"]).success
+        tags_fetched = true
+      }
+      const tag_object = run_git(cfg, ["rev-parse", "${tag}^{tag}"])
+      const tag_target = run_git(cfg, ["rev-parse", "${tag}^{}"])
+      const tag_contents = if tag_object.success {
+        run_git(cfg, ["cat-file", "tag", trim(tag_object.stdout)])
+      } else {
+        {success: false, stdout: ""}
+      }
+      const signature = if tag_object.success {
+        run_git(cfg, ["verify-tag", tag])
+      } else {
+        {success: false}
+      }
+      const identity = release_tag_identity_verification(
+        tag,
+        trim(tag_object.stdout),
+        trim(tag_target.stdout),
+        trim(tag_object.stdout),
+        trim(tag_target.stdout),
+        tag_contents.stdout ?? "",
+        tags_fetch_success && signature.success,
+      )
+      const readiness = harn_release_readiness(tag)
+      // Complete finalized assets are the durable hosted outcome. Historical
+      // workflow runs may remain red after a successful recovery dispatch and
+      // therefore cannot be the semantic owner of present release readiness.
+      const hosted_terminal = readiness.ready
+      const proof: ReleaseRefRecoveryProof = {
+        version: version,
+        tag: tag,
+        ref_oid: lowercase(trim(ref_oid)),
+        tag_target_oid: lowercase(trim(tag_target.stdout)),
+        signed_tag: identity.success,
+        hosted_terminal: hosted_terminal,
+        message: identity.reason
+          + "; "
+          + release_readiness_detail(readiness),
+      }
+      proof_cache[cache_key] = proof
+      return proof
+    },
+    worktree_branch: fn(checkout, branch) {
+      const result = run_git({repo: checkout, mock: false}, ["worktree", "list", "--porcelain"])
+      return if result.success {
+        worktree_owner(result.stdout, branch)
+      } else {
+        "<worktree-inspection-failed>"
+      }
+    },
+    local_commits_recoverable: fn(checkout, branch, tag) {
+      const result = run_git(
+        {repo: checkout, mock: false},
+        ["rev-list", "--max-count=1", branch, "--not", tag, "origin/main"],
+      )
+      return result.success && trim(result.stdout) == ""
+    },
+    delete_remote_ref: fn(checkout, ref, expected_oid) {
+      const deleted = run_git(
+        {repo: checkout, mock: false},
+        ["push", "--porcelain", "--force-with-lease=${ref}:${expected_oid}", "origin", ":${ref}"],
+      )
+      return {
+        success: deleted.success,
+        message: trim(
+          if deleted.success {
+            deleted.stdout
+          } else {
+            deleted.stderr
+          },
+        ),
+      }
+    },
+    delete_local_branch: fn(checkout, branch, expected_oid) {
+      const observed = run_git({repo: checkout, mock: false}, ["rev-parse", "refs/heads/${branch}"])
+      if !observed.success {
+        return {success: true, absent: true, message: "local branch is already absent"}
+      }
+      if lowercase(trim(observed.stdout)) != lowercase(trim(expected_oid)) {
+        return {
+          success: false,
+          message: "local branch moved after classification; refusing deletion",
+        }
+      }
+      const deleted = run_git({repo: checkout, mock: false}, ["branch", "-D", branch])
+      return {
+        success: deleted.success,
+        absent: false,
+        message: trim(
+          if deleted.success {
+            deleted.stdout
+          } else {
+            deleted.stderr
+          },
+        ),
+      }
+    },
+  }
+}
+
+fn prior_receipt(path: string) -> ReleaseRefSweepReceipt? {
+  const loaded = read_json_result(path)
+  if !is_ok(loaded) {
+    return nil
+  }
+  const value = unwrap(loaded)
+  if value?.schema_version != "release_harn.ref_sweep.v1" {
+    throw "invalid release ref sweep receipt: " + path
+  }
+  return value
+}
+
+fn merge_absent(entries: list<ReleaseRefSweepEntry>, prior: ReleaseRefSweepReceipt?) {
+  let merged = entries
+  for old in prior?.refs ?? [] {
+    if old.action == "delete"
+      && !merged.any(
+      { current -> current.resource == old.resource && current.name == old.name },
+    ) {
+      merged = merged + [{...old, outcome: "absent", message: "proven disposable ref is absent"}]
+    }
+  }
+  return merged.sort_by({ entry -> "${entry.resource}:${entry.name}" })
+}
+
+fn write_receipt(path: string, receipt: ReleaseRefSweepReceipt) {
+  harness.fs.mkdir(dirname(path), true)
+  const temporary = path + ".tmp-" + uuid_v7()
+  write_json(temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+}
+
+fn sweep_state(mode: ReleaseRefSweepMode, refs: list<ReleaseRefSweepEntry>) {
+  if refs.any({ entry -> entry.outcome == "failed" }) {
+    return "blocked"
+  }
+  return if mode == "dry_run" {
+    "planned"
+  } else {
+    "completed"
+  }
+}
+
+fn sweep_message(state: string) {
+  if state == "blocked" {
+    return "one or more exact release refs could not be deleted safely"
+  }
+  if state == "planned" {
+    return "dry-run inventory classified every observed release-prefixed ref"
+  }
+  return "every proven disposable release ref is absent; retained refs carry recovery reasons"
+}
+
+/** Inventory every release-prefixed ref, optionally applying only exact planned deletions. */
+pub fn run_release_ref_sweep(
+  options: ReleaseRefSweepOptions,
+  injected_adapter: ReleaseRefSweepAdapter? = nil,
+) -> ReleaseRefSweepReceipt {
+  const adapter = injected_adapter ?? default_adapter(options.repo)
+  const mode = options.mode ?? "dry_run"
+  const slug = options.slug ?? "burin-labs/harn"
+  let refs: list<ReleaseRefSweepEntry> = []
+  for remote in adapter.remote_refs(options.repo) {
+    refs = refs
+      + [
+      release_remote_ref_sweep_entry(slug, remote, adapter.version_at_ref, adapter.recovery_proof),
+    ]
+  }
+  for local in adapter.local_refs(options.repo) {
+    refs = refs + [release_local_branch_sweep_entry(options.repo, slug, local, adapter)]
+  }
+  refs = merge_absent(refs, prior_receipt(options.receipt_path))
+  let receipt: ReleaseRefSweepReceipt = {
+    schema_version: "release_harn.ref_sweep.v1",
+    mode: mode,
+    slug: slug,
+    repo: options.repo,
+    state: sweep_state(mode, refs),
+    message: sweep_message(sweep_state(mode, refs)),
+    refs: refs,
+    updated_at: adapter.now(),
+  }
+  write_receipt(options.receipt_path, receipt)
+  if mode == "dry_run" {
+    return receipt
+  }
+  for index in range(0, len(refs)) {
+    const target = refs[index]
+    if target.action != "delete" || target.outcome != "planned" {
+      continue
+    }
+    const deleted = if target.resource == "remote_ref" {
+      adapter.delete_remote_ref(options.repo, target.name, target.expected_oid)
+    } else {
+      adapter.delete_local_branch(options.repo, target.name, target.expected_oid)
+    }
+    const updated: ReleaseRefSweepEntry = {
+      resource: target.resource,
+      name: target.name,
+      version: target.version,
+      expected_oid: target.expected_oid,
+      observed_oid: target.observed_oid,
+      action: target.action,
+      outcome: if deleted.success {
+        if deleted.absent ?? false {
+          "absent"
+        } else {
+          "deleted"
+        }
+      } else {
+        "failed"
+      },
+      reason_code: target.reason_code,
+      message: if trim(deleted.message ?? "") != "" {
+        trim(deleted.message)
+      } else if deleted.success {
+        "deleted proven disposable release ref"
+      } else {
+        "exact release ref deletion failed"
+      },
+    }
+    refs[index] = updated
+    const updated_receipt: ReleaseRefSweepReceipt = {
+      schema_version: "release_harn.ref_sweep.v1",
+      mode: receipt.mode,
+      slug: receipt.slug,
+      repo: receipt.repo,
+      state: sweep_state(mode, refs),
+      message: sweep_message(sweep_state(mode, refs)),
+      refs: refs,
+      updated_at: adapter.now(),
+    }
+    receipt = updated_receipt
+    write_receipt(options.receipt_path, receipt)
+  }
+  return receipt
+}

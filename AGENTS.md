@@ -15,6 +15,8 @@ The entry points are:
   requires `--yes-live-release`.
 - `watch_harn_release.harn`: resumes post-tag publish monitoring from the typed
   receipt written by `release_harn`. It never repeats preparation or tagging.
+- `sweep_release_refs.harn`: inventories historical local and remote release
+  refs. It is dry-run-first and applies only exact, tag-backed deletions.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
