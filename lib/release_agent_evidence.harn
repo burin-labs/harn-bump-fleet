@@ -1,0 +1,203 @@
+pub type ReleaseAgentEvidenceContext = {latest_tag: string, pin_sha: string, mock: bool}
+
+pub type ReleaseAgentEvidencePayload = {dispatch?: list | dict, ...rest}
+
+pub type ReleaseAgentObservation = {
+  tool_call_id: string,
+  tool_name: string,
+  operation: string,
+  source_sha: string,
+  source_tree: string,
+  target: string,
+  success: bool,
+  evidence_class: "delta" | "content" | "artifact" | "none",
+}
+
+pub type ReleaseAgentEvidenceDecision = {
+  complete: bool,
+  reason: string,
+  observations: list<ReleaseAgentObservation>,
+  delta_observation_id?: string,
+  content_observation_id?: string,
+}
+
+fn dispatches(payload) -> list {
+  if type_of(payload?.dispatch) == "list" {
+    return payload.dispatch
+  }
+  if type_of(payload?.dispatch) == "dict" {
+    return [payload.dispatch]
+  }
+  return []
+}
+
+fn argv_from(arguments) -> list<string> {
+  if type_of(arguments?.argv) == "list" {
+    return arguments.argv
+  }
+  if type_of(arguments?.command) == "list" {
+    return arguments.command
+  }
+  return []
+}
+
+fn expected_range(analysis: ReleaseAgentEvidenceContext) -> string {
+  return "${analysis.latest_tag}..${analysis.pin_sha}"
+}
+
+fn argv_contains(argv: list<string>, value: string) -> bool {
+  return argv.any({ item -> item == value })
+}
+
+fn exact_delta_observation(name: string, args, analysis: ReleaseAgentEvidenceContext) -> bool {
+  const range = expected_range(analysis)
+  const mock_range = "${analysis.latest_tag}..HEAD"
+  if name == "release_git" {
+    return ["diff", "log", "show"].contains(args?.operation ?? "")
+      && (args?.rev_range == range
+      || ((analysis
+      .mock
+      ?? false)
+      && args?.rev_range == mock_range))
+  }
+  if name != "release_run" {
+    return false
+  }
+  const argv = argv_from(args)
+  return len(argv) >= 2 && argv[0] == "git" && ["diff", "log", "show"].contains(argv[1])
+    && (argv_contains(
+    argv,
+    range,
+  )
+    || ((analysis.mock ?? false) && argv_contains(argv, mock_range)))
+}
+
+fn content_observation(name: string, args) -> bool {
+  if name == "release_read" || name == "release_read_tail" {
+    return trim(args?.path ?? "") != ""
+  }
+  if name == "release_search" {
+    return trim(args?.pattern ?? "") != ""
+  }
+  if name == "release_artifact_head" || name == "release_artifact_tail"
+    || name
+    == "release_artifact_search" {
+    return trim(args?.path ?? "") != ""
+  }
+  if name == "release_git" {
+    return ["diff", "show", "blame"].contains(args?.operation ?? "")
+  }
+  if name != "release_run" {
+    return false
+  }
+  const argv = argv_from(args)
+  if len(argv) < 1 {
+    return false
+  }
+  return (argv[0] == "git" && len(argv) >= 2 && ["diff", "show"].contains(argv[1]))
+    || (argv[0] == "gh"
+    && len(
+    argv,
+  )
+    >= 3
+    && argv[1] == "pr"
+    && argv[2] == "view")
+    || ["cat", "head", "sed"].contains(argv[0])
+}
+
+fn observation_target(name: string, args) -> string {
+  if trim(args?.path ?? "") != "" {
+    return args.path
+  }
+  if trim(args?.rev_range ?? "") != "" {
+    return args.rev_range
+  }
+  if trim(args?.rev ?? "") != "" {
+    return args.rev
+  }
+  const argv = argv_from(args)
+  return argv.join(" ")
+}
+
+/** Project successful tool dispatches into typed, exact-tree evidence. */
+pub fn release_agent_observations(
+  payload: ReleaseAgentEvidencePayload,
+  analysis: ReleaseAgentEvidenceContext,
+) -> list<ReleaseAgentObservation> {
+  let observations = []
+  for dispatch in dispatches(payload) {
+    if !(dispatch?.ok ?? false) {
+      continue
+    }
+    const name = dispatch?.tool_name ?? ""
+    const args = dispatch?.arguments ?? {}
+    const evidence_class = if exact_delta_observation(name, args, analysis) {
+      "delta"
+    } else if content_observation(name, args) {
+      if starts_with(name, "release_artifact_") {
+        "artifact"
+      } else {
+        "content"
+      }
+    } else {
+      "none"
+    }
+    observations = observations
+      + [
+      {
+        tool_call_id: dispatch?.tool_call_id ?? "",
+        tool_name: name,
+        operation: args?.operation ?? (argv_from(args)[1] ?? name),
+        source_sha: analysis.pin_sha,
+        source_tree: analysis.pin_sha,
+        target: observation_target(name, args),
+        success: true,
+        evidence_class: evidence_class,
+      },
+    ]
+  }
+  return observations
+}
+
+fn append_unique(existing, additions) {
+  let out = existing
+  for addition in additions {
+    if !out.any({ item -> item.tool_call_id == addition.tool_call_id }) {
+      out = out + [addition]
+    }
+  }
+  return out
+}
+
+/** Require distinct successful delta and concrete-content observations. */
+pub fn release_agent_evidence_decision(
+  existing: list<ReleaseAgentObservation>,
+  payload: ReleaseAgentEvidencePayload,
+  analysis: ReleaseAgentEvidenceContext,
+) -> ReleaseAgentEvidenceDecision {
+  const observations = append_unique(existing, release_agent_observations(payload, analysis))
+  const deltas = observations.filter({ item -> item.evidence_class == "delta" }).to_list()
+  const contents = observations.filter(
+    { item -> item.evidence_class == "content" || item.evidence_class == "artifact" },
+  )
+    .to_list()
+  for delta in deltas {
+    for content in contents {
+      if delta.tool_call_id != content.tool_call_id {
+        return {
+          complete: true,
+          reason: "distinct exact-range delta and concrete-content observations succeeded",
+          observations: observations,
+          delta_observation_id: delta.tool_call_id,
+          content_observation_id: content.tool_call_id,
+        }
+      }
+    }
+  }
+  const reason = if len(deltas) == 0 {
+    "missing a successful exact-range delta observation for ${expected_range(analysis)}"
+  } else {
+    "missing a distinct successful concrete-content observation"
+  }
+  return {complete: false, reason: reason, observations: observations}
+}
