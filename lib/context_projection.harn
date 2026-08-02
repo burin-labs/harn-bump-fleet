@@ -1,0 +1,173 @@
+// Bounded, typed projections for model-facing context.
+//
+// Durable run receipts remain complete on disk. Model prompts and interactive
+// chat receive only these projections so a retry cannot embed a prior receipt,
+// transcript, or model answer back into itself.
+import { truncate_text } from "std/text"
+import { FleetAuditReceipt, ReleaseAuditReceipt } from "./run_receipts"
+
+const FLEET_CONTEXT_MAX_CHARS = 12000
+
+const FLEET_CONTEXT_MAX_OUTCOMES = 48
+
+const OUTCOME_DETAIL_MAX_CHARS = 320
+
+fn bounded(value, limit: int) -> string {
+  const text = to_string(value ?? "")
+  if limit < 1 {
+    return ""
+  }
+  return truncate_text(text, limit)
+}
+
+fn compact_fleet_outcome(outcome) -> dict {
+  return {
+    slug: bounded(outcome.slug, 160),
+    status: bounded(outcome.status, 80),
+    detail: bounded(outcome.detail, OUTCOME_DETAIL_MAX_CHARS),
+    run_id: outcome.run_id,
+    pr_number: outcome.pr_number,
+    pr_url: bounded(outcome.pr_url, 240),
+    run_url: bounded(outcome.run_url, 240),
+    auto_merge: bounded(outcome.auto_merge, 120),
+    duration_ms: outcome.duration_ms,
+  }
+}
+
+fn compact_fleet_outcomes(outcomes, limit: int) -> list<dict> {
+  let result: list<dict> = []
+  let count = 0
+  for outcome in outcomes ?? [] {
+    if count >= limit {
+      break
+    }
+    result = result + [compact_fleet_outcome(outcome)]
+    count = count + 1
+  }
+  return result
+}
+
+fn fleet_digest_input(payload: FleetAuditReceipt, outcomes: list<dict>) -> dict {
+  return {
+    schema_version: payload.schema_version,
+    run_id: payload.run_id,
+    target_version: payload.target_version,
+    mode: payload.mode,
+    repos_total: payload.repos_total,
+    repos_dispatched: payload.repos_dispatched,
+    outcomes: outcomes.map(
+      fn(outcome) { return {
+        slug: outcome.slug,
+        status: outcome.status,
+        auto_merge: outcome.auto_merge,
+        duration_ms: outcome.duration_ms,
+      } },
+    )
+      .to_list(),
+  }
+}
+
+fn fleet_projection(payload: FleetAuditReceipt, outcomes: list<dict>, truncated: bool) -> dict {
+  const digest_input = fleet_digest_input(payload, outcomes)
+  return {
+    schema_version: "harn_bump_fleet.model_context.v1",
+    source_receipt: "fleet-audit.json",
+    source_digest: sha3_256(json_stringify(digest_input))[0:24],
+    target_version: payload.target_version,
+    mode: payload.mode,
+    repos_total: payload.repos_total,
+    repos_dispatched: payload.repos_dispatched,
+    outcome_count: len(payload.outcomes),
+    included_outcome_count: len(outcomes),
+    outcomes_truncated: truncated,
+    run_session_view: {
+      ok: payload.run_session_view?.ok ?? false,
+      status: payload.run_session_view?.check?.status ?? "",
+      target_change: payload.run_session_view?.target_change?.status ?? "",
+    },
+    public_surface_impact: {
+      source_status: payload.public_surface_impact?.source_status ?? "",
+      surface_count: payload.public_surface_impact?.surface_count ?? 0,
+      affected_repo_count: payload.public_surface_impact?.affected_repo_count ?? 0,
+    },
+    outcomes: outcomes,
+  }
+}
+
+/**
+ * Project a fleet receipt without carrying summary prose, transcripts, or
+ * nested artifacts. The result is bounded by construction and includes a
+ * digest so an operator can correlate it with the complete on-disk receipt.
+ */
+pub fn fleet_summary_context(payload: FleetAuditReceipt) -> dict {
+  let outcomes = compact_fleet_outcomes(payload.outcomes, FLEET_CONTEXT_MAX_OUTCOMES)
+  const truncated = len(outcomes) < len(payload.outcomes)
+  const projection = fleet_projection(payload, outcomes, truncated)
+  if len(json_stringify(projection)) <= FLEET_CONTEXT_MAX_CHARS {
+    return projection
+  }
+  // Long repository details are useful for the durable receipt but not for a
+  // summary retry. Reduce each detail before dropping whole outcome rows.
+  outcomes = outcomes.map(fn(outcome) { return outcome + {detail: bounded(outcome.detail, 80)} })
+    .to_list()
+  while len(json_stringify(fleet_projection(payload, outcomes, true))) > FLEET_CONTEXT_MAX_CHARS
+    && len(
+    outcomes,
+  )
+    > 0 {
+    outcomes = outcomes.take(len(outcomes) - 1).to_list()
+  }
+  return fleet_projection(payload, outcomes, true)
+}
+
+fn compact_release_execution(execution) -> list<dict> {
+  let result: list<dict> = []
+  for step in execution ?? [] {
+    result = result
+      + [
+      {
+        name: bounded(step.name, 160),
+        status: bounded(step.status, 40),
+        success: step.success ?? false,
+        exit_code: step.exit_code,
+        detail: bounded(step.stderr ?? step.stdout ?? step.detail, 240),
+      },
+    ]
+  }
+  return result
+}
+
+/** Compact release context for post-run chat; raw agent output stays on disk. */
+pub fn release_chat_context(payload: ReleaseAuditReceipt) -> dict {
+  const execution = compact_release_execution(payload.execution)
+  const projection = {
+    schema_version: "release_harn.model_context.v1",
+    source_receipt: "release-audit.json",
+    source_digest: sha3_256(
+      json_stringify(
+        {run_id: payload.run_id, next_version: payload.analysis.next_version, execution: execution},
+      ),
+    )[0:24],
+    mode: payload.config.mode,
+    current_version: payload.analysis.current_version,
+    next_version: payload.analysis.next_version,
+    branch: bounded(payload.analysis.branch, 180),
+    deterministic_findings: (payload.analysis.deterministic_findings ?? []).map(
+      fn(finding) { return bounded(finding, 240) },
+    )
+      .to_list(),
+    agent_review_digest: sha3_256(to_string(payload.agent_review ?? ""))[0:24],
+    agent_review_chars: len(to_string(payload.agent_review ?? "")),
+    execution: execution,
+  }
+  const rendered = json_stringify(projection)
+  if len(rendered) <= FLEET_CONTEXT_MAX_CHARS {
+    return projection
+  }
+  return projection
+    + {
+    deterministic_findings: projection.deterministic_findings.take(8).to_list(),
+    execution: projection.execution.take(24).to_list(),
+    truncated: true,
+  }
+}
