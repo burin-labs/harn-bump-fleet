@@ -3,12 +3,19 @@ import { read_json_result } from "std/fs"
 import { git_ls_remote, git_push } from "std/git"
 import { shell_quote } from "std/runtime"
 import { map_settled } from "std/settled"
+import {
+  ExactWorkflowRunProvider,
+  ExactWorkflowRunRequest,
+  acquire_exact_workflow_run,
+} from "./exact_workflow_run"
 import { remote_branch_oid } from "./git"
 import {
   github_actions_run,
   github_actions_run_cancel,
   github_actions_run_jobs,
+  github_actions_run_rerun,
   github_workflow_dispatch,
+  github_workflow_runs,
 } from "./github"
 import { run_cmd, run_git } from "./release_runtime"
 
@@ -82,6 +89,7 @@ pub type PlatformCertificationDecisionCode = "invalid_binary_sha" \
 
 type PlatformCertificationProofFailureCode = "dispatch_identity_changed" \
   | "run_id_changed" \
+  | "run_attempt_changed" \
   | "workflow_path_changed" \
   | "source_sha_changed" \
   | "unexpected_event" \
@@ -98,7 +106,7 @@ type PlatformCertificationProofFailureCode = "dispatch_identity_changed" \
   | "run_poll_timeout"
 
 pub type PlatformCertificationAdapter = {
-  dispatch: fn(PlatformCertificationSpec) -> Result<dict, dict>,
+  acquire: fn(PlatformCertificationSpec) -> Result<dict, dict>,
   run: fn(int) -> Result<dict, dict>,
   jobs: fn(int) -> Result<dict, dict>,
   cancel: fn(int) -> Result<dict, dict>,
@@ -120,6 +128,17 @@ const PLATFORM_SPECS: list<PlatformCertificationSpec> = [
     workflow_path: ".github/workflows/macos-nightly.yml",
     required_job: "Workspace nextest (macos-latest)",
   },
+]
+
+const ACQUISITION_ACTIONS = ["reuse_success", "reuse_active", "rerun_failed", "dispatch_new"]
+
+const ACQUISITION_REASONS = [
+  "successful_exact_run",
+  "active_exact_run",
+  "retryable_failed_run",
+  "no_reusable_exact_run",
+  "nonretryable_terminal_run",
+  "concurrent_exact_run",
 ]
 
 /**
@@ -263,10 +282,34 @@ fn production_adapter(
   harness: Harness,
   cfg: PlatformCertificationConfig,
 ) -> PlatformCertificationAdapter {
-  return {
-    dispatch: fn(spec) { return connector_result(
-      github_workflow_dispatch(harness, cfg.repo, spec.workflow_path, {}, cfg.branch),
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(request) { return connector_result(
+      github_workflow_runs(
+        harness,
+        request.repo,
+        request.workflow_path,
+        {branch: request.ref, event: "workflow_dispatch"},
+        100,
+      ),
     ) },
+    dispatch: fn(request) { return connector_result(
+      github_workflow_dispatch(harness, request.repo, request.workflow_path, {}, request.ref),
+    ) },
+    rerun:
+      fn(run_id) { return connector_result(github_actions_run_rerun(harness, cfg.repo, run_id)) },
+    cancel: fn(run_id) { return github_actions_run_cancel_exact(harness, cfg.repo, run_id) },
+    wait: fn(ms) { harness.clock.sleep_ms(ms) },
+  }
+  return {
+    acquire: fn(spec) {
+      const request: ExactWorkflowRunRequest = {
+        repo: cfg.repo,
+        workflow_path: spec.workflow_path,
+        ref: cfg.branch,
+        head_sha: cfg.pin_sha,
+      }
+      return acquire_exact_workflow_run(request, provider)
+    },
     run: fn(run_id) { return connector_result(github_actions_run(harness, cfg.repo, run_id)) },
     jobs: fn(run_id) { return connector_result(
       github_actions_run_jobs(harness, cfg.repo, run_id, "latest"),
@@ -484,6 +527,12 @@ fn exact_dispatch_identity(
     && dispatch.event == "workflow_dispatch"
     && dispatch.run_attempt != nil
     && dispatch.run_attempt >= 1
+    && ACQUISITION_ACTIONS.contains(dispatch.action ?? "")
+    && ACQUISITION_REASONS.contains(
+    dispatch.selection_reason ?? "",
+  )
+    && dispatch.reused == (dispatch.action != "dispatch_new")
+    && dispatch.cancellations != nil
     && trim(dispatch.url ?? "") != ""
 }
 
@@ -502,6 +551,9 @@ fn exact_platform_proof(
   }
   if dispatch.run_id != run.id {
     return platform_error(spec, "run_id_changed", "returned run id changed")
+  }
+  if dispatch.run_attempt != run.run_attempt {
+    return platform_error(spec, "run_attempt_changed", "returned run attempt changed")
   }
   if dispatch.workflow_path != spec.workflow_path || run.workflow_path != spec.workflow_path {
     return platform_error(spec, "workflow_path_changed", "workflow path changed")
@@ -577,6 +629,12 @@ fn exact_platform_proof(
         head_sha: run.head_sha,
         url: run.url,
       },
+      acquisition: {
+        action: dispatch.action,
+        selection_reason: dispatch.selection_reason,
+        reused: dispatch.reused,
+        cancellations: dispatch.cancellations,
+      },
       jobs: {
         repo: cfg.repo,
         run_id: run.id,
@@ -619,6 +677,17 @@ fn await_platform(
     const run = unwrap(queried)
     if run.id != dispatch.run_id {
       return platform_error(spec, "run_query_mismatch", "exact run query returned another id")
+    }
+    const observed_attempt = to_int(run.run_attempt)
+    if observed_attempt != nil && observed_attempt > dispatch.run_attempt {
+      return platform_error(spec, "run_attempt_changed", "exact run advanced past selected attempt")
+    }
+    if observed_attempt == nil || observed_attempt < dispatch.run_attempt {
+      poll = poll + 1
+      if poll < 720 {
+        adapter.wait(10000)
+      }
+      continue
     }
     if run.status == "completed" {
       let job_attempt = 0
@@ -777,7 +846,7 @@ pub fn resolve_platform_certification(
   let starts: list<int> = []
   for spec in PLATFORM_SPECS {
     const started = adapter.now_ms()
-    const result = adapter.dispatch(spec)
+    const result = adapter.acquire(spec)
     if is_err(result) {
       const cancellations = cleanup_runs(adapter, dispatches)
       return {
@@ -917,7 +986,7 @@ pub fn mock_platform_certification_adapter(
 ) -> PlatformCertificationAdapter {
   let clock = 100
   return {
-    dispatch: fn(spec) {
+    acquire: fn(spec) {
       const id = if spec.platform == "windows" {
         6001
       } else {
@@ -933,6 +1002,10 @@ pub fn mock_platform_certification_adapter(
           head_branch: cfg.branch,
           event: "workflow_dispatch",
           url: "https://github.com/burin-labs/harn/actions/runs/${id}",
+          action: "dispatch_new",
+          selection_reason: "no_reusable_exact_run",
+          reused: false,
+          cancellations: [],
         },
       )
     },

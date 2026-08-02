@@ -1,0 +1,319 @@
+import {
+  ExactWorkflowRunProvider,
+  ExactWorkflowRunRequest,
+  acquire_exact_workflow_run,
+} from "../lib/exact_workflow_run"
+
+const SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+fn request() -> ExactWorkflowRunRequest {
+  return {
+    repo: "burin-labs/harn",
+    workflow_path: ".github/workflows/windows-nightly.yml",
+    ref: "release-certify/${SHA}",
+    head_sha: SHA,
+  }
+}
+
+fn exact_run(id: int, status: string, conclusion, attempt: int = 1) -> dict {
+  const r = request()
+  return {
+    id: id,
+    workflow_path: r.workflow_path,
+    event: "workflow_dispatch",
+    status: status,
+    conclusion: conclusion,
+    head_branch: r.ref,
+    head_sha: r.head_sha,
+    run_attempt: attempt,
+    url: "https://github.com/burin-labs/harn/actions/runs/${id}",
+  }
+}
+
+fn dispatch_receipt(id: int) -> dict {
+  const r = request()
+  return {
+    run_id: id,
+    workflow_path: r.workflow_path,
+    ref: r.ref,
+    head_sha: r.head_sha,
+    event: "workflow_dispatch",
+    run_attempt: 1,
+    url: "https://github.com/burin-labs/harn/actions/runs/${id}",
+  }
+}
+
+fn cancel_ok(id: int) -> Result<dict, dict> {
+  return Ok({run_id: id, accepted: true, state: "cancel_requested"})
+}
+
+pipeline test_list_failure_has_exact_error_and_no_mutations(task) {
+  let dispatches = 0
+  let reruns = 0
+  let cancellations = 0
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Err({code: "network", message: "offline"}) },
+    dispatch: fn(_r) {
+      dispatches = dispatches + 1
+      return Ok(dispatch_receipt(7001))
+    },
+    rerun: fn(id) {
+      reruns = reruns + 1
+      return Ok({run_id: id, accepted: true})
+    },
+    cancel: fn(id) {
+      cancellations = cancellations + 1
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const result = acquire_exact_workflow_run(request(), provider)
+  assert_eq(is_err(result), true)
+  assert_eq(unwrap_err(result).code, "run_list_failed")
+  assert_eq([dispatches, reruns, cancellations], [0, 0, 0])
+}
+
+pipeline test_success_is_reused_and_active_duplicates_are_cancelled(task) {
+  let cancelled: list<int> = []
+  const runs = [
+    exact_run(7101, "completed", "success", 2),
+    exact_run(7102, "in_progress", nil),
+    exact_run(7103, "queued", nil),
+  ]
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok({runs: runs}) },
+    dispatch: fn(_r) { return Err({code: "unexpected_dispatch"}) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) {
+      cancelled = cancelled + [id]
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const result = acquire_exact_workflow_run(request(), provider)
+  assert_eq(is_ok(result), true)
+  const acquisition = unwrap(result)
+  assert_eq(acquisition.run_id, 7101)
+  assert_eq(acquisition.run_attempt, 2)
+  assert_eq(acquisition.action, "reuse_success")
+  assert_eq(acquisition.selection_reason, "successful_exact_run")
+  assert_eq(acquisition.reused, true)
+  assert_eq(cancelled, [7102, 7103])
+  assert_eq(acquisition.cancellations.map({ receipt -> receipt.run_id }).to_list(), cancelled)
+}
+
+pipeline test_oldest_active_run_is_the_deterministic_winner(task) {
+  let cancelled: list<int> = []
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok(
+      {runs: [exact_run(7202, "queued", nil), exact_run(7201, "in_progress", nil)]},
+    ) },
+    dispatch: fn(_r) { return Err({code: "unexpected_dispatch"}) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) {
+      cancelled = cancelled + [id]
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const acquisition = unwrap(acquire_exact_workflow_run(request(), provider))
+  assert_eq(acquisition.run_id, 7201)
+  assert_eq(acquisition.action, "reuse_active")
+  assert_eq(acquisition.selection_reason, "active_exact_run")
+  assert_eq(cancelled, [7202])
+}
+
+pipeline test_retryable_failure_reruns_the_same_run_and_next_attempt(task) {
+  let rerun_ids: list<int> = []
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok(
+      {
+        runs: [
+          exact_run(7301, "completed", "failure", 1),
+          exact_run(7302, "completed", "timed_out", 3),
+        ],
+      },
+    ) },
+    dispatch: fn(_r) { return Err({code: "unexpected_dispatch"}) },
+    rerun: fn(id) {
+      rerun_ids = rerun_ids + [id]
+      return Ok({run_id: id, accepted: true, state: "rerun_requested"})
+    },
+    cancel: cancel_ok,
+    wait: fn(_ms) {
+    },
+  }
+  const acquisition = unwrap(acquire_exact_workflow_run(request(), provider))
+  assert_eq(acquisition.run_id, 7302)
+  assert_eq(acquisition.run_attempt, 4)
+  assert_eq(acquisition.action, "rerun_failed")
+  assert_eq(acquisition.selection_reason, "retryable_failed_run")
+  assert_eq(rerun_ids, [7302])
+}
+
+pipeline test_nonretryable_and_inexact_runs_dispatch_once(task) {
+  const r = request()
+  let list_calls = 0
+  let dispatches = 0
+  const inexact = [
+    exact_run(7401, "completed", "action_required"),
+    {...exact_run(7402, "queued", nil), event: "push"},
+    {...exact_run(7403, "queued", nil), head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {...exact_run(7404, "queued", nil), head_branch: "main"},
+    {...exact_run(7405, "queued", nil), workflow_path: ".github/workflows/macos-nightly.yml"},
+  ]
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_request) {
+      list_calls = list_calls + 1
+      return Ok(
+        {
+          runs: if list_calls == 1 {
+            inexact
+          } else {
+            inexact + [exact_run(7499, "queued", nil)]
+          },
+        },
+      )
+    },
+    dispatch: fn(observed) {
+      assert_eq(observed, r)
+      dispatches = dispatches + 1
+      return Ok(dispatch_receipt(7499))
+    },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: cancel_ok,
+    wait: fn(ms) { assert_eq(ms, 1000) },
+  }
+  const acquisition = unwrap(acquire_exact_workflow_run(r, provider))
+  assert_eq(acquisition.run_id, 7499)
+  assert_eq(acquisition.action, "dispatch_new")
+  assert_eq(acquisition.selection_reason, "nonretryable_terminal_run")
+  assert_eq(acquisition.reused, false)
+  assert_eq(dispatches, 1)
+}
+
+pipeline test_two_callers_converge_on_one_provider_run(task) {
+  let runs: list<dict> = []
+  let dispatches = 0
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok({runs: runs}) },
+    dispatch: fn(_r) {
+      dispatches = dispatches + 1
+      const receipt = dispatch_receipt(7501)
+      runs = [exact_run(7501, "queued", nil)]
+      return Ok(receipt)
+    },
+    rerun: fn(id) { return Ok({run_id: id, accepted: true}) },
+    cancel: cancel_ok,
+    wait: fn(_ms) {
+    },
+  }
+  const first = unwrap(acquire_exact_workflow_run(request(), provider))
+  const second = unwrap(acquire_exact_workflow_run(request(), provider))
+  assert_eq(first.run_id, 7501)
+  assert_eq(second.run_id, first.run_id)
+  assert_eq(first.run_attempt, second.run_attempt)
+  assert_eq(first.action, "dispatch_new")
+  assert_eq(second.action, "reuse_active")
+  assert_eq(dispatches, 1)
+}
+
+pipeline test_post_dispatch_race_elects_oldest_run_and_cancels_its_sibling(task) {
+  let list_calls = 0
+  let cancelled: list<int> = []
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) {
+      list_calls = list_calls + 1
+      return Ok(
+        {
+          runs: if list_calls == 1 {
+            []
+          } else {
+            [exact_run(7601, "in_progress", nil), exact_run(7602, "queued", nil)]
+          },
+        },
+      )
+    },
+    dispatch: fn(_r) { return Ok(dispatch_receipt(7602)) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) {
+      cancelled = cancelled + [id]
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const acquisition = unwrap(acquire_exact_workflow_run(request(), provider))
+  assert_eq(acquisition.run_id, 7601)
+  assert_eq(acquisition.action, "reuse_active")
+  assert_eq(acquisition.selection_reason, "concurrent_exact_run")
+  assert_eq(cancelled, [7602])
+}
+
+pipeline test_duplicate_cancellation_failure_fails_closed(task) {
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok(
+      {runs: [exact_run(7701, "queued", nil), exact_run(7702, "in_progress", nil)]},
+    ) },
+    dispatch: fn(_r) { return Err({code: "unexpected_dispatch"}) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) { return Err({code: "denied", run_id: id}) },
+    wait: fn(_ms) {
+    },
+  }
+  const result = acquire_exact_workflow_run(request(), provider)
+  assert_eq(is_err(result), true)
+  assert_eq(unwrap_err(result).code, "duplicate_cancel_failed")
+  assert_eq(unwrap_err(result).selected_run_id, 7701)
+  assert_eq(unwrap_err(result).duplicate_run_id, 7702)
+}
+
+pipeline test_invalid_dispatch_identity_is_cancelled_when_run_id_is_known(task) {
+  let cancelled: list<int> = []
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) { return Ok({runs: []}) },
+    dispatch: fn(_r) { return Ok({...dispatch_receipt(7801), head_sha: "wrong"}) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) {
+      cancelled = cancelled + [id]
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const result = acquire_exact_workflow_run(request(), provider)
+  assert_eq(is_err(result), true)
+  assert_eq(unwrap_err(result).code, "dispatch_identity_invalid")
+  assert_eq(unwrap_err(result).cleanup.run_id, 7801)
+  assert_eq(cancelled, [7801])
+}
+
+pipeline test_reconciliation_failure_cleans_the_new_run(task) {
+  let list_calls = 0
+  let cancelled: list<int> = []
+  const provider: ExactWorkflowRunProvider = {
+    list: fn(_r) {
+      list_calls = list_calls + 1
+      if list_calls == 1 {
+        return Ok({runs: []})
+      }
+      return Err({code: "network", message: "visibility failed"})
+    },
+    dispatch: fn(_r) { return Ok(dispatch_receipt(7901)) },
+    rerun: fn(_id) { return Err({code: "unexpected_rerun"}) },
+    cancel: fn(id) {
+      cancelled = cancelled + [id]
+      return cancel_ok(id)
+    },
+    wait: fn(_ms) {
+    },
+  }
+  const result = acquire_exact_workflow_run(request(), provider)
+  assert_eq(is_err(result), true)
+  assert_eq(unwrap_err(result).code, "dispatch_reconciliation_failed")
+  assert_eq(unwrap_err(result).cleanup.run_id, 7901)
+  assert_eq(cancelled, [7901])
+}
