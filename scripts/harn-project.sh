@@ -24,6 +24,16 @@ case "$action" in
   *) usage ;;
 esac
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+harn_bin="${repo_root}/.harn/bin/harn"
+if [ ! -x "$harn_bin" ]; then
+  harn_bin="$(command -v harn || true)"
+fi
+if [ -z "$harn_bin" ]; then
+  echo "harn-project: harn is not installed; run scripts/install_harn.sh" >&2
+  exit 127
+fi
+
 inventory="$(mktemp "${TMPDIR:-/tmp}/harn-project-sources.XXXXXX")"
 trap 'rm -f "$inventory"' EXIT
 
@@ -45,15 +55,15 @@ if [ "${#sources[@]}" -eq 0 ]; then
 fi
 
 run_check() {
-  harn check --strict-types "${sources[@]}"
+  "$harn_bin" check --strict-types "${sources[@]}"
 }
 
 run_lint() {
-  harn lint --strict "${sources[@]}"
+  "$harn_bin" lint --strict "${sources[@]}"
 }
 
 run_fmt_check() {
-  harn fmt --check "${sources[@]}"
+  "$harn_bin" fmt --check "${sources[@]}"
 }
 
 case "$action" in
@@ -65,5 +75,5 @@ case "$action" in
   check) run_check ;;
   lint) run_lint ;;
   fmt-check) run_fmt_check ;;
-  format) harn fmt "${sources[@]}" ;;
+  format) "$harn_bin" fmt "${sources[@]}" ;;
 esac
