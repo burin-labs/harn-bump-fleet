@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Release audits now materialize the resolved `--at-sha` commit in an isolated
+  detached worktree, record that snapshot identity, and remove the exact
+  run-owned worktree on success or failure instead of mixing pinned history
+  with files from the operator's checkout.
 - Pre-tag release recovery now preserves an explicit `--at-sha` pin and rejects
   immutable checkpoints certified from a different source commit instead of
   silently publishing the stale checkpoint.

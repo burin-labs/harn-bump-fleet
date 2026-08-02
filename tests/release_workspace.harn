@@ -1,9 +1,11 @@
+import { changelog_top, current_version } from "../lib/release_analysis"
 import { release_publication } from "../lib/release_publication"
-import { ReleaseConfig, parse_release_args } from "../lib/release_runtime"
+import { ReleaseConfig, parse_release_args, resolve_pin_sha } from "../lib/release_runtime"
 import {
   align_pre_tag_release_workspace,
   finish_release_workspace,
   materialize_release_workspace,
+  release_analysis_snapshot,
   release_post_cleanup_config,
 } from "../lib/release_workspace"
 
@@ -38,6 +40,99 @@ fn live_cfg(harness: Harness, repo: string, pin: string) -> ReleaseConfig {
   return cfg
 }
 
+fn audit_snapshot_fixture(harness: Harness) -> dict {
+  const root = path_join(harness.fs.temp_dir(), "release-audit-snapshot-" + uuid_v7())
+  const repo = path_join(root, "harn")
+  sh("git init -q '" + repo + "'")
+  sh("git -C '" + repo + "' config user.email test@example.com")
+  sh("git -C '" + repo + "' config user.name test")
+  sh("git -C '" + repo + "' checkout -q -b main")
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.3\"\n")
+  harness.fs.write_text(path_join(repo, "CHANGELOG.md"), "# Changelog\n\n## v1.2.3\n\n- Base.\n")
+  sh("git -C '" + repo + "' add Cargo.toml CHANGELOG.md")
+  sh("git -C '" + repo + "' commit -q -m base")
+  sh("git -C '" + repo + "' tag v1.2.3")
+  sh("git -C '" + repo + "' switch -q -c candidate")
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.4\"\n")
+  harness.fs.write_text(
+    path_join(repo, "CHANGELOG.md"),
+    "# Changelog\n\n## v1.2.4\n\n- Exact pinned candidate.\n\n## v1.2.3\n\n- Base.\n",
+  )
+  harness.fs.write_text(path_join(repo, "candidate.txt"), "pin\n")
+  sh("git -C '" + repo + "' add Cargo.toml CHANGELOG.md candidate.txt")
+  sh("git -C '" + repo + "' commit -q -m 'candidate (#42)'")
+  const pin = trim(sh("git -C '" + repo + "' rev-parse HEAD").stdout)
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.5\"\n")
+  harness.fs.write_text(path_join(repo, "candidate.txt"), "later\n")
+  sh("git -C '" + repo + "' add Cargo.toml candidate.txt")
+  sh("git -C '" + repo + "' commit -q -m later")
+  const later = trim(sh("git -C '" + repo + "' rev-parse HEAD").stdout)
+  sh("git -C '" + repo + "' switch -q main")
+  sh("git -C '" + repo + "' branch -f candidate '" + pin + "'")
+  return {root: root, repo: repo, pin: pin, later: later}
+}
+
+fn audit_cfg(harness: Harness, repo: string) -> ReleaseConfig {
+  let cfg = parse_release_args(
+    harness,
+    ["--repo", repo, "--mode", "audit", "--at-sha", "candidate"],
+  )
+  cfg["pin_sha"] = resolve_pin_sha(cfg)
+  return cfg
+}
+
+pipeline test_audit_snapshot_is_exact_across_caller_and_ref_drift(task) {
+  const fixture = audit_snapshot_fixture(harness)
+  const canonical_source = trim(
+    sh("git -C '" + fixture.repo + "' rev-parse --show-toplevel").stdout,
+  )
+  const source_head = trim(sh("git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
+  const source_status = sh("git -C '" + fixture.repo + "' status --porcelain").stdout
+  const unresolved = audit_cfg(harness, fixture.repo)
+  assert_eq(unresolved.pin_sha, fixture.pin)
+  let unresolved_error = ""
+  try {
+    release_analysis_snapshot(unresolved)
+  } catch (e) {
+    unresolved_error = to_string(e)
+  }
+  assert_eq(unresolved_error, "release analysis requires one detached worktree at the resolved pin")
+  const run_id = "test-audit-snapshot-" + uuid_v7()
+  const cfg = materialize_release_workspace(harness, unresolved, run_id)
+  sh("git -C '" + fixture.repo + "' branch -f candidate '" + fixture.later + "'")
+  const snapshot = release_analysis_snapshot(cfg)
+  assert_eq(snapshot.kind, "detached_worktree")
+  assert_eq(snapshot.requested_sha, "candidate")
+  assert_eq(snapshot.resolved_sha, fixture.pin)
+  assert_eq(snapshot.analysis_head, fixture.pin)
+  assert_eq(snapshot.analysis_root, cfg.repo)
+  assert_eq(snapshot.source_repo, canonical_source)
+  assert_eq(current_version(harness, cfg), "1.2.4")
+  assert_eq(changelog_top(harness, cfg), "1.2.4")
+  assert_eq(harness.fs.read_text(path_join(cfg.repo, "candidate.txt")), "pin\n")
+  assert_eq(trim(sh("git -C '" + cfg.repo + "' rev-parse HEAD").stdout), fixture.pin)
+  assert_eq(trim(sh("git -C '" + fixture.repo + "' rev-parse candidate").stdout), fixture.later)
+  assert_eq(trim(sh("git -C '" + fixture.repo + "' rev-parse HEAD").stdout), source_head)
+  assert_eq(sh("git -C '" + fixture.repo + "' status --porcelain").stdout, source_status)
+  let wrong_owner_error = ""
+  try {
+    finish_release_workspace(harness, cfg, false, "another-run")
+  } catch (e) {
+    wrong_owner_error = to_string(e)
+  }
+  assert(contains(wrong_owner_error, "not owned by run another-run"))
+  assert_eq(harness.fs.exists(cfg.repo), true)
+  const cleanup = finish_release_workspace(harness, cfg, false, run_id)
+  assert_eq(cleanup?.success, true)
+  assert_eq(cleanup?.preserved, false)
+  assert_eq(harness.fs.exists(cfg.repo), false)
+  const repeated = finish_release_workspace(harness, cfg, false, run_id)
+  assert_eq(repeated?.success, true)
+  assert_eq(repeated?.skipped, true)
+  assert_eq(trim(sh("git -C '" + fixture.repo + "' rev-parse HEAD").stdout), source_head)
+  assert_eq(sh("git -C '" + fixture.repo + "' status --porcelain").stdout, source_status)
+}
+
 pipeline test_release_workspace_preserves_dirty_operator_checkout_and_warm_target(task) {
   const fixture = repo_fixture(harness)
   sh("git -C '" + fixture.repo + "' switch -q -c operator-work")
@@ -52,7 +147,8 @@ pipeline test_release_workspace_preserves_dirty_operator_checkout_and_warm_targe
   const before_index = sh("git -C '" + fixture.repo + "' diff --cached --binary").stdout
   const before_worktree = sh("git -C '" + fixture.repo + "' diff --binary").stdout
   const original = live_cfg(harness, fixture.repo, fixture.pin)
-  const cfg = materialize_release_workspace(harness, original, "test-dirty-operator-" + uuid_v7())
+  const run_id = "test-dirty-operator-" + uuid_v7()
+  const cfg = materialize_release_workspace(harness, original, run_id)
   assert(cfg.repo != fixture.repo)
   assert_eq(
     cfg.source_repo,
@@ -67,7 +163,7 @@ pipeline test_release_workspace_preserves_dirty_operator_checkout_and_warm_targe
   )
   assert_eq(trim(sh("git -C '" + cfg.repo + "' rev-parse HEAD").stdout), fixture.pin)
   assert_eq(trim(sh("git -C '" + cfg.repo + "' branch --show-current").stdout), "")
-  const cleanup = finish_release_workspace(harness, cfg, true, "test-dirty-operator")
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
   assert_eq(cleanup?.success, true)
   assert_eq(harness.fs.exists(cfg.repo), false)
   const post_cleanup_cfg = release_post_cleanup_config(cfg, cleanup)
@@ -86,12 +182,13 @@ pipeline test_release_workspace_preserves_dirty_operator_checkout_and_warm_targe
 
 pipeline test_failed_release_workspace_is_preserved_with_recovery_path(task) {
   const fixture = repo_fixture(harness)
+  const run_id = "test-failed-" + uuid_v7()
   const cfg = materialize_release_workspace(
     harness,
     live_cfg(harness, fixture.repo, fixture.pin),
-    "test-failed-" + uuid_v7(),
+    run_id,
   )
-  const cleanup = finish_release_workspace(harness, cfg, false, "test-failed")
+  const cleanup = finish_release_workspace(harness, cfg, false, run_id)
   assert_eq(cleanup?.preserved, true)
   assert(contains(cleanup?.detail ?? "", cfg.repo))
   assert_eq(harness.fs.exists(cfg.repo), true)
@@ -101,13 +198,14 @@ pipeline test_failed_release_workspace_is_preserved_with_recovery_path(task) {
 
 pipeline test_successful_cleanup_preserves_unexpected_dirty_workspace(task) {
   const fixture = repo_fixture(harness)
+  const run_id = "test-dirty-workspace-" + uuid_v7()
   const cfg = materialize_release_workspace(
     harness,
     live_cfg(harness, fixture.repo, fixture.pin),
-    "test-dirty-workspace-" + uuid_v7(),
+    run_id,
   )
   harness.fs.write_text(path_join(cfg.repo, "unexpected.txt"), "preserve me\n")
-  const cleanup = finish_release_workspace(harness, cfg, true, "test-dirty-workspace")
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
   assert_eq(cleanup?.success, false)
   assert_eq(cleanup?.preserved, true)
   assert(contains(cleanup?.warning ?? "", "dirty"))
@@ -124,10 +222,11 @@ pipeline test_pre_tag_resume_aligns_only_isolated_workspace_to_candidate(task) {
   const candidate = trim(sh("git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
   const source_branch = trim(sh("git -C '" + fixture.repo + "' branch --show-current").stdout)
   const source_head = candidate
+  const run_id = "test-pre-tag-" + uuid_v7()
   let cfg = materialize_release_workspace(
     harness,
     live_cfg(harness, fixture.repo, fixture.pin),
-    "test-pre-tag-" + uuid_v7(),
+    run_id,
   )
   cfg["pre_tag_resume"] = true
   cfg["fixup_publication"] = release_publication("1.2.3", candidate)
@@ -136,6 +235,6 @@ pipeline test_pre_tag_resume_aligns_only_isolated_workspace_to_candidate(task) {
   assert_eq(trim(sh("git -C '" + cfg.repo + "' branch --show-current").stdout), "")
   assert_eq(trim(sh("git -C '" + fixture.repo + "' branch --show-current").stdout), source_branch)
   assert_eq(trim(sh("git -C '" + fixture.repo + "' rev-parse HEAD").stdout), source_head)
-  const cleanup = finish_release_workspace(harness, cfg, true, "test-pre-tag")
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
   assert_eq(cleanup?.success, true)
 }

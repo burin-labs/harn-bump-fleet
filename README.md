@@ -525,13 +525,18 @@ attempt ref when one is available. Recover by recreating the fold content from
 the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
-Live runs first freeze the release parent (`--at-sha` /
-`HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD). Canonical `ship-pr` then uses
-Harn's harness-only materialization boundary to produce and sign the versioned
-candidate, proves that the frozen parent is its sole parent, and publishes the
-write-once `release-attempt/...` ref. Because GitHub `workflow_dispatch` cannot
-target a bare SHA, certification publishes a second write-once
-`release-certify/<candidate-oid>` branch at that exact prepared commit.
+Every non-mock run first freezes the release parent (`--at-sha` /
+`HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD) and materializes that exact commit
+in a detached, run-owned worktree. Audit, version, changelog, diff, generated
+artifact, and agent-review inputs all use that one root; the receipt records the
+requested ref, resolved commit, source checkout, and analyzed root. Read-only
+audits remove their worktree on success or failure without changing the caller's
+branch, index, or files. Canonical `ship-pr` uses the same materialization
+boundary to produce and sign the versioned candidate, proves that the frozen
+parent is its sole parent, and publishes the write-once `release-attempt/...`
+ref. Because GitHub `workflow_dispatch` cannot target a bare SHA, certification
+publishes a second write-once `release-certify/<candidate-oid>` branch at that
+exact prepared commit.
 
 The controller dispatches `windows-nightly.yml` and `macos-nightly.yml` against
 that branch through the typed GitHub Actions connector and retains the exact
