@@ -1,0 +1,434 @@
+import {
+  github_branch_head,
+  github_disable_auto_merge,
+  github_enable_auto_merge,
+  github_merge_queue_entries,
+  github_pr_checks,
+  github_pr_view,
+} from "./github"
+import {
+  ReleaseQueueEntryState,
+  ReleaseQueueHold,
+  ReleaseQueueMutationAdapter,
+  ReleaseQueueMutationResult,
+  ReleaseQueuePlanOptions,
+  ReleaseQueueReservationPlan,
+  ReleaseQueueReservationReceipt,
+  ReleaseQueueSourceCheck,
+  release_queue_audit_receipt,
+  release_queue_reservation_plan,
+  release_queue_reserve,
+  release_queue_restore,
+} from "./release_queue_reservation"
+import {
+  release_queue_active_reservation_id,
+  release_queue_checkpoint,
+  release_queue_receipt_path,
+  release_queue_receipt_read,
+  release_queue_receipt_write,
+} from "./release_queue_state"
+import {
+  GithubConnectorResult,
+  GithubMergeQueueEntry,
+  GithubPullRequestChecks,
+  GithubPullRequestView,
+} from "harn-github-connector/default"
+
+pub type ReleaseQueueRuntimeConfig = {
+  repo: string,
+  base_branch: string,
+  base_oid: string,
+  critical_pull_numbers: list<int>,
+  live_pull_numbers: list<int>,
+  noncritical_live_overrides: list<int>,
+}
+
+pub type ReleaseQueueRuntimeBaseHead = {repo: string, branch: string, oid: string}
+
+pub type ReleaseQueueRuntimeQueueEntry = {
+  id: string,
+  pull_number: int,
+  head_sha: string,
+  position: int,
+  state: ReleaseQueueEntryState,
+}
+
+pub type ReleaseQueueRuntimeQueueSnapshot = {
+  repo: string,
+  branch: string,
+  configured: bool,
+  entries: list<ReleaseQueueRuntimeQueueEntry>,
+}
+
+pub type ReleaseQueueRuntimePull = {
+  number: int,
+  head: {sha: string},
+  auto_merge_armed: bool,
+  auto_merge_method: string?,
+  queue_membership: {entry: {position: int}?},
+}
+
+pub type ReleaseQueueRuntimeChecks = {
+  head_sha: string,
+  state: string,
+  checks: list<ReleaseQueueSourceCheck>,
+}
+
+pub type ReleaseQueueRuntimeAdapter = {
+  base_head: fn(string, string) -> ReleaseQueueRuntimeBaseHead,
+  queue_snapshot: fn(string, string) -> ReleaseQueueRuntimeQueueSnapshot,
+  pull: fn(string, int) -> ReleaseQueueRuntimePull,
+  checks: fn(string, int) -> ReleaseQueueRuntimeChecks,
+  hold: fn(string, string, string, ReleaseQueueHold) -> ReleaseQueueMutationResult,
+  restore: fn(string, ReleaseQueueHold) -> ReleaseQueueMutationResult,
+}
+
+fn connector_value<T>(result: GithubConnectorResult<T>, operation: string) -> T {
+  if is_err(result) {
+    throw operation + " failed: " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+fn queue_entry_state(value: string) -> ReleaseQueueEntryState {
+  const normalized = uppercase(trim(value))
+  if normalized == "QUEUED" || normalized == "AWAITING_CHECKS" || normalized == "MERGEABLE"
+    || normalized
+    == "UNMERGEABLE"
+    || normalized
+    == "LOCKED" {
+    return normalized
+  }
+  throw "GitHub returned unsupported merge queue state: " + value
+}
+
+fn runtime_queue_entry(entry: GithubMergeQueueEntry) -> ReleaseQueueRuntimeQueueEntry {
+  return {
+    id: entry.id,
+    pull_number: entry.pull_number,
+    head_sha: entry.head_sha,
+    position: entry.position,
+    state: queue_entry_state(entry.state),
+  }
+}
+
+fn runtime_pull(pull: GithubPullRequestView) -> ReleaseQueueRuntimePull {
+  return {
+    number: pull.number,
+    head: {sha: pull.head.sha},
+    auto_merge_armed: pull.auto_merge_armed,
+    auto_merge_method: pull.auto_merge_method,
+    queue_membership: {
+      entry: if pull.queue_membership.entry == nil {
+        nil
+      } else {
+        {position: pull.queue_membership.entry.position}
+      },
+    },
+  }
+}
+
+fn runtime_checks(checks: GithubPullRequestChecks) -> ReleaseQueueRuntimeChecks {
+  return {
+    head_sha: checks.head_sha,
+    state: checks.state,
+    checks: checks.checks.map(
+      fn(check) { return {
+        name: check.name,
+        status: check.status,
+        conclusion: check.conclusion,
+        details_url: check.details_url ?? "",
+      } },
+    ),
+  }
+}
+
+fn default_adapter(harness: Harness) -> ReleaseQueueRuntimeAdapter {
+  return {
+    base_head: fn(repo, branch) {
+      const head = connector_value(
+        github_branch_head(harness, repo, branch),
+        "base branch observation",
+      )
+      return {repo: head.repo, branch: head.branch, oid: head.oid}
+    },
+    queue_snapshot: fn(repo, branch) {
+      const queue = connector_value(
+        github_merge_queue_entries(harness, repo, branch),
+        "merge queue observation",
+      )
+      return {
+        repo: queue.repo,
+        branch: queue.branch,
+        configured: queue.configured,
+        entries: queue.entries.map(runtime_queue_entry),
+      }
+    },
+    pull: fn(repo, number) { return runtime_pull(
+      connector_value(github_pr_view(harness, repo, number), "pull request #${number} observation"),
+    ) },
+    checks: fn(repo, number) { return runtime_checks(
+      connector_value(github_pr_checks(harness, repo, number), "pull request #${number} checks"),
+    ) },
+    hold: fn(repo, base_branch, base_oid, hold) {
+      const disabled = github_disable_auto_merge(
+        harness,
+        {
+          slug: repo,
+          pull_number: hold.pull_number,
+          expected_head_oid: hold.expected_head_oid,
+          base_branch: base_branch,
+          expected_base_oid: base_oid,
+          restore_merge_method: hold.restore_merge_method,
+        },
+      )
+      if is_err(disabled) {
+        return {ok: false, detail: "hold failed: " + to_string(unwrap_err(disabled))}
+      }
+      return {ok: true, detail: "held " + unwrap(disabled).state}
+    },
+    restore: fn(repo, hold) {
+      const enabled = github_enable_auto_merge(
+        harness,
+        repo,
+        hold.pull_number,
+        hold.expected_head_oid,
+        hold.restore_merge_method,
+      )
+      if is_err(enabled) {
+        return {ok: false, detail: "restore failed: " + to_string(unwrap_err(enabled))}
+      }
+      const observed = github_pr_view(harness, repo, hold.pull_number)
+      if is_err(observed) {
+        return {ok: false, detail: "restore proof failed: " + to_string(unwrap_err(observed))}
+      }
+      const pull = unwrap(observed)
+      if pull?.head?.sha != hold.expected_head_oid || !(pull?.auto_merge_armed ?? false) {
+        return {ok: false, detail: "restored auto-merge did not retain its exact head lease"}
+      }
+      return {
+        ok: true,
+        detail: "restored " + to_string(unwrap(enabled)?.state ?? "enabled"),
+        after_position: pull?.queue_membership?.entry?.position,
+      }
+    },
+  }
+}
+
+fn observe_pull(
+  adapter: ReleaseQueueRuntimeAdapter,
+  repo: string,
+  number: int,
+) -> ReleaseQueueRuntimePull {
+  const pull = adapter.pull(repo, number)
+  if pull?.number != number || trim(to_string(pull?.head?.sha ?? "")) == "" {
+    throw "pull request #${number} observation omitted its exact head"
+  }
+  return pull
+}
+
+/** Gather one exact, read-only queue plan from connector-owned records. */
+pub fn release_queue_observe_plan(
+  harness: Harness,
+  root: string,
+  cfg: ReleaseQueueRuntimeConfig,
+  injected_adapter: ReleaseQueueRuntimeAdapter? = nil,
+) -> ReleaseQueueReservationPlan {
+  const adapter = injected_adapter ?? default_adapter(harness)
+  const base_head = adapter.base_head(cfg.repo, cfg.base_branch)
+  if base_head?.repo != cfg.repo || base_head?.branch != cfg.base_branch
+    || base_head?.oid
+    != cfg.base_oid {
+    throw "release base moved before queue observation: expected ${cfg.repo}:${cfg.base_branch}@${cfg.base_oid}"
+  }
+  const queue = adapter.queue_snapshot(cfg.repo, cfg.base_branch)
+  if !queue.configured {
+    throw "GitHub merge queue is not configured for ${cfg.repo}:${cfg.base_branch}"
+  }
+  if queue.repo != cfg.repo || queue.branch != cfg.base_branch {
+    throw "merge queue observation does not match ${cfg.repo}:${cfg.base_branch}"
+  }
+  let critical = []
+  for number in cfg.critical_pull_numbers {
+    const pull = observe_pull(adapter, cfg.repo, number)
+    critical = critical + [{pull_number: number, expected_head_oid: pull.head.sha}]
+  }
+  let entries = []
+  let pulls = []
+  for entry in queue.entries {
+    const number = entry.pull_number
+    entries = entries
+      + [
+      {
+        entry_id: entry.id,
+        pull_number: number,
+        head_oid: entry.head_sha,
+        position: entry.position,
+        state: entry.state,
+      },
+    ]
+    const pull = observe_pull(adapter, cfg.repo, number)
+    const checks = adapter.checks(cfg.repo, number)
+    if checks.head_sha != pull.head.sha {
+      throw "source checks for pull request #${number} do not match its observed head"
+    }
+    pulls = pulls
+      + [
+      {
+        pull_number: number,
+        head_oid: pull.head.sha,
+        auto_merge_armed: pull.auto_merge_armed,
+        merge_method: pull.auto_merge_method ?? "",
+        source_check_state: checks.state,
+        source_checks: checks.checks,
+      },
+    ]
+  }
+  let options: ReleaseQueuePlanOptions = {
+    live_pull_numbers: cfg.live_pull_numbers,
+    noncritical_live_overrides: cfg.noncritical_live_overrides,
+  }
+  const active_reservation_id = release_queue_active_reservation_id(harness.fs, root)
+  if active_reservation_id != nil {
+    options["active_reservation_id"] = active_reservation_id
+  }
+  return release_queue_reservation_plan(
+    cfg.repo,
+    cfg.base_branch,
+    cfg.base_oid,
+    critical,
+    entries,
+    pulls,
+    options,
+  )
+}
+
+fn mutation_adapter(plan, adapter) -> ReleaseQueueMutationAdapter {
+  return {
+    hold: fn(hold) { return adapter.hold(plan.repo, plan.base_branch, plan.base_oid, hold) },
+    restore: fn(hold) { return adapter.restore(plan.repo, hold) },
+  }
+}
+
+/** Persist the read-only audit plan without changing queue state. */
+pub fn release_queue_audit(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  root: string,
+  plan: ReleaseQueueReservationPlan,
+) -> ReleaseQueueReservationReceipt {
+  const receipt = release_queue_audit_receipt(plan)
+  release_queue_receipt_write(harness, root, receipt)
+  return receipt
+}
+
+/** Reserve a safe plan, reusing every exact mutation already checkpointed. */
+pub fn release_queue_apply_reservation(
+  harness: Harness,
+  root: string,
+  plan: ReleaseQueueReservationPlan,
+  injected_adapter: ReleaseQueueRuntimeAdapter? = nil,
+  force_hold_pull_numbers: list<int> = [],
+) -> ReleaseQueueReservationReceipt {
+  const adapter = injected_adapter ?? default_adapter(harness)
+  const prior = release_queue_receipt_read(
+    harness.fs,
+    release_queue_receipt_path(root, plan.reservation_id, "reserve"),
+  )
+  return release_queue_reserve(
+    plan,
+    prior,
+    mutation_adapter(plan, adapter),
+    release_queue_checkpoint({fs: harness.fs, random: harness.random}, root),
+    force_hold_pull_numbers,
+  )
+}
+
+fn cumulative_refresh_plan(
+  prior: ReleaseQueueReservationPlan,
+  refreshed: ReleaseQueueReservationPlan,
+) -> ReleaseQueueReservationPlan {
+  let holds = prior.holds
+  let observed_entries = prior.observed_entries
+  for hold in refreshed.holds {
+    if !holds.any({ item -> item.pull_number == hold.pull_number }) {
+      holds = holds + [hold]
+    }
+  }
+  for entry in refreshed.observed_entries {
+    if !observed_entries.any(
+      { item -> item.pull_number == entry.pull_number && item.head_oid == entry.head_oid },
+    ) {
+      observed_entries = observed_entries + [entry]
+    }
+  }
+  return refreshed + {holds: holds, observed_entries: observed_entries}
+}
+
+/** Re-observe an active reservation and hold newly eligible queue entries idempotently. */
+pub fn release_queue_refresh_active(
+  harness: Harness,
+  root: string,
+  injected_adapter: ReleaseQueueRuntimeAdapter? = nil,
+) -> ReleaseQueueReservationReceipt? {
+  const reservation_id = release_queue_active_reservation_id(harness.fs, root)
+  if reservation_id == nil {
+    return nil
+  }
+  const reserved = release_queue_receipt_read(
+    harness.fs,
+    release_queue_receipt_path(root, reservation_id, "reserve"),
+  )
+  if reserved == nil || reserved.status != "reserved" {
+    throw "active release queue reservation has no terminal reserve receipt"
+  }
+  const plan = reserved.plan
+  const refreshed = release_queue_observe_plan(
+    harness,
+    root,
+    {
+      repo: plan.repo,
+      base_branch: plan.base_branch,
+      base_oid: plan.base_oid,
+      critical_pull_numbers: plan.critical.map({ item -> item.pull_number }).to_list(),
+      live_pull_numbers: plan.options.live_pull_numbers,
+      noncritical_live_overrides: plan.options.noncritical_live_overrides,
+    },
+    injected_adapter,
+  )
+  if refreshed.reservation_id != reservation_id {
+    throw "queue refresh changed active reservation identity"
+  }
+  const current_holds = refreshed.holds.map({ hold -> hold.pull_number }).to_list()
+  const cumulative = cumulative_refresh_plan(plan, refreshed)
+  return release_queue_apply_reservation(harness, root, cumulative, injected_adapter, current_holds)
+}
+
+/** Restore the active reservation and retain a durable terminal receipt. */
+pub fn release_queue_restore_active(
+  harness: Harness,
+  root: string,
+  injected_adapter: ReleaseQueueRuntimeAdapter? = nil,
+) -> ReleaseQueueReservationReceipt? {
+  const reservation_id = release_queue_active_reservation_id(harness.fs, root)
+  if reservation_id == nil {
+    return nil
+  }
+  const reserved = release_queue_receipt_read(
+    harness.fs,
+    release_queue_receipt_path(root, reservation_id, "reserve"),
+  )
+  if reserved == nil {
+    throw "active release queue reservation has no typed reserve receipt"
+  }
+  const prior_restore = release_queue_receipt_read(
+    harness.fs,
+    release_queue_receipt_path(root, reservation_id, "restore"),
+  )
+  const adapter = injected_adapter ?? default_adapter(harness)
+  return release_queue_restore(
+    reserved,
+    prior_restore,
+    mutation_adapter(reserved.plan, adapter),
+    release_queue_checkpoint({fs: harness.fs, random: harness.random}, root),
+  )
+}

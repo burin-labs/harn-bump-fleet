@@ -1,0 +1,197 @@
+import {
+  release_queue_apply_reservation,
+  release_queue_audit,
+  release_queue_observe_plan,
+  release_queue_refresh_active,
+  release_queue_restore_active,
+} from "../lib/release_queue_runtime"
+
+const CRITICAL_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const HELD_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+const REFILLED_HEAD = "dddddddddddddddddddddddddddddddddddddddd"
+
+fn pull(number, head, armed = true, method = "SQUASH") {
+  return {
+    number: number,
+    head: {sha: head},
+    auto_merge_armed: armed,
+    auto_merge_method: method,
+    queue_membership: {entry: nil},
+  }
+}
+
+pipeline test_runtime_observes_audits_reserves_retries_and_restores(harness: Harness, task) {
+  const root = path_join(harness.fs.temp_dir(), "release-queue-runtime-" + harness.random.uuid_v7())
+  let holds = 0
+  let restores = 0
+  let refilled = false
+  let held_30 = false
+  let held_40 = false
+  const adapter = {
+    base_head: fn(repo, branch) { return {
+      repo: repo,
+      branch: branch,
+      oid: "cccccccccccccccccccccccccccccccccccccccc",
+    } },
+    queue_snapshot: fn(_repo, _branch) { return {
+      repo: "burin-labs/harn",
+      branch: "main",
+      configured: true,
+      entries: [
+        {
+          id: "entry-20",
+          pull_number: 20,
+          head_sha: CRITICAL_HEAD,
+          position: 1,
+          state: "AWAITING_CHECKS",
+        },
+      ]
+        + if !held_30 {
+        [{id: "entry-30", pull_number: 30, head_sha: HELD_HEAD, position: 2, state: "QUEUED"}]
+      } else {
+        []
+      }
+        + if refilled {
+        if !held_40 {
+          [
+            {
+              id: "entry-40",
+              pull_number: 40,
+              head_sha: REFILLED_HEAD,
+              position: 3,
+              state: "QUEUED",
+            },
+          ]
+        } else {
+          []
+        }
+      } else {
+        []
+      },
+    } },
+    pull: fn(_repo, number) { return if number == 20 {
+      pull(20, CRITICAL_HEAD)
+    } else if number == 40 {
+      pull(40, REFILLED_HEAD, !held_40)
+    } else {
+      pull(30, HELD_HEAD, !held_30)
+    } },
+    checks: fn(_repo, number) { return {
+      head_sha: if number == 20 {
+        CRITICAL_HEAD
+      } else if number == 40 {
+        REFILLED_HEAD
+      } else {
+        HELD_HEAD
+      },
+      state: "green",
+      checks: [
+        {
+          name: "source",
+          status: "completed",
+          conclusion: "success",
+          details_url: "https://ci.test/${number}",
+        },
+      ],
+    } },
+    hold: fn(_repo, base_branch, base_oid, hold) {
+      assert_eq(base_branch, "main")
+      assert_eq(base_oid, "cccccccccccccccccccccccccccccccccccccccc")
+      holds = holds + 1
+      if hold.pull_number == 30 {
+        held_30 = true
+      } else {
+        held_40 = true
+      }
+      return {ok: true, detail: "held", after_position: nil}
+    },
+    restore: fn(_repo, hold) {
+      restores = restores + 1
+      return {ok: true, detail: "restored", after_position: hold.position}
+    },
+  }
+  const cfg = {
+    repo: "burin-labs/harn",
+    base_branch: "main",
+    base_oid: "cccccccccccccccccccccccccccccccccccccccc",
+    critical_pull_numbers: [20],
+    live_pull_numbers: [],
+    noncritical_live_overrides: [],
+  }
+  assert_eq(adapter.queue_snapshot(cfg.repo, cfg.base_branch).configured, true)
+  const plan = release_queue_observe_plan(harness, root, cfg, adapter)
+  assert(plan.safe)
+  assert_eq(plan.preserved.map(fn(item) { return item.pull_number }), [20])
+  assert_eq(plan.holds.map(fn(item) { return item.pull_number }), [30])
+  const audit = release_queue_audit({fs: harness.fs, random: harness.random}, root, plan)
+  assert_eq(audit.status, "planned")
+  assert_eq([holds, restores], [0, 0])
+  const reserved = release_queue_apply_reservation(harness, root, plan, adapter)
+  assert_eq(reserved.status, "reserved")
+  assert_eq(holds, 1)
+  const retried = release_queue_apply_reservation(harness, root, plan, adapter)
+  assert_eq(retried.mutations, reserved.mutations)
+  assert_eq(holds, 1)
+  refilled = true
+  const refreshed = release_queue_refresh_active(harness, root, adapter)
+  assert(refreshed != nil)
+  assert_eq(refreshed.status, "reserved")
+  assert_eq(refreshed.mutations.map({ mutation -> mutation.pull_number }).to_list(), [30, 40])
+  assert_eq(holds, 2)
+  held_30 = false
+  const reheld = release_queue_refresh_active(harness, root, adapter)
+  assert(reheld != nil)
+  assert_eq(
+    reheld.mutations.map({ mutation -> mutation.pull_number }).to_list(),
+    [30, 40, 30],
+    "an externally re-enqueued exact head is held again with a new mutation receipt",
+  )
+  assert_eq(holds, 3)
+  const restored = release_queue_restore_active(harness, root, adapter)
+  assert_eq(restored?.status, "restored")
+  assert_eq(restores, 2)
+  assert_eq(release_queue_restore_active(harness, root, adapter), nil)
+  assert_eq(restores, 2)
+}
+
+pipeline test_runtime_rejects_a_moved_base_before_queue_observation(harness: Harness, task) {
+  const root = path_join(
+    harness.fs.temp_dir(),
+    "release-queue-moved-base-" + harness.random.uuid_v7(),
+  )
+  let queue_reads = 0
+  const adapter = {
+    base_head: fn(repo, branch) { return {
+      repo: repo,
+      branch: branch,
+      oid: "dddddddddddddddddddddddddddddddddddddddd",
+    } },
+    queue_snapshot: fn(_repo, _branch) {
+      queue_reads = queue_reads + 1
+      return {}
+    },
+    pull: fn(_repo, _number) { return {} },
+    checks: fn(_repo, _number) { return {} },
+    hold: fn(_repo, _branch, _base_oid, _hold) { return {ok: true} },
+    restore: fn(_repo, _hold) { return {ok: true} },
+  }
+  const observed = try {
+    release_queue_observe_plan(
+      harness,
+      root,
+      {
+        repo: "burin-labs/harn",
+        base_branch: "main",
+        base_oid: "cccccccccccccccccccccccccccccccccccccccc",
+        critical_pull_numbers: [20],
+        live_pull_numbers: [],
+        noncritical_live_overrides: [],
+      },
+      adapter,
+    )
+  }
+  assert(is_err(observed))
+  assert_eq(queue_reads, 0, "moved base stops before queue or pull reads")
+}

@@ -1,0 +1,236 @@
+import {
+  ReleaseQueueEntry,
+  ReleaseQueuePull,
+  release_queue_audit_receipt,
+  release_queue_reservation_plan,
+  release_queue_reserve,
+  release_queue_restore,
+} from "../lib/release_queue_reservation"
+
+fn queue_entry(number, position, head) -> ReleaseQueueEntry {
+  return {
+    entry_id: "entry-${number}",
+    pull_number: number,
+    head_oid: head,
+    position: position,
+    state: if position == 1 {
+      "AWAITING_CHECKS"
+    } else {
+      "QUEUED"
+    },
+  }
+}
+
+fn pull(number, head) -> ReleaseQueuePull {
+  return {
+    pull_number: number,
+    head_oid: head,
+    auto_merge_armed: true,
+    merge_method: "squash",
+    source_check_state: "green",
+    source_checks: [
+      {name: "source", status: "completed", conclusion: "success", details_url: "https://ci.test"},
+    ],
+  }
+}
+
+fn fixture_entries() {
+  let entries: list<ReleaseQueueEntry> = [queue_entry(10, 1, "head-10")]
+  for number in 20 to 30 {
+    entries = entries + [queue_entry(number, number - 18, "head-${number}")]
+  }
+  entries = entries + [queue_entry(40, 12, "queue-head-40"), queue_entry(50, 13, "head-50")]
+  return entries
+}
+
+fn fixture_pulls() {
+  let pulls: list<ReleaseQueuePull> = [pull(10, "head-10")]
+  for number in 20 to 30 {
+    pulls = pulls + [pull(number, "head-${number}")]
+  }
+  pulls = pulls + [pull(40, "changed-head-40")]
+  return pulls
+}
+
+pipeline test_audit_is_read_only_and_refuses_unknown_or_changed_heads(task) {
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    fixture_entries(),
+    fixture_pulls(),
+    {live_pull_numbers: [10], noncritical_live_overrides: []},
+  )
+  const receipt = release_queue_audit_receipt(plan)
+  assert_eq(receipt.status, "refused")
+  assert_eq(receipt.mutations, [])
+  assert_eq(len(plan.holds), 10)
+  assert_eq(plan.preserved.map(fn(item) { return item.pull_number }), [10, 20])
+  assert_eq(
+    plan.refusals.map(fn(item) { return item.code }),
+    ["changed_head", "unknown_queue_entry"],
+  )
+}
+
+pipeline test_reserve_retry_and_restore_are_exactly_once(task) {
+  const entries = [
+    queue_entry(10, 1, "head-10"),
+    queue_entry(20, 2, "head-20"),
+    queue_entry(30, 3, "head-30"),
+  ]
+  const pulls = [pull(10, "head-10"), pull(20, "head-20"), pull(30, "head-30")]
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    entries,
+    pulls,
+    {live_pull_numbers: [10], noncritical_live_overrides: []},
+  )
+  assert(plan.safe)
+  let holds = 0
+  let restores = 0
+  let checkpoints = 0
+  let checkpoint_statuses: list<string> = []
+  const adapter = {
+    hold: fn(_hold) {
+      holds = holds + 1
+      return {ok: true, detail: "held", after_position: nil}
+    },
+    restore: fn(_hold) {
+      restores = restores + 1
+      return {ok: true, detail: "restored", after_position: _hold.position}
+    },
+  }
+  const checkpoint = fn(receipt) {
+    checkpoints = checkpoints + 1
+    checkpoint_statuses = checkpoint_statuses + [receipt.status]
+    return nil
+  }
+  const reserved = release_queue_reserve(plan, nil, adapter, checkpoint)
+  assert_eq(reserved.status, "reserved")
+  assert_eq([holds, checkpoints], [1, 2])
+  assert_eq(checkpoint_statuses, ["partial", "reserved"])
+  assert_eq(reserved.mutations[0]?.before_position, 3)
+  assert_eq(reserved.mutations[0]?.after_position, nil)
+  assert_eq(reserved.plan.holds[0]?.source_checks?.[0]?.conclusion, "success")
+  assert_eq(reserved.plan.holds[0]?.source_check_state, "green")
+  const retried = release_queue_reserve(plan, reserved, adapter, checkpoint)
+  assert_eq(retried.mutations, reserved.mutations)
+  assert_eq(holds, 1)
+  const restored = release_queue_restore(reserved, nil, adapter, checkpoint)
+  assert_eq(restored.status, "restored")
+  assert_eq(restores, 1)
+  assert_eq(restored.mutations[0]?.after_position, 3)
+  const restore_retry = release_queue_restore(reserved, restored, adapter, checkpoint)
+  assert_eq(restore_retry.mutations, restored.mutations)
+  assert_eq(restores, 1)
+}
+
+pipeline test_partial_reservation_restores_every_successful_hold(task) {
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    [queue_entry(20, 1, "head-20"), queue_entry(30, 2, "head-30"), queue_entry(40, 3, "head-40")],
+    [pull(20, "head-20"), pull(30, "head-30"), pull(40, "head-40")],
+    {live_pull_numbers: [], noncritical_live_overrides: []},
+  )
+  let restores = []
+  const adapter = {
+    hold: fn(hold) { return {
+      ok: hold.pull_number == 30,
+      detail: if hold.pull_number == 30 {
+        "held"
+      } else {
+        "failed"
+      },
+    } },
+    restore: fn(hold) {
+      restores = restores + [hold.pull_number]
+      return {ok: true, detail: "restored", after_position: hold.position}
+    },
+  }
+  const persist = fn(_receipt) { return nil }
+  const reserved = release_queue_reserve(plan, nil, adapter, persist)
+  assert_eq(reserved.status, "partial")
+  assert_eq(
+    reserved.mutations.map({ mutation -> mutation.status }).to_list(),
+    ["applied", "failed"],
+  )
+  const restored = release_queue_restore(reserved, nil, adapter, persist)
+  assert_eq(restored.status, "restored")
+  assert_eq(restores, [30])
+}
+
+pipeline test_concurrent_release_fails_closed(task) {
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    [queue_entry(20, 1, "head-20")],
+    [pull(20, "head-20")],
+    {
+      live_pull_numbers: [],
+      noncritical_live_overrides: [],
+      active_reservation_id: "burin-labs/harn:main@other-base:30@head-30",
+    },
+  )
+  assert(!plan.safe)
+  assert_eq(plan.refusals.map(fn(item) { return item.code }), ["concurrent_release"])
+}
+
+pipeline test_explicit_override_can_hold_the_live_front(task) {
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    [queue_entry(10, 1, "head-10"), queue_entry(20, 2, "head-20")],
+    [pull(10, "head-10"), pull(20, "head-20")],
+    {live_pull_numbers: [10], noncritical_live_overrides: [10]},
+  )
+  assert(plan.safe)
+  assert_eq(plan.holds.map(fn(item) { return item.pull_number }), [10])
+  assert_eq(plan.preserved.map(fn(item) { return item.pull_number }), [20])
+}
+
+pipeline test_every_structural_live_state_is_preserved(task) {
+  let entries: list<ReleaseQueueEntry> = []
+  let pulls: list<ReleaseQueuePull> = []
+  const states = ["AWAITING_CHECKS", "MERGEABLE", "UNMERGEABLE", "LOCKED"]
+  let index = 0
+  for state in states {
+    const number = 10 + index
+    entries = entries
+      + [
+      {
+        entry_id: "entry-${number}",
+        pull_number: number,
+        head_oid: "head-${number}",
+        position: index + 2,
+        state: state,
+      },
+    ]
+    pulls = pulls + [pull(number, "head-${number}")]
+    index = index + 1
+  }
+  entries = entries + [queue_entry(20, 6, "head-20"), queue_entry(30, 7, "head-30")]
+  pulls = pulls + [pull(20, "head-20"), pull(30, "head-30")]
+  const plan = release_queue_reservation_plan(
+    "burin-labs/harn",
+    "main",
+    "base-oid",
+    [{pull_number: 20, expected_head_oid: "head-20"}],
+    entries,
+    pulls,
+    {live_pull_numbers: [], noncritical_live_overrides: []},
+  )
+  assert(plan.safe)
+  assert_eq(plan.preserved.map(fn(item) { return item.pull_number }), [10, 11, 12, 13, 20])
+  assert_eq(plan.holds.map(fn(item) { return item.pull_number }), [30])
+}
