@@ -1,20 +1,11 @@
-import {
-  ChangelogCategory,
-  ChangelogFragment,
-  changelog_assemble_fragments,
-  changelog_find_section,
-  changelog_merge_unreleased,
-  changelog_parse_fragment,
-} from "std/changelog"
+import { changelog_find_section } from "std/changelog"
 import { command_result_fail, command_result_ok } from "std/command"
 // Extracted release-harness stage. See AGENTS.md for ownership.
 import { GitRemoteRef, git_merge_base } from "std/git"
-import { shell_quote } from "std/runtime"
 import {
   changelog_bullet_count,
   changelog_fixup_release_body,
   changelog_promote_pin_time_unreleased,
-  changelog_release_section_update,
   changelog_release_section_valid,
   changelog_repair_post_merge_drift,
   changelog_replace_top_section,
@@ -36,6 +27,12 @@ import {
   release_recovery_is_pre_tag_resume,
   release_recovery_pin_decision,
 } from "./release_fixup"
+import {
+  assemble_fragment_records,
+  candidate_tree_release_note_fold,
+  fold_candidate_release_note_text,
+  persist_candidate_tree_release_note_fold,
+} from "./release_note_fold"
 import { ReleasePublication, release_recovery_source } from "./release_publication"
 import { harn_crate_published } from "./release_readiness"
 import { remote_tag_sha, remote_tag_target_sha } from "./release_repin"
@@ -51,6 +48,7 @@ import {
 import { ReleaseAgentReviewResult, run_recovery_agent_loop } from "release_agent"
 import { ReleaseAnalysis, changelog_top } from "release_analysis"
 import {
+  ReleaseCommandResult,
   ReleaseConfig,
   ReleaseRepoConfig,
   prompt_asset,
@@ -120,79 +118,9 @@ const RELEASE_BODY_CORRECTION_START = "<!-- harn-release-body-correction:v1 -->"
 
 const RELEASE_BODY_CORRECTION_END = "<!-- /harn-release-body-correction -->"
 
-const RELEASE_CHANGELOG_CATEGORIES: list<ChangelogCategory> = [
-  {slug: "breaking", heading: "Breaking"},
-  {slug: "added", heading: "Added"},
-  {slug: "changed", heading: "Changed"},
-  {slug: "deprecated", heading: "Deprecated"},
-  {slug: "removed", heading: "Removed"},
-  {slug: "fixed", heading: "Fixed"},
-  {slug: "security", heading: "Security"},
-]
-
 fn changelog_section_body(text, heading) {
   const section = changelog_find_section(text, heading)
   return is_ok(section) ? unwrap(section).body : ""
-}
-
-fn assemble_fragment_records(fragments: list<ChangelogFragment>) -> string {
-  const assembled = changelog_assemble_fragments(fragments, RELEASE_CHANGELOG_CATEGORIES)
-  if is_err(assembled) {
-    throw unwrap_err(assembled).message
-  }
-  return unwrap(assembled)
-}
-
-fn read_agent_notes(harness: Harness, notes_path) {
-  if notes_path == nil || notes_path == "" || !harness.fs.exists(notes_path) {
-    return ""
-  }
-  return trim(harness.fs.read_text(notes_path))
-}
-
-/**
- * Discover towncrier-style fragment files under `changelog.d/` in the
- * target repo and assemble them into a Keep-a-Changelog section body.
- * Returns `{section, paths}` where `section` is the rendered markdown
- * (empty when there are no parseable fragments) and `paths` lists the
- * absolute fragment paths consumed (so the caller can stage their
- * deletion alongside the CHANGELOG.md update).
- *
- * Mock mode is a no-op so the v0.7.52→v0.7.53 rehearsal stays
- * fragment-free without needing fixture files.
- */
-fn assemble_repo_fragments(harness: Harness, cfg) {
-  if cfg.mock {
-    return {section: "", paths: []}
-  }
-  const dir = path_join(cfg.repo, "changelog.d")
-  if !harness.fs.exists(dir) {
-    return {section: "", paths: []}
-  }
-  const listing = shell_at(cfg.repo, "ls changelog.d/ 2>/dev/null")
-  if !listing.success {
-    return {section: "", paths: []}
-  }
-  let fragments: list<ChangelogFragment> = []
-  let paths = []
-  for name in listing.stdout.split("\n") {
-    const trimmed = trim(name)
-    if trimmed == "" {
-      continue
-    }
-    const full = path_join(dir, trimmed)
-    if !harness.fs.exists(full) {
-      continue
-    }
-    const body = trim(harness.fs.read_text(full))
-    const parsed = changelog_parse_fragment(trimmed, body, RELEASE_CHANGELOG_CATEGORIES)
-    if is_err(parsed) {
-      continue
-    }
-    fragments = fragments.push(unwrap(parsed))
-    paths = paths.push(full)
-  }
-  return {section: assemble_fragment_records(fragments), paths: paths, fragments: fragments}
 }
 
 pub type ReleaseRecoveryVerification = {immutable_ref: string, tag_object_oid: string}
@@ -253,59 +181,6 @@ pub fn verify_release_recovery_source(
 }
 
 /**
- * Delete fragment files consumed in this release. `git add -u` (run later
- * by scripts/release_ship.sh) picks the deletions up so they ride in the
- * same release commit as the CHANGELOG.md update.
- */
-fn delete_repo_fragments(cfg, paths) {
-  for p in paths {
-    shell_at(cfg.repo, "rm -f " + shell_quote(p))
-  }
-}
-
-/**
- * Deterministic changelog fold: merge assembled `changelog.d` fragments into
- * `## Unreleased`, then rename/insert the `## v${next_version}` section. Pure
- * with respect to the filesystem (no writes) so it can be run twice for an
- * idempotent recovery retry. Returns `{success, message, text, changed}`.
- */
-fn fold_changelog_text(original, fragments_section, next_version, agent_notes) {
-  const merged = if trim(fragments_section ?? "") == "" {
-    {success: true, changed: false, text: original, message: "no changelog.d fragments"}
-  } else {
-    const result = changelog_merge_unreleased(
-      original,
-      fragments_section,
-      RELEASE_CHANGELOG_CATEGORIES,
-    )
-    if is_ok(result) {
-      const value = unwrap(result)
-      {
-        success: true,
-        changed: value.changed,
-        text: value.text,
-        message: "merged changelog.d fragments into ## Unreleased",
-      }
-    } else {
-      {success: false, changed: false, text: original, message: unwrap_err(result).message}
-    }
-  }
-  if !merged.success {
-    return {success: false, message: merged.message, text: original, changed: false}
-  }
-  const update = changelog_release_section_update(merged.text, next_version, agent_notes)
-  if !update.success {
-    return {success: false, message: update.message, text: merged.text, changed: false}
-  }
-  return {
-    success: true,
-    message: update.message,
-    text: update.text,
-    changed: update.changed || merged.changed,
-  }
-}
-
-/**
  * F1b: fold the CHANGELOG deterministically, then recover if the result is
  * malformed. The deterministic fold is the normal path. If the resulting
  * `## v${next_version}` section is invalid (wrong heading, no bullets, or an
@@ -316,43 +191,35 @@ fn fold_changelog_text(original, fragments_section, next_version, agent_notes) {
  * reached; on unrecoverable failure the fold fails loud and leaves fragments in
  * place.
  */
-fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path, run_id) {
-  const changelog_path = path_join(cfg.repo, "CHANGELOG.md")
-  if !cfg.mock && !harness.fs.exists(changelog_path) {
-    return command_result_fail(1, "missing CHANGELOG.md")
-  }
-  const original = read_repo_file(harness, cfg, "CHANGELOG.md")
-  let fragments = assemble_repo_fragments(harness, cfg)
-  const fragment_records = fragments.fragments ?? []
-  const agent_notes = read_agent_notes(harness, notes_path)
-  const folded = fold_changelog_text(
-    original,
-    fragments.section,
-    analysis.next_version,
-    agent_notes,
-  )
+fn apply_candidate_tree_release_notes(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  notes_path: string?,
+  run_id: string,
+) -> ReleaseCommandResult {
+  const folded = candidate_tree_release_note_fold(harness, cfg, analysis.next_version, notes_path)
   if !folded.success {
     return command_result_fail(1, folded.message)
   }
-  const gate = changelog_release_section_valid(folded.text, analysis.next_version, fragment_records)
   let final_text = folded.text
   let recovery_note = ""
-  if !gate.valid {
+  if !folded.valid {
     release_log_event(
       harness,
       run_id,
       "changelog_fold_invalid",
-      {version: analysis.next_version, findings: gate.findings},
+      {version: analysis.next_version, findings: folded.findings},
     )
     // Deterministic-first recovery: re-run the idempotent fold once.
-    const refold = fold_changelog_text(
+    const refold = fold_candidate_release_note_text(
       folded.text,
-      fragments.section,
+      folded.fragment_section,
       analysis.next_version,
-      agent_notes,
+      folded.agent_notes,
     )
     const regate = if refold.success {
-      changelog_release_section_valid(refold.text, analysis.next_version, fragment_records)
+      changelog_release_section_valid(refold.text, analysis.next_version, folded.fragments)
     } else {
       {valid: false, findings: [refold.message]}
     }
@@ -368,7 +235,7 @@ fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path, run_id
         analysis,
         run_id,
         folded.text,
-        fragment_records,
+        folded.fragments,
       )
       if massage.valid {
         final_text = massage.text
@@ -379,7 +246,7 @@ fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path, run_id
           1,
           "changelog fold produced an invalid `## v${analysis.next_version}` section and recovery failed:\n"
             + join(
-            gate.findings + (massage.findings ?? []),
+            folded.findings + (massage.findings ?? []),
             "\n",
           ),
         )
@@ -389,22 +256,19 @@ fn apply_draft_release_notes(harness: Harness, cfg, analysis, notes_path, run_id
         1,
         "changelog fold produced an invalid `## v${analysis.next_version}` section:\n"
           + join(
-          gate.findings,
+          folded.findings,
           "\n",
         ),
       )
     }
   }
-  if !cfg.mock {
-    harness.fs.write_text(changelog_path, final_text)
-  }
-  if !cfg.mock && len(fragments.paths) > 0 {
-    delete_repo_fragments(cfg, fragments.paths)
-  }
-  const fragments_note = if len(fragments.paths) == 0 {
+  let persisted = folded
+  persisted["text"] = final_text
+  persist_candidate_tree_release_note_fold(harness, cfg, persisted)
+  const fragments_note = if len(folded.fragment_paths) == 0 {
     ""
   } else {
-    "; folded ${len(fragments.paths)} changelog.d fragment(s)"
+    "; folded ${len(folded.fragment_paths)} changelog.d fragment(s)"
   }
   return command_result_ok("ok: " + folded.message + fragments_note + recovery_note + "\n")
 }
@@ -1274,13 +1138,13 @@ fn release_notes_draft_path(harness: Harness, run_id, analysis, agent_review_res
 
 pub fn live_release_notes_blocker(
   harness: Harness,
-  cfg: dict,
-  analysis: dict,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
 ) -> ReleaseRecordedStep? {
   if cfg.mode == "audit" || cfg.agent || analysis.changelog_top == analysis.next_version {
     return nil
   }
-  if cfg.fixup_mode ?? false {
+  if (cfg.fixup_mode ?? false) && cfg.release_notes_scope == "frozen_artifact" {
     return nil
   }
   // The deterministic notes builder promotes `## Unreleased` (plus any
@@ -1288,7 +1152,8 @@ pub fn live_release_notes_blocker(
   // releases are equivalent because prepare folds `changelog.d` into
   // `## Unreleased` before promotion.
   const unreleased_bullets = changelog_bullet_count(analysis.changelog_unreleased_section ?? "")
-  const fragment_bullets = changelog_bullet_count(assemble_repo_fragments(harness, cfg).section)
+  const candidate_fold = candidate_tree_release_note_fold(harness, cfg, analysis.next_version, nil)
+  const fragment_bullets = changelog_bullet_count(candidate_fold.fragment_section)
   if unreleased_bullets + fragment_bullets > 0 {
     return nil
   }
@@ -1415,7 +1280,7 @@ pub fn ensure_release_notes_with_run_id(
       ),
     ]
   }
-  if cfg.fixup_mode ?? false {
+  if cfg.release_notes_scope == "frozen_artifact" {
     const r = apply_fixup_release_notes(harness, cfg, analysis)
     return [
       recorded_step(
@@ -1426,14 +1291,18 @@ pub fn ensure_release_notes_with_run_id(
     ]
   }
   const draft_path = release_notes_draft_path(harness, run_id, analysis, agent_review_result)
-  const r = apply_draft_release_notes(harness, cfg, analysis, draft_path, run_id)
-  return [
-    recorded_step(
-      "draft-release-notes",
-      "insert draft CHANGELOG.md section for v${analysis.next_version}",
-      r,
-    ),
-  ]
+  const r = apply_candidate_tree_release_notes(harness, cfg, analysis, draft_path, run_id)
+  const step_name = if cfg.fixup_mode ?? false {
+    "fixup-fold-fresh-candidate-notes"
+  } else {
+    "draft-release-notes"
+  }
+  const detail = if cfg.fixup_mode ?? false {
+    "fold current `## Unreleased` and every candidate-tree fragment into v${analysis.next_version}"
+  } else {
+    "insert draft CHANGELOG.md section for v${analysis.next_version}"
+  }
+  return [recorded_step(step_name, detail, r)]
 }
 
 fn prepared_release_findings(raw, original) {
@@ -1472,6 +1341,7 @@ pub fn prepared_release_analysis(
   out["deterministic_findings"] = prepared_release_findings(raw, original)
   out["run_session_view"] = original.run_session_view ?? raw.run_session_view
   out["fixup_mode"] = original.fixup_mode
+  out["release_notes_scope"] = original.release_notes_scope
   out["fixup_tag"] = original.fixup_tag
   out["fixup_pr_url"] = original.fixup_pr_url
   return out

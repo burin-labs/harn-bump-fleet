@@ -36,7 +36,8 @@ Release implementation changes belong in the stage that owns the behavior:
   validation, artifacts, and recovery
 - `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
   reconciliation, branch setup, and checkout state
-- `release_notes`: fragments, release notes, and fixup/drift state
+- `release_note_fold` / `release_notes`: candidate-tree folding, release notes,
+  and fixup/drift state
 - `release_reporting`: PR rendering and execution summaries
 - `release_crystallization`: deterministic, agent, and tool fixture streams
   plus their manifest and artifact writer
@@ -137,6 +138,12 @@ lane blocks the signed tag. An explicit startup pin remains load-bearing for
 parent ancestry, base fast-forward suppression, and the pre-tag drift probe.
 The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
 base-branch commits cannot leak into the published artifact.
+
+A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
+rebuilds that candidate on fresh base, the fresh base is part of the artifact:
+fold its current `## Unreleased` body and every parseable fragment into the
+candidate release section before certification. Only an already-tagged fixup
+may preserve newer notes for the following release.
 
 If release assets already exist and an open `release/vX.Y.Z` PR remains,
 post-publish fixup mode is paperwork only: recreate the branch on fresh base,
