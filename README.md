@@ -491,8 +491,16 @@ including the active job step and receipt path, so a slow platform build remains
 visibly live without repeating identical state every 30 seconds. After terminal
 hosted proof, it discovers version-matched content-addressed `release-attempt/`
 and `release-certify/` refs, deletes each through an exact target lease, and
-persists an idempotent `.ref-cleanup.json` receipt. A moved ref blocks cleanup;
-`--no-ref-cleanup` explicitly retains recovery refs. The warm dispatch runs on
+persists an idempotent `.ref-cleanup.json` receipt. It then sweeps historical
+attempt, certification, failed-recovery, and local `release/v*` refs through
+the same exact-OID policy. Signed tag identity plus a finalized hosted release,
+the published crate, and the complete required asset set are required;
+worktree-held, unique, moved, unpublished, and malformed refs remain with
+explicit reasons in a durable
+`.ref-sweep.json` receipt. The standalone `sweep_release_refs.harn` entrypoint
+is dry-run-first; `--apply --yes-live-release` is required to mutate refs. A
+moved current ref blocks cleanup; `--no-ref-cleanup` explicitly retains all
+recovery refs. The warm dispatch runs on
 `main`; its receipt stores the source SHA observed by
 GitHub, which may differ from the release commit after squash merge or later
 mainline changes. Hitting `--max-polls` returns a durable pending receipt;
