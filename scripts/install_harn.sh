@@ -119,4 +119,8 @@ if [ -n "${GITHUB_PATH:-}" ]; then
   echo "${bin_dir}" >> "${GITHUB_PATH}"
 fi
 
-"${bin_dir}/harn" --version
+env \
+  -u HARN_INSTALL_ROOT \
+  -u HARN_INSTALL_FROM_SOURCE \
+  -u HARN_NO_VERIFY \
+  "${bin_dir}/harn" --version
