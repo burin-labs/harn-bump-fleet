@@ -1,9 +1,133 @@
 import { command_result_fail, command_result_ok } from "std/command"
 // Extracted release-harness stage. See AGENTS.md for ownership.
 import { git_status } from "std/git"
+import { git_worktree_path_for_branch } from "./git_worktrees"
 import { recorded_step } from "./release_execution"
 import { ReleaseAnalysis, changelog_top, current_version } from "release_analysis"
-import { ReleaseConfig, append_command_step, checked_git, probe_git_ok } from "release_runtime"
+import {
+  ReleaseCommandResult,
+  ReleaseConfig,
+  append_command_step,
+  checked_git,
+  probe_git_ok,
+  run_git,
+} from "release_runtime"
+
+pub type ReleaseCheckoutGitRunner = fn(list<string>) -> ReleaseCommandResult
+
+pub type SupersededReleaseWorktreeAction = "noop" | "detached" | "fail"
+
+pub type SupersededReleaseWorktreeResult = {
+  success: bool,
+  action: SupersededReleaseWorktreeAction,
+  reason: string,
+  owner_path: string,
+  observed_oid: string,
+}
+
+/**
+ * Free the local convenience branch when a corrected pin supersedes a proven
+ * immutable candidate. The old worktree and commit remain intact, detached at
+ * the exact OID. Every unreadable, dirty, moved, or unproven case fails closed.
+ */
+pub fn reconcile_superseded_release_worktree(
+  git: ReleaseCheckoutGitRunner,
+  branch: string,
+  expected_oid: string,
+  pre_tag_supersede: bool,
+) -> SupersededReleaseWorktreeResult {
+  if !pre_tag_supersede {
+    return {
+      success: true,
+      action: "noop",
+      reason: "release is not superseding a pre-tag immutable candidate",
+      owner_path: "",
+      observed_oid: "",
+    }
+  }
+  const listed = git(["worktree", "list", "--porcelain"])
+  if !(listed.success ?? false) {
+    return {
+      success: false,
+      action: "fail",
+      reason: "could not inspect worktrees before superseding ${branch}",
+      owner_path: "",
+      observed_oid: "",
+    }
+  }
+  const owner = git_worktree_path_for_branch(listed.stdout ?? "", branch)
+  if owner == "" {
+    return {
+      success: true,
+      action: "noop",
+      reason: "no other worktree owns ${branch}",
+      owner_path: "",
+      observed_oid: "",
+    }
+  }
+  const clean_expected = lowercase(trim(expected_oid))
+  if len(regex_captures("^[0-9a-f]{40}$", clean_expected)) != 1 {
+    return {
+      success: false,
+      action: "fail",
+      reason: "immutable publication OID is missing or malformed for ${branch}",
+      owner_path: owner,
+      observed_oid: "",
+    }
+  }
+  const status = git(["-C", owner, "status", "--porcelain", "--untracked-files=normal"])
+  if !(status.success ?? false) || trim(status.stdout ?? "") != "" {
+    return {
+      success: false,
+      action: "fail",
+      reason: "${branch} is owned by an unreadable or dirty worktree at ${owner}",
+      owner_path: owner,
+      observed_oid: "",
+    }
+  }
+  const head = git(["-C", owner, "rev-parse", "HEAD"])
+  const observed = lowercase(trim(head.stdout ?? ""))
+  if !(head.success ?? false) || observed != clean_expected {
+    return {
+      success: false,
+      action: "fail",
+      reason:
+        "${branch} owner ${owner} is at ${observed}, not proven immutable candidate ${clean_expected}",
+      owner_path: owner,
+      observed_oid: observed,
+    }
+  }
+  const detached = git(["-C", owner, "switch", "--detach", clean_expected])
+  if !(detached.success ?? false) {
+    return {
+      success: false,
+      action: "fail",
+      reason: "failed to detach proven ${branch} owner ${owner}: ${trim(detached.stderr ?? "")}",
+      owner_path: owner,
+      observed_oid: observed,
+    }
+  }
+  const verified = git(["worktree", "list", "--porcelain"])
+  if !(verified.success ?? false)
+    || git_worktree_path_for_branch(verified.stdout ?? "", branch)
+    != "" {
+    return {
+      success: false,
+      action: "fail",
+      reason: "${branch} still has a worktree owner after detaching ${owner}",
+      owner_path: owner,
+      observed_oid: observed,
+    }
+  }
+  return {
+    success: true,
+    action: "detached",
+    reason:
+      "preserved superseded immutable candidate ${clean_expected} in detached worktree ${owner}",
+    owner_path: owner,
+    observed_oid: observed,
+  }
+}
 
 pub type ReleaseCheckoutTargetState = {
   branch: string,
@@ -127,9 +251,40 @@ pub fn setup_release_branch(
       return steps
     }
   }
+  const branch_exists = local_branch_exists(cfg, target_branch)
+  if branch_exists {
+    const expected_oid = cfg.fixup_publication?.head_oid ?? ""
+    const reconciled = reconcile_superseded_release_worktree(
+      { args -> run_git(cfg, args) },
+      target_branch,
+      expected_oid,
+      cfg.pre_tag_supersede ?? false,
+    )
+    if reconciled.action != "noop" || (cfg.pre_tag_supersede ?? false) {
+      const result = if reconciled.success {
+        command_result_ok(reconciled.reason + "\n")
+      } else {
+        command_result_fail(2, reconciled.reason)
+      }
+      steps = steps
+        + [
+        {
+          ...recorded_step(
+            "reconcile-superseded-release-worktree",
+            "typed git worktree ownership reconciliation for ${target_branch}",
+            result,
+          ),
+          reconciliation: reconciled,
+        },
+      ]
+      if !reconciled.success {
+        return steps
+      }
+    }
+  }
   let switch_step = "create-release-branch-from-pin"
   let switch_argv = ["git", "switch", "-c", target_branch, cfg.pin_sha]
-  if local_branch_exists(cfg, target_branch) {
+  if branch_exists {
     switch_step = "reset-release-branch-to-pin"
     switch_argv = ["git", "switch", "-C", target_branch, cfg.pin_sha]
   }
