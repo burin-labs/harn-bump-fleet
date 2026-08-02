@@ -619,6 +619,14 @@ its workflow, event, branch, head SHA, target job, and required size step all
 match. The harness then pushes the tag and creates the PR without rebuilding or
 re-signing the release commit.
 
+If an explicit pin makes that checkpoint ineligible for direct resume, the
+harness supersedes it with a newly certified candidate on fresh base. That
+candidate includes the fresh-base source, so its note scope does too: the
+harness folds current `## Unreleased` content and every parseable
+`changelog.d` fragment into the versioned section and removes the consumed
+fragments. This differs from the already-tagged paperwork path below, where the
+artifact is frozen and later notes must remain unreleased.
+
 Run recovery directly in a terminal or through a supervisor configured for one
 attempt. Do not use `launchctl submit` as a one-shot wrapper: submitted jobs can
 be respawned after exit. The release owner guard rejects concurrent attempts,
