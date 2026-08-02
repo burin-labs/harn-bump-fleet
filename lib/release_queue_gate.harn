@@ -1,0 +1,279 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { ReleaseRecordedStep, execution_failed, recorded_step } from "./release_execution"
+import {
+  ReleaseQueueReservationPlan,
+  ReleaseQueueReservationReceipt,
+} from "./release_queue_reservation"
+import {
+  release_queue_apply_reservation,
+  release_queue_audit,
+  release_queue_observe_plan,
+  release_queue_refresh_active,
+  release_queue_restore_active,
+} from "./release_queue_runtime"
+import { release_repo_slug, release_run_root } from "./release_runtime"
+
+pub type ReleaseQueueGate = {
+  enabled: bool,
+  root: string,
+  failure: string,
+  plan: ReleaseQueueReservationPlan?,
+  audit: ReleaseQueueReservationReceipt?,
+}
+
+pub type ReleaseQueueGateStep = {
+  proceed: bool,
+  receipt: ReleaseQueueReservationReceipt?,
+  step: ReleaseRecordedStep?,
+}
+
+pub type ReleaseQueueWork = fn() -> list<ReleaseRecordedStep>
+
+pub type ReleaseQueueRefresh = fn() -> bool
+
+pub type ReleaseQueueGuardedExecution = {steps: list<ReleaseRecordedStep>, owns_queue: bool}
+
+fn refusal_text(plan) {
+  return join(plan.refusals.map(fn(item) { return item.code + ": " + item.message }), "; ")
+}
+
+/** Observe and persist the exact read-only reservation plan before release side effects. */
+pub fn release_queue_gate_probe(harness: Harness, cfg: dict) -> ReleaseQueueGate {
+  const root = release_run_root(harness.fs)
+  if cfg.mock || cfg.mode == "prepare" {
+    return {enabled: false, root: root, failure: "", plan: nil, audit: nil}
+  }
+  if len(cfg.queue_critical_prs ?? []) == 0 {
+    return {enabled: false, root: root, failure: "", plan: nil, audit: nil}
+  }
+  const observed = try {
+    release_queue_observe_plan(
+      harness,
+      root,
+      {
+        repo: release_repo_slug({env: harness.env, process: harness.process}, cfg),
+        base_branch: cfg.base,
+        base_oid: cfg.pin_sha,
+        critical_pull_numbers: cfg.queue_critical_prs,
+        live_pull_numbers: cfg.queue_live_prs ?? [],
+        noncritical_live_overrides: cfg.queue_noncritical_live_prs ?? [],
+      },
+    )
+  }
+  if is_err(observed) {
+    return {
+      enabled: true,
+      root: root,
+      failure: "release queue observation failed: " + to_string(unwrap_err(observed)),
+      plan: nil,
+      audit: nil,
+    }
+  }
+  const plan = unwrap(observed)
+  const audit = release_queue_audit({fs: harness.fs, random: harness.random}, root, plan)
+  return {
+    enabled: true,
+    root: root,
+    failure: if plan.safe {
+      ""
+    } else {
+      "release queue reservation refused: " + refusal_text(plan)
+    },
+    plan: plan,
+    audit: audit,
+  }
+}
+
+/** Convert the preflight into one recorded audit or exact mutation step. */
+pub fn release_queue_gate_step(
+  harness: Harness,
+  gate: ReleaseQueueGate,
+  mode: string,
+) -> ReleaseQueueGateStep {
+  if !gate.enabled {
+    return {proceed: true, receipt: nil, step: nil}
+  }
+  if gate.failure != "" || gate.plan == nil {
+    return {
+      proceed: false,
+      receipt: gate.audit,
+      step: recorded_step(
+        "release-queue-reservation",
+        "reserve the release-critical merge queue path",
+        command_result_fail(2, gate.failure),
+      ),
+    }
+  }
+  if mode == "audit" {
+    return {
+      proceed: true,
+      receipt: gate.audit,
+      step: recorded_step(
+        "release-queue-audit",
+        "audit the release-critical merge queue path",
+        command_result_ok(
+          "planned ${len(gate.plan.holds)} hold(s), preserved ${len(gate.plan.preserved)} entry or entries, reservation ${gate.plan.reservation_id}\n",
+        ),
+      ),
+    }
+  }
+  const reserved = release_queue_apply_reservation(harness, gate.root, gate.plan)
+  const proceed = reserved.status == "reserved"
+  return {
+    proceed: proceed,
+    receipt: reserved,
+    step: recorded_step(
+      "release-queue-reservation",
+      "reserve the release-critical merge queue path",
+      if proceed {
+        command_result_ok(
+          "reserved ${len(reserved.mutations)} queued pull request(s) under ${reserved.reservation_id}\n",
+        )
+      } else {
+        command_result_fail(
+          2,
+          "queue reservation ended in ${reserved.status}: " + refusal_text(reserved.plan),
+        )
+      },
+    ),
+  }
+}
+
+/** Restore any active exact-head holds and return a recorded terminal step. */
+pub fn release_queue_restore_step(harness: Harness, root: string) -> ReleaseRecordedStep? {
+  const restored = try {
+    release_queue_restore_active(harness, root)
+  }
+  if is_err(restored) {
+    return recorded_step(
+      "release-queue-restore",
+      "restore held merge queue entries",
+      command_result_fail(2, "queue restoration failed: " + to_string(unwrap_err(restored))),
+    )
+  }
+  const receipt = unwrap(restored)
+  if receipt == nil {
+    return nil
+  }
+  return recorded_step(
+    "release-queue-restore",
+    "restore held merge queue entries",
+    if receipt.status == "restored" {
+      command_result_ok(
+        "restored ${len(receipt.mutations)} pull request(s) under ${receipt.reservation_id}\n",
+      )
+    } else {
+      command_result_fail(2, "queue restoration ended in ${receipt.status}")
+    },
+  )
+}
+
+/** Narrow an optional gate step once before composing it with release steps. */
+pub fn release_queue_gate_steps(result: ReleaseQueueGateStep) -> list<ReleaseRecordedStep> {
+  if result.step == nil {
+    return []
+  }
+  return [result.step]
+}
+
+/** Report whether a gate step owns holds that require terminal restoration. */
+pub fn release_queue_gate_owns_queue(result: ReleaseQueueGateStep) -> bool {
+  return result.receipt != nil
+    && result.receipt.phase == "reserve"
+    && (result.receipt.status == "partial"
+    || result.receipt.status
+    == "reserved")
+}
+
+/** Keep an active reservation enforced while one long-running release phase executes. */
+pub fn release_queue_execute_reserved(
+  harness: Harness,
+  gate: ReleaseQueueGate,
+  work: ReleaseQueueWork,
+  refresh_interval_ms: int = 30000,
+  refresh: ReleaseQueueRefresh? = nil,
+) -> list<ReleaseRecordedStep> {
+  if !gate.enabled || gate.plan == nil {
+    return work()
+  }
+  const done = harness.runtime.shared_cell(
+    {scope: "task_group", key: "release_queue_monitor_${harness.random.uuid_v7()}", initial: false},
+  )
+  const tasks = ["release", "monitor"]
+  const results = parallel each tasks with { max_concurrent: 2 } { kind ->
+    if kind == "release" {
+      try {
+        return work()
+      } finally {
+        harness.runtime.shared_set(done, true)
+      }
+    }
+    const interval = max(10, refresh_interval_ms)
+    let waited = 0
+    while !harness.runtime.shared_get(done) {
+      harness.clock.sleep_ms(min(1000, interval - waited))
+      waited = waited + min(1000, interval - waited)
+      if harness.runtime.shared_get(done) {
+        break
+      }
+      if waited >= interval {
+        const healthy = if refresh != nil {
+          refresh()
+        } else {
+          const refreshed = release_queue_refresh_active(harness, gate.root)
+          refreshed != nil && refreshed.status == "reserved"
+        }
+        if !healthy {
+          throw "active release queue reservation could not be refreshed"
+        }
+        waited = 0
+      }
+    }
+    return []
+  }
+  return results[0] ?? []
+}
+
+/** Own queue reservation composition so the release facade stays policy-free. */
+pub fn release_queue_guarded_execution(
+  harness: Harness,
+  gate: ReleaseQueueGate,
+  mode: string,
+  work: ReleaseQueueWork,
+) -> ReleaseQueueGuardedExecution {
+  const gate_step = release_queue_gate_step(harness, gate, mode)
+  const prefix = release_queue_gate_steps(gate_step)
+  const owns_queue = release_queue_gate_owns_queue(gate_step)
+  if !gate_step.proceed || mode == "audit" {
+    return {steps: prefix, owns_queue: owns_queue}
+  }
+  return {
+    steps: prefix + release_queue_execute_reserved(harness, gate, work),
+    owns_queue: owns_queue,
+  }
+}
+
+/** Append terminal restoration when guarded release work fails. */
+pub fn release_queue_restore_failed_execution(
+  harness: Harness,
+  gate: ReleaseQueueGate,
+  execution: ReleaseQueueGuardedExecution,
+) -> list<ReleaseRecordedStep> {
+  if !execution.owns_queue || !execution_failed(execution.steps) {
+    return execution.steps
+  }
+  const restored = release_queue_restore_step(harness, gate.root)
+  return if restored == nil {
+    execution.steps
+  } else {
+    execution.steps + [restored]
+  }
+}
+
+/** Re-enforce an active reservation or fail the enclosing watcher poll. */
+pub fn release_queue_refresh_or_throw(harness: Harness, root: string) -> nil {
+  const refreshed = release_queue_refresh_active(harness, root)
+  if refreshed != nil && refreshed.status != "reserved" {
+    throw "release queue reservation refresh ended in ${refreshed.status}"
+  }
+}

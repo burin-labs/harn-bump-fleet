@@ -28,6 +28,7 @@ import {
   last_failed_step,
   recorded_step,
   release_failure_explanation,
+  release_recorded_steps,
 } from "lib/release_execution"
 import { analysis_with_fixup_state, with_fixup_state } from "lib/release_fixup"
 import { pre_release_gate } from "lib/release_gate_chat"
@@ -60,6 +61,12 @@ import {
 } from "lib/release_preflight"
 pub import { release_prepare_audit_plan } from "lib/release_prepare"
 import { with_derived_release_options } from "lib/release_prepare"
+import {
+  release_queue_gate_probe,
+  release_queue_guarded_execution,
+  release_queue_restore_failed_execution,
+  release_queue_restore_step,
+} from "lib/release_queue_gate"
 import { render_release_rehearsal_markdown, run_release_rehearsal } from "lib/release_rehearsal"
 import { require_release_repo_path } from "lib/release_repo_guard"
 import { pre_release_pr_body_text, release_recovery_note_report } from "lib/release_reporting"
@@ -653,6 +660,14 @@ pipeline main(harness: Harness) {
         {reason: gate.reason},
       )
     }
+    const queue_gate = release_queue_gate_probe(harness, effective_cfg)
+    if queue_gate.audit != nil {
+      analysis["release_queue_reservation"] = queue_gate.audit
+      harness.stdio.println("   queue reservation: ${queue_gate.audit.reservation_id}")
+      harness.stdio.println(
+        "   queue plan       : ${len(queue_gate.audit.plan.holds)} hold(s), ${len(queue_gate.audit.plan.preserved)} preserved",
+      )
+    }
     const build_scope = release_with_build_lease(
       harness,
       effective_cfg,
@@ -667,10 +682,9 @@ pipeline main(harness: Harness) {
         )
         if view_blocker != nil {
           execution = [view_blocker]
-        } else if cfg.agent && !(effective_cfg.pre_tag_resume ?? false) && cfg.mode != "audit"
-          && len(
-          agent_review_result.validation_findings,
-        )
+        } else if cfg.agent && !(effective_cfg.pre_tag_resume ?? false)
+          && cfg.mode != "audit"
+          && len(agent_review_result.validation_findings)
           > 0 {
           execution = [
             recorded_step(
@@ -705,22 +719,45 @@ pipeline main(harness: Harness) {
             },
           )
         } else if cfg.mode == "ship-pr" {
-          require_release_repo_path(harness.fs, effective_cfg, "ship-pr execution")
-          harness.stdio.println("== running prepare + PR handoff ...")
-          release_log_event(
-            {clock: harness.clock, fs: harness.fs},
-            run_id,
-            "mode_execution_started",
-            {mode: "ship-pr"},
-          )
-          execution = timed_release_steps(
-            harness.clock,
-            "release.mode_execution",
-            {mode: "ship-pr", mock: effective_cfg.mock},
+          const guarded = release_queue_guarded_execution(
+            harness,
+            queue_gate,
+            effective_cfg.mode,
             { ->
-              return execute_ship_pr(harness, effective_cfg, analysis, agent_review_result, run_id)
+              require_release_repo_path(harness.fs, effective_cfg, "ship-pr execution")
+              harness.stdio.println("== running prepare + PR handoff ...")
+              release_log_event(
+                {clock: harness.clock, fs: harness.fs},
+                run_id,
+                "mode_execution_started",
+                {mode: "ship-pr"},
+              )
+              return release_recorded_steps(
+                timed_release_steps(
+                  harness.clock,
+                  "release.mode_execution",
+                  {mode: "ship-pr", mock: effective_cfg.mock},
+                  { ->
+                    return execute_ship_pr(
+                      harness,
+                      effective_cfg,
+                      analysis,
+                      agent_review_result,
+                      run_id,
+                    )
+                  },
+                ),
+              )
             },
           )
+          execution = release_queue_restore_failed_execution(harness, queue_gate, guarded)
+        } else if cfg.mode == "audit" {
+          execution = release_queue_guarded_execution(
+            harness,
+            queue_gate,
+            effective_cfg.mode,
+            { -> return [] },
+          ).steps
         }
         const cleanup = timed(
           harness.clock,
@@ -859,13 +896,26 @@ pipeline main(harness: Harness) {
     return exit_code
   } catch (e) {
     let cleanup_failure = ""
+    const queue_restore = release_queue_restore_step(harness, release_run_root(harness.fs))
+    if queue_restore != nil && execution_failed([queue_restore]) {
+      cleanup_failure = trim(queue_restore.stderr ?? "release queue restoration failed")
+    }
     try {
       const cleanup = finish_workspace(harness, cfg, false, run_id)
       if cleanup != nil && !cleanup.success {
-        cleanup_failure = trim(cleanup.warning ?? cleanup.detail ?? "workspace cleanup failed")
+        const workspace_failure = trim(
+          cleanup.warning ?? cleanup.detail ?? "workspace cleanup failed",
+        )
+        cleanup_failure = join(
+          [cleanup_failure, workspace_failure].filter({ value -> value != "" }).to_list(),
+          "; ",
+        )
       }
     } catch (cleanup_error) {
-      cleanup_failure = to_string(cleanup_error)
+      cleanup_failure = join(
+        [cleanup_failure, to_string(cleanup_error)].filter({ value -> value != "" }).to_list(),
+        "; ",
+      )
     }
     finish_release_run_timing(harness.clock, run_timing, "exception", false)
     release_owner_guard_finish(harness.host_lease, owner_guard, "exception", false)
