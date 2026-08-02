@@ -162,6 +162,7 @@ pub fn platform_certification_branch(pin_sha: string) -> string {
  * stable ref those dispatches need; it is never the release PR head.
  */
 pub fn ensure_platform_certification_branch(
+  harness: HarnessProcess,
   workspace: string,
   pin_sha: string,
   mock: bool = false,
@@ -177,7 +178,7 @@ pub fn ensure_platform_certification_branch(
     }
   }
   const ref = "refs/heads/${branch}"
-  const initial = git_ls_remote("origin", {repo: workspace, refs: [ref], heads: true})
+  const initial = git_ls_remote(harness, "origin", {repo: workspace, refs: [ref], heads: true})
   if !initial.success {
     return {
       success: false,
@@ -204,8 +205,8 @@ pub fn ensure_platform_certification_branch(
         "certification branch ${branch} targets ${observed}, not pin ${sha}; refusing to overwrite it",
     }
   }
-  const pushed = git_push("origin", "${sha}:${ref}", workspace)
-  const confirmed = git_ls_remote("origin", {repo: workspace, refs: [ref], heads: true})
+  const pushed = git_push(harness, "origin", "${sha}:${ref}", workspace)
+  const confirmed = git_ls_remote(harness, "origin", {repo: workspace, refs: [ref], heads: true})
   const push_detail = if pushed.success {
     ""
   } else {
@@ -321,7 +322,11 @@ fn production_adapter(
         + " && HARN_BIN="
         + shell_quote(cfg.harn_bin)
         + " ./scripts/release_gate.sh audit --source-only"
-      const result = run_cmd({repo: cfg.workspace, mock: false}, command)
+      const result = run_cmd(
+        {env: harness.env, process: harness.process},
+        {repo: cfg.workspace, mock: false},
+        command,
+      )
       if !result.success {
         return Err({code: "local_source_failed", message: command_output_text(result)})
       }
@@ -329,6 +334,7 @@ fn production_adapter(
     },
     source_lanes: fn() {
       const lanes = contract_source_lanes(
+        harness.fs,
         path_join(cfg.workspace, "scripts", "release_audit_contract.json"),
       )
       if lanes == nil {
@@ -343,6 +349,7 @@ fn production_adapter(
     },
     remote_sha: fn() {
       const result = run_git(
+        {env: harness.env, process: harness.process},
         {repo: cfg.workspace, mock: false},
         ["ls-remote", "origin", "refs/heads/${cfg.branch}"],
       )
@@ -363,7 +370,7 @@ fn production_adapter(
     },
     // `date_parse` returns Unix seconds. Keep the adapter contract and receipt
     // fields honest by converting once at the production clock boundary.
-    now_ms: fn() { return (to_int(date_parse(date_now_iso())) ?? 0) * 1000 },
+    now_ms: fn() { return (to_int(date_parse(harness.clock.date_iso())) ?? 0) * 1000 },
     wait: fn(ms) { harness.clock.sleep_ms(ms) },
   }
 }
@@ -439,7 +446,12 @@ fn platform_cause_category(code: string) -> PlatformCertificationCauseCategory {
  * This lane is a single blocking call, so it can trip the abort but cannot
  * observe one -- by the time it could check, it is already done.
  */
-fn local_source_lane(started_at_ms: int, adapter: PlatformCertificationAdapter, abort) {
+fn local_source_lane(
+  harness: HarnessRuntime,
+  started_at_ms: int,
+  adapter: PlatformCertificationAdapter,
+  abort,
+) {
   const result = adapter.local_source()
   const completed = adapter.now_ms()
   if is_err(result) {
@@ -448,7 +460,7 @@ fn local_source_lane(started_at_ms: int, adapter: PlatformCertificationAdapter, 
       code: "local_source_failed",
       message: to_string(failure?.message ?? failure),
     }
-    shared_set(abort, "local source lane: " + to_string(normalized))
+    harness.shared_set(abort, "local source lane: " + to_string(normalized))
     return Err(normalized)
   }
   return Ok(
@@ -463,6 +475,7 @@ fn local_source_lane(started_at_ms: int, adapter: PlatformCertificationAdapter, 
 
 /** Run one hosted platform lane, publishing a real verdict as the abort cause. */
 fn platform_lane(
+  harness: HarnessRuntime,
   cfg: PlatformCertificationConfig,
   task,
   dispatches,
@@ -476,12 +489,12 @@ fn platform_lane(
   if spec == nil || dispatch == nil || started == nil {
     return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
   }
-  const proof = await_platform(cfg, spec, dispatch, started, adapter, abort)
+  const proof = await_platform(harness, cfg, spec, dispatch, started, adapter, abort)
   // Only a lane that reached its own verdict may doom the run. Republishing an
   // abandonment would let the first abandoned lane abort the lane that is still
   // the only one able to report a real cause.
   if is_err(proof) && !is_abandoned(proof) {
-    shared_set(abort, to_string(unwrap_err(proof)))
+    harness.shared_set(abort, to_string(unwrap_err(proof)))
   }
   return proof
 }
@@ -651,6 +664,7 @@ fn exact_platform_proof(
 }
 
 fn await_platform(
+  harness: HarnessRuntime,
   cfg: PlatformCertificationConfig,
   spec: PlatformCertificationSpec,
   dispatch,
@@ -724,7 +738,7 @@ fn await_platform(
       // it also means a lane keeps polling for up to 720 * 10s after another
       // lane has already doomed the run. Checking the shared cell here bounds
       // the waste at one poll interval without giving up the settled results.
-      const failure = shared_get(abort)
+      const failure = harness.shared_get(abort)
       if failure != nil {
         return platform_abandoned(spec, to_string(failure))
       }
@@ -734,8 +748,8 @@ fn await_platform(
   return platform_error(spec, "run_poll_timeout", "run did not become terminal within 720 polls")
 }
 
-fn contract_source_lanes(path: string) -> list<string>? {
-  const loaded = read_json_result(path)
+fn contract_source_lanes(harness: HarnessFs, path: string) -> list<string>? {
+  const loaded = read_json_result(harness, path)
   if !is_ok(loaded) {
     return nil
   }
@@ -882,12 +896,14 @@ pub fn resolve_platform_certification(
   // between polls and stop early. A cell is the mechanism because `parallel
   // settle` bodies run in isolated interpreters -- plain values are copied in,
   // so only an explicit shared handle crosses the boundary.
-  const abort = shared_cell({scope: "task_group", key: "platform_certification_abort"})
+  const abort = harness.runtime.shared_cell(
+    {scope: "task_group", key: "platform_certification_abort"},
+  )
   const settled = parallel settle tasks with { max_concurrent: 3 } { task ->
     if task.kind == "local_source" {
-      return local_source_lane(local_started, adapter, abort)
+      return local_source_lane(harness.runtime, local_started, adapter, abort)
     }
-    return platform_lane(cfg, task, dispatches, starts, adapter, abort)
+    return platform_lane(harness.runtime, cfg, task, dispatches, starts, adapter, abort)
   }
   const results = map_settled(
     settled.results,

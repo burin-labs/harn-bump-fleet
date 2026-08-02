@@ -1,4 +1,5 @@
 // Extracted release-harness stage. See AGENTS.md for ownership.
+import { agent_loop } from "std/agent/loop"
 import { agent_preset } from "std/agent/presets"
 import { changelog_parse_sections } from "std/changelog"
 import { command_output_tail } from "std/command"
@@ -71,8 +72,8 @@ fn run_release_agent_loop(
   session_suffix,
   audit_tools,
 ) {
-  const paths = agent_artifact_paths(run_id)
-  const evidence_cell = shared_cell(
+  const paths = agent_artifact_paths(harness.fs, run_id)
+  const evidence_cell = harness.runtime.shared_cell(
     {scope: "process", key: "release-agent-evidence:${run_id}:${session_suffix}", initial: []},
   )
   const role = if require_tool_evidence {
@@ -91,7 +92,12 @@ fn run_release_agent_loop(
   // call (`tool_choice: "none"`) makes no tool calls; install_binder is
   // still safe because the binder layer only fires when tools have
   // schemas and `_nl_intent` arrives in the call.
-  const binder = install_binder_after_preflight(raw_tools, cfg.planner_preflight)
+  const binder = install_binder_after_preflight(
+    harness,
+    harness.clock,
+    raw_tools,
+    cfg.planner_preflight,
+  )
   const compaction_policy = if require_tool_evidence {
     release_compaction_policy("audit")
   } else {
@@ -103,6 +109,7 @@ fn run_release_agent_loop(
     summary_projection_policy(4)
   }
   let options = agent_preset(
+    harness,
     role,
     {
       ...release_agent_infra_defaults(cfg, MOCK_AGENT_MODEL),
@@ -120,13 +127,20 @@ fn run_release_agent_loop(
       },
       turn_policy: {allow_done_sentinel: false, max_prose_chars: 30000},
       post_turn_callback: if require_tool_evidence {
-        { payload -> release_review_post_turn(payload, analysis, evidence_cell) }
+        { payload ->
+          release_review_post_turn(
+            {fs: harness.fs, runtime: harness.runtime},
+            payload,
+            analysis,
+            evidence_cell,
+          )
+        }
       } else {
         nil
       },
       compaction: {strategy: "hybrid", keep_last_n: 8, policy: compaction_policy},
       transcript_projection: projection_policy,
-      session_id: release_session_id(harness, cfg, analysis, run_id) + session_suffix,
+      session_id: release_session_id(harness.env, cfg, analysis, run_id) + session_suffix,
       llm_transcript_dir: paths.llm_transcript_dir,
     },
   )
@@ -136,28 +150,31 @@ fn run_release_agent_loop(
   if !require_tool_evidence {
     options = {...options, tool_choice: "none"}
   }
-  const result = agent_loop(prompt, system, options)
+  const result = agent_loop(harness, prompt, system, options)
+  if result == nil {
+    throw "release agent loop returned no result"
+  }
   if !require_tool_evidence {
     return result
   }
   const evidence = release_agent_evidence_decision(
-    shared_get(evidence_cell) ?? [],
+    harness.runtime.shared_get(evidence_cell) ?? [],
     {dispatch: []},
     analysis,
   )
   return result + {release_agent_evidence: evidence}
 }
 
-fn persist_agent_artifacts(harness: Harness, run_id, result, attempts, validation_findings) {
-  const paths = agent_artifact_paths(run_id)
-  harness.fs.mkdir(paths.out_dir, true)
-  harness.fs.write_text(
+fn persist_agent_artifacts(harness: HarnessFs, run_id, result, attempts, validation_findings) {
+  const paths = agent_artifact_paths(harness, run_id)
+  harness.mkdir(paths.out_dir, true)
+  harness.write_text(
     paths.raw_result_json,
     json_stringify({attempts: attempts, final_result: result}) + "\n",
   )
-  harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
+  harness.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
   const transcript_context = agent_transcript_context_metadata(result)
-  harness.fs.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
+  harness.write_text(paths.transcript_context_json, json_stringify(transcript_context) + "\n")
   return {
     raw_result_json: paths.raw_result_json,
     trace_json: paths.trace_json,
@@ -169,9 +186,9 @@ fn persist_agent_artifacts(harness: Harness, run_id, result, attempts, validatio
   }
 }
 
-fn recovery_artifact_paths(run_id, step_name) {
-  const safe_step = regex_replace_all("[^A-Za-z0-9_.-]+", "-", step_name)
-  const out_dir = path_join(release_run_dir(run_id), "recovery")
+fn recovery_artifact_paths(harness: HarnessFs, run_id, step_name) {
+  const safe_step = regex_replace("[^A-Za-z0-9_.-]+", "-", step_name)
+  const out_dir = path_join(release_run_dir(harness, run_id), "recovery")
   return {
     out_dir: out_dir,
     raw_result_json: path_join(out_dir, safe_step + "-agent-result.json"),
@@ -183,7 +200,7 @@ fn recovery_artifact_paths(run_id, step_name) {
   }
 }
 
-fn recovery_session_id(harness: Harness, cfg, analysis, run_id, step_name) {
+fn recovery_session_id(harness: HarnessEnv, cfg, analysis, run_id, step_name) {
   return release_session_id(harness, cfg, analysis, run_id) + "-recovery-" + step_name
 }
 
@@ -201,7 +218,7 @@ fn unique_markdownlint_paths(violations) {
   return out
 }
 
-fn markdownlint_files_for_context(harness: Harness, cfg, paths) {
+fn markdownlint_files_for_context(harness: HarnessFs, cfg, paths) {
   let files = {}
   for path in paths ?? [] {
     const text = read_repo_file(harness, cfg, path)
@@ -212,12 +229,12 @@ fn markdownlint_files_for_context(harness: Harness, cfg, paths) {
   return files
 }
 
-fn candidate_diff_for_paths(cfg, paths) {
+fn candidate_diff_for_paths(harness: {env: HarnessEnv, process: HarnessProcess}, cfg, paths) {
   const pathlist = paths ?? []
   if len(pathlist) == 0 {
     return ""
   }
-  const r = run_git(cfg, ["diff", "--"] + pathlist)
+  const r = run_git(harness, cfg, ["diff", "--"] + pathlist)
   if !r.success {
     return ""
   }
@@ -233,7 +250,7 @@ fn includes_changelog_path(paths) {
   return false
 }
 
-fn changelog_lint_excerpt(harness: Harness, cfg, analysis, paths) {
+fn changelog_lint_excerpt(harness: HarnessFs, cfg, analysis, paths) {
   if !includes_changelog_path(paths) {
     return ""
   }
@@ -268,13 +285,17 @@ fn markdownlint_recovery_context(harness: Harness, cfg, analysis, log_text) {
     return nil
   }
   const paths = unique_markdownlint_paths(violations)
-  let files = markdownlint_files_for_context(harness, cfg, paths)
+  let files = markdownlint_files_for_context(harness.fs, cfg, paths)
   return {
     classification: "generated_markdown_lint_failed",
     violations: violations,
     source_context: markdownlint_source_context(violations, files, 2),
-    candidate_diff: candidate_diff_for_paths(cfg, paths),
-    changelog_excerpt: changelog_lint_excerpt(harness, cfg, analysis, paths),
+    candidate_diff: candidate_diff_for_paths(
+      {env: harness.env, process: harness.process},
+      cfg,
+      paths,
+    ),
+    changelog_excerpt: changelog_lint_excerpt(harness.fs, cfg, analysis, paths),
     preferred_edit_tool: "release_replace_file",
     fallback_edit_tool: "release_write_file",
     edit_guidance:
@@ -311,7 +332,7 @@ fn live_log_failure_context(harness: Harness, cfg, analysis, step) {
   const pattern_arg = shell_quote("fail|failed|error|ERROR|Summary:|MD[0-9]+")
   const path_arg = shell_quote(log_path)
   const matches = if harness.fs.exists(log_path) {
-    trim(shell("rg -n -- " + pattern_arg + " " + path_arg + " | tail -80").stdout)
+    trim(harness.process.shell("rg -n -- " + pattern_arg + " " + path_arg + " | tail -80").stdout)
   } else {
     ""
   }
@@ -347,7 +368,10 @@ fn recovery_failure_class(failed_step, live_context) {
  * agent_loop call still runs and will surface a real failure if Ollama
  * is genuinely broken.
  */
-fn warm_local_model_for_recovery(harness: Harness, cfg) {
+fn warm_local_model_for_recovery(
+  harness: {stdio: HarnessStdio, clock: HarnessClock, llm: HarnessLlm},
+  cfg,
+) {
   if cfg.mock ?? false {
     return
   }
@@ -365,11 +389,12 @@ fn warm_local_model_for_recovery(harness: Harness, cfg) {
   }
   harness.stdio.println("   → warming local model ${model} (long prepare may have cooled it)")
   const warm = timed(
+    harness.clock,
     "release.agent_warmup",
     {provider: "ollama", model: model},
     { ->
       return try {
-        llm_healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
+        harness.llm.healthcheck("ollama", {model: model, warm: true, keep_alive: "30m"})
       } catch (e) {
         {valid: false, status: "error", message: "${e}"}
       }
@@ -396,14 +421,20 @@ pub fn run_recovery_agent_loop(
   run_id: string,
   step_name: string,
 ) -> dict {
-  const paths = recovery_artifact_paths(run_id, step_name)
-  const system = render(prompt_asset("release_recovery_system.harn.prompt"), {})
-  warm_local_model_for_recovery(harness, cfg)
+  const paths = recovery_artifact_paths(harness.fs, run_id, step_name)
+  const system = harness.fs.render_prompt(
+    prompt_asset(harness.fs, "release_recovery_system.harn.prompt"),
+    {},
+  )
+  warm_local_model_for_recovery({stdio: harness.stdio, clock: harness.clock, llm: harness.llm}, cfg)
   const binder = install_binder_after_preflight(
+    harness,
+    harness.clock,
     release_repair_tools(harness, cfg, run_id),
     cfg.planner_preflight,
   )
   let options = agent_preset(
+    harness,
     "repair",
     {
       ...release_agent_infra_defaults(cfg, MOCK_AGENT_MODEL),
@@ -418,17 +449,17 @@ pub fn run_recovery_agent_loop(
         policy: release_compaction_policy("recovery"),
       },
       transcript_projection: tool_repair_projection_policy(),
-      session_id: recovery_session_id(harness, cfg, analysis, run_id, step_name),
+      session_id: recovery_session_id(harness.env, cfg, analysis, run_id, step_name),
       llm_transcript_dir: paths.llm_transcript_dir,
     },
   )
-  return agent_loop(prompt, system, options)
+  return agent_loop(harness, prompt, system, options)
 }
 
 fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, run_id) {
   if cfg.mock {
-    llm_mock_clear()
-    llm_mock(
+    harness.llm.mock_clear()
+    harness.llm.mock_enqueue(
       {
         text: "I will inspect the mocked push failure before recommending recovery.",
         tool_calls: [
@@ -440,7 +471,7 @@ fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, ru
         ],
       },
     )
-    llm_mock(
+    harness.llm.mock_enqueue(
       {
         text:
           "- The failed push is classified as a green-test pre-push hook budget timeout.\n- The release commit and branch can be reused.\n- Retry the normal push with `HARN_HOOKS_NO_LOCAL_BUILD=1` and keep both attempts in the run artifacts.",
@@ -449,8 +480,8 @@ fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, ru
   }
   const live_context = live_log_failure_context(harness, cfg, analysis, failed_step)
   const classification = recovery_failure_class(failed_step, live_context)
-  const prompt = render(
-    prompt_asset("release_recovery_prompt.harn.prompt"),
+  const prompt = harness.fs.render_prompt(
+    prompt_asset(harness.fs, "release_recovery_prompt.harn.prompt"),
     {
       failure_context_json: json_stringify(
         {
@@ -466,7 +497,7 @@ fn recovery_agent_advice(harness: Harness, cfg, analysis, steps, failed_step, ru
   )
   const result = run_recovery_agent_loop(harness, cfg, analysis, prompt, run_id, failed_step.name)
   const text = agent_result_text(result)
-  const paths = recovery_artifact_paths(run_id, failed_step.name)
+  const paths = recovery_artifact_paths(harness.fs, run_id, failed_step.name)
   harness.fs.mkdir(paths.out_dir, true)
   harness.fs.write_text(paths.raw_result_json, json_stringify(result) + "\n")
   harness.fs.write_text(paths.trace_json, json_stringify(result.trace ?? {}) + "\n")
@@ -541,21 +572,21 @@ pub fn logged_command_step<T>(
   command: T,
   run_id: string,
 ) -> dict {
-  log_step_started(harness, run_id, name, command)
+  log_step_started({clock: harness.clock, fs: harness.fs}, run_id, name, command)
   const result = append_command_step(harness, cfg, steps, name, command)
-  log_step_finished(harness, run_id, name, result, nil)
+  log_step_finished({clock: harness.clock, fs: harness.fs}, run_id, name, result, nil)
   return result
 }
 
 pub fn logged_github_operation_step<T>(
-  harness: Harness,
+  harness: {clock: HarnessClock, fs: HarnessFs},
   steps: list<dict>,
   name: string,
   label: string,
   run_id: string,
   operation: fn() -> T,
 ) -> dict {
-  log_step_started(harness, run_id, name, label)
+  log_step_started({clock: harness.clock, fs: harness.fs}, run_id, name, label)
   const receipt = operation()
   const result = if is_err(receipt) {
     command_result_fail(1, to_string(unwrap_err(receipt)))
@@ -563,7 +594,13 @@ pub fn logged_github_operation_step<T>(
     command_result_ok(json_stringify(receipt))
   }
   const step = recorded_step(name, label, result) + {github_receipt: receipt}
-  log_step_finished(harness, run_id, name, step, {github_receipt: receipt})
+  log_step_finished(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    name,
+    step,
+    {github_receipt: receipt},
+  )
   return {
     steps: steps + [step],
     success: !is_err(receipt),
@@ -583,17 +620,23 @@ pub fn logged_live_shell_command_step<T>(
   command: T,
   run_id: string,
 ) -> dict {
-  const live_log = command_live_log_path(run_id, name)
+  const live_log = command_live_log_path(harness.fs, run_id, name)
   harness.fs.mkdir(dirname(live_log), true)
   log_step_started(
-    harness,
+    {clock: harness.clock, fs: harness.fs},
     run_id,
     name,
     command,
     {live_log: live_log, tail_hint: "tail -f " + live_log},
   )
   const result = append_command_step(harness, cfg, steps, name, command, {live_log_path: live_log})
-  log_step_finished(harness, run_id, name, result, {live_log: live_log})
+  log_step_finished(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    name,
+    result,
+    {live_log: live_log},
+  )
   return result
 }
 
@@ -641,8 +684,11 @@ pub fn retry_prepare_after_agent_repair(
   return result.steps
 }
 
-pub fn release_repair_fingerprint(cfg: dict) -> string {
-  const diff = run_git(cfg, ["diff", "--binary", "--no-ext-diff", "HEAD"])
+pub fn release_repair_fingerprint(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+) -> string {
+  const diff = run_git(harness, cfg, ["diff", "--binary", "--no-ext-diff", "HEAD"])
   if !diff.success {
     return ""
   }
@@ -742,8 +788,8 @@ pub fn agent_review(
   run_id: string,
 ) -> ReleaseAgentReviewResult {
   if cfg.mock {
-    llm_mock_clear()
-    llm_mock(
+    harness.llm.mock_clear()
+    harness.llm.mock_enqueue(
       {
         text: "I will inspect the mocked release evidence.",
         tool_calls: [
@@ -760,15 +806,15 @@ pub fn agent_review(
       text:
         "Audit:\n- Version/readiness: v0.7.53 matches the mocked release analysis.\n- CHANGELOG coverage: the draft keeps the prepared v0.7.53 release note focused on the mocked one-PR handoff.\n- First post-tag commit: abc1234 release: consolidate harn release PR flow.\n- Release risks: no mocked blocking risks after the read-only evidence pass.\n- Next command: harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release.\n\nBEGIN_DRAFT_CHANGELOG\n## v0.7.53\n\n### Changed\n\n- **Consolidated release flow.** Exercises the mocked one-PR release path and auto-merge handoff.\nEND_DRAFT_CHANGELOG",
     }
-    llm_mock(mock_final)
-    llm_mock(mock_final)
-    llm_mock(mock_final)
-    llm_mock(mock_final)
+    harness.llm.mock_enqueue(mock_final)
+    harness.llm.mock_enqueue(mock_final)
+    harness.llm.mock_enqueue(mock_final)
+    harness.llm.mock_enqueue(mock_final)
   }
   const fixup_mode = analysis.fixup_mode ?? false
   const system = if fixup_mode {
-    render(
-      prompt_asset("release_fixup_system.harn.prompt"),
+    harness.fs.render_prompt(
+      prompt_asset(harness.fs, "release_fixup_system.harn.prompt"),
       {
         target_version: analysis.next_version,
         fixup_tag: analysis.fixup_tag ?? "",
@@ -778,11 +824,11 @@ pub fn agent_review(
       },
     )
   } else {
-    render(prompt_asset("release_agent_system.harn.prompt"), {})
+    harness.fs.render_prompt(prompt_asset(harness.fs, "release_agent_system.harn.prompt"), {})
   }
   const prompt = if fixup_mode {
-    render(
-      prompt_asset("release_fixup_user.harn.prompt"),
+    harness.fs.render_prompt(
+      prompt_asset(harness.fs, "release_fixup_user.harn.prompt"),
       {
         analysis_json: json_stringify(compact_agent_analysis(analysis)),
         target_version: analysis.next_version,
@@ -794,8 +840,8 @@ pub fn agent_review(
       },
     )
   } else {
-    render(
-      prompt_asset("release_agent_user.harn.prompt"),
+    harness.fs.render_prompt(
+      prompt_asset(harness.fs, "release_agent_user.harn.prompt"),
       {analysis_json: json_stringify(compact_agent_analysis(analysis))},
     )
   }
@@ -811,12 +857,13 @@ pub fn agent_review(
   // runs the agent, validates, and returns a "failed" branch while findings
   // remain — which is what drives the primitive's retry up to 3 attempts.
   const review = agent_review_execute(
+    harness,
     {
       task: prompt,
       max_attempts: 3,
       run_attempt: { ctx ->
-        const selection = agent_review_attempt_selection(ctx, analysis, system, prompt)
-        run_release_agent_loop(
+        const selection = agent_review_attempt_selection(harness.fs, ctx, analysis, system, prompt)
+        return run_release_agent_loop(
           harness,
           cfg,
           analysis,
@@ -844,11 +891,17 @@ pub fn agent_review(
   // not persist a draft that downstream release-note selection could apply;
   // the deterministic notes projection remains the fallback.
   const draft_changelog = if len(validation_findings) == 0 {
-    persist_agent_changelog(harness, run_id, text, analysis.next_version)
+    persist_agent_changelog(harness.fs, run_id, text, analysis.next_version)
   } else {
     nil
   }
-  const artifacts = persist_agent_artifacts(harness, run_id, result, attempts, validation_findings)
+  const artifacts = persist_agent_artifacts(
+    harness.fs,
+    run_id,
+    result,
+    attempts,
+    validation_findings,
+  )
   return {
     text: text,
     attempts: attempts,
