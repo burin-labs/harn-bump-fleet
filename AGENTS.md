@@ -57,13 +57,14 @@ Use the pinned Harn version from `.harn-version`.
 
 ```sh
 harn install --locked
-harn check --strict-types $(git ls-files '*.harn')
-harn fmt --check $(git ls-files '*.harn')
-harn lint --strict $(git ls-files '*.harn')
+scripts/harn-project.sh verify
 harn test tests/ --parallel --verbose
 ```
 
-Use `harn fmt $(git ls-files '*.harn')` for Harn formatting fixes.
+`scripts/harn-project.sh verify` includes tracked and non-ignored untracked Harn
+sources with filename-safe argument handling. Use `scripts/harn-project.sh
+format` for formatting fixes. CI passes `--tracked-only` to verify the exact
+committed tree.
 
 Common harness runs:
 
