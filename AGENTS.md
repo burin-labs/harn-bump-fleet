@@ -21,6 +21,8 @@ The entry points are:
   artifacts. It is not CI and should stay out of the main release/bump path.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
+- `sync_package_ci.harn`: checks or applies exact package CI adapters for
+  connector repositories that delegate projection ownership in `fleet.toml`.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
@@ -79,6 +81,7 @@ harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 harn run --no-sandbox sync_agent_guidance.harn -- --check
+harn run --no-sandbox sync_package_ci.harn -- --check
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
