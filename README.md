@@ -600,6 +600,11 @@ harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
 harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
 ```
 
+A tag claims only the exact OID it recovers. When a release tags one candidate
+and leaves others behind, those losers are orphans: no tag will ever recover
+them, so the sweep retains them forever and this harness is the only thing that
+retires them. It reports them as `orphaned_by_shipped_tag`.
+
 It renames each unclaimed attempt to `release-failed/vX.Y.Z/<oid>-abandoned`
 rather than deleting it, so the commit stays on origin and the sweep still
 inventories it through the normal proof path. Archiving always precedes the
