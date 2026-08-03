@@ -54,7 +54,7 @@ harn run --no-sandbox bump_fleet.harn -- --dry-run
 # Run on one repo only.
 harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
-# Check fleet-owned connector CI adapters without writing them.
+# Check fleet-owned package CI adapters without writing them.
 harn run --no-sandbox sync_package_ci.harn -- --check
 
 # Check fleet-owned runtime-bump adapters without writing them.
@@ -86,8 +86,9 @@ verifies other byte-exact file projections, and verifies that each canonical
 reusable-workflow pin still publishes the same bytes as the owner's current
 default branch. A fleet whose consumers all agree on a stale canonical pin
 therefore fails closed instead of silently treating internal consistency as
-freshness. Custom product refresh and validation commands remain named fields
-in the manifest; they do not create repository-local workflow templates.
+freshness. Custom package validation and runtime-bump refresh/validation
+commands remain named fields in the manifest; they do not create
+repository-local workflow templates or duplicate runtime bootstrap.
 
 ### Signed bot PRs
 
