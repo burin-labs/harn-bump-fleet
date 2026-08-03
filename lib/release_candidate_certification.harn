@@ -1,5 +1,10 @@
 import { command_result_fail, command_result_ok } from "std/command"
-import { map_settled } from "std/settled"
+import { interrupted } from "std/signal"
+import {
+  PlatformCertificationCancellationReceipt,
+  cancel_recorded_platform_certification_runs,
+  platform_certification_dispatch_registry,
+} from "./platform_certification"
 import { logged_live_shell_command_step } from "./release_agent"
 import { execution_failed, recorded_step } from "./release_execution"
 import {
@@ -12,13 +17,90 @@ import { ReleasePublication } from "./release_publication"
 import { release_log_event } from "./release_runtime"
 import { run_pre_tag_binary_size_gate } from "./release_tag"
 
-pub type ReleaseCandidateCertificationResult = {steps: list<dict>, success: bool, timing: dict}
+pub type CandidateCertificationTiming = {
+  started_at_ms: int,
+  completed_at_ms: int,
+  duration_ms: int,
+  critical_path: string,
+}
+
+pub type CandidateCertificationTimingLane = {
+  name: CandidateCertificationLaneName,
+  started_at_ms: int,
+  completed_at_ms: int,
+}
+
+pub type ReleaseCandidateCertificationResult = {
+  steps: list<dict>,
+  success: bool,
+  timing: CandidateCertificationTiming,
+}
+
+pub type CandidateCertificationLaneName = "platform" | "binary_size"
+
+pub type CandidateCertificationLaneStatus = "success" | "failed" | "cancelled" | "interrupted"
+
+pub type CandidateCertificationCancellation = {
+  kind: "sibling_failure" | "user_interruption",
+  cause: string,
+}
+
+pub type CertificationCleanup = list<PlatformCertificationCancellationReceipt>
+
+pub type CertificationCancelRequest = {lane: CandidateCertificationLaneName, cause: string}
+
+pub type CandidateCertificationAbortReason = {
+  kind: "lane_failed",
+  lane: CandidateCertificationLaneName,
+  cause: string,
+} \
+  | {kind: "user_interruption", cause: string}
+
+pub type CandidateCertificationLaneResult = {
+  success: bool,
+  steps: list<dict>,
+  evidence: ReleasePrepareAuditEvidence?,
+  error: string?,
+}
+
+pub type CandidateCertificationLaneReceipt = {
+  name: CandidateCertificationLaneName,
+  success: bool,
+  status: CandidateCertificationLaneStatus,
+  steps: list<dict>,
+  evidence: ReleasePrepareAuditEvidence?,
+  started_at_ms: int,
+  completed_at_ms: int,
+  error: string?,
+  cancellation: CandidateCertificationCancellation?,
+  cleanup: CertificationCleanup,
+}
+
+pub type CandidateCertificationLaneRun = {
+  lanes: list<CandidateCertificationLaneReceipt>,
+  abort_reason: CandidateCertificationAbortReason?,
+}
+
+pub type CandidateCertificationLaneSummary = {
+  name: CandidateCertificationLaneName,
+  success: bool,
+  status: CandidateCertificationLaneStatus,
+  started_at_ms: int,
+  completed_at_ms: int,
+  error: string?,
+  cancellation: CandidateCertificationCancellation?,
+  cleanup: CertificationCleanup,
+}
+
+pub type CertificationCanceller = fn(CertificationCancelRequest) -> CertificationCleanup
+
+pub type CandidateCertificationInterruptProbe = fn() -> bool
 
 fn now_ms(harness: HarnessClock) -> int {
   return (to_int(date_parse(harness.date_iso())) ?? 0) * 1000
 }
 
-fn certification_critical_path(lanes: list<dict>) -> string {
+fn certification_critical_path(lanes: list<CandidateCertificationTimingLane>) -> string {
   let name = ""
   let longest = -1
   for lane in lanes {
@@ -31,13 +113,253 @@ fn certification_critical_path(lanes: list<dict>) -> string {
   return name
 }
 
+const CANDIDATE_CERTIFICATION_LANES: list<CandidateCertificationLaneName> = [
+  "platform",
+  "binary_size",
+]
+
+fn publish_lane_failure(
+  runtime: HarnessRuntime,
+  abort,
+  lane: CandidateCertificationLaneName,
+  cause: string,
+) -> nil {
+  const snapshot = runtime.shared_snapshot(abort)
+  if snapshot.value == nil {
+    let _ = runtime.shared_cas(abort, snapshot, {kind: "lane_failed", lane: lane, cause: cause})
+  }
+  return nil
+}
+
+fn summarize_lane(lane: CandidateCertificationLaneReceipt) -> CandidateCertificationLaneSummary {
+  return {
+    name: lane.name,
+    success: lane.success,
+    status: lane.status,
+    started_at_ms: lane.started_at_ms,
+    completed_at_ms: lane.completed_at_ms,
+    error: lane.error,
+    cancellation: lane.cancellation,
+    cleanup: lane.cleanup,
+  }
+}
+
+/**
+ * Run exact-candidate lanes fail-fast while retaining a receipt for every lane.
+ *
+ * A terminal result is written before its task throws. Structured `parallel`
+ * cancellation then interrupts in-flight siblings; the parent join owns the
+ * cancelled receipt and cleanup when an aborted child cannot run its epilogue.
+ */
+pub fn run_candidate_certification_lanes(
+  runtime: HarnessRuntime,
+  random: HarnessRandom,
+  runner: fn(CandidateCertificationLaneName) -> CandidateCertificationLaneResult,
+  clock: fn() -> int,
+  canceller: CertificationCanceller? = nil,
+  interrupt_probe: CandidateCertificationInterruptProbe = interrupted,
+) -> CandidateCertificationLaneRun {
+  const invocation = random.uuid_v7()
+  const run_started = clock()
+  const receipts = runtime.shared_map(
+    {scope: "task_group", key: "candidate_certification_receipts_${invocation}"},
+  )
+  const starts = runtime.shared_map(
+    {scope: "task_group", key: "candidate_certification_starts_${invocation}"},
+  )
+  const abort = runtime.shared_cell(
+    {scope: "task_group", key: "candidate_certification_abort_${invocation}", initial: nil},
+  )
+  try {
+    let _ = parallel each CANDIDATE_CERTIFICATION_LANES with {
+      max_concurrent: len(CANDIDATE_CERTIFICATION_LANES),
+    } { name ->
+      const started = clock()
+      runtime.shared_map_set(starts, name, started)
+      let terminal = false
+      try {
+        let raw: CandidateCertificationLaneResult = {
+          success: false,
+          steps: [],
+          evidence: nil,
+          error: "lane did not return a verdict",
+        }
+        try {
+          raw = runner(name)
+        } catch (error) {
+          const cause = to_string(error)
+          if interrupt_probe() {
+            const snapshot = runtime.shared_snapshot(abort)
+            if snapshot.value == nil {
+              let _ = runtime.shared_cas(
+                abort,
+                snapshot,
+                {kind: "user_interruption", cause: "release certification interrupted by operator"},
+              )
+            }
+            throw "candidate certification interrupted"
+          }
+          const failed: CandidateCertificationLaneReceipt = {
+            name: name,
+            success: false,
+            status: "failed",
+            steps: [],
+            evidence: nil,
+            started_at_ms: started,
+            completed_at_ms: clock(),
+            error: cause,
+            cancellation: nil,
+            cleanup: [],
+          }
+          runtime.shared_map_set(receipts, name, failed)
+          terminal = true
+          publish_lane_failure(runtime, abort, name, cause)
+          throw "candidate certification lane failed"
+        }
+        const succeeded = raw.success
+        const lane_status: CandidateCertificationLaneStatus = if succeeded {
+          "success"
+        } else {
+          "failed"
+        }
+        const completed: CandidateCertificationLaneReceipt = {
+          name: name,
+          success: succeeded,
+          status: lane_status,
+          steps: raw.steps,
+          evidence: raw.evidence,
+          started_at_ms: started,
+          completed_at_ms: clock(),
+          error: if succeeded {
+            nil
+          } else {
+            trim(raw.error ?? "lane returned a failing verdict")
+          },
+          cancellation: nil,
+          cleanup: [],
+        }
+        runtime.shared_map_set(receipts, name, completed)
+        terminal = true
+        if !succeeded {
+          publish_lane_failure(runtime, abort, name, completed.error ?? "lane failed")
+          throw "candidate certification lane failed"
+        }
+      } finally {
+        if !terminal {
+          const reason = runtime.shared_get(abort)
+          const user_interruption = reason?.kind == "user_interruption"
+          const cause = trim(
+            reason?.cause
+              ?? if user_interruption {
+              "release certification interrupted by operator"
+            } else {
+              "a sibling lane failed"
+            },
+          )
+          const cancelled: CandidateCertificationLaneReceipt = {
+            name: name,
+            success: false,
+            status: if user_interruption {
+              "interrupted"
+            } else {
+              "cancelled"
+            },
+            steps: [],
+            evidence: nil,
+            started_at_ms: started,
+            completed_at_ms: clock(),
+            error: nil,
+            cancellation: {
+              kind: if user_interruption {
+                "user_interruption"
+              } else {
+                "sibling_failure"
+              },
+              cause: cause,
+            },
+            cleanup: [],
+          }
+          runtime.shared_map_set(receipts, name, cancelled)
+        }
+      }
+      return nil
+    }
+  } catch (error) {
+    // The terminal lane receipt and the cancelled sibling receipts are the
+    // durable error surface. The thrown sentinel exists only to trigger
+    // structured cancellation.
+    if runtime.shared_get(abort) == nil {
+      throw error
+    }
+  }
+  let lanes: list<CandidateCertificationLaneReceipt> = []
+  for name in CANDIDATE_CERTIFICATION_LANES {
+    let lane = runtime.shared_map_get(receipts, name, nil)
+    if lane == nil {
+      const reason = runtime.shared_get(abort)
+      if reason == nil {
+        throw "candidate certification lane '${name}' produced no terminal receipt"
+      }
+      const user_interruption = reason?.kind == "user_interruption"
+      const cause = trim(
+        reason?.cause
+          ?? if user_interruption {
+          "release certification interrupted by operator"
+        } else {
+          "a sibling lane failed"
+        },
+      )
+      lane = {
+        name: name,
+        success: false,
+        status: if user_interruption {
+          "interrupted"
+        } else {
+          "cancelled"
+        },
+        steps: [],
+        evidence: nil,
+        started_at_ms: runtime.shared_map_get(starts, name, run_started),
+        completed_at_ms: clock(),
+        error: nil,
+        cancellation: {
+          kind: if user_interruption {
+            "user_interruption"
+          } else {
+            "sibling_failure"
+          },
+          cause: cause,
+        },
+        cleanup: [],
+      }
+    }
+    if (lane.status == "cancelled" || lane.status == "interrupted") && canceller != nil {
+      lane = {
+        ...lane,
+        cleanup: canceller(
+          {lane: name, cause: lane.cancellation?.cause ?? "a sibling lane failed"},
+        ),
+      }
+    }
+    runtime.shared_map_set(receipts, name, lane)
+    lanes = lanes + [lane]
+  }
+  return {lanes: lanes, abort_reason: runtime.shared_get(abort)}
+}
+
 /** Join independent exact-candidate lanes by elapsed wall time, never by their sum. */
-pub fn release_candidate_certification_join(lanes: list<dict>) -> dict {
+pub fn release_candidate_certification_join(
+  lanes: list<CandidateCertificationTimingLane>,
+) -> CandidateCertificationTiming {
   if len(lanes) == 0 {
     return {started_at_ms: 0, completed_at_ms: 0, duration_ms: 0, critical_path: ""}
   }
-  let started = lanes[0].started_at_ms
-  let completed = lanes[0].completed_at_ms
+  const first = lanes[0]
+  if first == nil {
+    throw "non-empty certification lane list has no first receipt"
+  }
+  let started = first.started_at_ms
+  let completed = first.completed_at_ms
   for lane in lanes {
     started = min(started, lane.started_at_ms)
     completed = max(completed, lane.completed_at_ms)
@@ -71,73 +393,102 @@ pub fn run_release_candidate_certification(
     bootstrap_new_crates: cfg.bootstrap_new_crates,
     bump: cfg.bump,
   }
-  const tasks = [{kind: "platform"}, {kind: "binary_size"}]
-  const settled = parallel settle tasks with { max_concurrent: 2 } { task ->
-    const started_at_ms = now_ms(harness.clock)
-    if task.kind == "platform" {
-      const evidence = release_candidate_audit_evidence(harness, audit_cfg, publication, run_id)
-      return {
-        name: task.kind,
-        success: evidence.receipt_path != ""
-          && evidence.harn_bin != ""
-          && !execution_failed(evidence.steps),
-        steps: evidence.steps,
-        evidence: evidence,
-        started_at_ms: started_at_ms,
-        completed_at_ms: now_ms(harness.clock),
+  const platform_dispatches = platform_certification_dispatch_registry(
+    harness.runtime,
+    "candidate_platform_dispatches_${run_id}",
+  )
+  const lane_run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    { kind ->
+      if kind == "platform" {
+        const evidence = release_candidate_audit_evidence(
+          harness,
+          audit_cfg,
+          publication,
+          run_id,
+          platform_dispatches,
+        )
+        return {
+          success: evidence.receipt_path != ""
+            && evidence.harn_bin != ""
+            && !execution_failed(evidence.steps),
+          steps: evidence.steps,
+          evidence: evidence,
+          error: "platform certification failed",
+        }
       }
-    }
-    const binary = run_pre_tag_binary_size_gate(harness, cfg, publication, [], run_id)
-    return {
-      name: task.kind,
-      success: binary.success,
-      steps: binary.steps,
-      evidence: nil,
-      started_at_ms: started_at_ms,
-      completed_at_ms: now_ms(harness.clock),
-    }
-  }
-  const results = map_settled(
-    settled.results,
-    { value, _index -> value },
-    { message, _index -> Err({code: "candidate_certification_lane_panicked", message: message}) },
+      const binary = run_pre_tag_binary_size_gate(harness, cfg, publication, [], run_id)
+      return {
+        success: binary.success,
+        steps: binary.steps,
+        evidence: nil,
+        error: "pre-tag binary-size certification failed",
+      }
+    },
+    fn() { return now_ms(harness.clock) },
+    { request ->
+      if request.lane != "platform" {
+        return []
+      }
+      return cancel_recorded_platform_certification_runs(
+        harness,
+        "burin-labs/harn",
+        platform_dispatches,
+        cfg.mock,
+      )
+    },
   )
   let merged_steps = steps
-  let lanes = []
+  const lanes = lane_run.lanes
   let platform_evidence: ReleasePrepareAuditEvidence? = nil
   let success = true
-  for result in results {
-    if is_err(result) {
+  for lane in lanes {
+    merged_steps = merged_steps + lane.steps
+    if lane.status == "cancelled" || lane.status == "interrupted" {
       success = false
       merged_steps = merged_steps
         + [
         recorded_step(
-          "candidate-certification-lane",
-          "run exact-candidate certification lane",
-          command_result_fail(2, to_string(unwrap_err(result))),
+          if lane.status == "interrupted" {
+            "candidate-certification-lane-interrupted"
+          } else {
+            "candidate-certification-lane-cancelled"
+          },
+          if lane.status == "interrupted" {
+            "stop ${lane.name} certification after operator interruption"
+          } else {
+            "cancel ${lane.name} certification after sibling failure"
+          },
+          command_result_fail(130, lane.cancellation?.cause ?? "sibling lane failed"),
         ),
       ]
       continue
     }
-    const lane = unwrap(result)
-    merged_steps = merged_steps + lane.steps
-    lanes = lanes
-      + [
-      {name: lane.name, started_at_ms: lane.started_at_ms, completed_at_ms: lane.completed_at_ms},
-    ]
     if !lane.success {
       success = false
+      if lane.error != nil && len(lane.steps) == 0 {
+        merged_steps = merged_steps
+          + [
+          recorded_step(
+            "candidate-certification-lane",
+            "run ${lane.name} exact-candidate certification lane",
+            command_result_fail(2, lane.error ?? "certification lane failed"),
+          ),
+        ]
+      }
     }
-    if lane.name == "platform" {
+    if lane.name == "platform" && lane.success {
       platform_evidence = lane.evidence
     }
   }
   const timing = release_candidate_certification_join(lanes)
+  const lane_summaries = lanes.map({ lane -> summarize_lane(lane) }).to_list()
   release_log_event(
     {clock: harness.clock, fs: harness.fs},
     run_id,
     "release_candidate_certification_joined",
-    {success: success, publication: publication, lanes: lanes, join: timing},
+    {success: success, publication: publication, lanes: lane_summaries, join: timing},
   )
   const join_result = if success {
     command_result_ok(
@@ -155,7 +506,7 @@ pub fn run_release_candidate_certification(
         join_result,
       ),
       candidate_certification_timing: timing,
-      candidate_certification_lanes: lanes,
+      candidate_certification_lanes: lane_summaries,
       publication: publication,
     },
   ]

@@ -1,0 +1,125 @@
+import { PlatformCertificationCancellationReceipt } from "../lib/platform_certification"
+import {
+  CandidateCertificationLaneName,
+  CertificationCleanup,
+  run_candidate_certification_lanes,
+} from "../lib/release_candidate_certification"
+
+fn wall_clock_ms(clock: HarnessClock) -> int {
+  return (to_int(date_parse(clock.date_iso())) ?? 0) * 1000
+}
+
+fn mock_cleanup(lane: CandidateCertificationLaneName) -> CertificationCleanup {
+  if lane != "platform" {
+    return []
+  }
+  const receipt: PlatformCertificationCancellationReceipt = {
+    platform: "windows",
+    run_id: 42,
+    success: true,
+    provider: "mock",
+    receipt: nil,
+    error: nil,
+  }
+  return [receipt]
+}
+
+pipeline test_candidate_failure_cancels_and_cleans_up_its_running_sibling(harness: Harness, task) {
+  const fixture_id = harness.random.uuid_v7()
+  const running_path = path_join(harness.fs.temp_dir(), "candidate-lanes-${fixture_id}.running")
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    { name ->
+      if name == "binary_size" {
+        // Fail only once the sibling is demonstrably mid-flight, so the
+        // cancellation path is the one under test rather than a lane that
+        // had not started.
+        const deadline_ms = wall_clock_ms(harness.clock) + 5000
+        while !harness.fs.exists(running_path) && wall_clock_ms(harness.clock) < deadline_ms {
+          harness.clock.sleep_ms(10)
+        }
+        if !harness.fs.exists(running_path) {
+          throw "platform fixture did not start"
+        }
+        return {success: false, steps: [], evidence: nil, error: "terminal binary-size failure"}
+      }
+      harness.fs.write_text(running_path, "running")
+      harness.clock.sleep_ms(500)
+      return {success: true, steps: [], evidence: nil, error: nil}
+    },
+    fn() { return wall_clock_ms(harness.clock) },
+    fn(request) { return mock_cleanup(request.lane) },
+  )
+  assert_eq(
+    run.abort_reason,
+    {kind: "lane_failed", lane: "binary_size", cause: "terminal binary-size failure"},
+  )
+  assert_eq(run.lanes.map({ lane -> lane.status }).to_list(), ["cancelled", "failed"])
+  assert_eq(
+    run.lanes[0]?.cancellation,
+    {kind: "sibling_failure", cause: "terminal binary-size failure"},
+  )
+  // The cancelled lane's hosted work is what actually costs wall clock, so the
+  // canceller must run for it and produce a cleanup receipt. A cancelled lane
+  // with an empty cleanup means dispatched runs were left burning.
+  assert_eq(
+    run.lanes[0]?.cleanup,
+    [{platform: "windows", run_id: 42, success: true, provider: "mock", receipt: nil, error: nil}],
+  )
+  assert_eq(run.lanes[1]?.error, "terminal binary-size failure")
+  // The sibling's own verdict is discarded: whatever it returns, a terminal
+  // failure elsewhere makes it cancelled, never successful.
+  assert_eq(run.lanes[0]?.success, false)
+}
+
+pipeline test_candidate_lane_success_receipts_preserve_input_order(harness: Harness, task) {
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    fn(_name) { return {success: true, steps: [], evidence: nil, error: nil} },
+    fn() { return 42 },
+  )
+  assert_eq(run.abort_reason, nil)
+  assert_eq(
+    run.lanes.map({ lane -> {name: lane.name, status: lane.status, success: lane.success} })
+      .to_list(),
+    [
+      {name: "platform", status: "success", success: true},
+      {name: "binary_size", status: "success", success: true},
+    ],
+  )
+}
+
+pipeline test_candidate_user_interruption_is_not_reported_as_sibling_failure(
+  harness: Harness,
+  task,
+) {
+  const run = run_candidate_certification_lanes(
+    harness.runtime,
+    harness.random,
+    fn(_name) {
+      throw "interrupted wait"
+    },
+    fn() { return 42 },
+    fn(request) { return mock_cleanup(request.lane) },
+    fn() { return true },
+  )
+  assert_eq(
+    run.abort_reason,
+    {kind: "user_interruption", cause: "release certification interrupted by operator"},
+  )
+  assert_eq(run.lanes.map({ lane -> lane.status }).to_list(), ["interrupted", "interrupted"])
+  for lane in run.lanes {
+    assert_eq(
+      lane.cancellation,
+      {kind: "user_interruption", cause: "release certification interrupted by operator"},
+    )
+    assert_eq(lane.error, nil)
+    if lane.name == "platform" {
+      assert_eq(lane.cleanup[0]?.provider, "mock")
+    } else {
+      assert_eq(lane.cleanup, [])
+    }
+  }
+}
