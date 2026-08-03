@@ -490,6 +490,55 @@ harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-rel
 harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 ```
 
+### Running the release on hosted runners
+
+`.github/workflows/hosted-release.yml` runs the same harness on a
+GitHub-hosted runner. Both this repository and `burin-labs/harn` are public,
+so the runner minutes cost nothing, and the Rust compilation that dominates a
+local release moves off the operator machine. On a measured v0.10.53 run,
+`prepare` and `release-cli-aot` accounted for 17 of the 24 minutes before the
+certification gate; the model agent accounted for 0.3 minutes, so the LLM is
+not the expensive part of a release.
+
+Dispatch it from the Actions tab or with `gh`:
+
+```sh
+gh workflow run hosted-release.yml --repo burin-labs/harn-bump-fleet \
+  -f bump=patch -f mode=audit
+```
+
+`mode: audit` is read-only. `mode: prepare` builds and certifies the candidate
+and then stops, because release tags are signed with the maintainer's personal
+SSH key and no runner can reach it. Producing the tag stays a local step:
+
+```sh
+harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+```
+
+Removing that step means minting a dedicated bot signing key and adding its
+public half to the repository's allowed signers, which moves tag provenance off
+the maintainer identity. That is a deliberate choice rather than something
+hosting the build should decide.
+
+Both repositories are public, so the workflow assumes any secret it can read is
+worth attacking, and layers the controls accordingly:
+
+- `workflow_dispatch` is the only trigger. GitHub restricts manual dispatch to
+  actors with write access, so no fork or pull request can start the run.
+- The job binds to the `release` environment, whose protection rules require a
+  reviewer and allow only protected branches. The job pauses before any secret
+  is materialized until that reviewer approves, so even a collaborator with
+  write access cannot spend the API key unattended.
+- Top-level `permissions` is read-only. Write access to `burin-labs/harn` comes
+  from a short-lived GitHub App token scoped to that one repository.
+- Free-text inputs reach `run:` blocks through the environment rather than
+  string interpolation, and `at_sha` is rejected unless it is a full 40-hex SHA.
+- Every third-party action is pinned by commit SHA.
+
+The `release` environment holds `OPENROUTER_API_KEY` and `CEREBRAS_API_KEY`.
+The planner model is already well under a $2/Mtok budget — see
+`lib/llm_defaults` — so a release costs cents of inference rather than dollars.
+
 `ship-pr` returns as soon as the tag, branch, PR, auto-merge handoff, and typed
 watch receipt are durable. It does not hold the operator process open while
 GitHub compiles release binaries. The receipt lives at

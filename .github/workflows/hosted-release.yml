@@ -1,0 +1,176 @@
+name: Hosted harn release
+
+# Runs release_harn.harn on a GitHub-hosted runner instead of an operator
+# laptop. Both burin-labs/harn and burin-labs/harn-bump-fleet are public, so
+# the runner minutes are free, and the ~17 minutes of Rust compilation that
+# dominate a local release (prepare + release-cli-aot) move off the operator
+# machine entirely.
+#
+# Signing stays local on purpose. Release tags are signed with the maintainer's
+# personal SSH key, which no runner can reach; a hosted `prepare` therefore
+# stops at the prepared candidate and hands off a receipt. Minting a bot
+# signing key would remove that step, at the cost of moving tag provenance off
+# the maintainer identity, so it stays an explicit future choice rather than a
+# side effect of hosting the build.
+#
+# Secret exposure controls, in layers, because both repos are public:
+#
+#   1. `workflow_dispatch` is the only trigger. GitHub restricts manual
+#      dispatch to actors with write access, so no fork, pull request, or
+#      outside contributor can start this run.
+#   2. The job binds to the `release` environment. Its protection rules
+#      (required reviewers, `main`-only deployment branches) gate the secrets:
+#      the job pauses before any secret is materialized until a reviewer
+#      approves, so even a write-access collaborator cannot spend the API key
+#      unattended.
+#   3. Top-level `permissions` is read-only. Write access to burin-labs/harn
+#      comes from a separately scoped, short-lived GitHub App token.
+#   4. Free-text inputs never reach a shell as interpolated text; they cross
+#      into `run:` blocks through the environment so a crafted value cannot
+#      escape into the command line.
+#   5. Every third-party action is pinned by commit SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version bump for the next release.
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      mode:
+        description: >-
+          audit is read-only. prepare builds and certifies the candidate,
+          then stops before the signed tag.
+        type: choice
+        options: [audit, prepare]
+        default: audit
+      at_sha:
+        description: >-
+          Optional 40-character base pin. Blank pins the release at
+          origin/main when the run starts.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-harn-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: ${{ inputs.mode }} v-next (${{ inputs.bump }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: release
+
+    steps:
+      - name: Check out release harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: harn-bump-fleet
+          persist-credentials: false
+
+      # Scoped to burin-labs/harn only. `audit` never writes, but the same
+      # token serves both modes so the checkout remote is uniform; the
+      # harness itself is what decides whether a write happens.
+      - name: Mint scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          repositories: harn
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+
+      # Full history: the harness reconciles tags, walks commit evidence back
+      # to the previous release, and adds a release worktree.
+      - name: Check out harn
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          path: harn
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Identify the release author
+        working-directory: harn
+        run: |
+          set -euo pipefail
+          git config user.name "harn-release-bot[bot]"
+          git config user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+
+      - uses: burin-labs/harn/.github/actions/rust-toolchain@cf52e20564cb722f2f060bc222fa79d996cd3c30
+      - uses: burin-labs/harn/.github/actions/sccache-install@cf52e20564cb722f2f060bc222fa79d996cd3c30
+        continue-on-error: true
+      - uses: burin-labs/harn/.github/actions/rust-cache@cf52e20564cb722f2f060bc222fa79d996cd3c30
+        continue-on-error: true
+
+      - name: Install pinned Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@cf52e20564cb722f2f060bc222fa79d996cd3c30
+        with:
+          version-file: harn-bump-fleet/.harn-version
+
+      - name: Install Harn dependencies
+        working-directory: harn-bump-fleet
+        run: harn install --locked
+
+      # Inputs cross into the shell as environment values, never as
+      # interpolated command text.
+      - name: Run release harness
+        id: release
+        working-directory: harn-bump-fleet
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          RELEASE_BUMP: ${{ inputs.bump }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_AT_SHA: ${{ inputs.at_sha }}
+          HARN_RELEASE_CARGO_TARGET_DIR: ${{ github.workspace }}/release-target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${RELEASE_AT_SHA}" ] && ! printf '%s' "${RELEASE_AT_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "at_sha must be a full 40-character lowercase commit SHA" >&2
+            exit 2
+          fi
+
+          args=(--repo "${GITHUB_WORKSPACE}/harn" --bump "${RELEASE_BUMP}" --mode "${RELEASE_MODE}" --agent --no-chat)
+          # Only a mutating mode carries the live-release acknowledgement.
+          if [ "${RELEASE_MODE}" != "audit" ]; then
+            args+=(--yes-live-release)
+          fi
+          if [ -n "${RELEASE_AT_SHA}" ]; then
+            args+=(--at-sha "${RELEASE_AT_SHA}")
+          fi
+
+          harn run --no-sandbox release_harn.harn -- "${args[@]}" | tee hosted-release.md
+
+      - name: Publish run summary
+        if: always()
+        working-directory: harn-bump-fleet
+        run: |
+          set -euo pipefail
+          if [ -f hosted-release.md ]; then
+            cat hosted-release.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The event stream and live logs are the durable record of why a step
+      # failed; they are the first thing an operator reads on a red run.
+      - name: Upload release run artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-run-${{ github.run_id }}
+          path: |
+            harn-bump-fleet/.harn-runs/**
+            harn-bump-fleet/hosted-release.md
+          retention-days: 14
+          if-no-files-found: warn
