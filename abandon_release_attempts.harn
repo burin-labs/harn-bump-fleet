@@ -1,0 +1,198 @@
+#!/usr/bin/env harn
+import { help_requested } from "std/cli/argparse"
+import { env_str } from "std/config"
+import { git_push } from "std/git"
+import { cli_options } from "lib/cli_options"
+import {
+  ReleaseAttemptAbandonAdapter,
+  run_release_attempt_abandon,
+  valid_release_version,
+} from "lib/release_attempt_abandon"
+import { delete_remote_ref_with_lease } from "lib/release_ref_cleanup"
+import {
+  release_git_remote_refs,
+  release_github_pr_list,
+  release_github_release,
+  run_git,
+} from "lib/release_runtime"
+import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
+
+pub type ReleaseAttemptAbandonCliOptions = {
+  repo: string,
+  slug: string,
+  version: string,
+  apply: bool,
+  yes_live_release: bool,
+  json: bool,
+}
+
+const ARG_SPEC = {
+  name: "abandon-release-attempts",
+  args: [
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "flag", name: "slug", long: "--slug", default: "burin-labs/harn"},
+    {kind: "flag", name: "version", long: "--version", default: ""},
+    {kind: "switch", name: "apply", long: "--apply"},
+    {kind: "switch", name: "yes_live_release", long: "--yes-live-release"},
+    {kind: "switch", name: "json", long: "--json"},
+  ],
+}
+
+pub fn parse_release_attempt_abandon_args(args: list<string>) -> ReleaseAttemptAbandonCliOptions {
+  const parsed = cli_options<ReleaseAttemptAbandonCliOptions>(
+    ARG_SPEC,
+    args,
+    schema_of(ReleaseAttemptAbandonCliOptions),
+  )
+  if parsed.apply && !parsed.yes_live_release {
+    throw "--apply requires --yes-live-release"
+  }
+  if !valid_release_version(parsed.version) {
+    throw "--version must be X.Y.Z, got: " + trim(parsed.version)
+  }
+  if len(split(trim(parsed.slug), "/")) != 2 {
+    throw "--slug must be an owner/name repository"
+  }
+  return parsed
+}
+
+fn default_adapter(harness: Harness) -> ReleaseAttemptAbandonAdapter {
+  return {
+    now: fn() { return harness.clock.date_iso() },
+    attempt_refs: fn(repo, version) {
+      const observed = release_git_remote_refs(
+        harness.process,
+        {repo: repo, mock: false},
+        ["refs/heads/release-attempt/v${version}/*"],
+      )
+      if !observed.success {
+        throw "could not inventory release attempt refs: " + trim(observed.stderr)
+      }
+      return observed.refs
+    },
+    claim: fn(repo, version, oid) {
+      const cfg = {repo: repo, mock: false}
+      const tag = "v${version}"
+      const tag_lookup = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["ls-remote", "--tags", "origin", "refs/tags/${tag}"],
+      )
+      // A tag lookup that could not run at all must not read as "no tag".
+      if !tag_lookup.success {
+        throw "could not probe tag ${tag}: " + trim(tag_lookup.stderr)
+      }
+      const open = release_github_pr_list(
+        harness,
+        cfg,
+        {head: "release-attempt/v${version}/${oid}", state: "open", limit: 10},
+      )
+      return {
+        tag_exists: trim(tag_lookup.stdout) != "",
+        release_exists: release_github_release(harness, cfg, tag).found ?? false,
+        open_pr: if len(open) > 0 {
+          open[0]?.url ?? ""
+        } else {
+          ""
+        },
+      }
+    },
+    archive_ref: fn(repo, oid, ref) {
+      const pushed = git_push(harness.process, "origin", "${oid}:${ref}", repo)
+      return {
+        success: pushed.success,
+        message: trim(
+          if pushed.success {
+            pushed.stdout.inline
+          } else {
+            pushed.stderr.inline
+          },
+        ),
+      }
+    },
+    delete_ref: fn(repo, ref, oid) { return delete_remote_ref_with_lease(
+      harness.process,
+      repo,
+      ref,
+      oid,
+    ) },
+  }
+}
+
+fn usage() {
+  return """
+Usage:
+  harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+  harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
+
+Frees a version wedged by leftover release attempts. Two or more refs under
+`release-attempt/vX.Y.Z/` make that version unreleasable: every recovery route
+resumes an existing frozen candidate and none mints a fresh one at current
+main, so no fix that landed after the candidate froze can ever reach a gate.
+
+Each unclaimed attempt is renamed into `release-failed/vX.Y.Z/<oid>-abandoned`,
+never deleted, so the commit stays on origin and stays inventoried by
+`sweep_release_refs.harn`. An attempt claimed by a tag, a published release, or
+an open PR is retained, and one retained attempt blocks the whole operation —
+freeing a subset would leave recovery wedged on the remainder.
+
+The default is a dry run.
+
+Flags:
+  --repo PATH           Harn checkout (default ~/projects/harn).
+  --slug OWNER/REPO     Hosted repository (default burin-labs/harn).
+  --version X.Y.Z       Release version to free. Required.
+  --apply               Archive the planned attempts; default is dry-run.
+  --yes-live-release    Required with --apply.
+  --json                Print the complete machine-readable receipt.
+"""
+}
+
+pipeline main(harness: Harness) {
+  if help_requested(argv) {
+    harness.stdio.println(usage())
+    return 0
+  }
+  const sandbox_error = ensure_unrestricted_sandbox(
+    {stdio: harness.stdio, system: harness.system},
+    "abandon_release_attempts.harn",
+  )
+  if sandbox_error != nil {
+    return sandbox_error
+  }
+  const parsed = parse_release_attempt_abandon_args(argv)
+  const repo = if trim(parsed.repo) != "" {
+    parsed.repo
+  } else {
+    path_join(env_str(harness.env, "HOME") ?? "", "projects/harn")
+  }
+  const result = run_release_attempt_abandon(
+    default_adapter(harness),
+    {
+      repo: repo,
+      slug: parsed.slug,
+      version: parsed.version,
+      mode: if parsed.apply {
+        "apply"
+      } else {
+        "dry_run"
+      },
+    },
+  )
+  if parsed.json {
+    harness.stdio.println(json_stringify(result))
+  } else {
+    harness.stdio.println("== release attempt abandon: ${result.state}")
+    harness.stdio.println("   version : v${result.version}")
+    harness.stdio.println("   attempts: ${len(result.attempts)}")
+    harness.stdio.println("   ${result.message}")
+    for entry in result.attempts {
+      harness.stdio.println("   ${entry.outcome} ${entry.source_ref}: ${entry.message}")
+    }
+  }
+  return if result.state == "blocked" || result.state == "failed" {
+    2
+  } else {
+    0
+  }
+}
