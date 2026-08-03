@@ -508,17 +508,24 @@ gh workflow run hosted-release.yml --repo burin-labs/harn-bump-fleet \
 ```
 
 `mode: audit` is read-only. `mode: prepare` builds and certifies the candidate
-and then stops, because release tags are signed with the maintainer's personal
-SSH key and no runner can reach it. Producing the tag stays a local step:
+and then stops before the tag. `mode: ship-pr` signs and pushes the tag and
+opens the release PR, so a release needs no local step.
+
+Tags are signed by a dedicated release bot key that exists only in the
+workflow's `release` environment. The maintainer's personal signing key is
+deliberately not reachable from any runner. The public half is committed at
+`.github/release-bot-allowed-signers`, so anyone can check a release tag
+against this repository alone:
 
 ```sh
-harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+git -c gpg.ssh.allowedSignersFile=.github/release-bot-allowed-signers \
+  verify-tag v0.10.53
 ```
 
-Removing that step means minting a dedicated bot signing key and adding its
-public half to the repository's allowed signers, which moves tag provenance off
-the maintainer identity. That is a deliberate choice rather than something
-hosting the build should decide.
+The tagger is a GitHub App bot, and an App bot cannot hold SSH signing keys on
+GitHub, so the web UI marks these tags unverified even though the signature is
+valid. Restoring that badge would mean signing as a machine user account rather
+than the App bot.
 
 Both repositories are public, so the workflow assumes any secret it can read is
 worth attacking, and layers the controls accordingly:
