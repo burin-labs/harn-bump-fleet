@@ -17,6 +17,10 @@ The entry points are:
   receipt written by `release_harn`. It never repeats preparation or tagging.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
+- `abandon_release_attempts.harn`: frees a version wedged by leftover
+  `release-attempt/vX.Y.Z/` refs by renaming each unclaimed attempt into
+  `release-failed/vX.Y.Z/<oid>-abandoned`. Dry-run-first, and it refuses when a
+  tag, a published release, or an open PR still claims an attempt.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared

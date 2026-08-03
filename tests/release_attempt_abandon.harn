@@ -1,0 +1,226 @@
+import { GitRemoteRef } from "std/git"
+import {
+  ReleaseAttemptAbandonAdapter,
+  ReleaseAttemptClaim,
+  release_abandoned_attempt_ref,
+  release_attempt_abandon_decision,
+  release_attempt_abandon_entry,
+  run_release_attempt_abandon,
+} from "../lib/release_attempt_abandon"
+import { release_remote_ref_sweep_entry } from "../lib/release_ref_sweep"
+
+const FIRST = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const SECOND = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+fn remote(name: string, oid: string) -> GitRemoteRef {
+  return {ref: name, name: name, oid: oid, peeled: false}
+}
+
+fn attempt(oid: string, version: string = "1.2.3") -> GitRemoteRef {
+  return remote("refs/heads/release-attempt/v${version}/${oid}", oid)
+}
+
+fn unclaimed() -> ReleaseAttemptClaim {
+  return {tag_exists: false, release_exists: false, open_pr: ""}
+}
+
+/**
+ * Effects are observed through outcomes rather than a call log: a list handed
+ * to the adapter is copied, so a recorded-calls side channel cannot be read
+ * back. `delete_guard` lets a test assert that the delete never runs.
+ */
+fn effect_adapter(
+  refs: list<GitRemoteRef>,
+  claim: ReleaseAttemptClaim = {tag_exists: false, release_exists: false, open_pr: ""},
+  archive_ok: bool = true,
+  delete_ok: bool = true,
+  delete_guard: string = "",
+) -> ReleaseAttemptAbandonAdapter {
+  return {
+    now: fn() { return "2026-08-03T00:00:00Z" },
+    attempt_refs: fn(_repo, _version) { return refs },
+    claim: fn(_repo, _version, _oid) { return claim },
+    archive_ref: fn(_repo, _oid, _ref) { return {
+      success: archive_ok,
+      message: if archive_ok {
+        "pushed"
+      } else {
+        "remote rejected the archive push"
+      },
+    } },
+    delete_ref: fn(_repo, _ref, _oid) {
+      if trim(delete_guard) != "" {
+        throw delete_guard
+      }
+      return {
+        success: delete_ok,
+        message: if delete_ok {
+          "deleted"
+        } else {
+          "remote rejected the delete"
+        },
+      }
+    },
+  }
+}
+
+fn run(
+  refs: list<GitRemoteRef>,
+  mode: string = "apply",
+  claim: ReleaseAttemptClaim = {tag_exists: false, release_exists: false, open_pr: ""},
+  archive_ok: bool = true,
+  delete_ok: bool = true,
+  delete_guard: string = "",
+) {
+  return run_release_attempt_abandon(
+    effect_adapter(refs, claim, archive_ok, delete_ok, delete_guard),
+    {repo: "/tmp/harn", version: "1.2.3", mode: mode},
+  )
+}
+
+pipeline test_unclaimed_attempt_is_planned_for_archive(task) {
+  const entry = release_attempt_abandon_entry("1.2.3", attempt(FIRST), unclaimed())
+  assert_eq(entry.action, "archive")
+  assert_eq(entry.outcome, "planned")
+  assert_eq(entry.reason_code, "unclaimed_pre_tag_candidate")
+  assert_eq(entry.archive_ref, "refs/heads/release-failed/v1.2.3/${FIRST}-abandoned")
+}
+
+pipeline test_every_claim_retains_the_attempt(task) {
+  const claims = [
+    {claim: {tag_exists: true, release_exists: false, open_pr: ""}, code: "claimed_by_tag"},
+    {claim: {tag_exists: false, release_exists: true, open_pr: ""}, code: "claimed_by_release"},
+    {
+      claim: {tag_exists: false, release_exists: false, open_pr: "https://example.test/pr/7"},
+      code: "claimed_by_open_pr",
+    },
+  ]
+  for case in claims {
+    const decision = release_attempt_abandon_decision(case.claim)
+    assert_eq(decision.action, "retain")
+    assert_eq(decision.reason_code, case.code)
+    const entry = release_attempt_abandon_entry("1.2.3", attempt(FIRST), case.claim)
+    assert_eq(entry.outcome, "retained")
+    assert_eq(entry.archive_ref, "")
+  }
+}
+
+pipeline test_moved_ref_is_never_abandoned(task) {
+  // The ref name claims FIRST but origin has it pointing at SECOND, so the ref
+  // is not provably the attempt it names.
+  const entry = release_attempt_abandon_entry(
+    "1.2.3",
+    remote("refs/heads/release-attempt/v1.2.3/${FIRST}", SECOND),
+    unclaimed(),
+  )
+  assert_eq(entry.action, "retain")
+  assert_eq(entry.reason_code, "moved_ref")
+}
+
+pipeline test_other_version_attempt_is_never_abandoned(task) {
+  const entry = release_attempt_abandon_entry("1.2.3", attempt(FIRST, "1.2.4"), unclaimed())
+  assert_eq(entry.action, "retain")
+  assert_eq(entry.reason_code, "version_mismatch")
+}
+
+pipeline test_dry_run_plans_without_touching_any_ref(task) {
+  // The guard proves the dry run reaches no effect at all.
+  const result = run(
+    [attempt(FIRST), attempt(SECOND)],
+    "dry_run",
+    unclaimed(),
+    true,
+    true,
+    "dry run must not delete any ref",
+  )
+  assert_eq(result.state, "planned")
+  assert_eq(len(result.attempts), 2)
+  assert_eq(result.attempts[0]?.outcome, "planned")
+}
+
+pipeline test_apply_archives_before_deleting(task) {
+  const result = run([attempt(FIRST)])
+  assert_eq(result.state, "abandoned")
+  assert_eq(result.attempts[0]?.outcome, "archived")
+  assert_eq(
+    contains(
+      result.attempts[0]?.message ?? "",
+      "refs/heads/release-failed/v1.2.3/${FIRST}-abandoned",
+    ),
+    true,
+  )
+}
+
+pipeline test_one_claimed_attempt_blocks_every_sibling(task) {
+  // Freeing only part of the set would leave recovery wedged on the remainder,
+  // so the guard must never fire.
+  const result = run(
+    [attempt(FIRST), attempt(SECOND)],
+    "apply",
+    {tag_exists: false, release_exists: false, open_pr: "https://example.test/pr/9"},
+    true,
+    true,
+    "a claimed version must not delete any ref",
+  )
+  assert_eq(result.state, "blocked")
+  assert_eq(result.attempts[0]?.outcome, "retained")
+}
+
+pipeline test_failed_archive_keeps_the_attempt_ref(task) {
+  // Archive before delete is the whole safety property: a failed archive must
+  // never reach the delete, or the attempt would exist nowhere on origin.
+  const result = run(
+    [attempt(FIRST)],
+    "apply",
+    unclaimed(),
+    false,
+    true,
+    "delete must not run after a failed archive",
+  )
+  assert_eq(result.state, "failed")
+  assert_eq(result.attempts[0]?.outcome, "failed")
+  assert_eq(contains(result.attempts[0]?.message ?? "", "could not archive"), true)
+}
+
+pipeline test_failed_delete_reports_the_archived_copy(task) {
+  const result = run([attempt(FIRST)], "apply", unclaimed(), true, false)
+  assert_eq(result.state, "failed")
+  assert_eq(result.attempts[0]?.outcome, "failed")
+  assert_eq(
+    contains(
+      result.attempts[0]?.message ?? "",
+      "refs/heads/release-failed/v1.2.3/${FIRST}-abandoned",
+    ),
+    true,
+  )
+}
+
+pipeline test_version_without_attempts_is_already_clear(task) {
+  const result = run([])
+  assert_eq(result.state, "clear")
+  assert_eq(len(result.attempts), 0)
+}
+
+pipeline test_archive_namespace_is_the_one_the_sweep_owns(task) {
+  // The archive name is only useful if `sweep_release_refs` still recognizes
+  // it; an unowned namespace would be retained as malformed forever.
+  const archived = release_abandoned_attempt_ref("1.2.3", FIRST)
+  const entry = release_remote_ref_sweep_entry(
+    "burin-labs/harn",
+    remote(archived, FIRST),
+    fn(_slug, _ref) { return "1.2.3" },
+    fn(_oid) { return false },
+    fn(version, ref_oid, _slug) { return {
+      version: version,
+      tag: "v${version}",
+      ref_oid: ref_oid,
+      tag_target_oid: FIRST,
+      signed_tag: true,
+      hosted_terminal: true,
+      message: "signed published tag and terminal hosted release recover exact OID",
+    } },
+  )
+  assert_eq(entry.reason_code, "tag_backed_terminal_release")
+  assert_eq(entry.action, "delete")
+}

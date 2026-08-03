@@ -575,6 +575,36 @@ healthy only when crates.io and all five archives plus `SHA256SUMS` and
 `release-assets.json` are present; a cache is warm only after the exact five-job
 release matrix completes successfully.
 
+## Freeing a wedged release version
+
+Because the sweep only retires refs a verified signed tag can recover, an
+unclaimed pre-tag candidate stays on origin forever. Once two or more of them
+exist for one version, that version can no longer be cut. `--at-sha` matches a
+candidate's frozen *source pin*, so a pin that is not already one of them
+selects zero attempts and fails, while a pin that is one of them selects
+exactly one and then routes to `resume_pre_tag`. No route mints a fresh
+candidate at current `main`, and the resumed tree cannot contain a fix that
+landed after it froze — so a gate the fix was meant to satisfy keeps failing.
+
+`abandon_release_attempts.harn` is the escape:
+
+```sh
+harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
+```
+
+It renames each unclaimed attempt to `release-failed/vX.Y.Z/<oid>-abandoned`
+rather than deleting it, so the commit stays on origin and the sweep still
+inventories it through the normal proof path. Archiving always precedes the
+delete, so an interruption leaves a recoverable copy instead of losing the
+attempt. An attempt claimed by a tag, a published release, or an open PR is
+retained, and one retained attempt blocks the whole operation: freeing a subset
+would leave recovery wedged on the remainder.
+
+Afterwards, delete the local `release/vX.Y.Z` branch and any worktree holding
+it. Release preflight compares that branch against `origin/main` only, so an
+archived candidate still reads as un-pushed work and blocks the fresh cut.
+
 Before either live mode mutates its isolated worktree, it refreshes
 `origin/<base>` and proves the latest remote release tag has been folded back:
 both the workspace version and the top versioned CHANGELOG section must match
