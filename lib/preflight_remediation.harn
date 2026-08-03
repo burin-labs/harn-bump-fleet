@@ -269,6 +269,179 @@ fn current_worktree_path(git: PreflightGitRunner) -> string {
   return trim(current.stdout ?? "")
 }
 
+pub type PreflightOwnerWorktreeRequest = {
+  owner_path: string,
+  branch: string,
+  version: string,
+  head_sha: string,
+  dirty_file_count: int,
+  preserve_dirty_owner: bool,
+  authorization: FailedReleaseWorkspaceAuthorization?,
+}
+
+pub type PreflightPreservedWorkspace = {
+  preserved_workspace: string,
+  recovery_run_id: string,
+  diff_preserved: bool,
+}
+
+pub type PreflightOwnerWorktreeRelease = {
+  failure_reason: string?,
+  preserved: PreflightPreservedWorkspace?,
+}
+
+/**
+ * Release another worktree's hold on a known-stale release branch.
+ *
+ * A clean holder is removed outright. A dirty holder is only ever *detached*
+ * from the branch name, and only when durable receipts authorized it: its
+ * tracked and untracked bytes are fingerprinted before and after the detach and
+ * must match exactly, so a failed release workspace survives byte-for-byte.
+ */
+fn release_stale_branch_owner_worktree(
+  git: PreflightGitRunner,
+  request: PreflightOwnerWorktreeRequest,
+) -> PreflightOwnerWorktreeRelease {
+  const owner_path = request.owner_path
+  const version = request.version
+  const owner_status = git(["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"])
+  if !(owner_status.success ?? false) {
+    return {
+      failure_reason: "could not reverify release/${version} owner worktree ${owner_path}",
+      preserved: nil,
+    }
+  }
+  if trim(owner_status.stdout ?? "") == "" {
+    const removed = git(["worktree", "remove", "--force", owner_path])
+    if !(removed.success ?? false) {
+      return {
+        failure_reason:
+          "failed to remove stale release/${version} worktree ${owner_path}: ${trim(removed.stderr ?? "")}",
+        preserved: nil,
+      }
+    }
+    return {failure_reason: nil, preserved: nil}
+  }
+  const authorization = request.authorization
+  if !request.preserve_dirty_owner || authorization == nil {
+    return {
+      failure_reason:
+        "release/${version} is checked out in another dirty worktree; refusing to remove ${owner_path}",
+      preserved: nil,
+    }
+  }
+  const before_status = owner_status.stdout ?? ""
+  const before_diff = git(["-C", owner_path, "diff", "--binary", "--no-ext-diff", "HEAD"])
+  if !(before_diff.success ?? false) {
+    return {
+      failure_reason: "could not fingerprint failed release workspace ${owner_path}",
+      preserved: nil,
+    }
+  }
+  const detached = git(["-C", owner_path, "switch", "--detach", request.head_sha])
+  const after_status = git(["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"])
+  const after_diff = git(["-C", owner_path, "diff", "--binary", "--no-ext-diff", "HEAD"])
+  const preserved_exactly = (detached.success ?? false)
+    && (after_status.success ?? false)
+    && (after_diff.success ?? false)
+    && after_status.stdout == before_status
+    && after_diff.stdout == before_diff.stdout
+  if !preserved_exactly {
+    return {
+      failure_reason:
+        "failed to detach release/${version} while preserving failed workspace ${owner_path}",
+      preserved: nil,
+    }
+  }
+  return {
+    failure_reason: nil,
+    preserved: {
+      preserved_workspace: owner_path,
+      recovery_run_id: authorization.run_id,
+      diff_preserved: true,
+    },
+  }
+}
+
+pub type PreflightStaleBranchFacts = {
+  branch_exists: bool,
+  owner_path: string,
+  current_path: string,
+  external_owner: bool,
+  status_lines: list<string>,
+  current_branch: string,
+  head_sha: string,
+  dirty_owner_authorization: FailedReleaseWorkspaceAuthorization?,
+  unreadable_owner_path: string?,
+}
+
+/** Probe every git fact the stale-release-branch decision consumes, once. */
+fn stale_release_branch_facts(
+  git: PreflightGitRunner,
+  branch: string,
+  authorize_dirty_owner: PreflightDirtyOwnerAuthorizer?,
+) -> PreflightStaleBranchFacts {
+  const absent: PreflightStaleBranchFacts = {
+    branch_exists: false,
+    owner_path: "",
+    current_path: "",
+    external_owner: false,
+    status_lines: [],
+    current_branch: "",
+    head_sha: "",
+    dirty_owner_authorization: nil,
+    unreadable_owner_path: nil,
+  }
+  if !local_branch_present(git, branch) {
+    return absent
+  }
+  const owner_path = worktree_path_for_branch(git, branch)
+  const current_path = current_worktree_path(git)
+  const external_owner = owner_path != "" && owner_path != current_path
+  let status_lines: list<string> = []
+  if external_owner {
+    const owner_status = git(
+      ["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"],
+    )
+    if !(owner_status.success ?? false) {
+      return absent + {branch_exists: true, unreadable_owner_path: owner_path}
+    }
+    const status = trim(owner_status.stdout ?? "")
+    status_lines = if status == "" {
+      []
+    } else {
+      split(status, "\n")
+    }
+  } else {
+    status_lines = tree_status_lines(git)
+  }
+  const dirty = len(status_lines) > 0
+  // Git checks a branch out in at most one worktree, so an external owner
+  // proves this checkout is not standing on the release branch. Reporting the
+  // owner's branch here would let the "current dirty checkout" resume absorb
+  // another worktree's dirty tree and skip remediation entirely.
+  const current_branch = if dirty && !external_owner {
+    trim(git(["branch", "--show-current"]).stdout ?? "")
+  } else {
+    ""
+  }
+  return {
+    branch_exists: true,
+    owner_path: owner_path,
+    current_path: current_path,
+    external_owner: external_owner,
+    status_lines: status_lines,
+    current_branch: current_branch,
+    head_sha: lowercase(trim(git(["rev-parse", branch]).stdout ?? "")),
+    dirty_owner_authorization: if external_owner && dirty && authorize_dirty_owner != nil {
+      authorize_dirty_owner(owner_path, branch)
+    } else {
+      nil
+    },
+    unreadable_owner_path: nil,
+  }
+}
+
 /**
  * Heal a stale `release/<version>` branch when known-safe. `git` is a runner
  * closure `argv -> {success, stdout, stderr}`; `open_pr_count` is
@@ -287,68 +460,25 @@ pub fn preflight_remediate_stale_release_branch(
   const crashed_reclaim = config.crashed_reclaim ?? false
   const resume_current_dirty = config.resume_current_dirty ?? false
   const branch = "release/${version}"
-  const branch_exists = local_branch_present(git, branch)
-  const owner_path = if branch_exists {
-    worktree_path_for_branch(git, branch)
-  } else {
-    ""
-  }
-  const current_path = if branch_exists {
-    current_worktree_path(git)
-  } else {
-    ""
-  }
-  const external_owner = owner_path != "" && owner_path != current_path
-  const status_lines = if branch_exists {
-    if external_owner {
-      const owner_status = git(
-        ["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"],
-      )
-      if !(owner_status.success ?? false) {
-        return {
-          action: "fail",
-          safe: false,
-          reason: "could not inspect release/${version} owner worktree ${owner_path}",
-          remediated: false,
-          verified: false,
-          decision: {action: "fail", safe: false, reason: "owner worktree unreadable"},
-        }
-      }
-      const status = trim(owner_status.stdout ?? "")
-      if status == "" {
-        []
-      } else {
-        split(status, "\n")
-      }
-    } else {
-      tree_status_lines(git)
+  const facts = stale_release_branch_facts(git, branch, authorize_dirty_owner)
+  if facts.unreadable_owner_path != nil {
+    return {
+      action: "fail",
+      safe: false,
+      reason: "could not inspect release/${version} owner worktree ${facts.unreadable_owner_path}",
+      remediated: false,
+      verified: false,
+      decision: {action: "fail", safe: false, reason: "owner worktree unreadable"},
     }
-  } else {
-    []
   }
-  // Git checks a branch out in at most one worktree, so an external owner
-  // proves this checkout is not standing on the release branch. Reporting the
-  // owner's branch here would let the "current dirty checkout" resume below
-  // absorb another worktree's dirty tree and skip remediation entirely.
-  const current_branch = if branch_exists && len(status_lines) > 0 && !external_owner {
-    trim(git(["branch", "--show-current"]).stdout ?? "")
-  } else {
-    ""
-  }
-  const head_sha = if branch_exists {
-    lowercase(trim(git(["rev-parse", branch]).stdout ?? ""))
-  } else {
-    ""
-  }
-  const dirty_owner_authorization = if external_owner
-    && len(status_lines)
-    > 0
-    && authorize_dirty_owner
-    != nil {
-    authorize_dirty_owner(owner_path, branch)
-  } else {
-    nil
-  }
+  const branch_exists = facts.branch_exists
+  const owner_path = facts.owner_path
+  const current_path = facts.current_path
+  const external_owner = facts.external_owner
+  const status_lines = facts.status_lines
+  const current_branch = facts.current_branch
+  const head_sha = facts.head_sha
+  const dirty_owner_authorization = facts.dirty_owner_authorization
   const preserve_dirty_owner = (dirty_owner_authorization?.authorized ?? false)
     && lowercase(
     trim(dirty_owner_authorization?.pin_sha ?? ""),
@@ -401,88 +531,36 @@ pub fn preflight_remediate_stale_release_branch(
   } else {
     nil
   }
-  // If another clean worktree owns this known-stale branch, remove that holder
+  // If another worktree owns this known-stale branch, release that holder
   // first; otherwise `git branch -D` fails even though the branch is safe.
   if owner_path != "" && owner_path != current_path {
-    const owner_status = git(
-      ["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"],
+    const release = release_stale_branch_owner_worktree(
+      git,
+      {
+        owner_path: owner_path,
+        branch: branch,
+        version: version,
+        head_sha: head_sha,
+        dirty_file_count: len(status_lines),
+        preserve_dirty_owner: decision.preserve_dirty_owner ?? false,
+        authorization: dirty_owner_authorization,
+      },
     )
-    if !(owner_status.success ?? false) {
+    if release.failure_reason != nil {
       return {
         action: "fail",
         safe: false,
-        reason: "could not reverify release/${version} owner worktree ${owner_path}",
+        reason: release.failure_reason,
         remediated: false,
         verified: false,
         decision: decision,
       }
     }
-    if trim(owner_status.stdout ?? "") != "" {
-      if !(decision.preserve_dirty_owner ?? false) || dirty_owner_authorization == nil {
-        return {
-          action: "fail",
-          safe: false,
-          reason:
-            "release/${version} is checked out in another dirty worktree; refusing to remove ${owner_path}",
-          remediated: false,
-          verified: false,
-          decision: decision,
-        }
-      }
-      const before_status = owner_status.stdout ?? ""
-      const before_diff = git(["-C", owner_path, "diff", "--binary", "--no-ext-diff", "HEAD"])
-      if !(before_diff.success ?? false) {
-        return {
-          action: "fail",
-          safe: false,
-          reason: "could not fingerprint failed release workspace ${owner_path}",
-          remediated: false,
-          verified: false,
-          decision: decision,
-        }
-      }
-      const detached = git(["-C", owner_path, "switch", "--detach", head_sha])
-      const after_status = git(
-        ["-C", owner_path, "status", "--porcelain", "--untracked-files=normal"],
-      )
-      const after_diff = git(["-C", owner_path, "diff", "--binary", "--no-ext-diff", "HEAD"])
-      if !(detached.success ?? false)
-        || !(after_status.success ?? false)
-        || !(after_diff.success ?? false)
-        || after_status.stdout
-        != before_status
-        || after_diff.stdout
-        != before_diff.stdout {
-        return {
-          action: "fail",
-          safe: false,
-          reason:
-            "failed to detach release/${version} while preserving failed workspace ${owner_path}",
-          remediated: false,
-          verified: false,
-          decision: decision,
-        }
-      }
+    if release.preserved != nil {
       discarded = (discarded
         ?? {branch: branch, head_sha: head_sha, dirty_file_count: len(status_lines)})
-        + {
-        preserved_workspace: owner_path,
-        recovery_run_id: dirty_owner_authorization.run_id,
-        diff_preserved: true,
-      }
-    } else {
-      const removed = git(["worktree", "remove", "--force", owner_path])
-      if !(removed.success ?? false) {
-        return {
-          action: "fail",
-          safe: false,
-          reason:
-            "failed to remove stale release/${version} worktree ${owner_path}: ${trim(removed.stderr ?? "")}",
-          remediated: false,
-          verified: false,
-          decision: decision,
-        }
-      }
+        + release
+        .preserved
     }
   }
   // Only switch when we are standing on the branch we are about to remove.
