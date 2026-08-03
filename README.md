@@ -610,8 +610,10 @@ rather than deleting it, so the commit stays on origin and the sweep still
 inventories it through the normal proof path. Archiving always precedes the
 delete, so an interruption leaves a recoverable copy instead of losing the
 attempt. An attempt claimed by a tag, a published release, or an open PR is
-retained, and one retained attempt blocks the whole operation: freeing a subset
-would leave recovery wedged on the remainder.
+retained, and a live claim blocks the whole operation: pre-tag, freeing a subset
+would leave recovery wedged on the remainder. A tag-recovered attempt is the
+exception — it is terminal and the sweep retires it, so it does not block the
+orphans beside it.
 
 Afterwards, delete the local `release/vX.Y.Z` branch and any worktree holding
 it. Release preflight compares that branch against `origin/main` only, so an
