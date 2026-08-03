@@ -57,6 +57,9 @@ harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 # Check fleet-owned connector CI adapters without writing them.
 harn run --no-sandbox sync_package_ci.harn -- --check
 
+# Check fleet-owned runtime-bump adapters without writing them.
+harn run --no-sandbox sync_bump_workflows.harn -- --check
+
 # Inspect unsigned bot dependency PRs that are blocked by required signatures.
 harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
 
@@ -78,11 +81,13 @@ sandbox must be disabled.
 
 Before scheduled dispatch, `check_fleet_policy.harn` reads every declared
 repository's default-branch workflows through the GitHub connector. It checks
-thin package and bump adapters against `fleet.toml`, verifies byte-exact file
-projections, and verifies that each canonical reusable-workflow pin still
-publishes the same bytes as the owner's current default branch. A fleet whose
-consumers all agree on a stale canonical pin therefore fails closed instead of
-silently treating internal consistency as freshness.
+the byte-exact package and runtime-bump adapters generated from `fleet.toml`,
+verifies other byte-exact file projections, and verifies that each canonical
+reusable-workflow pin still publishes the same bytes as the owner's current
+default branch. A fleet whose consumers all agree on a stale canonical pin
+therefore fails closed instead of silently treating internal consistency as
+freshness. Custom product refresh and validation commands remain named fields
+in the manifest; they do not create repository-local workflow templates.
 
 ### Signed bot PRs
 

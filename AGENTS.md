@@ -23,6 +23,8 @@ The entry points are:
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies exact package CI adapters for
   connector repositories that delegate projection ownership in `fleet.toml`.
+- `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
+  every repository that delegates bump workflow ownership in `fleet.toml`.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
@@ -82,6 +84,7 @@ harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-rel
 harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 harn run --no-sandbox sync_agent_guidance.harn -- --check
 harn run --no-sandbox sync_package_ci.harn -- --check
+harn run --no-sandbox sync_bump_workflows.harn -- --check
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
