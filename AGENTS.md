@@ -113,6 +113,17 @@ allowlists and explicit manual-recovery instructions. Model output may
 summarize, audit, or draft text, but deterministic code must validate or parse
 it before it affects files, PRs, tags, dispatches, or merge settings.
 
+An out-of-band harness that rewrites shared release refs must serialize on the
+`release-owner` host lease, the same lane `release_harn` takes. Terminal
+evidence — a tag, a published release, an open PR — cannot substitute for it:
+a release that has not tagged yet has none of those, so its in-flight candidate
+is indistinguishable from abandoned state. `abandon_release_attempts.harn`
+holds the lane in both modes for exactly this reason.
+`sweep_release_refs.harn` does not need it because every deletion it applies is
+gated on positive proof that a published tag recovers the exact OID, which an
+in-flight candidate can never satisfy. Adding a new mutation path means
+deciding which of those two shapes it has, and saying so.
+
 Route model defaults through `lib/llm_defaults`:
 
 - Use `planner_defaults("HARN_<ROLE>")` for new planner calls.
