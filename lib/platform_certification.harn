@@ -7,6 +7,7 @@ import {
   ExactWorkflowRunProvider,
   ExactWorkflowRunRequest,
   acquire_exact_workflow_run,
+  exact_run_conclusion_is_inconclusive,
 } from "./exact_workflow_run"
 import { git_push_ref_plumbing, remote_branch_oid } from "./git"
 import {
@@ -149,6 +150,8 @@ type PlatformCertificationProofFailureCode = "dispatch_identity_changed" \
   | "run_query_mismatch" \
   | "jobs_query_failed" \
   | "run_unknown_state" \
+  | "run_inconclusive" \
+  | "reacquire_failed" \
   | "run_poll_timeout"
 
 pub type PlatformCertificationAdapter = {
@@ -571,6 +574,101 @@ fn local_source_lane(
   )
 }
 
+/**
+ * How many times one lane may re-acquire after an inconclusive run.
+ *
+ * Small on purpose. Each re-acquisition costs a full hosted run, and a version
+ * whose runs keep being cancelled has a cause the release should surface rather
+ * than absorb.
+ */
+const MAX_LANE_REACQUISITIONS = 2
+
+/** True when this failure is a run that reached no verdict, not one with a verdict. */
+fn is_inconclusive(result) -> bool {
+  return is_err(result) && to_string(unwrap_err(result)?.code ?? "") == "run_inconclusive"
+}
+
+/**
+ * Wait for this lane's verdict, re-acquiring when a run reaches none.
+ *
+ * A hosted run that ends cancelled has not judged the candidate, and the
+ * release has already paid for everything upstream of it. Failing there spends
+ * a ~50 minute build on a queue eviction. `adapter.acquire` is the same
+ * idempotent owner used to start the lane — it reruns the exact run and returns
+ * the next attempt — so the retry is a second call to it rather than a second
+ * retry policy.
+ *
+ * A run that failed or timed out is left alone: that is the lane reporting on
+ * the code, which is exactly what the release asked it for.
+ */
+fn await_lane_verdict(
+  runtime: HarnessRuntime,
+  cfg: PlatformCertificationConfig,
+  spec: PlatformCertificationSpec,
+  dispatch,
+  started_at_ms: int,
+  adapter: PlatformCertificationAdapter,
+  abort,
+  outer_abort = nil,
+  registry: PlatformCertificationDispatchRegistry? = nil,
+) {
+  let current = dispatch
+  let reacquisitions = 0
+  let proof = await_platform(
+    runtime,
+    cfg,
+    spec,
+    current,
+    started_at_ms,
+    adapter,
+    abort,
+    outer_abort,
+  )
+  while is_inconclusive(proof) && reacquisitions < MAX_LANE_REACQUISITIONS {
+    // Re-acquiring after the release is already doomed dispatches a run nobody
+    // will read. `await_platform` only samples the abort between polls, so a
+    // run that was already terminal never passed that check.
+    const failure = runtime.shared_get(abort)
+    if failure != nil {
+      return platform_abandoned(spec, to_string(failure))
+    }
+    if outer_abort != nil {
+      const outer = runtime.shared_get(outer_abort.cell)
+      if outer != nil {
+        return platform_abandoned(
+          spec,
+          trim(to_string(outer?.cause ?? "a sibling certification lane failed")),
+        )
+      }
+    }
+    reacquisitions = reacquisitions + 1
+    const reacquired = adapter.acquire(spec)
+    if is_err(reacquired) {
+      return platform_error(
+        spec,
+        "reacquire_failed",
+        "could not re-acquire after an inconclusive run: " + to_string(unwrap_err(reacquired)),
+      )
+    }
+    const next = unwrap(reacquired)
+    if !exact_dispatch_identity(cfg, spec, next) {
+      return platform_error(
+        spec,
+        "dispatch_identity_changed",
+        "re-acquisition returned a malformed exact identity",
+      )
+    }
+    // The registry is what cancels hosted work when an outer lane gives up, so
+    // it has to name the run this lane is actually waiting on.
+    if registry != nil {
+      record_platform_certification_dispatch(runtime, registry, spec.platform, next.run_id)
+    }
+    current = next
+    proof = await_platform(runtime, cfg, spec, current, started_at_ms, adapter, abort, outer_abort)
+  }
+  return proof
+}
+
 /** Run one hosted platform lane, publishing a real verdict as the abort cause. */
 fn platform_lane(
   runtime: HarnessRuntime,
@@ -581,6 +679,7 @@ fn platform_lane(
   adapter: PlatformCertificationAdapter,
   abort,
   outer_abort = nil,
+  registry: PlatformCertificationDispatchRegistry? = nil,
 ) {
   const spec = PLATFORM_SPECS[task.index]
   const dispatch = dispatches[task.index]
@@ -588,7 +687,17 @@ fn platform_lane(
   if spec == nil || dispatch == nil || started == nil {
     return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
   }
-  const proof = await_platform(runtime, cfg, spec, dispatch, started, adapter, abort, outer_abort)
+  const proof = await_lane_verdict(
+    runtime,
+    cfg,
+    spec,
+    dispatch,
+    started,
+    adapter,
+    abort,
+    outer_abort,
+    registry,
+  )
   // Only a lane that reached its own verdict may doom the run. Republishing an
   // abandonment would let the first abandoned lane abort the lane that is still
   // the only one able to report a real cause.
@@ -762,6 +871,53 @@ fn exact_platform_proof(
   )
 }
 
+/**
+ * Read the verdict out of a run that has finished.
+ *
+ * A conclusion that judged nothing is reported as such rather than as a
+ * failure, so the caller can decide whether to ask again. Everything else goes
+ * to the full proof, which is the only thing allowed to certify.
+ */
+fn terminal_platform_verdict(
+  cfg: PlatformCertificationConfig,
+  spec: PlatformCertificationSpec,
+  dispatch,
+  run,
+  started_at_ms: int,
+  adapter: PlatformCertificationAdapter,
+) {
+  const conclusion = to_string(run.conclusion ?? "")
+  if exact_run_conclusion_is_inconclusive(conclusion) {
+    return platform_error(
+      spec,
+      "run_inconclusive",
+      "run reached no verdict: ${run.status}/${conclusion}",
+    )
+  }
+  let job_attempt = 0
+  while job_attempt < 3 {
+    const queried_jobs = adapter.jobs(dispatch.run_id)
+    job_attempt = job_attempt + 1
+    if !is_err(queried_jobs) {
+      return exact_platform_proof(
+        cfg,
+        spec,
+        dispatch,
+        run,
+        unwrap(queried_jobs),
+        started_at_ms,
+        adapter.now_ms(),
+      )
+    }
+    const error = unwrap_err(queried_jobs)
+    if lowercase(trim(to_string(error?.code ?? ""))) != "network" || job_attempt >= 3 {
+      return platform_error(spec, "jobs_query_failed", to_string(error))
+    }
+    adapter.wait(1000 * job_attempt)
+  }
+  return platform_error(spec, "jobs_query_failed", "jobs page was unreachable")
+}
+
 fn await_platform(
   runtime: HarnessRuntime,
   cfg: PlatformCertificationConfig,
@@ -804,27 +960,7 @@ fn await_platform(
       continue
     }
     if run.status == "completed" {
-      let job_attempt = 0
-      while job_attempt < 3 {
-        const queried_jobs = adapter.jobs(dispatch.run_id)
-        job_attempt = job_attempt + 1
-        if !is_err(queried_jobs) {
-          return exact_platform_proof(
-            cfg,
-            spec,
-            dispatch,
-            run,
-            unwrap(queried_jobs),
-            started_at_ms,
-            adapter.now_ms(),
-          )
-        }
-        const error = unwrap_err(queried_jobs)
-        if lowercase(trim(to_string(error?.code ?? ""))) != "network" || job_attempt >= 3 {
-          return platform_error(spec, "jobs_query_failed", to_string(error))
-        }
-        adapter.wait(1000 * job_attempt)
-      }
+      return terminal_platform_verdict(cfg, spec, dispatch, run, started_at_ms, adapter)
     }
     if run.status != "queued" && run.status != "in_progress" && run.status != "waiting"
       && run.status
@@ -1036,6 +1172,7 @@ pub fn resolve_platform_certification(
       adapter,
       abort,
       outer_abort,
+      dispatch_registry,
     )
   }
   const results = map_settled(
