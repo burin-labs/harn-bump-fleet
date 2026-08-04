@@ -28,8 +28,9 @@ The entry points are:
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that
   delegate ownership in `fleet.toml`. `package_ci_ownership = "fleet"` owns the
-  whole `ci.yml`; `"pin"` owns only the canonical package job's `uses:` line, for
-  repositories whose CI is a superset of it and whose other jobs are their own.
+  whole `ci.yml`. `"pin"` owns only the canonical package job's `uses:` line.
+  Use `"pin"` for a repository whose CI is a superset of that job, and whose
+  other jobs are its own.
 - `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
   every repository that delegates bump workflow ownership in `fleet.toml`.
 
@@ -102,8 +103,8 @@ checkouts, run local Git commands, and let read-only diagnostic agents inspect
 authenticated GitHub state.
 
 Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
-installs the pinned CLI into this repo's ignored `.harn/bin`, and
-`scripts/with_env.sh` / `scripts/harn_shielded.sh` prefer that binary over a
+installs the pinned CLI into this repo's ignored `.harn/bin`.
+`scripts/with_env.sh` and `scripts/harn_shielded.sh` prefer that binary over a
 stale global `harn` on `PATH`.
 
 ## Implementation rules
@@ -112,18 +113,20 @@ Keep GitHub side effects deterministic. Production GitHub reads and writes go
 through typed connector contracts, and every head-sensitive mutation carries
 the observed PR-head lease. `gh` is limited to read-only diagnostic agent
 allowlists and explicit manual-recovery instructions. Model output may
-summarize, audit, or draft text, but deterministic code must validate or parse
-it before it affects files, PRs, tags, dispatches, or merge settings.
+summarize, audit, or draft text. Deterministic code must validate or parse that
+output before it affects files, PRs, tags, dispatches, or merge settings.
 
 An out-of-band harness that rewrites shared release refs must serialize on the
 `release-owner` host lease, the same lane `release_harn` takes. Terminal
-evidence — a tag, a published release, an open PR — cannot substitute for it:
-a release that has not tagged yet has none of those, so its in-flight candidate
-is indistinguishable from abandoned state. `abandon_release_attempts.harn`
-holds the lane in both modes for exactly this reason.
-`sweep_release_refs.harn` does not need it because every deletion it applies is
-gated on positive proof that a published tag recovers the exact OID, which an
-in-flight candidate can never satisfy. Adding a new mutation path means
+evidence — a tag, a published release, an open PR — cannot substitute for it.
+A release that has not tagged yet has none of those. Its in-flight candidate is
+therefore indistinguishable from abandoned state.
+`abandon_release_attempts.harn` holds the lane in both modes for exactly this
+reason.
+
+`sweep_release_refs.harn` does not need the lease. Every deletion it applies is
+gated on positive proof that a published tag recovers the exact OID, and an
+in-flight candidate can never satisfy that. Adding a new mutation path means
 deciding which of those two shapes it has, and saying so.
 
 Route model defaults through `lib/llm_defaults`:
@@ -165,18 +168,21 @@ The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
 base-branch commits cannot leak into the published artifact.
 
 A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
-rebuilds that candidate on fresh base, the fresh base is part of the artifact:
-fold its current `## Unreleased` body and every parseable fragment into the
+rebuilds that candidate on fresh base, the fresh base is part of the artifact.
+Fold its current `## Unreleased` body and every parseable fragment into the
 candidate release section before certification. Only an already-tagged fixup
 may preserve newer notes for the following release.
 
 If release assets already exist and an open `release/vX.Y.Z` PR remains,
-post-publish fixup mode is paperwork only: recreate the branch on fresh base,
-preserve the shipped release body from the tag, leave post-publish
-`## Unreleased` entries in place, skip retagging, and refresh the PR.
+post-publish fixup mode is paperwork only. It does the following:
 
-Changed prepared content creates a new immutable attempt ref and PR; a retry
-only resumes when the recorded ref still resolves to the exact prepared OID.
+- recreates the branch on fresh base;
+- preserves the shipped release body from the tag;
+- leaves post-publish `## Unreleased` entries in place;
+- skips retagging, and refreshes the PR.
+
+Changed prepared content creates a new immutable attempt ref and PR. A retry
+resumes only when the recorded ref still resolves to the exact prepared OID.
 
 ## Repo hygiene
 
@@ -193,9 +199,9 @@ Documentation should read plainly: no emoji, no title-case section headings, no
 marketing phrasing, no vague claims, and no filler endings. Use bullets only
 where they make scanning easier.
 
-Before opening a PR, rebase on the latest `origin/main`, run the checks above,
-review your own diff for stale comments and duplicated abstractions, then push a
-branch and enable auto-merge when CI is green.
+Before opening a PR, rebase on the latest `origin/main` and run the checks
+above. Review your own diff for stale comments and duplicated abstractions.
+Then push a branch, and enable auto-merge when CI is green.
 
 <!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->
 
