@@ -26,8 +26,10 @@ The entry points are:
   artifacts. It is not CI and should stay out of the main release/bump path.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
-- `sync_package_ci.harn`: checks or applies exact package CI adapters for
-  connector repositories that delegate projection ownership in `fleet.toml`.
+- `sync_package_ci.harn`: checks or applies package CI for repositories that
+  delegate ownership in `fleet.toml`. `package_ci_ownership = "fleet"` owns the
+  whole `ci.yml`; `"pin"` owns only the canonical package job's `uses:` line, for
+  repositories whose CI is a superset of it and whose other jobs are their own.
 - `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
   every repository that delegates bump workflow ownership in `fleet.toml`.
 
