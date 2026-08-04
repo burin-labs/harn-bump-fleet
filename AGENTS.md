@@ -33,6 +33,10 @@ The entry points are:
   other jobs are its own.
 - `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
   every repository that delegates bump workflow ownership in `fleet.toml`.
+- `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
+  harnesses. It reads every fleet-owned projection from its target's default
+  branch and proposes the repair as a pull request, so drift converges without a
+  machine holding all twenty-six checkouts. Dry-run first; `--apply` writes.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
@@ -93,6 +97,7 @@ harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 harn run --no-sandbox sync_agent_guidance.harn -- --check
 harn run --no-sandbox sync_package_ci.harn -- --check
 harn run --no-sandbox sync_bump_workflows.harn -- --check
+harn run --no-sandbox converge_fleet_projections.harn -- --check
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys

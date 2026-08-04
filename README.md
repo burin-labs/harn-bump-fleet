@@ -60,6 +60,12 @@ harn run --no-sandbox sync_package_ci.harn -- --check
 # Check fleet-owned runtime-bump adapters without writing them.
 harn run --no-sandbox sync_bump_workflows.harn -- --check
 
+# Report every remote fleet-owned file that drifts from fleet.toml.
+harn run --no-sandbox converge_fleet_projections.harn -- --check
+
+# Propose the repair as one pull request per drifted repository.
+harn run --no-sandbox converge_fleet_projections.harn -- --apply
+
 # Inspect unsigned bot dependency PRs that are blocked by required signatures.
 harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
 
@@ -89,6 +95,21 @@ therefore fails closed instead of silently treating internal consistency as
 freshness. Custom package validation and runtime-bump refresh/validation
 commands remain named fields in the manifest; they do not create
 repository-local workflow templates or duplicate runtime bootstrap.
+
+`converge_fleet_projections.harn` is the repair for what that check reports. It
+renders the same byte-exact projections, compares them against the same remote
+default branches, and proposes the difference as one pull request per drifted
+repository on a stable `automation/fleet-projections` branch. It repairs only
+the three violations that describe bytes drifting from a projection; a typed
+violation names a workflow the fleet does not render, so no correct content
+exists to propose. The local `sync_*` harnesses remain the way to converge a
+checkout you already have; this is how the fleet converges without one.
+
+Nothing in that path writes a default branch or merges anything. Each
+repository keeps its own gate, and a projection that cannot pass review is a
+manifest problem rather than something to force past it. The scheduled
+`Converge Fleet Projections` workflow is the only place `--apply` runs by
+default; the harness itself reports and exits unless asked to write.
 
 ### Signed bot PRs
 

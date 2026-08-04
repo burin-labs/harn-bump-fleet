@@ -16,6 +16,7 @@ import {
   GithubPullRequestEditReceipt,
   GithubPullRequestFiles,
   GithubPullRequestSummary,
+  GithubPullRequestUpsertReceipt,
   GithubPullRequestView,
   GithubRefClaim,
   GithubRefClaimPayload,
@@ -32,11 +33,13 @@ import {
   call,
   call_typed,
   github_close_pr,
+  github_create_signed_commit,
   github_file_at_ref,
   github_latest_release_lookup,
   github_release,
   github_release_edit_body,
   github_resolve_mergeable,
+  github_upsert_pull_request,
   pulls_disable_auto_merge,
   pulls_enable_auto_merge,
 } from "harn-github-connector/default"
@@ -59,6 +62,29 @@ pub type GithubAutoMergeHoldRequest = {
   base_branch: string,
   expected_base_oid: string,
   restore_merge_method: string,
+}
+
+/** One repository file to publish, addressed by path and carrying exact text. */
+pub type GithubBranchCommitFile = {path: string, contents: string}
+
+/** Leased request for one GitHub-signed commit that publishes exact file text. */
+pub type GithubBranchCommitRequest = {
+  slug: string,
+  branch: string,
+  expected_head_oid: string,
+  headline: string,
+  body: string,
+  files: list<GithubBranchCommitFile>,
+}
+
+/** Idempotent request for the one automation pull request a head branch may have. */
+pub type GithubPrUpsertRequest = {
+  slug: string,
+  head: string,
+  base: string,
+  title: string,
+  body: string,
+  expected_head_oid: string,
 }
 
 type GithubPullRequestList = list<GithubPullRequestSummary>
@@ -580,32 +606,49 @@ pub fn github_latest_release_tag(
 }
 
 /**
- * Claim one ref for this run, minting the payload that says who holds it.
+ * What a ref claim points at.
  *
- * The claim is atomic across machines and the payload is what a loser reads,
- * so the two travel together: a claim with no payload can report contention
- * but not who caused it.
+ * A lock has nothing to point at yet, so it names a `payload` and the connector
+ * mints a parentless commit from it — the message a loser reads to learn who
+ * holds the ref. A claim that opens a branch already has its object and names
+ * an `oid` instead. Exactly one, because a claim that named both would leave
+ * the connector to pick, and a claim that named neither has nothing to say.
+ */
+pub type GithubRefClaimObject = {oid?: string, payload?: GithubRefClaimPayload}
+
+/**
+ * Claim one ref for this run, atomically across machines.
+ *
+ * Contention is an outcome rather than an error: a lost claim returns
+ * `claimed: false` alongside the oid the ref actually holds and the holder's
+ * headline, so a caller learns both that it lost and to whom. For a branch
+ * claim, that oid is also the lease a follow-up commit needs, which is why
+ * creating an automation branch and appending to an existing one take the same
+ * path here.
  */
 pub fn github_claim_ref(
   harness: Harness,
   slug: string,
   ref: string,
-  payload: GithubRefClaimPayload,
+  object: GithubRefClaimObject,
   options: GithubClientOptions = github_connector_options(),
 ) -> GithubConnectorResult<GithubRefClaim> {
   const parts = github_slug_parts(slug)
-  if parts == nil || !starts_with(trim(ref), "refs/") || trim(payload.message) == "" {
+  const names_oid = trim(object.oid ?? "") != ""
+  const names_payload = trim(object.payload?.message ?? "") != ""
+  if parts == nil || !starts_with(trim(ref), "refs/") || names_oid == names_payload {
     return Err(
       {
         code: "invalid_ref_claim",
         category: "schema_drift",
-        message: "a ref claim requires owner/name, a `refs/...` ref, and a payload message",
+        message:
+          "a ref claim requires owner/name, a `refs/...` ref, and exactly one of an oid or a payload message",
       },
     )
   }
   return github_connector.github_claim_ref(
     harness,
-    {owner: parts.owner, repo: parts.repo, ref: ref, payload: payload, options: options},
+    {owner: parts.owner, repo: parts.repo, ref: ref, options: options} + object,
   )
 }
 
@@ -630,5 +673,67 @@ pub fn github_release_ref(
   return github_connector.github_release_ref(
     harness,
     {owner: parts.owner, repo: parts.repo, ref: ref, expected_oid: expected_oid, options: options},
+  )
+}
+
+/**
+ * Publish exact file text as one GitHub-signed commit under a branch-head lease.
+ *
+ * Text crosses this boundary as text and is encoded here, so no caller has to
+ * hold a base64 payload to describe a file it already has. The lease is the
+ * safety property: a branch that moved between observation and write fails
+ * closed rather than silently rebasing the caller's intent onto someone else's.
+ */
+pub fn github_branch_commit(
+  harness: Harness,
+  request: GithubBranchCommitRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubSignedCommitReceipt> {
+  const parts = github_slug_parts(request.slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const additions = request.files.map(
+    { file -> {path: file.path, contents_base64: base64_encode(file.contents)} },
+  )
+    .to_list()
+  return github_create_signed_commit(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      branch: request.branch,
+      expected_head_oid: request.expected_head_oid,
+      headline: request.headline,
+      body: request.body,
+      additions: additions,
+      deletions: [],
+      options: options,
+    },
+  )
+}
+
+/** Create or refresh the single pull request a head branch may have open. */
+pub fn github_pr_upsert(
+  harness: Harness,
+  request: GithubPrUpsertRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestUpsertReceipt> {
+  const parts = github_slug_parts(request.slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  return github_upsert_pull_request(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      head: request.head,
+      base: request.base,
+      title: request.title,
+      body: request.body,
+      expected_head_oid: request.expected_head_oid,
+      options: options,
+    },
   )
 }
