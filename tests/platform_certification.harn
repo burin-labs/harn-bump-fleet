@@ -678,3 +678,250 @@ pipeline test_outer_abort_stops_hosted_polling_within_one_interval(harness: Harn
   // Abandoning must not burn the 10s inter-poll sleep on the way out.
   assert_eq(waits.filter({ ms -> ms == 10000 }).count(), 0)
 }
+
+/**
+ * A macOS lane that ends its first run with `conclusion` and succeeds if asked
+ * again, plus a reader for how many times the lane was acquired.
+ *
+ * The hosted run id stays fixed and the attempt advances, which is what a
+ * rerun actually produces: acquisition reruns the exact run rather than
+ * dispatching a new one.
+ */
+fn conclusion_then_success_lane(cfg: PlatformCertificationConfig, conclusion: string) {
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          run_attempt: acquires,
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id != 6002 {
+        return Ok(run)
+      }
+      return Ok(
+        {
+          ...run,
+          run_attempt: acquires,
+          conclusion: if acquires == 1 {
+            conclusion
+          } else {
+            "success"
+          },
+        },
+      )
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  return {adapter: adapter, acquires: fn() { return acquires }}
+}
+
+pipeline test_a_cancelled_certification_run_is_re_acquired_not_reported(harness: Harness, task) {
+  // The v0.10.53 shape: the macOS lane was cancelled while still queued, after
+  // ~50 minutes of release work had already been paid for. A cancellation is
+  // not the lane's judgment of the candidate, so the release asks again.
+  const cfg = config()
+  const lane = conclusion_then_success_lane(cfg, "cancelled")
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, lane.adapter)
+  assert_eq(decision.success, true)
+  assert_eq(decision.code, "certified")
+  assert_eq(lane.acquires(), 2)
+  assert_eq(decision.receipt?.platforms[1]?.run.run_attempt, 2)
+}
+
+pipeline test_a_failed_certification_run_is_the_verdict_and_stands(harness: Harness, task) {
+  // The falsifier for the test above: `failure` is the lane reporting on the
+  // code. Re-acquiring there would spend a hosted run relitigating an answer
+  // the release already has, and could certify a candidate a lane rejected.
+  const cfg = config()
+  const lane = conclusion_then_success_lane(cfg, "failure")
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, lane.adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "lane_failed")
+  assert_eq(decision.cause?.code, "run_unsuccessful")
+  assert_eq(lane.acquires(), 1)
+}
+
+pipeline test_re_acquisition_is_bounded_and_reports_the_last_inconclusive_run(
+  harness: Harness,
+  task,
+) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const always_cancelled: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id != 6002 {
+        return Ok(run)
+      }
+      return Ok({...run, conclusion: "cancelled"})
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, always_cancelled)
+  assert_eq(decision.success, false)
+  assert_eq(decision.cause?.code, "run_inconclusive")
+  // One dispatch plus the bounded re-acquisitions, and no more.
+  assert_eq(acquires, 3)
+  assert(contains(decision.reason, "run reached no verdict"))
+}
+
+pipeline test_a_re_acquired_run_is_the_one_the_registry_can_cancel(harness: Harness, task) {
+  // The registry is how an outer lane cancels hosted work when it gives up. A
+  // lane that moved to a new run without saying so would leave that run
+  // billing until GitHub's own job timeout.
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const moved: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          run_id: 6042,
+          url: "https://github.com/burin-labs/harn/actions/runs/6042",
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(
+        if id == 6042 {
+          6002
+        } else {
+          id
+        },
+      )
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id == 6002 {
+        return Ok({...run, conclusion: "cancelled"})
+      }
+      if id == 6042 {
+        return Ok({...run, id: 6042, url: "https://github.com/burin-labs/harn/actions/runs/6042"})
+      }
+      return Ok(run)
+    },
+    jobs: fn(id) {
+      const result = base.jobs(
+        if id == 6042 {
+          6002
+        } else {
+          id
+        },
+      )
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const page = unwrap(result)
+      if id != 6042 {
+        return Ok(page)
+      }
+      return Ok(
+        {
+          ...page,
+          run_id: 6042,
+          jobs: (page.jobs ?? []).map({ job -> {...job, run_id: 6042} }).to_list(),
+        },
+      )
+    },
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const registry = platform_certification_dispatch_registry(
+    harness.runtime,
+    "re-acquired-${harness.random.uuid_v7()}",
+  )
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, moved, registry)
+  assert_eq(decision.success, true)
+  const receipts = cancel_recorded_platform_certification_runs(
+    harness,
+    "burin-labs/harn",
+    registry,
+    true,
+  )
+  assert_eq(receipts.map({ receipt -> receipt.run_id }).to_list().sort(), [6001, 6042])
+}
