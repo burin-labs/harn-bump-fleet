@@ -1,0 +1,222 @@
+import { FleetProjectionTarget } from "./fleet_projection_targets"
+import {
+  github_branch_commit,
+  github_branch_head,
+  github_claim_ref,
+  github_connector_options,
+  github_file_text_at_ref,
+  github_pr_upsert,
+} from "./github"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+/**
+ * The branch every repository's projection proposal lives on.
+ *
+ * One stable name per repository is what makes a scheduled run idempotent: the
+ * same drift converges onto the same branch and refreshes the same pull
+ * request, instead of opening a new one every night until someone notices.
+ */
+pub const REMOTE_PROJECTION_BRANCH: string = "automation/fleet-projections"
+
+const PROJECTION_HEADLINE = "chore: restore fleet-owned projections"
+
+/**
+ * Outcome of converging one repository's fleet-owned files.
+ *
+ * The first four states mean what they mean for a local sync: `clean` is
+ * already correct, `drift` is a difference this run did not repair, `applied`
+ * wrote, `error` could not tell. `pending` is the state only a remote sync can
+ * be in — the repair is already proposed and waiting on review, which is
+ * neither drift the run should re-report nor work it should redo.
+ */
+pub type RemoteConvergenceResult = {
+  slug: string,
+  status: "clean" | "drift" | "pending" | "applied" | "error",
+  drifted: list<string>,
+  branch?: string,
+  commit?: string,
+  pull_request?: int,
+  url?: string,
+  error?: string,
+}
+
+fn unwrap_or_throw(result: unknown, context: string) -> unknown {
+  if is_err(result) {
+    throw context + ": " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+/** Describe the proposal for a reader who has the diff but not the manifest. */
+fn proposal_body(slug: string, targets: list<FleetProjectionTarget>) -> string {
+  let lines = [
+    "`fleet.toml` in `burin-labs/harn-bump-fleet` owns the exact bytes of the",
+    "files below, and they had drifted from it. This pull request restores the",
+    "rendered projection; it does not change what the manifest says.",
+    "",
+    "Edit the projection at its owner and let the fleet re-render it. An edit",
+    "made here is reverted by the next convergence run.",
+    "",
+  ]
+  for target in targets {
+    lines = lines + ["- `${target.path}` — ${target.origin}"]
+  }
+  return join(lines + ["", "Repository: `${slug}`."], "\n")
+}
+
+fn drifted_targets(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions,
+) -> list<FleetProjectionTarget> {
+  return targets.filter(
+    { target ->
+      github_file_text_at_ref(harness, slug, target.path, default_branch, options)
+        != target.expected
+    },
+  )
+    .to_list()
+}
+
+/**
+ * Whether the proposal branch already carries every byte this run would write.
+ *
+ * A branch that survived from an earlier run holds an open pull request. Adding
+ * an identical commit to it would publish a no-op every night, so the check is
+ * what separates "already proposed" from "proposed something else".
+ */
+fn branch_already_proposes(
+  harness: Harness,
+  slug: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions,
+) -> bool {
+  for target in targets {
+    if github_file_text_at_ref(harness, slug, target.path, REMOTE_PROJECTION_BRANCH, options)
+      != target
+      .expected {
+      return false
+    }
+  }
+  return true
+}
+
+fn converge_repository(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  apply: bool,
+  options: GithubClientOptions,
+) -> RemoteConvergenceResult {
+  const drifted = drifted_targets(harness, slug, default_branch, targets, options)
+  const paths = drifted.map({ target -> target.path }).to_list()
+  if len(drifted) == 0 {
+    return {slug: slug, status: "clean", drifted: []}
+  }
+  if !apply {
+    return {slug: slug, status: "drift", drifted: paths}
+  }
+  const head = unwrap_or_throw(
+    github_branch_head(harness, slug, default_branch, options),
+    "branch head lookup failed",
+  )
+  const claim = unwrap_or_throw(
+    github_claim_ref(
+      harness,
+      slug,
+      "refs/heads/" + REMOTE_PROJECTION_BRANCH,
+      {oid: to_string(head?.oid ?? "")},
+      options,
+    ),
+    "projection branch claim failed",
+  )
+  const branch_oid = to_string(claim?.oid ?? "")
+  if !(claim?.claimed ?? false) && branch_already_proposes(harness, slug, drifted, options) {
+    return {
+      slug: slug,
+      status: "pending",
+      drifted: paths,
+      branch: REMOTE_PROJECTION_BRANCH,
+      commit: branch_oid,
+    }
+  }
+  const body = proposal_body(slug, drifted)
+  const commit = unwrap_or_throw(
+    github_branch_commit(
+      harness,
+      {
+        slug: slug,
+        branch: REMOTE_PROJECTION_BRANCH,
+        expected_head_oid: branch_oid,
+        headline: PROJECTION_HEADLINE,
+        body: body,
+        files: drifted.map({ target -> {path: target.path, contents: target.expected} }).to_list(),
+      },
+      options,
+    ),
+    "projection commit failed",
+  )
+  const commit_oid = to_string(commit?.oid ?? "")
+  const pull = unwrap_or_throw(
+    github_pr_upsert(
+      harness,
+      {
+        slug: slug,
+        head: REMOTE_PROJECTION_BRANCH,
+        base: default_branch,
+        title: PROJECTION_HEADLINE,
+        body: body,
+        expected_head_oid: commit_oid,
+      },
+      options,
+    ),
+    "projection pull request failed",
+  )
+  return {
+    slug: slug,
+    status: "applied",
+    drifted: paths,
+    branch: REMOTE_PROJECTION_BRANCH,
+    commit: commit_oid,
+    pull_request: to_int(pull?.number) ?? 0,
+    url: to_string(pull?.url ?? ""),
+  }
+}
+
+/**
+ * Bring one repository's fleet-owned files back to their manifest bytes.
+ *
+ * The repair is always a proposal on a branch, never a write to the default
+ * branch: the fleet owns what these files should say, but each repository still
+ * owns its own merge gate, and a projection that cannot pass that gate is a
+ * manifest problem rather than something to force past review.
+ *
+ * A provider failure ends this repository and no other. Twenty-six repositories
+ * share one run, and the fleet has already been taken down once by a single
+ * check that aborted the whole job, so the failure of one is reported rather
+ * than raised.
+ */
+pub fn converge_remote_repository(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  apply: bool,
+  options: GithubClientOptions = github_connector_options(),
+) -> RemoteConvergenceResult {
+  const attempt = try {
+    converge_repository(harness, slug, default_branch, targets, apply, options)
+  }
+  if is_err(attempt) {
+    return {slug: slug, status: "error", drifted: [], error: to_string(unwrap_err(attempt))}
+  }
+  return unwrap(attempt)
+}
+
+/** Whether an outcome leaves the fleet out of conformance once the run ends. */
+pub fn remote_convergence_failed(result: RemoteConvergenceResult) -> bool {
+  return result.status == "drift" || result.status == "error"
+}
