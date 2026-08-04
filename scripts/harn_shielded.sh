@@ -61,7 +61,7 @@ find_source_harn() {
 
 source_bin="$(find_source_harn)"
 
-cache_root="${HARN_SHIELDED_DIR:-${XDG_CACHE_HOME:-${HOME}/Library/Caches}/harn-shielded}"
+cache_root="${HARN_EXT_SHIELDED_DIR:-${XDG_CACHE_HOME:-${HOME}/Library/Caches}/harn-shielded}"
 mkdir -p "$cache_root"
 staged="$cache_root/harn"
 fingerprint_file="$cache_root/harn.fingerprint"

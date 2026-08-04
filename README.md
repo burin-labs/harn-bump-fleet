@@ -135,7 +135,7 @@ apply a fix to the harness or release artifacts mid-debrief if you ask.
 
 ```sh
 # Disable chat even when at a TTY.
-harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_CHAT=0`
+harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_EXT_CHAT=0`
 
 # Skip the pipeline; open the loop over a prior run.
 harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
@@ -178,20 +178,20 @@ harness on the version pinned in `.harn-version` instead of whatever `harn`
 appears first on the ambient `PATH`:
 
 ```sh
-# Sources ~/projects/burin-code/.env (override with HARN_BUMP_FLEET_ENV_FILE),
+# Sources ~/projects/burin-code/.env (override with HARN_EXT_BUMP_FLEET_ENV_FILE),
 # then ./.env and ./.env.local from the repo root, then runs the harness.
 scripts/install_harn.sh
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Verbose mode prints which files were sourced.
-HARN_ENV_VERBOSE=1 scripts/with_env.sh harn run --no-sandbox release_harn.harn
+HARN_EXT_ENV_VERBOSE=1 scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
 
 Discovery order (later entries override earlier ones):
 
-1. `$HARN_BUMP_FLEET_ENV_FILE` (default `~/projects/burin-code/.env`)
-2. `$HARN_BUMP_FLEET_ENV_FILES` (colon-separated list)
+1. `$HARN_EXT_BUMP_FLEET_ENV_FILE` (default `~/projects/burin-code/.env`)
+2. `$HARN_EXT_BUMP_FLEET_ENV_FILES` (colon-separated list)
 3. `./.env` at the cwd
 4. `./.env.local` at the cwd
 
@@ -229,15 +229,15 @@ Knobs (all `env_str`-style, all optional):
 |---|---|---|
 | `OPENROUTER_API_KEY` | (none) | Authenticates the default OpenRouter cloud planner |
 | `CEREBRAS_API_KEY` | (none) | Auto-enables binder |
-| `HARN_BINDER` | `auto` | `0` to force off, `1` to force on |
+| `HARN_EXT_BINDER` | `auto` | `0` to force off, `1` to force on |
 | `HARN_BINDER_PROVIDER` / `_MODEL` | `cerebras` / `gpt-oss-120b` | Override binder route |
-| `HARN_BINDER_TIMEOUT_MS` | `100` | Binder hop wall-clock budget |
-| `HARN_BINDER_MAX_TOKENS` | `1024` | Per [#1814 finding 3](https://github.com/burin-labs/harn/pull/1814) |
+| `HARN_EXT_BINDER_TIMEOUT_MS` | `100` | Binder hop wall-clock budget |
+| `HARN_EXT_BINDER_MAX_TOKENS` | `1024` | Per [#1814 finding 3](https://github.com/burin-labs/harn/pull/1814) |
 | `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
 | `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
-| `HARN_RELEASE_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `release_harn` (`0` = uncapped) |
-| `HARN_RELEASE_CARGO_TARGET_DIR` | user cache dir | Cargo target cache for live `release_harn` prepare/audit |
-| `HARN_BUMP_FLEET_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `bump_fleet` (`0` = uncapped) |
+| `HARN_EXT_RELEASE_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `release_harn` (`0` = uncapped) |
+| `HARN_EXT_RELEASE_CARGO_TARGET_DIR` | user cache dir | Cargo target cache for live `release_harn` prepare/audit |
+| `HARN_EXT_BUMP_FLEET_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `bump_fleet` (`0` = uncapped) |
 
 The default release Cargo target is
 `$XDG_CACHE_HOME/harn-bump-fleet/release-harn-target`, or
@@ -469,7 +469,7 @@ index, or working tree, then routes analysis, agent tools, release-branch
 creation, preparation, tagging, and publication through the isolated path.
 Dirty files and arbitrary branches in the operator checkout remain untouched.
 
-The release worktree uses the same external `HARN_RELEASE_CARGO_TARGET_DIR`
+The release worktree uses the same external `HARN_EXT_RELEASE_CARGO_TARGET_DIR`
 and exact-pin `HARN_BIN` path as before, so compiled artifacts remain warm
 across runs without sharing mutable source or Cargo build-script scratch with
 the operator checkout. Pre-tag recovery aligns only the isolated worktree to
@@ -636,7 +636,7 @@ the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
 Every non-mock run first freezes the release parent (`--at-sha` /
-`HARN_RELEASE_PIN_SHA` / `origin/<base>` HEAD) and materializes that exact commit
+`HARN_EXT_RELEASE_PIN_SHA` / `origin/<base>` HEAD) and materializes that exact commit
 in a detached, run-owned worktree. Audit, version, changelog, diff, generated
 artifact, and agent-review inputs all use that one root; the receipt records the
 requested ref, resolved commit, source checkout, and analyzed root. Read-only
@@ -695,7 +695,7 @@ Options:
   OID-qualified immutable `release-attempt/...` ref is published from the
   prepared head, the tag is pushed pointing here, and `latest_tag..<pin>` bounds every
   changelog/audit walk. Use to ship an older known-good commit while
-  newer commits sit on the base. Honors `HARN_RELEASE_PIN_SHA` env var
+  newer commits sit on the base. Honors `HARN_EXT_RELEASE_PIN_SHA` env var
   as a fallback.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
