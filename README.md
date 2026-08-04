@@ -615,6 +615,14 @@ would leave recovery wedged on the remainder. A tag-recovered attempt is the
 exception — it is terminal and the sweep retires it, so it does not block the
 orphans beside it.
 
+Every claim above is terminal, and a release that has not tagged yet has none
+of them: its in-flight candidate looks exactly like an unclaimed orphan. So
+both modes take the `release-owner` host lease for the whole run and refuse
+outright while a live release holds it. The dry run serializes too — its plan is
+what an operator acts on, and a plan sampled mid-cut is what makes archiving a
+live candidate look safe. The residual blind spot is a release driven from
+another machine or from CI, where there is no local lease to observe.
+
 Afterwards, delete the local `release/vX.Y.Z` branch and any worktree holding
 it. Release preflight compares that branch against `origin/main` only, so an
 archived candidate still reads as un-pushed work and blocks the fresh cut.
