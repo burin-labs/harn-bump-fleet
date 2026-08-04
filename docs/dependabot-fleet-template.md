@@ -122,7 +122,30 @@ Only two, and both need a comment saying why:
   registry).
 - **Extra `groups`** entries that split a large ecosystem into reviewable
   families (`react`, `eslint`, `opentelemetry`). These are additive; the
-  `*-minor-patch` catch-all stays.
+  `*-minor-patch` catch-all stays, and it must name every family in
+  `exclude-patterns`:
+
+  ```yaml
+  groups:
+    opentelemetry:
+      patterns:
+        - "opentelemetry*"
+    cargo-minor-patch:
+      patterns:
+        - "*"
+      exclude-patterns:
+        - "opentelemetry*"
+      update-types:
+        - "minor"
+        - "patch"
+  ```
+
+  GitHub would resolve the overlap on its own by assigning an update to the
+  first group it matches in file order, so the excludes change nothing about
+  what Dependabot does. They change what a reader — and
+  `scripts/check_dependabot_groups.harn` in `harn` — can verify: membership
+  becomes a property of the group rather than of where it sits in the file.
+  Reordering the file then cannot silently move a family into the batch.
 
 Large multi-package repos (`burin-code`, `harn`, `harn-cloud`) exercise both.
 Everything else should be a verbatim instance of the template.
