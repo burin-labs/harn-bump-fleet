@@ -17,6 +17,25 @@ fn sh(harness: HarnessProcess, command: string) -> dict {
   return result
 }
 
+/**
+ * Seconds-resolution mtime, on both GNU and BSD `stat`.
+ *
+ * The two spell the same question incompatibly, and each silently misreads the
+ * other's flag: GNU `stat -f` asks about the filesystem and takes `%m` as a
+ * path, BSD `stat` has no `-c`. Trying GNU first and falling back keeps the
+ * caller from comparing two mount points and calling it an mtime.
+ */
+fn file_mtime(process: HarnessProcess, path: string) -> string {
+  const quoted = "'" + path + "'"
+  const stamp = trim(
+    sh(process, "stat -c '%Y' " + quoted + " 2>/dev/null || stat -f '%m' " + quoted).stdout,
+  )
+  if regex_match("^[0-9]+$", stamp) == nil {
+    throw "expected an epoch-seconds mtime for ${path}, got '${stamp}'"
+  }
+  return stamp
+}
+
 fn repo_fixture(harness: {fs: HarnessFs, random: HarnessRandom, process: HarnessProcess}) -> dict {
   const root = path_join(harness.fs.temp_dir(), "release-workspace-" + harness.random.uuid_v7())
   const repo = path_join(root, "harn")
@@ -304,4 +323,96 @@ pipeline test_pre_tag_resume_aligns_only_isolated_workspace_to_candidate(harness
   )
   const cleanup = finish_release_workspace(harness, cfg, true, run_id)
   assert_eq(cleanup?.success, true)
+}
+
+pipeline test_shared_workspace_is_reused_and_keeps_untouched_file_mtimes(harness: Harness, task) {
+  // The whole point of a shared workspace is Cargo's fingerprint, which is an
+  // mtime comparison. A worktree recreated at any path — stable or not —
+  // presents every file as new and recompiles everything, so reuse only pays
+  // if it switches a surviving checkout instead of checking one out again.
+  // Falsifier: without reuse, `fixture.txt` carries a fresh mtime after the
+  // second run and every crate reading it would rebuild.
+  const fixture = repo_fixture({fs: harness.fs, random: harness.random, process: harness.process})
+  const first_run = "test-shared-first-" + harness.random.uuid_v7()
+  const first = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    first_run,
+    true,
+  )
+  assert_eq(basename(first.repo), "release")
+  assert_eq(first.release_workspace_shared, true)
+  const stamped = file_mtime(harness.process, path_join(first.repo, "fixture.txt"))
+  const shipped = finish_release_workspace(harness, first, true, first_run)
+  assert_eq(shipped?.retained, true)
+  assert_eq(shipped?.preserved, false)
+  assert_eq(harness.fs.exists(first.repo), true)
+  // Retention is as final as removal for this run: post-run tools go back to
+  // the durable source checkout either way.
+  assert_eq(release_post_cleanup_config(first, shipped).repo, first.source_repo)
+  assert(first.source_repo != first.repo)
+  harness.fs.write_text(path_join(fixture.repo, "next.txt"), "next\n")
+  sh(harness.process, "git -C '" + fixture.repo + "' add next.txt")
+  sh(harness.process, "git -C '" + fixture.repo + "' commit -q -m next")
+  const next_pin = trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
+  const second_run = "test-shared-second-" + harness.random.uuid_v7()
+  const second = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, next_pin),
+    second_run,
+    true,
+  )
+  assert_eq(second.repo, first.repo)
+  assert_eq(
+    lowercase(trim(sh(harness.process, "git -C '" + second.repo + "' rev-parse HEAD").stdout)),
+    lowercase(next_pin),
+  )
+  assert_eq(harness.fs.exists(path_join(second.repo, "next.txt")), true)
+  assert_eq(file_mtime(harness.process, path_join(second.repo, "fixture.txt")), stamped)
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + second.repo + "'")
+}
+
+pipeline test_unreusable_shared_workspace_is_moved_aside_not_deleted(harness: Harness, task) {
+  // A surviving workspace may be the only copy of a failed release's recovery
+  // state, so a run that cannot reuse it must never remove it.
+  const fixture = repo_fixture({fs: harness.fs, random: harness.random, process: harness.process})
+  const first_run = "test-superseded-first-" + harness.random.uuid_v7()
+  const first = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    first_run,
+    true,
+  )
+  harness.fs.write_text(path_join(first.repo, "recovery.txt"), "do not lose me\n")
+  const second_run = "test-superseded-second-" + harness.random.uuid_v7()
+  const second = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    second_run,
+    true,
+  )
+  assert_eq(second.repo, first.repo)
+  const displaced = first.repo + "-superseded-" + second_run
+  assert_eq(harness.fs.exists(displaced), true)
+  assert_eq(harness.fs.read_text(path_join(displaced, "recovery.txt")), "do not lose me\n")
+  assert_eq(trim(sh(harness.process, "git -C '" + second.repo + "' status --porcelain").stdout), "")
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + second.repo + "'")
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + displaced + "'")
+}
+
+pipeline test_a_run_without_the_release_lane_keeps_its_own_workspace(harness: Harness, task) {
+  // Reuse is safe only because the release lane proves one run at a time. A run
+  // that does not hold it gets today's per-run path and today's refusal.
+  const fixture = repo_fixture({fs: harness.fs, random: harness.random, process: harness.process})
+  const run_id = "test-unshared-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    run_id,
+  )
+  assert_eq(basename(cfg.repo), "release-" + run_id)
+  assert_eq(cfg.release_workspace_shared, false)
+  const shipped = finish_release_workspace(harness, cfg, true, run_id)
+  assert_eq(shipped?.retained, false)
+  assert_eq(harness.fs.exists(cfg.repo), false)
 }

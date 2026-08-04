@@ -26,6 +26,7 @@ pub type ReleaseWorkspaceCleanup = {
   steps: list<dict>,
   path: string,
   preserved: bool,
+  retained: bool,
 }
 
 /**
@@ -48,6 +49,9 @@ pub fn release_post_cleanup_config(
   if cleanup.path != cfg.release_workspace {
     throw "successful release cleanup path does not match the managed workspace"
   }
+  // Removal is one proof the managed worktree holds nothing this run still
+  // owns. A retained shared workspace carries the other: verified clean and
+  // detached at the shipped commit, waiting for the next release to switch it.
   if trim(cfg.source_repo) == "" {
     throw "successful managed release cleanup is missing a durable source repo"
   }
@@ -152,11 +156,26 @@ fn assert_source_unchanged(
   }
 }
 
+/**
+ * Where one release materializes its checkout.
+ *
+ * A run that owns the release lane gets the shared path, which every such run
+ * reuses. Cargo fingerprints a source file by mtime, so a worktree recreated at
+ * any path — stable or not — presents every file as newer than the artifacts
+ * built from it and recompiles the whole workspace. Only switching a surviving
+ * checkout to the new pin leaves untouched files untouched, which is what makes
+ * the shared release target directory worth anything.
+ *
+ * A run without the lane gets a per-run path. Reuse needs exclusivity, and the
+ * `release-owner` lease is where this repo already proves it; a second locking
+ * scheme beside it would be a parallel system with no additional authority.
+ */
 fn release_workspace_path(
   harness: {env: HarnessEnv, process: HarnessProcess},
   cfg: dict,
   source_repo: string,
   run_id: string,
+  shared: bool,
 ) -> string {
   if len(regex_captures("^[A-Za-z0-9][A-Za-z0-9._-]*$", run_id)) == 0 {
     throw "invalid release run id for workspace path: " + run_id
@@ -173,8 +192,81 @@ fn release_workspace_path(
   return path_join(
     dirname(primary_checkout),
     basename(primary_checkout) + "-worktrees",
-    "release-" + run_id,
+    if shared {
+      "release"
+    } else {
+      "release-" + run_id
+    },
   )
+}
+
+/**
+ * Take over a surviving shared workspace by switching it to this run's pin.
+ *
+ * Reuse is the only path that preserves Cargo's fingerprints, so it is also the
+ * only path that can carry a previous run's state into this one. Every
+ * condition here is a reason the surviving tree cannot be trusted as a clean
+ * checkout of the pin; failing any of them is not an error, it just means this
+ * run materializes fresh instead.
+ */
+fn reuse_shared_release_workspace(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_repo: string,
+  workspace: string,
+) -> bool {
+  const registered = run_git(
+    harness,
+    source_cfg(cfg, source_repo),
+    ["worktree", "list", "--porcelain"],
+  )
+  if !registered.success || !contains(registered.stdout ?? "", "worktree " + workspace + "\n") {
+    return false
+  }
+  const workspace_cfg = source_cfg(cfg, workspace)
+  const status = run_git(
+    harness,
+    workspace_cfg,
+    ["status", "--porcelain", "--untracked-files=normal"],
+  )
+  if !status.success || trim(status.stdout ?? "") != "" {
+    return false
+  }
+  const switched = run_git(harness, workspace_cfg, ["switch", "--detach", cfg.pin_sha])
+  if !switched.success {
+    return false
+  }
+  const head = checked_git(harness, workspace_cfg, ["rev-parse", "HEAD"])
+  const branch = checked_git(harness, workspace_cfg, ["branch", "--show-current"])
+  return lowercase(head) == lowercase(cfg.pin_sha) && branch == ""
+}
+
+/**
+ * Move a shared workspace this run cannot reuse out of the way.
+ *
+ * Whatever is there was left by a previous release and may be the only copy of
+ * its recovery state, so it is never removed — only renamed, and reported.
+ */
+fn displace_shared_release_workspace(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_repo: string,
+  workspace: string,
+  run_id: string,
+) -> string {
+  const displaced = workspace + "-superseded-" + run_id
+  const moved = run_git(
+    harness,
+    source_cfg(cfg, source_repo),
+    ["worktree", "move", workspace, displaced],
+  )
+  if !moved.success {
+    throw "refusing to reuse a shared release workspace that cannot be moved aside: ${workspace}\n"
+      + trim(
+      moved.stderr,
+    )
+  }
+  return displaced
 }
 
 /**
@@ -186,6 +278,7 @@ pub fn materialize_release_workspace(
   harness: Harness,
   cfg: ReleaseConfig,
   run_id: string,
+  owns_release_lane: bool = false,
 ) -> ReleaseConfig {
   if cfg.mock {
     let mock_cfg = cfg
@@ -214,18 +307,40 @@ pub fn materialize_release_workspace(
     cfg,
     source_repo,
     run_id,
+    owns_release_lane,
   )
+  let reused = false
+  let displaced = ""
   if harness.fs.exists(workspace) {
-    throw "release workspace already exists: " + workspace
+    if !owns_release_lane {
+      throw "release workspace already exists: " + workspace
+    }
+    reused = reuse_shared_release_workspace(
+      {env: harness.env, process: harness.process},
+      cfg,
+      source_repo,
+      workspace,
+    )
+    if !reused {
+      displaced = displace_shared_release_workspace(
+        {env: harness.env, process: harness.process},
+        cfg,
+        source_repo,
+        workspace,
+        run_id,
+      )
+    }
   }
-  harness.fs.mkdir(dirname(workspace), true)
-  const added = run_git(
-    {env: harness.env, process: harness.process},
-    source_cfg(cfg, source_repo),
-    ["worktree", "add", "--detach", workspace, cfg.pin_sha],
-  )
-  if !added.success {
-    throw "failed to create isolated release workspace at ${workspace}:\n${trim(added.stderr)}"
+  if !reused {
+    harness.fs.mkdir(dirname(workspace), true)
+    const added = run_git(
+      {env: harness.env, process: harness.process},
+      source_cfg(cfg, source_repo),
+      ["worktree", "add", "--detach", workspace, cfg.pin_sha],
+    )
+    if !added.success {
+      throw "failed to create isolated release workspace at ${workspace}:\n${trim(added.stderr)}"
+    }
   }
   try {
     const after = source_snapshot({env: harness.env, process: harness.process}, cfg, source_repo)
@@ -249,6 +364,7 @@ pub fn materialize_release_workspace(
     out["repo"] = workspace
     out["release_workspace"] = workspace
     out["release_workspace_managed"] = true
+    out["release_workspace_shared"] = owns_release_lane
     out["analysis_snapshot"] = {
       kind: "detached_worktree",
       requested_sha: cfg.pin_sha_input,
@@ -269,10 +385,19 @@ pub fn materialize_release_workspace(
         source_head: before.head,
         source_dirty: trim(before.status) != "",
         cargo_target_dir: cfg.release_cargo_target_dir,
+        shared: owns_release_lane,
+        reused: reused,
+        superseded_workspace: displaced,
       },
     )
     return out
   } catch (e) {
+    // A reused workspace was already clean and detached before this run touched
+    // it, so there is nothing partial to unwind and removing it would discard
+    // the compiled state that reuse exists to keep.
+    if reused {
+      throw e
+    }
     const removed = run_git(
       {env: harness.env, process: harness.process},
       source_cfg(cfg, source_repo),
@@ -346,6 +471,7 @@ fn preservation_cleanup(
     steps: [step],
     path: cfg.release_workspace,
     preserved: true,
+    retained: false,
   }
 }
 
@@ -358,7 +484,8 @@ fn assert_release_workspace_target(
   if trim(cfg.source_repo) == "" || cfg.repo != workspace {
     throw "managed release workspace identity is incomplete"
   }
-  const expected = release_workspace_path(harness, cfg, cfg.source_repo, run_id)
+  const shared = cfg.release_workspace_shared ?? false
+  const expected = release_workspace_path(harness, cfg, cfg.source_repo, run_id, shared)
   if workspace != expected {
     throw "refusing to remove a release workspace not owned by run ${run_id}: ${workspace}"
   }
@@ -392,6 +519,7 @@ fn removal_cleanup(
       ],
       path: workspace,
       preserved: false,
+      retained: false,
     }
     release_log_event(
       {clock: harness.clock, fs: harness.fs},
@@ -443,6 +571,7 @@ fn removal_cleanup(
     ],
     path: workspace,
     preserved: !removed_cleanly,
+    retained: false,
   }
   release_log_event(
     {clock: harness.clock, fs: harness.fs},
@@ -539,6 +668,7 @@ pub fn finish_release_workspace(
       ],
       path: workspace,
       preserved: true,
+      retained: false,
     }
     release_log_event(
       {clock: harness.clock, fs: harness.fs},
@@ -548,5 +678,51 @@ pub fn finish_release_workspace(
     )
     return cleanup
   }
+  if cfg.release_workspace_shared ?? false {
+    return retention_cleanup(harness, cfg, run_id, branch)
+  }
   return removal_cleanup(harness, cfg, run_id, branch, false)
+}
+
+/**
+ * Keep a shipped shared workspace so the next release can switch it to a new
+ * pin instead of checking out every file again.
+ *
+ * The caller has already proven the tree clean, which is what makes retaining
+ * it equivalent to removing it as far as this run's state is concerned. The
+ * detached HEAD is recorded so a later run's reuse decision, and an operator
+ * reading the receipt, can both see what is sitting there.
+ */
+fn retention_cleanup(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+  branch: string,
+) -> ReleaseWorkspaceCleanup {
+  const workspace = cfg.release_workspace
+  const head = trim(
+    run_git({env: harness.env, process: harness.process}, cfg, ["rev-parse", "HEAD"]).stdout ?? "",
+  )
+  const detail = "shipped release workspace retained for reuse at ${head}: ${workspace}"
+  const cleanup: ReleaseWorkspaceCleanup = {
+    success: true,
+    skipped: true,
+    branch: branch,
+    detail: detail,
+    warning: "",
+    fatal: false,
+    steps: [
+      recorded_step("retain-release-workspace", "retain " + workspace, command_result_ok(detail)),
+    ],
+    path: workspace,
+    preserved: false,
+    retained: true,
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_workspace_retained",
+    cleanup,
+  )
+  return cleanup
 }
