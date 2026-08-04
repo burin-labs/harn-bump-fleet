@@ -8,20 +8,20 @@ set -euo pipefail
 # scripts themselves.
 #
 # Discovery order (later entries override earlier ones):
-#   1. $HARN_BUMP_FLEET_ENV_FILE (single absolute path; default
+#   1. $HARN_EXT_BUMP_FLEET_ENV_FILE (single absolute path; default
 #      ~/projects/burin-code/.env if that file exists)
-#   2. $HARN_BUMP_FLEET_ENV_FILES (colon-separated list of paths)
+#   2. $HARN_EXT_BUMP_FLEET_ENV_FILES (colon-separated list of paths)
 #   3. ./.env at the repo root (current working directory)
 #   4. ./.env.local at the repo root
 #
-# Missing files are silently skipped — set HARN_ENV_VERBOSE=1 to print
+# Missing files are silently skipped — set HARN_EXT_ENV_VERBOSE=1 to print
 # which files were sourced.
 #
 # Usage:
 #   scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr
 #   scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
-verbose="${HARN_ENV_VERBOSE:-0}"
+verbose="${HARN_EXT_ENV_VERBOSE:-0}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
@@ -51,10 +51,10 @@ source_if_present() {
   set +a
 }
 
-default_env="${HARN_BUMP_FLEET_ENV_FILE:-${HOME}/projects/burin-code/.env}"
+default_env="${HARN_EXT_BUMP_FLEET_ENV_FILE:-${HOME}/projects/burin-code/.env}"
 source_if_present "$default_env"
 
-extra="${HARN_BUMP_FLEET_ENV_FILES:-}"
+extra="${HARN_EXT_BUMP_FLEET_ENV_FILES:-}"
 if [ -n "$extra" ]; then
   IFS=':'
   for f in $extra; do
@@ -85,8 +85,8 @@ normalize_harn_version() {
 }
 
 ensure_repo_harn_matches_pin() {
-  if [ "${HARN_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL:-0}" = "1" ]; then
-    note "skip harn auto-install (HARN_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL=1)"
+  if [ "${HARN_EXT_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL:-0}" = "1" ]; then
+    note "skip harn auto-install (HARN_EXT_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL=1)"
     return 0
   fi
   if [ ! -f "$repo_pin_file" ] || [ ! -x "$install_harn" ]; then

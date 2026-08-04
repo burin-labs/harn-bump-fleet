@@ -137,7 +137,7 @@ ignored and must not be committed.
 ## Release policy
 
 `release_harn.harn` pins each live release at startup from `--at-sha`,
-`HARN_RELEASE_PIN_SHA`, or `origin/<base>`. The local `release/vX.Y.Z` branch is
+`HARN_EXT_RELEASE_PIN_SHA`, or `origin/<base>`. The local `release/vX.Y.Z` branch is
 parented at that pin and is never published. Canonical ship mode materializes
 and signs the versioned candidate, publishes one OID-qualified immutable
 `release-attempt/...` ref, then certifies that prepared OID rather than the
