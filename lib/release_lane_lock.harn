@@ -1,0 +1,281 @@
+import { github_claim_ref, github_release_ref } from "./github"
+import { GithubRefClaim, GithubRefRelease } from "harn-github-connector/default"
+
+/**
+ * The release lane, asked one scope wider than the machine.
+ *
+ * `release_owner_guard` serializes releases on one host, which is all a
+ * `std/host_lease` can do: a hosted runner and a laptop each acquire it
+ * happily. Every other guard in the release path detects a collision only
+ * after a candidate exists — the immutable attempt ref, the write-once
+ * certification branch, the tag — so each detection costs a full build first.
+ * v0.10.53 spent a 63-minute hosted run building a candidate a local session
+ * had already superseded, and neither run could have known.
+ *
+ * `POST /git/refs` is the primitive GitHub serializes across machines. One ref
+ * per version, carrying a payload commit that says who holds it, turns "you
+ * will collide" into something knowable at minute one.
+ *
+ * Advisory first, by design: this module reports and never blocks. A wrong
+ * answer here costs a misleading line of output, where a wrong answer from a
+ * blocking gate wedges a release that had nothing wrong with it. Promotion to
+ * a hard gate is a separate decision, taken once the advisory has run clean.
+ */
+pub type ReleaseLaneHolder = {run_id: string, host: string, mode: string, started_at: string}
+
+pub type ReleaseLaneState = "acquired" | "held" | "abandoned" | "stale" | "unreadable"
+
+/**
+ * One lane claim, named rather than positional.
+ *
+ * `now` is a parameter and not a clock read because every state this function
+ * reports is a statement about elapsed time, and a caller that cannot choose
+ * "now" cannot test the ones that matter.
+ */
+pub type ReleaseLaneRequest = {
+  slug: string,
+  base_branch: string,
+  version: string,
+  holder: ReleaseLaneHolder,
+  now: string,
+}
+
+pub type ReleaseLaneClaim = {
+  state: ReleaseLaneState,
+  version: string,
+  ref: string,
+  oid: string,
+  holder: ReleaseLaneHolder?,
+  held_for_minutes: int,
+  message: string,
+}
+
+/**
+ * How long a lane may be held before the claim reports it as stale.
+ *
+ * Sized against the work, not the clock: a full hosted release is roughly an
+ * hour, and the macOS certification lane alone has waited 78 minutes for a
+ * runner. Three hours is past anything a live release explains.
+ */
+const STALE_AFTER_MINUTES = 180
+
+/**
+ * Not `refs/heads/`. A lock under `refs/heads/` is a branch: it shows up in
+ * branch pickers and stale-branch reports, and it inherits whatever ruleset
+ * governs branch names in the repository. A ref outside the branch namespace
+ * is still atomic to create and still visible to `ls-remote`, and it is
+ * unmistakably not somewhere to merge.
+ */
+pub fn release_lane_ref(version: string) -> string {
+  return "refs/release-lane/v" + trim(version)
+}
+
+/**
+ * The payload's first line, which is the only part a contended caller reads.
+ *
+ * `holder_headline` is exactly one line, so everything a loser needs to name
+ * the winner has to fit on it. Keyed fields rather than prose because this is
+ * parsed back by the next caller, not only read by a person.
+ */
+pub fn release_lane_headline(version: string, holder: ReleaseLaneHolder) -> string {
+  return "release-lane v${trim(version)} run=${trim(holder.run_id)} host=${trim(holder.host)}"
+    + " mode=${trim(holder.mode)} started=${trim(holder.started_at)}"
+}
+
+/** Recover a holder from a headline this module wrote, or nil for anything else. */
+pub fn parse_release_lane_headline(headline: string) -> ReleaseLaneHolder? {
+  const captured = regex_captures(
+    "^release-lane v[^ ]+ run=([^ ]*) host=([^ ]*) mode=([^ ]*) started=([^ ]*)$",
+    trim(headline),
+  )
+  if len(captured) != 1 {
+    return nil
+  }
+  const groups = captured[0].groups
+  return {run_id: groups[0], host: groups[1], mode: groups[2], started_at: groups[3]}
+}
+
+/**
+ * Age in whole minutes, or zero when either end is unreadable.
+ *
+ * `date_parse` throws on anything it does not recognize, and the earlier end of
+ * this span comes out of a commit message in another repository — written by a
+ * run this one has never met, or by something else entirely. An advisory is not
+ * worth crashing a release for, so an unreadable timestamp reports no age
+ * rather than a wrong one.
+ */
+fn minutes_between(earlier: string, later: string) -> int {
+  const started = try {
+    to_int(date_parse(trim(earlier)))
+  } catch (_e) {
+    nil
+  }
+  const now = try {
+    to_int(date_parse(trim(later)))
+  } catch (_e) {
+    nil
+  }
+  if started == nil || now == nil || now < started {
+    return 0
+  }
+  return (now - started) / 60
+}
+
+fn held_message(
+  version: string,
+  holder: ReleaseLaneHolder?,
+  minutes: int,
+  state: ReleaseLaneState,
+) -> string {
+  if holder == nil {
+    return "another release of v${version} holds the lane, with no readable payload"
+  }
+  if state == "abandoned" {
+    return "the lane for v${version} is still held by this host's run ${holder.run_id}"
+      + " (${holder.mode}), started ${minutes}m ago"
+  }
+  const age = if state == "stale" {
+    "started ${minutes}m ago, past the ${STALE_AFTER_MINUTES}m mark"
+  } else {
+    "started ${minutes}m ago"
+  }
+  return "another release of v${version} holds the lane: run ${holder.run_id} on ${holder.host}"
+    + " (${holder.mode}), ${age}"
+}
+
+/**
+ * Read one claim outcome as a lane state.
+ *
+ * Pure, and separate from the request, because the interesting cases are the
+ * ones a live GitHub will not produce on demand: a holder whose payload was
+ * collected, a headline written by something else, a lane held long enough to
+ * be abandoned.
+ *
+ * `abandoned` is the case a timeout alone would take three hours to reach. The
+ * caller holds this host's release lease, so no other release process is
+ * running here; a lane still claimed by this host therefore belongs to a run
+ * that is already gone. That is knowable immediately, and it is the state a
+ * retry after a failed release lands in.
+ */
+pub fn release_lane_claim_state(
+  claim: GithubRefClaim,
+  version: string,
+  now: string,
+  this_host: string = "",
+) -> ReleaseLaneClaim {
+  if claim.claimed {
+    return {
+      state: "acquired",
+      version: version,
+      ref: claim.ref,
+      oid: claim.oid,
+      holder: nil,
+      held_for_minutes: 0,
+      message: "holds the release lane for v${version}",
+    }
+  }
+  const holder = parse_release_lane_headline(claim.holder_headline)
+  const minutes = if holder == nil {
+    0
+  } else {
+    minutes_between(holder.started_at, now)
+  }
+  const state: ReleaseLaneState = if holder == nil {
+    "held"
+  } else if trim(this_host) != ""
+    && holder.host == trim(this_host) {
+    "abandoned"
+  } else if minutes >= STALE_AFTER_MINUTES {
+    "stale"
+  } else {
+    "held"
+  }
+  return {
+    state: state,
+    version: version,
+    ref: claim.ref,
+    oid: claim.oid,
+    holder: holder,
+    held_for_minutes: minutes,
+    message: held_message(version, holder, minutes, state),
+  }
+}
+
+/**
+ * Claim the lane for one version, reporting whoever already holds it.
+ *
+ * A claim that cannot be made at all is `unreadable`, never `acquired`: an
+ * advisory that goes quiet when GitHub is unreachable reads exactly like an
+ * uncontended lane, which is the one thing it must not do.
+ */
+pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> ReleaseLaneClaim {
+  const version = request.version
+  const ref = release_lane_ref(version)
+  const claimed = github_claim_ref(
+    harness,
+    request.slug,
+    ref,
+    {
+      message: release_lane_headline(version, request.holder),
+      base_ref: "refs/heads/" + trim(request.base_branch),
+    },
+  )
+  if is_err(claimed) {
+    return {
+      state: "unreadable",
+      version: version,
+      ref: ref,
+      oid: "",
+      holder: nil,
+      held_for_minutes: 0,
+      message: "could not read the release lane for v${version}: "
+        + to_string(
+        unwrap_err(claimed)?.message ?? unwrap_err(claimed),
+      ),
+    }
+  }
+  return release_lane_claim_state(unwrap(claimed), version, request.now, request.holder.host)
+}
+
+/** Let go of a lane this run still holds. A lane held by anyone else is left alone. */
+pub fn release_release_lane(
+  harness: Harness,
+  slug: string,
+  version: string,
+  oid: string,
+) -> GithubRefRelease? {
+  if trim(oid) == "" {
+    return nil
+  }
+  const released = github_release_ref(harness, slug, release_lane_ref(version), oid)
+  if is_err(released) {
+    return nil
+  }
+  return unwrap(released)
+}
+
+/**
+ * The operator-facing lines for one claim.
+ *
+ * Empty when the lane was free, because a release that is alone should not
+ * spend a line saying so. Everything else is worth interrupting for.
+ */
+pub fn release_lane_report(claim: ReleaseLaneClaim) -> list<string> {
+  if claim.state == "acquired" {
+    return []
+  }
+  if claim.state == "unreadable" {
+    return ["   !! release lane: ${claim.message}"]
+  }
+  if claim.state == "stale" || claim.state == "abandoned" {
+    return [
+      "   !! release lane: ${claim.message}",
+      "      free it with:",
+      "         harn run --no-sandbox abandon_release_attempts.harn -- --version ${claim.version} --apply --yes-live-release",
+    ]
+  }
+  return [
+    "   !! release lane: ${claim.message}",
+    "      this run will build a candidate the other one supersedes",
+  ]
+}
