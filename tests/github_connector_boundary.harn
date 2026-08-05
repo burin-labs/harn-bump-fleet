@@ -1,3 +1,4 @@
+import { command_run } from "std/command"
 import {
   github_branch_commit,
   github_branch_head,
@@ -13,7 +14,14 @@ import {
   github_release_body_edit,
   github_release_ref,
 } from "../lib/github"
+import {
+  SignedBotPullRequest,
+  load_pr_signature_metadata,
+  load_queued_pr_numbers,
+  rewrite_plan,
+} from "../lib/signed_bot_prs"
 import { GithubClientOptions } from "harn-github-connector/default"
+import { github_commit_worktree } from "harn-github-connector/worktree"
 
 /**
  * Every fleet call into the GitHub connector, exercised through the real
@@ -238,6 +246,152 @@ pipeline test_projection_writes_reach_their_exact_endpoints(harness: Harness, ta
       ),
     ),
   )
+}
+
+fn git_ok(tools: HarnessTools, root: string, args: list<string>) {
+  const result = command_run(tools, ["git", "-C", root] + args)
+  if !result.success {
+    throw "fixture git " + join(args, " ") + " failed: " + trim(to_string(result.stderr ?? ""))
+  }
+}
+
+/**
+ * One commit and one staged change, which is the state `sign_bot_prs` prepares.
+ *
+ * `soft-reset-to-base` leaves the PR's tree in the index with `HEAD` at the
+ * base, so the delta the publish derives is index-against-`HEAD`. Reproducing
+ * that exactly is what makes the request reach the network at all: an empty
+ * delta is a clean local outcome that sends nothing.
+ */
+fn staged_repo(harness: Harness) -> string {
+  const root = path_join(harness.fs.temp_dir(), "signed-bot-boundary-" + harness.random.uuid_v7())
+  if !command_run(harness.tools, ["git", "init", "-q", root]).success {
+    throw "fixture git init failed at " + root
+  }
+  // `gc.autoDetach` defaults on, so a commit can fork a repack that outlives it
+  // and keeps writing while teardown removes the directory.
+  git_ok(harness.tools, root, ["config", "gc.auto", "0"])
+  git_ok(harness.tools, root, ["config", "user.email", "boundary@example.test"])
+  git_ok(harness.tools, root, ["config", "user.name", "Boundary Test"])
+  git_ok(harness.tools, root, ["config", "commit.gpgsign", "false"])
+  harness.fs.write_text(path_join(root, "CHANGELOG.md"), "# base\n")
+  git_ok(harness.tools, root, ["add", "CHANGELOG.md"])
+  git_ok(harness.tools, root, ["commit", "-q", "-m", "base"])
+  harness.fs.write_text(path_join(root, "CHANGELOG.md"), "# base\n\n## 1.0.1\n")
+  git_ok(harness.tools, root, ["add", "CHANGELOG.md"])
+  return root
+}
+
+fn boundary_pr(branch: string, head_oid: string) -> SignedBotPullRequest {
+  return {
+    slug: SLUG,
+    number: 42,
+    title: "build(deps): bump example from 1.0.0 to 1.0.1",
+    url: "https://github.test/octo-org/octo-repo/pull/42",
+    state: "open",
+    base_ref_name: "main",
+    head_ref_name: branch,
+    head_oid: head_oid,
+    head_repo: SLUG,
+    head_owner: "octo-org",
+    author_login: "dependabot[bot]",
+    author_type: "Bot",
+    merge_state_status: "blocked",
+    auto_merge_enabled: false,
+    cross_repository: false,
+    commits: [],
+  }
+}
+
+pipeline test_the_merge_queue_read_is_unwrapped_before_it_is_used(harness: Harness, task) {
+  // Unlike the request-shape checks above, this one needs a *successful*
+  // response: the defect it guards is reading a field off a `Result` that was
+  // never unwrapped, which yields `nil` rather than failing, and no error path
+  // can show that.
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    BASE + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            repository: {
+              mergeQueue: {
+                url: "https://github.test/queue",
+                entries: {
+                  nodes: [
+                    {
+                      id: "MQE_1",
+                      position: 1,
+                      state: "AWAITING_CHECKS",
+                      enqueuedAt: "2026-08-05T03:07:17Z",
+                      headOid: "56de5b80f593c62ac36f605fb258ea9c4206c3ea",
+                      pullRequest: {
+                        number: 999901,
+                        url: "https://github.test/pull/999901",
+                        baseRefName: "main",
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ),
+    },
+  )
+  assert_eq(load_queued_pr_numbers(harness, SLUG, "main", options()), [999901])
+}
+
+pipeline test_the_signature_metadata_read_reaches_its_pull_request(harness: Harness, task) {
+  // `github_pr_view` is the read every rewrite decision is made from, and it is
+  // reached here through `load_pr_signature_metadata` rather than directly, so
+  // the arity of that hop is exercised too.
+  harness.testing.http_mock_clear()
+  absent(harness.testing, "GET", BASE + "/repos/octo-org/octo-repo/pulls/42")
+  const read = try {
+    load_pr_signature_metadata(harness, SLUG, 42, options())
+  }
+  assert(is_err(read))
+  const failure = to_string(unwrap_err(read))
+  assert(contains(failure, "404"), "the request resolved to the mocked pull request")
+  assert(!contains(failure, "schema_drift"), "the record reached the endpoint intact")
+  assert_eq(len(harness.testing.http_mock_calls()), 1)
+}
+
+pipeline test_a_signed_rewrite_carries_its_branch_lease(harness: Harness, task) {
+  // The rewrite reaches the connector through a second export (`worktree`), and
+  // hands it the largest request record the fleet builds for any connector call.
+  // `harn check` verifies neither across the package boundary, so only a request
+  // that lands on an exact URL — still carrying the lease — says this call site
+  // is shaped right.
+  harness.testing.http_mock_clear()
+  const head_oid = "abcdef1234567890abcdef1234567890abcdef12"
+  const repo_dir = staged_repo(harness)
+  const plan = rewrite_plan(
+    harness.random,
+    SLUG,
+    boundary_pr("dependabot/cargo/example-1.0.1", head_oid),
+    {home: "/nonexistent", temp_path: repo_dir},
+  )
+  absent(
+    harness.testing,
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/git/ref/heads/dependabot/cargo/example-1.0.1",
+  )
+  const published = github_commit_worktree(harness, plan.publish + {options: options()})
+  command_run(harness.tools, ["rm", "-rf", repo_dir])
+  // Not `schema_drift`: the record kept owner, repo, branch, headline, and
+  // repo_dir, so the adapter got as far as deriving a delta and asking GitHub
+  // where the branch is. And not a bare 404 either — an absent branch is a
+  // lease violation only because `expected_branch_oid` survived the trip.
+  const failure = unwrap_err(published)
+  assert_eq(failure?.code, "stale_head")
+  assert(contains(to_string(failure?.message ?? ""), head_oid))
+  assert_eq(len(harness.testing.http_mock_calls()), 1, "nothing was written")
 }
 
 pipeline test_a_ref_claim_must_name_exactly_one_object(harness: Harness, task) {

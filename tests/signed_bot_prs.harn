@@ -1,11 +1,14 @@
 import { command_result_fail, command_result_ok } from "std/command"
 import {
+  SIGNED_BOT_PUBLISH_STEP,
+  await_published_head,
   checkout_origin_check,
   default_temp_path,
   is_bot_pr_author,
   maybe_enable_auto_merge,
   parse_pr_numbers,
-  rewrite_command_plan,
+  rewrite_plan,
+  run_rewrite_with,
   signed_bot_pr_decision,
   unsigned_commits,
 } from "../lib/signed_bot_prs"
@@ -108,48 +111,226 @@ pipeline test_signed_bot_decision_rewrites_only_unsigned_bots(task) {
   assert_eq(no_op.action, "already_signed")
 }
 
-pipeline test_rewrite_command_plan_uses_exact_lease_and_fsmonitor_off(harness: Harness, task) {
-  const pr = sample_pr()
-  const temp = default_temp_path(harness.random, "burin-labs/example", 42, pr.head_oid)
-  const second_temp = default_temp_path(harness.random, "burin-labs/example", 42, pr.head_oid)
-  assert(starts_with(temp, "/tmp/harn-signed-bot-prs/burin-labs-example-pr-42-abcdef123456-"))
-  assert(temp != second_temp, "parallel rewrites use distinct worktrees")
-  const plan = rewrite_command_plan(
-    harness.random,
+fn test_plan(random: HarnessRandom) {
+  return rewrite_plan(
+    random,
     "burin-labs/example",
-    pr,
+    sample_pr(),
     {
       home: "/Users/example",
       temp_path: "/tmp/harn-signed-bot-prs/test-pr-42",
       trailer: "Co-Authored-By: Codex <codex@openai.com>",
     },
   )
+}
+
+fn fake_runner(failing_argv_token: string = "") {
+  return { argv ->
+    if failing_argv_token != "" && contains(argv, failing_argv_token) {
+      return command_result_fail(1, "refused: " + failing_argv_token)
+    }
+    return command_result_ok("")
+  }
+}
+
+pipeline test_rewrite_plan_prepares_an_exact_state_and_nothing_else(harness: Harness, task) {
+  const pr = sample_pr()
+  const temp = default_temp_path(harness.random, "burin-labs/example", 42, pr.head_oid)
+  const second_temp = default_temp_path(harness.random, "burin-labs/example", 42, pr.head_oid)
+  assert(starts_with(temp, "/tmp/harn-signed-bot-prs/burin-labs-example-pr-42-abcdef123456-"))
+  assert(temp != second_temp, "parallel rewrites use distinct worktrees")
+  const plan = test_plan(harness.random)
   assert_eq(plan.checkout, "/Users/example/projects/example")
   assert_eq(plan.temp_path, "/tmp/harn-signed-bot-prs/test-pr-42")
   assert_eq(plan.branch, "dependabot/cargo/example-1.0.1")
-  const names = plan.commands.map({ c -> c.name })
   assert_eq(
-    names,
+    plan.prepare.map({ c -> c.name }),
     [
       "fetch-pr-head",
       "mkdir-temp-root",
       "add-temp-worktree",
       "disable-temp-fsmonitor",
       "soft-reset-to-base",
-      "create-signed-commit",
-      "push-signed-head",
-      "remove-temp-worktree",
     ],
   )
-  assert(contains(plan.commands[0]?.argv ?? [], "core.fsmonitor=false"))
-  assert(contains(plan.commands[4]?.argv ?? [], "reset"))
-  assert(contains(plan.commands[4]?.argv ?? [], "origin/main"))
-  assert(
-    contains(
-      plan.commands[6]?.argv ?? [],
-      "--force-with-lease=refs/heads/dependabot/cargo/example-1.0.1:abcdef1234567890abcdef1234567890abcdef12",
-    ),
+  assert(contains(plan.prepare[0]?.argv ?? [], "core.fsmonitor=false"))
+  assert(contains(plan.prepare[4]?.argv ?? [], "reset"))
+  assert(contains(plan.prepare[4]?.argv ?? [], "origin/main"))
+  assert_eq(plan.cleanup.name, "remove-temp-worktree")
+  // No local commit and no push: the only remaining local work is producing the
+  // state, and GitHub does the writing.
+  for command in plan.prepare + [plan.cleanup] {
+    assert(!contains(command.argv, "commit"), "${command.name} must not commit locally")
+    assert(!contains(command.argv, "push"), "${command.name} must not push")
+  }
+}
+
+pipeline test_rewrite_plan_leases_the_branch_it_rewinds(harness: Harness, task) {
+  const publish = test_plan(harness.random).publish
+  assert_eq(publish.owner, "burin-labs")
+  assert_eq(publish.repo, "example")
+  assert_eq(publish.branch, "dependabot/cargo/example-1.0.1")
+  assert_eq(publish.repo_dir, "/tmp/harn-signed-bot-prs/test-pr-42")
+  assert_eq(publish.headline, "build(deps): bump example from 1.0.0 to 1.0.1")
+  assert_eq(publish.body, "Co-Authored-By: Codex <codex@openai.com>")
+  // The two fields that carry what the retired `git push --force-with-lease`
+  // guaranteed. Without the lease the reset below it is an unconditional force.
+  assert_eq(publish.expected_branch_oid, "abcdef1234567890abcdef1234567890abcdef12")
+  assert_eq(publish.reset_branch, true)
+  // The index, not the working tree: `soft-reset-to-base` put the PR's tree
+  // there, and restaging the working tree would sweep in untracked files.
+  assert_eq(publish.source, "index")
+}
+
+fn sample_receipt(committed = true) {
+  return {
+    repository: "burin-labs/example",
+    owner: "burin-labs",
+    repo: "example",
+    branch: "dependabot/cargo/example-1.0.1",
+    source: "index",
+    base_oid: "1111111111111111111111111111111111111111",
+    committed: committed,
+    commit_oid: if committed {
+      "2222222222222222222222222222222222222222"
+    } else {
+      ""
+    },
+    commit_url: "",
+    branch_action: if committed {
+      "reset"
+    } else {
+      "skipped"
+    },
+    changes: [],
+    signature: {verified: committed, signed_by_github: committed, state: "VALID"},
+  }
+}
+
+fn ran(result, name: string) -> bool {
+  return len(result.steps.filter({ s -> s.name == name })) == 1
+}
+
+pipeline test_a_rewrite_that_never_prepared_never_publishes(harness: Harness, task) {
+  let published = 0
+  const result = run_rewrite_with(
+    fake_runner("worktree"),
+    { _request ->
+      published = published + 1
+      return Ok(sample_receipt())
+    },
+    test_plan(harness.random),
   )
+  assert_eq(result.success, false)
+  assert_eq(result.failed_step, "add-temp-worktree")
+  assert(contains(result.detail, "refused: worktree"))
+  assert_eq(published, 0, "a worktree that was never built has nothing to publish")
+  assert_eq(ran(result, "disable-temp-fsmonitor"), false, "nothing after the refusal ran")
+  // The scratch worktree may already exist -- `add-temp-worktree` is the step
+  // that creates it -- so the failure path has to clear it like any other.
+  assert(ran(result, "remove-temp-worktree"), "cleanup runs on the failure path too")
+}
+
+pipeline test_a_worktree_that_will_not_be_removed_is_not_a_failed_rewrite(harness: Harness, task) {
+  const result = run_rewrite_with(
+    fake_runner("remove"),
+    { _request -> Ok(sample_receipt()) },
+    test_plan(harness.random),
+  )
+  // A leftover directory cannot retract a signature GitHub has already issued,
+  // and calling this a failure would send the caller back to rewrite a head
+  // that now fails its own lease.
+  assert_eq(result.success, true)
+  assert_eq(result.receipt?.commit_oid, "2222222222222222222222222222222222222222")
+  const cleanup = result.steps.filter({ s -> s.name == "remove-temp-worktree" })[0]
+  assert_eq(cleanup?.result?.success, false, "the cleanup really did fail")
+}
+
+pipeline test_publish_outcomes_name_what_went_wrong(harness: Harness, task) {
+  const plan = test_plan(harness.random)
+  const refused = run_rewrite_with(
+    fake_runner(),
+    { _request ->
+      Err({code: "stale_head", category: "conflict", message: "branch is at 9999, not abcdef"})
+    },
+    plan,
+  )
+  assert_eq(refused.success, false)
+  assert_eq(refused.failed_step, SIGNED_BOT_PUBLISH_STEP)
+  assert(contains(refused.detail, "branch is at 9999"))
+  assert_eq(refused.receipt, nil)
+  assert(ran(refused, "remove-temp-worktree"), "cleanup runs after a refused publish")
+  // A connector-clean empty delta is still a failed rewrite: the unsigned head
+  // is untouched, so reporting success would arm auto-merge on a blocked PR.
+  const empty = run_rewrite_with(fake_runner(), { _request -> Ok(sample_receipt(false)) }, plan)
+  assert_eq(empty.success, false)
+  assert_eq(empty.failed_step, SIGNED_BOT_PUBLISH_STEP)
+  assert(contains(empty.detail, "proposes no change"))
+  assert_eq(empty.receipt?.branch_action, "skipped")
+}
+
+const PUBLISHED = "2222222222222222222222222222222222222222"
+
+/** Reads that answer with the base first, then the published head. */
+fn lagging_reader(lag: int, base_head: string = "1111111111111111111111111111111111111111") {
+  let reads = 0
+  return { ->
+    reads = reads + 1
+    if reads <= lag {
+      // What the #660 probe actually saw: the branch reset had landed and the
+      // commit on top of it had not, so the commits read failed outright.
+      throw "github.pr.commits response omitted a positive commit count"
+    }
+    const pr = sample_pr(true)
+    return pr
+      + {
+      head_oid: if reads == lag + 1 {
+        PUBLISHED
+      } else {
+        base_head
+      },
+    }
+  }
+}
+
+pipeline test_a_pull_request_record_that_lags_the_publish_is_waited_out(harness: Harness, task) {
+  const awaited = await_published_head(
+    harness.clock,
+    lagging_reader(2),
+    PUBLISHED,
+    {max_attempts: 5, interval_ms: 1},
+  )
+  assert_eq(awaited.settled, true)
+  assert_eq(awaited.attempts, 3, "the two failing reads were retries, not verdicts")
+  assert_eq(awaited.pr?.head_oid, PUBLISHED)
+}
+
+pipeline test_a_head_that_never_arrives_reports_what_github_said(harness: Harness, task) {
+  // A branch someone else moved reads exactly like lag until the bound runs
+  // out, and this is the only thing that tells the two apart.
+  const stalled = await_published_head(
+    harness.clock,
+    { -> sample_pr(true) + {head_oid: "9999999999999999999999999999999999999999"} },
+    PUBLISHED,
+    {max_attempts: 2, interval_ms: 1},
+  )
+  assert_eq(stalled.settled, false)
+  assert_eq(stalled.attempts, 2)
+  assert(contains(stalled.detail, "still reports head 9999"))
+  // Reads that never succeed carry the error instead, so the operator is not
+  // told the head is wrong when the truth is that it was never read.
+  const unread = await_published_head(
+    harness.clock,
+    lagging_reader(9),
+    PUBLISHED,
+    {max_attempts: 2, interval_ms: 1},
+  )
+  assert_eq(unread.settled, false)
+  assert_eq(unread.pr, nil)
+  assert(contains(unread.detail, "omitted a positive commit count"))
+  // A publish with no commit to confirm is a bug in the caller, not a wait.
+  const nothing = await_published_head(harness.clock, lagging_reader(0), "", {max_attempts: 2})
+  assert_eq([nothing.settled, nothing.attempts], [false, 0])
 }
 
 pipeline test_disabled_auto_merge_is_a_typed_success(harness: Harness, task) {
