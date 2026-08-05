@@ -37,6 +37,9 @@ The entry points are:
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
   machine holding all twenty-six checkouts. Dry-run first; `--apply` writes.
+  `--apply` also arms auto-merge, leased to the commit it published, so each
+  repair lands once that repository's own checks pass. `--no-auto-merge` holds
+  arming; it never merges anything itself.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.

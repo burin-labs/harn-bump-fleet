@@ -4,7 +4,9 @@ import {
   github_branch_head,
   github_claim_ref,
   github_connector_options,
+  github_enable_auto_merge,
   github_file_text_at_ref,
+  github_pr_list,
   github_pr_upsert,
 } from "./github"
 import { GithubClientOptions } from "harn-github-connector/default"
@@ -37,6 +39,23 @@ pub type RemoteConvergenceResult = {
   commit?: string,
   pull_request?: int,
   url?: string,
+  error?: string,
+  auto_merge?: AutoMergeOutcome,
+}
+
+/**
+ * What arming asked GitHub for, and what GitHub said.
+ *
+ * `held` is the operator's brake rather than a failure. `refused` is GitHub
+ * declining — a repository with auto-merge switched off, a queue that owns the
+ * strategy, a gate the App may not satisfy — and it is reported rather than
+ * raised, because an unarmed proposal is the behavior this loop had all along.
+ * Silence would be the real defect: a fleet that quietly stopped converging
+ * reads exactly like a fleet with nothing to converge.
+ */
+pub type AutoMergeOutcome = {
+  state: "armed" | "already_armed" | "held" | "refused",
+  method?: string,
   error?: string,
 }
 
@@ -103,12 +122,61 @@ fn branch_already_proposes(
   return true
 }
 
+/**
+ * Arm auto-merge on a proposal, leased to the exact commit this run published.
+ *
+ * The lease carries the safety argument. `commit_oid` is the commit holding the
+ * manifest's bytes and nothing else, so a branch someone appended to between
+ * that commit and this call fails closed rather than merging work the fleet
+ * never rendered. Arming is also not merging: it asks GitHub to merge *if and
+ * when the repository's own required checks pass*, so a red projection stays
+ * open exactly as it did before, and every gate each repository set for itself
+ * still decides.
+ */
+fn arm_auto_merge(
+  harness: Harness,
+  slug: string,
+  pull_number: int,
+  commit_oid: string,
+  options: GithubClientOptions,
+) -> AutoMergeOutcome {
+  const armed = github_enable_auto_merge(harness, slug, pull_number, commit_oid, "squash", options)
+  if is_err(armed) {
+    return {state: "refused", error: to_string(unwrap_err(armed))}
+  }
+  const receipt = unwrap(armed)
+  return {
+    state: if receipt.already_enabled {
+      "already_armed"
+    } else {
+      "armed"
+    },
+    method: receipt.merge_method,
+  }
+}
+
+/** Arm the proposal, or record that the operator asked this run not to. */
+fn arm_or_hold(
+  harness: Harness,
+  slug: string,
+  pull_number: int,
+  commit_oid: string,
+  arm: bool,
+  options: GithubClientOptions,
+) -> AutoMergeOutcome {
+  if !arm {
+    return {state: "held"}
+  }
+  return arm_auto_merge(harness, slug, pull_number, commit_oid, options)
+}
+
 fn converge_repository(
   harness: Harness,
   slug: string,
   default_branch: string,
   targets: list<FleetProjectionTarget>,
   apply: bool,
+  arm: bool,
   options: GithubClientOptions,
 ) -> RemoteConvergenceResult {
   const drifted = drifted_targets(harness, slug, default_branch, targets, options)
@@ -134,16 +202,57 @@ fn converge_repository(
     "projection branch claim failed",
   )
   const branch_oid = to_string(claim?.oid ?? "")
+  const body = proposal_body(slug, drifted)
   if !(claim?.claimed ?? false) && branch_already_proposes(harness, slug, drifted, options) {
+    // The branch already says what this run would say, so it must not commit
+    // again: that duplicate is exactly what one stable branch name prevents.
+    // Arming is still retried, because a run that published a commit but could
+    // not arm it has to recover on its own. Leaving that proposal unarmed
+    // forever would rebuild the pile-up this loop exists to prevent, one
+    // repository at a time.
+    if !arm {
+      return {
+        slug: slug,
+        status: "pending",
+        drifted: paths,
+        branch: REMOTE_PROJECTION_BRANCH,
+        commit: branch_oid,
+        auto_merge: {state: "held"},
+      }
+    }
+    const listed = github_pr_list(
+      harness,
+      slug,
+      {state: "open", head: REMOTE_PROJECTION_BRANCH, base: default_branch},
+      options,
+    )
+    if is_err(listed) {
+      throw "projection pull request lookup failed: " + to_string(unwrap_err(listed))
+    }
+    const open = unwrap(listed)
+    // No open proposal means someone closed it. The drift is still reported,
+    // but reopening the pull request nightly would overrule a human decision
+    // with a cron job. The next byte change proposes again on its own.
+    if len(open) == 0 {
+      return {
+        slug: slug,
+        status: "pending",
+        drifted: paths,
+        branch: REMOTE_PROJECTION_BRANCH,
+        commit: branch_oid,
+      }
+    }
+    const open_number = to_int(open[0]?.number) ?? 0
     return {
       slug: slug,
       status: "pending",
       drifted: paths,
       branch: REMOTE_PROJECTION_BRANCH,
       commit: branch_oid,
+      pull_request: open_number,
+      auto_merge: arm_or_hold(harness, slug, open_number, branch_oid, arm, options),
     }
   }
-  const body = proposal_body(slug, drifted)
   const commit = unwrap_or_throw(
     github_branch_commit(
       harness,
@@ -159,7 +268,7 @@ fn converge_repository(
     ),
     "projection commit failed",
   )
-  const commit_oid = to_string(commit?.oid ?? "")
+  const head_oid = to_string(commit?.oid ?? "")
   const pull = unwrap_or_throw(
     github_pr_upsert(
       harness,
@@ -169,20 +278,22 @@ fn converge_repository(
         base: default_branch,
         title: PROJECTION_HEADLINE,
         body: body,
-        expected_head_oid: commit_oid,
+        expected_head_oid: head_oid,
       },
       options,
     ),
     "projection pull request failed",
   )
+  const pull_number = to_int(pull?.number) ?? 0
   return {
     slug: slug,
     status: "applied",
     drifted: paths,
     branch: REMOTE_PROJECTION_BRANCH,
-    commit: commit_oid,
-    pull_request: to_int(pull?.number) ?? 0,
+    commit: head_oid,
+    pull_request: pull_number,
     url: to_string(pull?.url ?? ""),
+    auto_merge: arm_or_hold(harness, slug, pull_number, head_oid, arm, options),
   }
 }
 
@@ -193,6 +304,13 @@ fn converge_repository(
  * branch: the fleet owns what these files should say, but each repository still
  * owns its own merge gate, and a projection that cannot pass that gate is a
  * manifest problem rather than something to force past review.
+ *
+ * With `arm`, that proposal also asks GitHub to merge it once those same gates
+ * pass. That does not move the gate — GitHub merges only what the repository's
+ * required checks already accepted — it removes the human whose only remaining
+ * job was to agree with a byte comparison this loop had already made. What it
+ * cannot remove is the lease: arming names the exact commit this run
+ * published, so an appended commit fails closed instead of riding along.
  *
  * A provider failure ends this repository and no other. Twenty-six repositories
  * share one run, and the fleet has already been taken down once by a single
@@ -205,10 +323,11 @@ pub fn converge_remote_repository(
   default_branch: string,
   targets: list<FleetProjectionTarget>,
   apply: bool,
+  arm: bool = false,
   options: GithubClientOptions = github_connector_options(),
 ) -> RemoteConvergenceResult {
   const attempt = try {
-    converge_repository(harness, slug, default_branch, targets, apply, options)
+    converge_repository(harness, slug, default_branch, targets, apply, arm, options)
   }
   if is_err(attempt) {
     return {slug: slug, status: "error", drifted: [], error: to_string(unwrap_err(attempt))}
