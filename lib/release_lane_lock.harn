@@ -1,5 +1,9 @@
-import { github_claim_ref, github_release_ref } from "./github"
-import { GithubRefClaim, GithubRefRelease } from "harn-github-connector/default"
+import { github_claim_ref, github_connector_options, github_release_ref } from "./github"
+import {
+  GithubClientOptions,
+  GithubRefClaim,
+  GithubRefRelease,
+} from "harn-github-connector/default"
 
 /**
  * The release lane, asked one scope wider than the machine.
@@ -38,6 +42,10 @@ pub type ReleaseLaneRequest = {
   version: string,
   holder: ReleaseLaneHolder,
   now: string,
+  // Endpoint identity, defaulted from the fleet's connector options. Named here
+  // so a test can answer these requests itself: the reclaim is four round trips
+  // deep, and none of them is reachable from the pure state function.
+  options?: GithubClientOptions,
 }
 
 pub type ReleaseLaneClaim = {
@@ -48,6 +56,10 @@ pub type ReleaseLaneClaim = {
   holder: ReleaseLaneHolder?,
   held_for_minutes: int,
   message: string,
+  // Acquired by taking back a lane this host had abandoned, rather than by
+  // finding it free. Worth a line: it is how an operator learns that a previous
+  // run of this version died without getting to say so.
+  reclaimed?: bool,
 }
 
 /**
@@ -155,7 +167,9 @@ fn held_message(
  * caller holds this host's release lease, so no other release process is
  * running here; a lane still claimed by this host therefore belongs to a run
  * that is already gone. That is knowable immediately, and it is the state a
- * retry after a failed release lands in.
+ * retry after a failed release lands in — which is why `claim_release_lane`
+ * takes it back rather than reporting it. Reaching an operator with this state
+ * means the reclaim itself could not finish.
  */
 pub fn release_lane_claim_state(
   claim: GithubRefClaim,
@@ -207,8 +221,52 @@ pub fn release_lane_claim_state(
  * A claim that cannot be made at all is `unreadable`, never `acquired`: an
  * advisory that goes quiet when GitHub is unreachable reads exactly like an
  * uncontended lane, which is the one thing it must not do.
+ *
+ * An `abandoned` lane is taken back rather than reported. Nothing frees a lane
+ * on the way out of a release, and nothing should have to: a run that is
+ * killed, a build that dies, a machine that reboots — none of them get to run
+ * cleanup, so an exit-path release would be bookkeeping that fails in exactly
+ * the cases it exists for. The claim is the one place that can be certain
+ * instead. `abandoned` already means the holder is this host, and the caller
+ * holds this host's release lease, so that run is provably gone. Reclaiming
+ * there makes every retry after a failed release quiet, which is the path this
+ * would otherwise have interrupted most often.
  */
 pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> ReleaseLaneClaim {
+  const first = claim_release_lane_once(harness, request)
+  if first.state != "abandoned" {
+    return first
+  }
+  const freed = release_release_lane(
+    harness,
+    request.slug,
+    request.version,
+    first.oid,
+    request.options ?? github_connector_options(),
+  )
+  // `held_by_another` means the lane changed hands between the read and the
+  // delete, so the reclaim is off and whatever the first claim reported stands.
+  if freed == nil || !(freed.released || freed.reason == "already_absent") {
+    return first
+  }
+  const second = claim_release_lane_once(harness, request)
+  if second.state != "acquired" {
+    return second
+  }
+  return {
+    state: "acquired",
+    version: second.version,
+    ref: second.ref,
+    oid: second.oid,
+    holder: nil,
+    held_for_minutes: 0,
+    message: "reclaimed the release lane for v${second.version} from this host's"
+      + " abandoned run ${first.holder?.run_id ?? "(unnamed)"}",
+    reclaimed: true,
+  }
+}
+
+fn claim_release_lane_once(harness: Harness, request: ReleaseLaneRequest) -> ReleaseLaneClaim {
   const version = request.version
   const ref = release_lane_ref(version)
   const claimed = github_claim_ref(
@@ -221,6 +279,7 @@ pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> Rele
         base_ref: "refs/heads/" + trim(request.base_branch),
       },
     },
+    request.options ?? github_connector_options(),
   )
   if is_err(claimed) {
     return {
@@ -245,11 +304,12 @@ pub fn release_release_lane(
   slug: string,
   version: string,
   oid: string,
+  options: GithubClientOptions = github_connector_options(),
 ) -> GithubRefRelease? {
   if trim(oid) == "" {
     return nil
   }
-  const released = github_release_ref(harness, slug, release_lane_ref(version), oid)
+  const released = github_release_ref(harness, slug, release_lane_ref(version), oid, options)
   if is_err(released) {
     return nil
   }
@@ -264,6 +324,9 @@ pub fn release_release_lane(
  */
 pub fn release_lane_report(claim: ReleaseLaneClaim) -> list<string> {
   if claim.state == "acquired" {
+    if claim.reclaimed ?? false {
+      return ["   -- release lane: ${claim.message}"]
+    }
     return []
   }
   if claim.state == "unreadable" {
