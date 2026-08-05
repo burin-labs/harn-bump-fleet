@@ -1,5 +1,7 @@
 import {
   ReleaseLaneHolder,
+  ReleaseLaneRequest,
+  claim_release_lane,
   parse_release_lane_headline,
   release_lane_claim_state,
   release_lane_headline,
@@ -8,6 +10,7 @@ import {
 } from "../lib/release_lane_lock"
 import { ReleaseOwnerGuard } from "../lib/release_owner_guard"
 import { release_lane_advisory } from "../lib/release_preflight"
+import { GithubClientOptions } from "harn-github-connector/default"
 
 const NOW = "2026-08-04T16:41:00Z"
 
@@ -161,6 +164,162 @@ pipeline test_an_unparseable_timestamp_does_not_invent_an_age(task) {
   )
   assert_eq(claim.held_for_minutes, 0)
   assert_eq(claim.state, "held")
+}
+
+const API = "https://github.test"
+
+const LANE_REF = "release-lane/v0.10.53"
+
+const THEIRS = "1111111111111111111111111111111111111111"
+
+const MINE = "7777777777777777777777777777777777777777"
+
+fn api_options() -> GithubClientOptions {
+  return {api_base_url: API, installation_token: "release-lane-test-token"}
+}
+
+fn lane_request() -> ReleaseLaneRequest {
+  return {
+    slug: "burin-labs/harn",
+    base_branch: "main",
+    version: "0.10.53",
+    holder: {run_id: "019fd000", host: "laptop", mode: "ship-pr", started_at: NOW},
+    now: NOW,
+    options: api_options(),
+  }
+}
+
+fn json(testing: HarnessTesting, method: string, url: string, status: int, body) {
+  testing.http_mock(method, url, {status: status, body: json_stringify(body)})
+}
+
+const BASE_TIP = "3333333333333333333333333333333333333333"
+
+const BASE_TREE = "4444444444444444444444444444444444444444"
+
+/**
+ * Every request a claim that mints its own payload makes, in order.
+ *
+ * `creates` is one scripted response per ref-create attempt, which is what
+ * makes a reclaim expressible at all: the same URL has to refuse the first
+ * claim and accept the one that follows the delete.
+ */
+fn mock_mint_and_create(testing: HarnessTesting, creates: list<dict>) {
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/ref/heads/main",
+    200,
+    {ref: "refs/heads/main", object: {sha: BASE_TIP, type: "commit"}},
+  )
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/commits/" + BASE_TIP,
+    200,
+    {sha: BASE_TIP, tree: {sha: BASE_TREE}},
+  )
+  json(
+    testing,
+    "POST",
+    API + "/repos/burin-labs/harn/git/commits",
+    201,
+    {sha: MINE, tree: {sha: BASE_TREE}},
+  )
+  testing.http_mock("POST", API + "/repos/burin-labs/harn/git/refs", {responses: creates})
+}
+
+fn taken() -> dict {
+  return {status: 422, body: json_stringify({message: "Reference already exists"})}
+}
+
+fn created() -> dict {
+  return {status: 201, body: json_stringify({ref: "refs/" + LANE_REF})}
+}
+
+fn mock_lane_held_by(testing: HarnessTesting, host: string) {
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/ref/" + LANE_REF,
+    200,
+    {ref: "refs/" + LANE_REF, object: {sha: THEIRS, type: "commit"}},
+  )
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/commits/" + THEIRS,
+    200,
+    {
+      sha: THEIRS,
+      message: release_lane_headline(
+        "0.10.53",
+        {run_id: "019fc846", host: host, mode: "ship-pr", started_at: "2026-08-04T16:00:00Z"},
+      ),
+    },
+  )
+}
+
+fn deletes(testing: HarnessTesting) -> int {
+  return len(testing.http_mock_calls().filter({ call -> call.method == "DELETE" }).to_list())
+}
+
+pipeline test_a_lane_this_host_abandoned_is_taken_back_rather_than_reported(
+  harness: Harness,
+  task,
+) {
+  // Nothing frees a lane on the way out of a release, and nothing can: a run
+  // that is killed mid-build never reaches cleanup. So the retry — the single
+  // most likely next run — used to meet its own leftover and be told to go run
+  // a destructive-sounding repair on it. The claim is the one place that can be
+  // certain the holder is gone, so it is the place that acts.
+  harness.testing.http_mock_clear()
+  mock_lane_held_by(harness.testing, "laptop")
+  // Refused, then accepted: the second claim wins the ref the delete just freed.
+  mock_mint_and_create(harness.testing, [taken(), created()])
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "acquired")
+  assert_eq(claim.reclaimed, true)
+  assert_eq(deletes(harness.testing), 1)
+  assert(contains(claim.message, "abandoned run 019fc846"))
+  assert(contains(to_string(release_lane_report(claim)), "reclaimed the release lane"))
+}
+
+pipeline test_a_lane_another_machine_holds_is_never_deleted(harness: Harness, task) {
+  // The falsifier for the reclaim. Same shape, same refusal, one field
+  // different: the holder is not this host, so there is no proof its run is
+  // gone and taking the lane would be taking it from a live release.
+  harness.testing.http_mock_clear()
+  mock_lane_held_by(harness.testing, "hosted-runner")
+  mock_mint_and_create(harness.testing, [taken()])
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "held")
+  assert_eq(claim.reclaimed ?? false, false)
+  assert_eq(deletes(harness.testing), 0, "another machine's lane was left alone")
+}
+
+pipeline test_a_reclaim_that_cannot_free_the_ref_reports_the_abandoned_lane(
+  harness: Harness,
+  task,
+) {
+  // The delete is itself leased on the exact oid, so a lane that changes hands
+  // between the read and the delete refuses. Reaching an operator with
+  // `abandoned` means exactly this: the reclaim was tried and could not finish.
+  harness.testing.http_mock_clear()
+  mock_lane_held_by(harness.testing, "laptop")
+  mock_mint_and_create(harness.testing, [taken()])
+  json(
+    harness.testing,
+    "DELETE",
+    API + "/repos/burin-labs/harn/git/refs/" + LANE_REF,
+    500,
+    {message: "Server Error"},
+  )
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "abandoned")
+  assert(contains(to_string(release_lane_report(claim)), "abandon_release_attempts.harn"))
 }
 
 pipeline test_only_a_live_owned_prepare_or_ship_claims_a_lane(harness: Harness, task) {
