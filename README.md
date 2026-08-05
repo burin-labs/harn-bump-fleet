@@ -105,11 +105,22 @@ violation names a workflow the fleet does not render, so no correct content
 exists to propose. The local `sync_*` harnesses remain the way to converge a
 checkout you already have; this is how the fleet converges without one.
 
-Nothing in that path writes a default branch or merges anything. Each
-repository keeps its own gate, and a projection that cannot pass review is a
-manifest problem rather than something to force past it. The scheduled
-`Converge Fleet Projections` workflow is the only place `--apply` runs by
-default; the harness itself reports and exits unless asked to write.
+Nothing in that path writes a default branch or merges anything itself. It does
+arm auto-merge on each proposal, leased to the exact commit it just published,
+so an appended commit fails closed instead of riding along. Every repository
+still keeps its own gate: GitHub merges only once that repository's required
+checks pass, and a red projection sits open exactly as before. What arming
+removes is the person whose remaining job was to agree with a byte comparison
+the loop had already made — and whose absence, for three days in August 2026,
+left the whole fleet unable to bump. `--no-auto-merge` proposes without arming.
+
+A repository that refuses arming — auto-merge switched off, or a gate the
+fleet's App cannot satisfy — is reported as `auto_merge.state = "refused"` and
+left for a human. It does not fail the run, because an unarmed proposal is
+still a correct repair.
+
+The scheduled `Converge Fleet Projections` workflow is the only place `--apply`
+runs by default; the harness itself reports and exits unless asked to write.
 
 ### Signed bot PRs
 

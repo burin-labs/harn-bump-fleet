@@ -1,5 +1,9 @@
 import { FleetProjectionTarget } from "../lib/fleet_projection_targets"
-import { REMOTE_PROJECTION_BRANCH, converge_remote_repository } from "../lib/remote_projection"
+import {
+  REMOTE_PROJECTION_BRANCH,
+  converge_remote_repository,
+  remote_convergence_failed,
+} from "../lib/remote_projection"
 import { GithubClientOptions } from "harn-github-connector/default"
 
 /**
@@ -91,7 +95,15 @@ fn wrote_anything(testing: HarnessTesting) -> bool {
 pipeline test_matching_bytes_need_no_proposal(harness: Harness, task) {
   harness.testing.http_mock_clear()
   mock_file(harness.testing, "main", EXPECTED)
-  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, options())
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
   assert_eq(result.status, "clean")
   assert_eq(result.drifted, [])
   assert_eq(wrote_anything(harness.testing), false)
@@ -102,7 +114,15 @@ pipeline test_a_dry_run_reports_drift_and_writes_nothing(harness: Harness, task)
   // that the run noticed; the request log is what proves it stayed read-only.
   harness.testing.http_mock_clear()
   mock_file(harness.testing, "main", "name: stale\n")
-  const result = converge_remote_repository(harness, SLUG, "main", targets(), false, options())
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    false,
+    false,
+    options(),
+  )
   assert_eq(result.status, "drift")
   assert_eq(result.drifted, [PATH])
   assert_eq(wrote_anything(harness.testing), false)
@@ -171,7 +191,15 @@ pipeline test_applying_proposes_the_projection_on_a_branch(harness: Harness, tas
       ),
     },
   )
-  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, options())
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
   assert_eq(result.status, "applied")
   assert_eq(result.drifted, [PATH])
   assert_eq(result.branch, REMOTE_PROJECTION_BRANCH)
@@ -208,7 +236,15 @@ pipeline test_an_open_proposal_is_not_proposed_again(harness: Harness, task) {
     BASE + "/repos/octo-org/octo-repo/git/commits/" + BRANCH_OID,
     {status: 200, body: json_stringify({sha: BRANCH_OID, message: "chore: restore\n"})},
   )
-  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, options())
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
   assert_eq(result.status, "pending")
   assert_eq(result.branch, REMOTE_PROJECTION_BRANCH)
   assert_eq(contains(methods_called(harness.testing), "POST " + BASE + "/graphql"), false)
@@ -224,8 +260,330 @@ pipeline test_one_repository_failing_does_not_raise(harness: Harness, task) {
     BASE + "/repos/octo-org/octo-repo/branches/main",
     {status: 500, body: json_stringify({message: "server error"})},
   )
-  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, options())
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
   assert_eq(result.status, "error")
   assert_eq(result.slug, SLUG)
   assert_eq(contains(result.error ?? "", "branch head lookup failed"), true)
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// Arming
+//
+// The loop proposes and then asks GitHub to merge the proposal once the target
+// repository's own required checks pass. Every claim below is about which
+// request was issued and with which lease, because a receipt saying `armed` is
+// exactly what a run that armed the wrong commit would also print.
+//
+// One mock per method-and-URL replaces the previous one rather than queueing,
+// so the single `POST /graphql` mock answers both the commit mutation and the
+// arming mutation. Each mutation reads only its own key out of `data`, and the
+// request bodies below are what actually separate them.
+
+// -------------------------------------------------------------------------------------------------
+
+const AUTO_MERGE_PR = 77
+
+fn graphql_request_containing(testing: HarnessTesting, needle: string) -> dict? {
+  for call in testing.http_mock_calls() {
+    if to_string(call?.method ?? "") == "POST" && to_string(call?.url ?? "") == BASE + "/graphql"
+      && contains(
+      to_string(call?.body ?? ""),
+      needle,
+    ) {
+      return call
+    }
+  }
+  return nil
+}
+
+fn mock_commit_and_arm_graphql(testing: HarnessTesting) {
+  testing.http_mock(
+    "POST",
+    BASE + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            createCommitOnBranch: {
+              commit: {
+                oid: COMMIT_OID,
+                url: "https://github.com/octo-org/octo-repo/commit/" + COMMIT_OID,
+                signature: {isValid: true, state: "VALID", wasSignedByGitHub: true},
+              },
+              ref: {name: REMOTE_PROJECTION_BRANCH, target: {oid: COMMIT_OID}},
+            },
+            enablePullRequestAutoMerge: {
+              actor: {login: "harn-fleet"},
+              pullRequest: {
+                number: AUTO_MERGE_PR,
+                url: "https://github.com/octo-org/octo-repo/pull/77",
+                mergeStateStatus: "BLOCKED",
+                autoMergeRequest: {enabledAt: "2026-08-04T18:00:00Z", mergeMethod: "SQUASH"},
+              },
+            },
+          },
+        },
+      ),
+    },
+  )
+}
+
+fn mock_pull_for_arming(testing: HarnessTesting, head_oid: string) {
+  testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/pulls/" + to_string(AUTO_MERGE_PR),
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          number: AUTO_MERGE_PR,
+          node_id: "PR_node_77",
+          state: "open",
+          html_url: "https://github.com/octo-org/octo-repo/pull/77",
+          auto_merge: nil,
+          base: {ref: "main", sha: BASE_OID, repo: {full_name: SLUG, owner: {login: "octo-org"}}},
+          head: {
+            ref: REMOTE_PROJECTION_BRANCH,
+            sha: head_oid,
+            repo: {full_name: SLUG, owner: {login: "octo-org"}},
+          },
+        },
+      ),
+    },
+  )
+}
+
+fn mock_created_pull(testing: HarnessTesting) {
+  testing.http_mock(
+    "GET",
+    BASE
+      + "/repos/octo-org/octo-repo/pulls?state=open&head=octo-org%3Aautomation%2Ffleet-projections&base=main&per_page=2",
+    {status: 200, body: "[]"},
+  )
+  testing.http_mock(
+    "POST",
+    BASE + "/repos/octo-org/octo-repo/pulls",
+    {
+      status: 201,
+      body: json_stringify(
+        {
+          number: AUTO_MERGE_PR,
+          title: "chore: restore fleet-owned projections",
+          body: "body",
+          state: "open",
+          html_url: "https://github.com/octo-org/octo-repo/pull/77",
+          base: {ref: "main", sha: BASE_OID, repo: {full_name: SLUG, owner: {login: "octo-org"}}},
+          head: {
+            ref: REMOTE_PROJECTION_BRANCH,
+            sha: COMMIT_OID,
+            repo: {full_name: SLUG, owner: {login: "octo-org"}},
+          },
+        },
+      ),
+    },
+  )
+}
+
+fn mock_fresh_proposal(testing: HarnessTesting) {
+  testing.http_mock_clear()
+  mock_file(testing, "main", "name: stale\n")
+  mock_branch_head(testing)
+  testing.http_mock(
+    "POST",
+    refs_url(),
+    {
+      status: 201,
+      body: json_stringify(
+        {ref: "refs/heads/" + REMOTE_PROJECTION_BRANCH, object: {sha: BASE_OID, type: "commit"}},
+      ),
+    },
+  )
+  mock_commit_and_arm_graphql(testing)
+  mock_created_pull(testing)
+}
+
+pipeline test_arming_leases_the_commit_this_run_published(harness: Harness, task) {
+  // The lease is the safety property. Arming against the branch name, or
+  // against the base it forked from, would let a commit appended between the
+  // publication and this call ride in on the fleet's authority.
+  mock_fresh_proposal(harness.testing)
+  mock_pull_for_arming(harness.testing, COMMIT_OID)
+  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, true, options())
+  assert_eq(result.status, "applied")
+  assert_eq(result.auto_merge?.state, "armed")
+  assert_eq(result.auto_merge?.method, "SQUASH")
+  const mutation = graphql_request_containing(harness.testing, "EnableAutoMerge")
+  assert(mutation != nil, "an auto-merge mutation was issued")
+  const variables = json_parse(to_string(mutation?.body ?? "")).get("variables")
+  assert_eq(variables.get("expectedHeadOid"), COMMIT_OID)
+  assert_eq(variables.get("pullRequestId"), "PR_node_77")
+}
+
+pipeline test_a_stale_branch_head_is_refused_rather_than_armed(harness: Harness, task) {
+  // The falsifier for the test above: if the lease were decorative, a pull
+  // request whose head moved after publication would still be armed.
+  mock_fresh_proposal(harness.testing)
+  mock_pull_for_arming(harness.testing, BRANCH_OID)
+  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, true, options())
+  assert_eq(result.status, "applied")
+  assert_eq(result.auto_merge?.state, "refused")
+  assert_eq(graphql_request_containing(harness.testing, "EnableAutoMerge"), nil)
+}
+
+pipeline test_holding_arming_still_proposes(harness: Harness, task) {
+  // `--no-auto-merge` has to leave the repair and remove only the arming.
+  mock_fresh_proposal(harness.testing)
+  mock_pull_for_arming(harness.testing, COMMIT_OID)
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
+  assert_eq(result.status, "applied")
+  assert_eq(result.pull_request, AUTO_MERGE_PR)
+  assert_eq(result.auto_merge?.state, "held")
+  assert_eq(graphql_request_containing(harness.testing, "EnableAutoMerge"), nil)
+}
+
+pipeline test_a_refused_arming_does_not_fail_the_repository(harness: Harness, task) {
+  // A repository with auto-merge switched off, or a gate the App may not
+  // satisfy, leaves a proposal a human can still merge — which is the behavior
+  // this loop had before arming existed. It must be reported, and it must not
+  // turn a successful repair into a failed run.
+  mock_fresh_proposal(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/pulls/" + to_string(AUTO_MERGE_PR),
+    {status: 403, body: json_stringify({message: "Resource not accessible by integration"})},
+  )
+  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, true, options())
+  assert_eq(result.status, "applied")
+  assert_eq(result.auto_merge?.state, "refused")
+  assert_eq(remote_convergence_failed(result), false)
+  assert(trim(result.auto_merge?.error ?? "") != "", "a refusal names why")
+}
+
+pipeline test_an_already_proposed_repair_is_armed_without_a_second_commit(harness: Harness, task) {
+  // The recovery path. A run that published a commit but could not arm it must
+  // arm on the next run, or one transient refusal parks that repository
+  // forever — the pile-up this loop exists to prevent, one repository at a
+  // time. It must do that without publishing the duplicate commit that
+  // idempotence forbids.
+  harness.testing.http_mock_clear()
+  mock_file(harness.testing, "main", "name: stale\n")
+  mock_file(harness.testing, REMOTE_PROJECTION_BRANCH, EXPECTED)
+  mock_branch_head(harness.testing)
+  harness.testing.http_mock(
+    "POST",
+    refs_url(),
+    {status: 422, body: json_stringify({message: "Reference already exists"})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/git/ref/heads/" + REMOTE_PROJECTION_BRANCH,
+    {
+      status: 200,
+      body: json_stringify(
+        {ref: "refs/heads/" + REMOTE_PROJECTION_BRANCH, object: {sha: BRANCH_OID, type: "commit"}},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/git/commits/" + BRANCH_OID,
+    {status: 200, body: json_stringify({sha: BRANCH_OID, message: "chore: restore\n"})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE
+      + "/repos/octo-org/octo-repo/pulls?state=open&head=octo-org%3Aautomation%2Ffleet-projections&base=main",
+    {
+      status: 200,
+      body: json_stringify(
+        [
+          {
+            number: AUTO_MERGE_PR,
+            title: "chore: restore fleet-owned projections",
+            state: "open",
+            html_url: "https://github.com/octo-org/octo-repo/pull/77",
+            base: {ref: "main", sha: BASE_OID, repo: {full_name: SLUG, owner: {login: "octo-org"}}},
+            head: {
+              ref: REMOTE_PROJECTION_BRANCH,
+              sha: BRANCH_OID,
+              repo: {full_name: SLUG, owner: {login: "octo-org"}},
+            },
+          },
+        ],
+      ),
+    },
+  )
+  mock_commit_and_arm_graphql(harness.testing)
+  mock_pull_for_arming(harness.testing, BRANCH_OID)
+  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, true, options())
+  assert_eq(result.status, "pending")
+  assert_eq(result.pull_request, AUTO_MERGE_PR)
+  assert_eq(result.auto_merge?.state, "armed")
+  assert_eq(graphql_request_containing(harness.testing, "CreateCommitOnBranch"), nil)
+  const mutation = graphql_request_containing(harness.testing, "EnableAutoMerge")
+  assert(mutation != nil, "the standing proposal was armed")
+  assert_eq(
+    json_parse(to_string(mutation?.body ?? "")).get("variables").get("expectedHeadOid"),
+    BRANCH_OID,
+  )
+}
+
+pipeline test_a_closed_proposal_is_not_reopened_by_a_cron_job(harness: Harness, task) {
+  // Closing the pull request is how a person says no. The drift is still
+  // reported, but a nightly run must not overrule that decision.
+  harness.testing.http_mock_clear()
+  mock_file(harness.testing, "main", "name: stale\n")
+  mock_file(harness.testing, REMOTE_PROJECTION_BRANCH, EXPECTED)
+  mock_branch_head(harness.testing)
+  harness.testing.http_mock(
+    "POST",
+    refs_url(),
+    {status: 422, body: json_stringify({message: "Reference already exists"})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/git/ref/heads/" + REMOTE_PROJECTION_BRANCH,
+    {
+      status: 200,
+      body: json_stringify(
+        {ref: "refs/heads/" + REMOTE_PROJECTION_BRANCH, object: {sha: BRANCH_OID, type: "commit"}},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/git/commits/" + BRANCH_OID,
+    {status: 200, body: json_stringify({sha: BRANCH_OID, message: "chore: restore\n"})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    BASE
+      + "/repos/octo-org/octo-repo/pulls?state=open&head=octo-org%3Aautomation%2Ffleet-projections&base=main",
+    {status: 200, body: "[]"},
+  )
+  const result = converge_remote_repository(harness, SLUG, "main", targets(), true, true, options())
+  assert_eq(result.status, "pending")
+  assert_eq(result.pull_request, nil)
+  assert_eq(result.auto_merge, nil)
+  for call in methods_called(harness.testing) {
+    assert_eq(starts_with(call, "POST " + BASE + "/repos/octo-org/octo-repo/pulls"), false)
+  }
 }
