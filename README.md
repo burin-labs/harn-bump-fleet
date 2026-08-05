@@ -127,12 +127,22 @@ passed. The volume of PRs this helper has to handle is set by how much
 Dependabot coverage the fleet carries; see
 [docs/dependabot-fleet-template.md](docs/dependabot-fleet-template.md) for the
 canonical per-repo config and its grouping rules.
-A live rewrite verifies the local checkout's origin matches `--repo`,
-uses a fsmonitor-disabled temp worktree, soft-resets the PR tree to
-`origin/main`, creates one signed commit with the configured trailer, pushes
-with an exact `--force-with-lease=refs/heads/<branch>:<oldHeadOid>`, verifies
-the pushed head no longer has unsigned commits, then re-checks auto-merge. It
-does not bypass CI.
+A live rewrite verifies the local checkout's origin matches `--repo`, uses a
+fsmonitor-disabled temp worktree, and soft-resets the PR tree to `origin/main`,
+leaving the index holding exactly the tree the PR proposes. That state is
+published as one commit through `createCommitOnBranch`, which GitHub signs
+server-side under the identity of the token already in hand. The rewrite then
+waits for GitHub's pull request record to catch up to the publish, verifies the
+confirmed head no longer has unsigned commits, and re-checks auto-merge. It does
+not bypass CI.
+
+Nothing here holds a signing key, and nothing here pushes: the mutation is the
+write. That is what lets a workflow run this against its own blocked PR. The
+branch is leased with `expected_branch_oid`, which means what
+`git push --force-with-lease=<branch>:<oid>` meant before it — a branch that
+moved, or that was deleted, refuses with `stale_head` and nothing is written.
+The scratch worktree is always removed, and failing to remove it does not
+retract a signature GitHub has already issued.
 
 Common flags:
 
