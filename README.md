@@ -558,6 +558,29 @@ GitHub, so the web UI marks these tags unverified even though the signature is
 valid. Restoring that badge would mean signing as a machine user account rather
 than the App bot.
 
+The release commit is a different problem, and the bot key is the wrong answer
+to it. `burin-labs/harn`'s `main` ruleset requires signatures, and GitHub counts
+only a signature it can attribute to the committer's account — so a release
+commit signed with the bot key is real, checkable, and still refused, leaving
+the release PR blocked with every check green. The hosted workflow therefore
+passes `--github-signed-commit`, which has the harness create that commit
+through `createCommitOnBranch` under the App token it already holds. GitHub
+signs it server-side, so it needs no key at all, and the gate that follows asks
+GitHub for its verdict on the exact commit rather than asking whether this
+machine can check a signature — the same question the ruleset asks.
+
+The commit lands on a scratch `release-candidate/vX.Y.Z` branch first, because
+the immutable attempt ref is named for the object id GitHub is about to choose.
+The local branch is reset onto that commit before any gate reads it, and the
+scratch branch is deleted, so every proof below — parent, size, certification,
+tag — sees the exact commit that will be published.
+
+A release run from a machine whose signing key GitHub already accepts does not
+pass the flag and is unchanged. That route adds failure modes the local one does
+not have: `createCommitOnBranch` cannot carry a new executable file or a file
+mode change, and fails closed rather than publishing a different tree. It should
+become the only route once a hosted release has shipped through it.
+
 Both repositories are public, so the workflow assumes any secret it can read is
 worth attacking, and layers the controls accordingly:
 
