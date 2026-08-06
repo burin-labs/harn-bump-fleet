@@ -40,8 +40,12 @@ printf '%s\n' "$entry" >>"$store_path"
 git config --global credential.helper "store --file=${store_path}"
 
 # Re-login so `gh auth token` (connector gh-auth fallback) returns the remint.
-# stdin is the token; never echo it.
-printf '%s\n' "$token" | gh auth login --with-token --hostname "$host" >/dev/null
+# stdin is the token; never echo it. Clear GH_TOKEN/GITHUB_TOKEN: `gh auth login`
+# refuses to store credentials while either is set in the environment.
+env -u GH_TOKEN -u GITHUB_TOKEN \
+  printf '%s\n' "$token" \
+  | env -u GH_TOKEN -u GITHUB_TOKEN \
+    gh auth login --with-token --hostname "$host" >/dev/null
 
 # Prove the credential resolves without echoing the secret.
 if ! printf 'protocol=https\nhost=%s\n\n' "$host" \
@@ -54,7 +58,7 @@ if ! printf 'protocol=https\nhost=%s\n\n' "$host" \
   exit 1
 fi
 
-if ! gh auth token --hostname "$host" >/dev/null; then
+if ! env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname "$host" >/dev/null; then
   echo "refreshed credential did not resolve via gh auth token" >&2
   exit 1
 fi
