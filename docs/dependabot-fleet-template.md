@@ -150,6 +150,27 @@ Only two, and both need a comment saying why:
 Large multi-package repos (`burin-code`, `harn`, `harn-cloud`) exercise both.
 Everything else should be a verbatim instance of the template.
 
+## Enforcement ownership
+
+This file owns the *written* fleet contract (schedule, cooldown, grouping,
+`open-pull-requests-limit`). Delivery-policy *checks* that fail closed on the
+silent absence of Dependabot PRs live in
+`burin-labs/.github/.github/actions/check-dependabot-config`:
+
+- every update entry has a catch-all group (block or inline `patterns: ["*"]`)
+- every committed lockfile has a matching ecosystem entry
+- Cargo workspace members and path deps stay inside the configured `directory`
+- exact `pnpm-workspace.yaml` overrides carry a `# pin:` annotation
+
+Product repos call that composite action from always-on hygiene (or an
+always-on-equivalent job). Do not re-home a parallel line-reader per repo.
+Harn-local family membership (`check_dependabot_groups.harn`) remains a
+deepening for named groups + catch-all `update-types`; it is not the fleet
+delivery gate.
+
+Org package repos still project `templates/dependabot.yml` as a byte-for-byte
+`github-actions` prefix via `harn-repo-policy`.
+
 ## Conformance, audited 2026-07-18
 
 This template was written by reading what the fleet already does, not by
