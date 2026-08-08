@@ -531,7 +531,7 @@ scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode prepare --
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 
 # Resume the independent post-tag monitor. Safe to stop and rerun.
-scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
+scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 ```
 
 ### Running the release on hosted runners

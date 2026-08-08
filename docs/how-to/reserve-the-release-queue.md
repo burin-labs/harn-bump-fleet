@@ -66,7 +66,7 @@ After a successful handoff, `watch_harn_release.harn` restores them when the
 release succeeds or fails. Each watcher poll also refreshes the reservation:
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- \
+scripts/watch_harn_release.sh \
   --tag v0.10.52 \
   --yes-live-release
 ```
