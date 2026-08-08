@@ -19,10 +19,10 @@ that canonical file. It preserves every repository-specific rule outside the
 markers.
 
 ```sh
-harn run --no-sandbox sync_agent_guidance.harn -- --check
-harn run --no-sandbox sync_agent_guidance.harn -- --dry-run
-harn run --no-sandbox sync_agent_guidance.harn -- --apply
-harn run --no-sandbox sync_agent_guidance.harn -- --only harn-cloud
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --dry-run
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --apply
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --only harn-cloud
 ```
 
 ## Repository scope
@@ -36,49 +36,51 @@ ignored under `.harn-runs/` and `.harn/`.
 
 Harn sandboxes `harn run` by default. These local ops harnesses inspect
 `~/projects`, local Git state, and authenticated GitHub connector state, so use
-`harn run --no-sandbox` for real local release and bump runs. Mock release
-rehearsals can stay sandboxed.
+`scripts/with_env.sh harn run --no-sandbox` for real local release and bump
+runs. The wrapper verifies the repo-pinned runtime before Harn parses the
+program and loads the configured provider environment. Mock release rehearsals
+can stay sandboxed.
 
 ## Usage
 
 ```sh
 # Bump every dependent repo to the latest harn release.
-harn run --no-sandbox bump_fleet.harn
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn
 
 # Pin to an explicit tag.
-harn run --no-sandbox bump_fleet.harn -- vX.Y.Z
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- vX.Y.Z
 
 # Discover-only: never dispatches anything, useful before a real run.
-harn run --no-sandbox bump_fleet.harn -- --dry-run
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Run on one repo only.
-harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
 # Check fleet-owned package CI adapters without writing them.
-harn run --no-sandbox sync_package_ci.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 
 # Check fleet-owned runtime-bump adapters without writing them.
-harn run --no-sandbox sync_bump_workflows.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
 
 # Report every remote fleet-owned file that drifts from fleet.toml.
-harn run --no-sandbox converge_fleet_projections.harn -- --check
+scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 
 # Propose the repair as one pull request per drifted repository.
-harn run --no-sandbox converge_fleet_projections.harn -- --apply
+scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --apply
 
 # Inspect unsigned bot dependency PRs that are blocked by required signatures.
-harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
+scripts/with_env.sh harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
 
 # Rewrite one selected in-repo bot PR head as a signed commit and re-check auto-merge.
-harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --pr 3704 --live
+scripts/with_env.sh harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --pr 3704 --live
 
 # Verify a release prerequisite PR is actually merged before acting on it.
-harn run --no-sandbox verify_prerequisite_pr.harn -- --repo burin-labs/harn --pr 4872 --expected-head <sha>
+scripts/with_env.sh harn run --no-sandbox verify_prerequisite_pr.harn -- --repo burin-labs/harn --pr 4872 --expected-head <sha>
 
 # Use a different local LLM for the summary.
 HARN_BUMP_FLEET_MODEL=gpt-oss:120b \
 HARN_BUMP_FLEET_PROVIDER=ollama \
-  harn run --no-sandbox bump_fleet.harn
+  scripts/with_env.sh harn run --no-sandbox bump_fleet.harn
 ```
 
 These operation harnesses inspect sibling checkouts under `~/projects`, run
@@ -177,14 +179,14 @@ apply a fix to the harness or release artifacts mid-debrief if you ask.
 
 ```sh
 # Disable chat even when at a TTY.
-harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_EXT_CHAT=0`
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_EXT_CHAT=0`
 
 # Skip the pipeline; open the loop over a prior run.
-harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
-harn run --no-sandbox release_harn.harn -- --chat-only --chat-run <run-id>   # direct
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only --chat-run <run-id>   # direct
 
 # Change the start-typing timeout (default 60s).
-harn run --no-sandbox bump_fleet.harn -- --chat-timeout-s 120
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --chat-timeout-s 120
 ```
 
 `release_harn.harn` also runs a **non-trivial classifier** before live
@@ -286,7 +288,7 @@ The default release Cargo target is
 `$HOME/.cache/harn-bump-fleet/release-harn-target` when `XDG_CACHE_HOME` is
 unset. Override it only when a release lane needs an isolated cache.
 
-`harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
+`scripts/with_env.sh harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
 at the top of every run summarizing the resolved route.
 
 ### AMFI-shielded launcher (macOS)
@@ -303,8 +305,8 @@ and execs that copy. Re-stages only when the source binary's size+mtime
 changes, so warm runs cost ~50ms.
 
 ```sh
-scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
-scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
 ```
 
 Drop-in for any `harn ...` invocation. CI environments don't need it
@@ -330,7 +332,7 @@ auto-selected), set `HARN_PLANNER_PROVIDER=ollama` and pull the model:
 
 ```sh
 ollama pull qwen3.6:35b-a3b-coding-nvfp4
-HARN_PLANNER_PROVIDER=ollama harn run --no-sandbox release_harn.harn
+HARN_PLANNER_PROVIDER=ollama scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
 
 ## CI
@@ -475,26 +477,26 @@ failure stops publication before the tag reaches the remote.
 Default mode is read-only audit:
 
 ```sh
-harn run --no-sandbox release_harn.harn
+scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
 
 Useful rehearsals:
 
 ```sh
 # Fully mocked vX.Y.Z -> vX.Y.(Z+1) audit. No repo/GitHub writes.
-harn run --no-sandbox release_harn.harn -- --mock
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock
 
 # Mocked agent/tool loop using Harn's mock LLM provider.
-harn run --no-sandbox release_harn.harn -- --mock --agent
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent
 
 # Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
-harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 
 # Run the scheduled fail-collect rehearsal matrix. This uses the safe mock
 # release path under adversarial operator environments and writes JSON/Markdown
 # reports under .harn-runs/release-rehearsal/.
-harn run --no-sandbox release_harn.harn -- --rehearsal --no-chat
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --rehearsal --no-chat
 ```
 
 Real release cuts should have a green release rehearsal from the previous
@@ -523,13 +525,13 @@ titles.
 ```sh
 # The source checkout may be on any branch or dirty; release work is isolated.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
-harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
-harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 
 # Resume the independent post-tag monitor. Safe to stop and rerun.
-harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
+scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
 ```
 
 ### Running the release on hosted runners
@@ -620,7 +622,10 @@ warm-cache run identity and outcome.
 `watch_harn_release.harn` validates that receipt at the JSON boundary, rewrites
 it through rename-into-place after every snapshot, and may be restarted without
 repeating release preparation, tag creation, binary recovery dispatch, or an
-accepted warm-cache run. A normal invocation continues after release health is
+accepted warm-cache run. One cancellation-safe host lease makes the full
+read-transition-write loop, recovery dispatch, queue restoration, and ref
+cleanup single-writer; a second local watcher fails before reading the receipt.
+A normal invocation continues after release health is
 proven until the release PR merges and the warm matrix completes or fails. The
 watcher prints semantic workflow/job transitions plus a five-minute heartbeat,
 including the active job step and receipt path, so a slow platform build remains
@@ -661,8 +666,8 @@ landed after it froze — so a gate the fix was meant to satisfy keeps failing.
 `abandon_release_attempts.harn` is the escape:
 
 ```sh
-harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
-harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
+scripts/with_env.sh harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+scripts/with_env.sh harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
 ```
 
 A tag claims only the exact OID it recovers. When a release tags one candidate

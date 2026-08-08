@@ -91,16 +91,16 @@ committed tree.
 Common harness runs:
 
 ```sh
-harn run --no-sandbox bump_fleet.harn -- --dry-run
-harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
-harn run --no-sandbox release_harn.harn
-harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
-harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
-harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
-harn run --no-sandbox sync_agent_guidance.harn -- --check
-harn run --no-sandbox sync_package_ci.harn -- --check
-harn run --no-sandbox sync_bump_workflows.harn -- --check
-harn run --no-sandbox converge_fleet_projections.harn -- --check
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
+scripts/with_env.sh harn run --no-sandbox release_harn.harn
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
+scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 ```
 
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
@@ -114,6 +114,14 @@ Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
 installs the pinned CLI into this repo's ignored `.harn/bin`.
 `scripts/with_env.sh` and `scripts/harn_shielded.sh` prefer that binary over a
 stale global `harn` on `PATH`.
+
+Use `scripts/with_env.sh harn ...` for every documented harness invocation. It
+installs and selects the repo-pinned runtime before Harn parses the program, and
+loads the provider environment without putting secrets on the command line.
+Direct ambient `harn` invocations are not a supported release path. Hosted and
+local releases are alternative owners of the same lane, not parallel fallbacks:
+do not start one while the other is active. Run only one live release watcher;
+the watcher host lease refuses a second local receipt writer.
 
 ## Implementation rules
 

@@ -214,7 +214,7 @@ unsigned. Dependabot PRs will sit un-mergeable until they are re-signed. Use
 `sign_bot_prs.harn` in this repo:
 
 ```sh
-harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
+scripts/with_env.sh harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs/harn --prs 3704,3705
 ```
 
 Budget for this when adding coverage to a repo: more ecosystems means more bot
