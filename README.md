@@ -702,16 +702,21 @@ release; do not start the next version from an orphaned fold.
 
 Every non-mock run first freezes the release parent (`--at-sha` /
 `HARN_EXT_RELEASE_PIN_SHA` / `origin/<base>` HEAD) and materializes that exact commit
-in a detached, run-owned worktree. Audit, version, changelog, diff, generated
+in a detached managed worktree. Audit, version, changelog, diff, generated
 artifact, and agent-review inputs all use that one root; the receipt records the
-requested ref, resolved commit, source checkout, and analyzed root. Read-only
-audits remove their worktree on success or failure without changing the caller's
-branch, index, or files. Canonical `ship-pr` uses the same materialization
-boundary to produce and sign the versioned candidate, proves that the frozen
-parent is its sole parent, and publishes the write-once `release-attempt/...`
-ref. Because GitHub `workflow_dispatch` cannot target a bare SHA, certification
-publishes a second write-once `release-certify/<candidate-oid>` branch at that
-exact prepared commit.
+requested ref, resolved commit, source checkout, and analyzed root. One typed
+`release-workspace` host lease owns the reusable checkout for its complete
+lifecycle. An audit takes it only when free and retains the checkout only after
+proving it clean; a contending audit uses a per-run checkout and removes that
+checkout on every terminal path. A live release waits for an earlier audit and
+then inherits the warm checkout instead of silently recompiling, while new
+audits yield as soon as `release-owner` records the live claimant. None of these
+paths changes the caller's branch, index, or files. Canonical `ship-pr` uses the
+same materialization boundary to produce and sign the versioned candidate,
+proves that the frozen parent is its sole parent, and publishes the write-once
+`release-attempt/...` ref. Because GitHub `workflow_dispatch` cannot target a
+bare SHA, certification publishes a second write-once
+`release-certify/<candidate-oid>` branch at that exact prepared commit.
 
 The controller dispatches `windows-nightly.yml` and `macos-nightly.yml` against
 that branch through the typed GitHub Actions connector and retains the exact
