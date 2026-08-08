@@ -96,7 +96,7 @@ scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/h
 scripts/with_env.sh harn run --no-sandbox release_harn.harn
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
-scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- --tag vX.Y.Z --yes-live-release
+scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
@@ -121,7 +121,10 @@ loads the provider environment without putting secrets on the command line.
 Direct ambient `harn` invocations are not a supported release path. Hosted and
 local releases are alternative owners of the same lane, not parallel fallbacks:
 do not start one while the other is active. Run only one live release watcher;
-the watcher host lease refuses a second local receipt writer.
+the watcher host lease refuses a second local receipt writer. Always start that
+watcher through `scripts/watch_harn_release.sh`; it selects and shields the
+repo-pinned runtime and supplies the exact `git.push` operator grant required by
+terminal leased-ref cleanup.
 
 ## Implementation rules
 
