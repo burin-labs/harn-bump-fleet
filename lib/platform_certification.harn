@@ -112,6 +112,27 @@ pub type PlatformCertificationDecision = {
   cancellations: list<dict>,
 }
 
+/**
+ * Exact hosted runs acquired for one immutable candidate.
+ *
+ * Acquisition is intentionally separate from receipt closure so callers can
+ * start the expensive hosted workflows before producing local warm evidence.
+ * The session is not evidence: only `finish_platform_certification` may turn
+ * these identities into a certification receipt.
+ */
+pub type PlatformCertificationSessionCode = "acquired" \
+  | "dispatch_failed" \
+  | "dispatch_identity_invalid"
+
+pub type PlatformCertificationSession = {
+  success: bool,
+  code: PlatformCertificationSessionCode,
+  reason: string,
+  dispatches: list<dict>,
+  starts: list<int>,
+  cancellations: list<dict>,
+}
+
 pub type PlatformCertificationCauseCategory = "platform_proof" \
   | "local_source" \
   | "lane_abandoned" \
@@ -1082,32 +1103,14 @@ pub fn platform_certification_duration_ms(timing: dict) -> int {
   return duration
 }
 
-/**
- * Dispatch exact hosted runs, overlap both waits with the local source audit,
- * then close a receipt only after `cfg.branch` is re-read unchanged.
- *
- * Callers must publish `platform_certification_branch(pin_sha)` first and pass
- * that immutable ref as `cfg.branch`. Dispatching on a moving base branch races
- * merges into the exact-identity check.
- */
-pub fn resolve_platform_certification(
+/** Acquire the exact hosted runs without claiming any certification evidence. */
+pub fn begin_platform_certification(
   harness: Harness,
   cfg: PlatformCertificationConfig,
-  binary_sha256: string,
   query_adapter: PlatformCertificationAdapter? = nil,
   dispatch_registry: PlatformCertificationDispatchRegistry? = nil,
-  outer_abort: LaneAbortProbe? = nil,
-) -> PlatformCertificationDecision {
+) -> PlatformCertificationSession {
   const adapter = query_adapter ?? production_adapter(harness, cfg)
-  const binary_sha = lowercase(trim(binary_sha256))
-  if len(regex_captures("^[0-9a-f]{64}$", binary_sha)) == 0 {
-    return {
-      success: false,
-      code: "invalid_binary_sha",
-      reason: "exact-pin Harn CLI hash was invalid",
-      cancellations: [],
-    }
-  }
   let dispatches: list<dict> = []
   let starts: list<int> = []
   for spec in PLATFORM_SPECS {
@@ -1119,6 +1122,8 @@ pub fn resolve_platform_certification(
         success: false,
         code: "dispatch_failed",
         reason: "dispatch failed for ${spec.platform}: " + to_string(unwrap_err(result)),
+        dispatches: dispatches,
+        starts: starts,
         cancellations: cancellations,
       }
     }
@@ -1132,6 +1137,8 @@ pub fn resolve_platform_certification(
         success: false,
         code: "dispatch_identity_invalid",
         reason: "dispatch returned malformed exact identity for ${spec.platform}",
+        dispatches: dispatches + [dispatch],
+        starts: starts + [started],
         cancellations: cancellations,
       }
     }
@@ -1144,6 +1151,75 @@ pub fn resolve_platform_certification(
         spec.platform,
         dispatch.run_id,
       )
+    }
+  }
+  return {
+    success: true,
+    code: "acquired",
+    reason: "acquired exact Windows and macOS runs for ${cfg.pin_sha}",
+    dispatches: dispatches,
+    starts: starts,
+    cancellations: [],
+  }
+}
+
+/** Cancel every hosted run named by an acquired session. */
+pub fn cancel_platform_certification_session(
+  harness: Harness,
+  cfg: PlatformCertificationConfig,
+  session: PlatformCertificationSession,
+  query_adapter: PlatformCertificationAdapter? = nil,
+) -> list<dict> {
+  const adapter = query_adapter ?? production_adapter(harness, cfg)
+  return cleanup_runs(adapter, session.dispatches)
+}
+
+/**
+ * Join an acquired hosted session with local source and warm-binary evidence.
+ *
+ * This is the only receipt-closing path. Re-reading the immutable remote ref,
+ * exact workflow/job identity, local source lanes, and the binary digest remain
+ * mandatory even when acquisition happened before the local warm.
+ */
+pub fn finish_platform_certification(
+  harness: Harness,
+  cfg: PlatformCertificationConfig,
+  binary_sha256: string,
+  session: PlatformCertificationSession,
+  query_adapter: PlatformCertificationAdapter? = nil,
+  dispatch_registry: PlatformCertificationDispatchRegistry? = nil,
+  outer_abort: LaneAbortProbe? = nil,
+) -> PlatformCertificationDecision {
+  const adapter = query_adapter ?? production_adapter(harness, cfg)
+  if !session.success {
+    return {
+      success: false,
+      code: if session.code == "dispatch_identity_invalid" {
+        "dispatch_identity_invalid"
+      } else {
+        "dispatch_failed"
+      },
+      reason: session.reason,
+      cancellations: session.cancellations,
+    }
+  }
+  const binary_sha = lowercase(trim(binary_sha256))
+  if len(regex_captures("^[0-9a-f]{64}$", binary_sha)) == 0 {
+    return {
+      success: false,
+      code: "invalid_binary_sha",
+      reason: "exact-pin Harn CLI hash was invalid",
+      cancellations: cleanup_runs(adapter, session.dispatches),
+    }
+  }
+  const dispatches = session.dispatches
+  const starts = session.starts
+  if len(dispatches) != len(PLATFORM_SPECS) || len(starts) != len(PLATFORM_SPECS) {
+    return {
+      success: false,
+      code: "dispatch_identity_invalid",
+      reason: "acquired platform session was incomplete",
+      cancellations: cleanup_runs(adapter, dispatches),
     }
   }
   const local_started = adapter.now_ms()
@@ -1264,6 +1340,42 @@ pub fn resolve_platform_certification(
     receipt: receipt,
     cancellations: [],
   }
+}
+
+/**
+ * Acquire and finish in one call for consumers that do not own earlier work.
+ * Release preparation uses the same begin/finish pair directly to overlap its
+ * exact-pin warm; this wrapper is only the synchronous projection of that one
+ * certification system.
+ */
+pub fn resolve_platform_certification(
+  harness: Harness,
+  cfg: PlatformCertificationConfig,
+  binary_sha256: string,
+  query_adapter: PlatformCertificationAdapter? = nil,
+  dispatch_registry: PlatformCertificationDispatchRegistry? = nil,
+  outer_abort: LaneAbortProbe? = nil,
+) -> PlatformCertificationDecision {
+  const binary_sha = lowercase(trim(binary_sha256))
+  if len(regex_captures("^[0-9a-f]{64}$", binary_sha)) == 0 {
+    return {
+      success: false,
+      code: "invalid_binary_sha",
+      reason: "exact-pin Harn CLI hash was invalid",
+      cancellations: [],
+    }
+  }
+  const adapter = query_adapter ?? production_adapter(harness, cfg)
+  const session = begin_platform_certification(harness, cfg, adapter, dispatch_registry)
+  return finish_platform_certification(
+    harness,
+    cfg,
+    binary_sha256,
+    session,
+    adapter,
+    dispatch_registry,
+    outer_abort,
+  )
 }
 
 /** Deterministic adapter used by release-pipeline fixtures. */
