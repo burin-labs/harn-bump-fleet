@@ -95,6 +95,12 @@ import {
   materialize_release_workspace,
   release_post_cleanup_config,
 } from "lib/release_workspace"
+import {
+  ReleaseWorkspaceLease,
+  release_workspace_lease_acquire,
+  release_workspace_lease_finish,
+  release_workspace_lease_shared,
+} from "lib/release_workspace_lease"
 import { ReleaseAuditReceipt } from "lib/run_receipts"
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { timing_artifacts, timing_summary_lines } from "lib/timing_report"
@@ -104,8 +110,22 @@ fn finish_workspace(
   cfg: ReleaseConfig,
   succeeded: bool,
   run_id: string,
+  workspace_lease: ReleaseWorkspaceLease,
 ) -> dict? {
-  const cleanup = finish_release_workspace(harness, cfg, succeeded, run_id)
+  let cleanup: dict? = nil
+  try {
+    cleanup = finish_release_workspace(harness, cfg, succeeded, run_id)
+  } finally {
+    const finished = release_workspace_lease_finish(harness.host_lease, workspace_lease)
+    if finished != nil {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "release_workspace_lease_released",
+        finished,
+      )
+    }
+  }
   if cleanup != nil {
     harness.stdio.println("== release workspace")
     if trim(cleanup.warning ?? "") != "" {
@@ -226,9 +246,47 @@ pipeline main(harness: Harness) {
       },
     )
   }
-  // Only a run holding the release lane can share one reusable workspace with
-  // the runs before and after it. Everything else materializes its own.
-  cfg = materialize_release_workspace(harness, cfg, run_id, owner_guard.state == "owned")
+  const workspace_holder_class = if owner_guard.state == "owned" {
+    "release"
+  } else {
+    "audit"
+  }
+  const workspace_lease = release_workspace_lease_acquire(
+    {clock: harness.clock, host_lease: harness.host_lease, stdio: harness.stdio},
+    cfg,
+    run_id,
+    workspace_holder_class,
+  )
+  if workspace_lease.state == "owned" {
+    harness.stdio.println(
+      "   workspace lease: ${workspace_lease.handle.domain} (${workspace_lease.decision.action}, ${workspace_holder_class})",
+    )
+  } else if workspace_lease.state == "fallback" {
+    harness.stdio.println(
+      "   workspace lease: per-run fallback (${workspace_lease.decision.reason})",
+    )
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_workspace_lease_decided",
+    workspace_lease.decision,
+  )
+  // The workspace lease is the authority for the stable path. Audits take it
+  // opportunistically; live releases wait rather than silently pay for a fresh
+  // checkout when an earlier audit still owns it.
+  try {
+    cfg = materialize_release_workspace(
+      harness,
+      cfg,
+      run_id,
+      release_workspace_lease_shared(workspace_lease),
+    )
+  } catch (e) {
+    release_workspace_lease_finish(harness.host_lease, workspace_lease)
+    release_owner_guard_finish(harness.host_lease, owner_guard, "workspace_materialization", false)
+    throw e
+  }
   if cfg.release_workspace_managed {
     harness.stdio.println("   workspace: ${cfg.repo}")
     harness.stdio.println("   source   : ${cfg.source_repo} (left unchanged)")
@@ -275,7 +333,7 @@ pipeline main(harness: Harness) {
     )
     if !release_body_gate.proceed {
       harness.stdio.println("!! release body integrity blocked live release side effects")
-      finish_workspace(harness, derived_cfg, false, run_id)
+      finish_workspace(harness, derived_cfg, false, run_id, workspace_lease)
       finish_release_run_timing(harness.clock, run_timing, "release_body_integrity_blocked", false)
       release_owner_guard_finish(
         harness.host_lease,
@@ -337,7 +395,7 @@ pipeline main(harness: Harness) {
       if drift_state.kind == "paperwork_pr_open" {
         harness.stdio.println("== post-merge paperwork PR already open: ${drift_state.pr_url}")
         harness.stdio.println("   no changes needed (the open PR already fixes the drift)")
-        finish_workspace(harness, derived_cfg, true, run_id)
+        finish_workspace(harness, derived_cfg, true, run_id, workspace_lease)
         finish_release_run_timing(harness.clock, run_timing, "post_merge_paperwork_pr_open", true)
         release_owner_guard_finish(
           harness.host_lease,
@@ -353,7 +411,7 @@ pipeline main(harness: Harness) {
         {base: derived_cfg.base, mock: derived_cfg.mock},
         { -> return run_post_merge_paperwork_pr(harness, derived_cfg, drift_state, run_id) },
       ).result
-      finish_workspace(harness, derived_cfg, drift_exit == 0, run_id)
+      finish_workspace(harness, derived_cfg, drift_exit == 0, run_id, workspace_lease)
       finish_release_run_timing(
         harness.clock,
         run_timing,
@@ -457,7 +515,7 @@ pipeline main(harness: Harness) {
       for line in analysis.release_scope_findings {
         harness.stdio.println("   - ${line}")
       }
-      finish_workspace(harness, effective_cfg, false, run_id)
+      finish_workspace(harness, effective_cfg, false, run_id, workspace_lease)
       finish_release_run_timing(harness.clock, run_timing, "release_scope_aborted", false)
       release_owner_guard_finish(harness.host_lease, owner_guard, "release_scope_aborted", false)
       return 2
@@ -474,7 +532,7 @@ pipeline main(harness: Harness) {
         "tagged_fixup_pr_adopted",
         {pr_url: fixup_pr.url, head_oid: fixup_pr.head.sha, tag: fixup_state.tag},
       )
-      finish_workspace(harness, effective_cfg, true, run_id)
+      finish_workspace(harness, effective_cfg, true, run_id, workspace_lease)
       finish_release_run_timing(harness.clock, run_timing, "tagged_fixup_pr_open", true)
       release_owner_guard_finish(harness.host_lease, owner_guard, "tagged_fixup_pr_open", true)
       return 0
@@ -694,7 +752,7 @@ pipeline main(harness: Harness) {
           {reason: gate.reason},
         )
         harness.stdio.println("== chat: aborting before live release side effects (${gate.reason})")
-        finish_workspace(harness, effective_cfg, false, run_id)
+        finish_workspace(harness, effective_cfg, false, run_id, workspace_lease)
         finish_release_run_timing(harness.clock, run_timing, "pre_release_gate_aborted", false)
         release_owner_guard_finish(
           harness.host_lease,
@@ -815,7 +873,13 @@ pipeline main(harness: Harness) {
           "release.workspace_cleanup",
           {mode: effective_cfg.mode, mock: effective_cfg.mock},
           { ->
-            return finish_workspace(harness, effective_cfg, !execution_failed(execution), run_id)
+            return finish_workspace(
+              harness,
+              effective_cfg,
+              !execution_failed(execution),
+              run_id,
+              workspace_lease,
+            )
           },
         ).result
         return {execution: execution, cleanup: cleanup}
@@ -952,7 +1016,7 @@ pipeline main(harness: Harness) {
       cleanup_failure = trim(queue_restore.stderr ?? "release queue restoration failed")
     }
     try {
-      const cleanup = finish_workspace(harness, cfg, false, run_id)
+      const cleanup = finish_workspace(harness, cfg, false, run_id, workspace_lease)
       if cleanup != nil && !cleanup.success {
         const workspace_failure = trim(
           cleanup.warning ?? cleanup.detail ?? "workspace cleanup failed",

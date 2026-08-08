@@ -1,0 +1,237 @@
+import {
+  HostLeaseAcquireReceipt,
+  HostLeaseHandle,
+  HostLeaseOptions,
+  host_lease_acquire,
+  host_lease_release,
+  host_lease_status,
+} from "std/host_lease"
+
+const RELEASE_OWNER_DOMAIN = "release-owner"
+
+const RELEASE_WORKSPACE_DOMAIN = "release-workspace"
+
+const RELEASE_WORKSPACE_WAIT_MS = 30 * 60 * 1000
+
+const RELEASE_WORKSPACE_WAIT_SLICE_MS = 250
+
+pub type ReleaseWorkspaceHolderClass = "release" | "audit"
+
+pub type ReleaseWorkspaceLeaseHarness = {
+  clock: HarnessClock,
+  host_lease: HarnessHostLease,
+  stdio: HarnessStdio,
+}
+
+pub type ReleaseWorkspaceLeaseDecision = {
+  action: "disabled" | "acquired" | "recovered_dead_owner" | "waited_for_audit" | "fallback",
+  holder_class: ReleaseWorkspaceHolderClass,
+  reason: string,
+  waited_ms: int,
+  active_owner: string,
+  active_holder_class: string,
+}
+
+pub type ReleaseWorkspaceLease = {
+  state: "disabled" | "fallback",
+  decision: ReleaseWorkspaceLeaseDecision,
+} \
+  | {
+  state: "owned",
+  acquire: HostLeaseAcquireReceipt,
+  handle: HostLeaseHandle,
+  decision: ReleaseWorkspaceLeaseDecision,
+}
+
+pub type ReleaseWorkspaceLeaseFinish = {
+  released: bool,
+  holder_class: ReleaseWorkspaceHolderClass,
+  lease_id: string,
+  domain: string,
+}
+
+fn disabled_decision(holder_class: ReleaseWorkspaceHolderClass) -> ReleaseWorkspaceLeaseDecision {
+  return {
+    action: "disabled",
+    holder_class: holder_class,
+    reason: "mock releases do not materialize a workspace",
+    waited_ms: 0,
+    active_owner: "",
+    active_holder_class: "",
+  }
+}
+
+fn active_holder_class(acquire: HostLeaseAcquireReceipt) -> string {
+  return trim(acquire.defer?.active?.metadata?.holder_class ?? "")
+}
+
+fn acquired_workspace_lease(
+  acquire: HostLeaseAcquireReceipt,
+  holder_class: ReleaseWorkspaceHolderClass,
+  waited_for_audit: bool,
+  waited_ms: int = 0,
+) -> ReleaseWorkspaceLease {
+  const handle = acquire.handle
+  if handle == nil || acquire.guard == nil {
+    throw "release workspace lease acquired without authority"
+  }
+  const action = if waited_for_audit {
+    "waited_for_audit"
+  } else if acquire.recovered != nil {
+    "recovered_dead_owner"
+  } else {
+    "acquired"
+  }
+  return {
+    state: "owned",
+    acquire: acquire,
+    handle: handle,
+    decision: {
+      action: action,
+      holder_class: holder_class,
+      reason: if waited_for_audit {
+        "live release waited for the audit holder and kept the reusable path"
+      } else {
+        "workspace lease ${action}"
+      },
+      waited_ms: waited_ms,
+      active_owner: "",
+      active_holder_class: "",
+    },
+  }
+}
+
+pub fn release_workspace_lease_options(
+  cfg: dict,
+  holder_class: ReleaseWorkspaceHolderClass,
+  run_id: string,
+) -> HostLeaseOptions {
+  return {
+    owner: "release-harn.${run_id}",
+    resource_class: "whole-machine",
+    domain: trim(cfg.release_workspace_lease_domain ?? RELEASE_WORKSPACE_DOMAIN),
+    priority_class: if holder_class == "release" {
+      "interactive"
+    } else {
+      "deferrable"
+    },
+    wait_timeout_ms: 0,
+    reason: "serialize reusable release workspace access",
+    metadata: {holder_class: holder_class, mode: cfg.mode ?? "", run_id: run_id},
+  }
+}
+
+/**
+ * Claim the one reusable release checkout for its complete materialized life.
+ *
+ * Audits are opportunistic: an existing workspace owner, or a live release
+ * that has already claimed `release-owner`, sends them to a per-run checkout.
+ * Live releases never silently take that slow path. If an audit was already
+ * using the shared checkout, the release waits for its guarded cleanup and
+ * then inherits the warmed tree. Host leases do not preempt healthy holders;
+ * replacing one would leave the audit touching the directory without authority.
+ */
+pub fn release_workspace_lease_acquire(
+  harness: ReleaseWorkspaceLeaseHarness,
+  cfg: dict,
+  run_id: string,
+  holder_class: ReleaseWorkspaceHolderClass,
+) -> ReleaseWorkspaceLease {
+  if cfg.mock ?? false {
+    return {state: "disabled", decision: disabled_decision(holder_class)}
+  }
+  const options = release_workspace_lease_options(cfg, holder_class, run_id)
+  if holder_class == "audit" {
+    const owner_state = host_lease_status(
+      harness.host_lease,
+      nil,
+      "whole-machine",
+      trim(cfg.owner_guard_domain ?? RELEASE_OWNER_DOMAIN),
+    )
+    if owner_state.active != nil {
+      return {
+        state: "fallback",
+        decision: {
+          action: "fallback",
+          holder_class: holder_class,
+          reason: "live release already owns the release lane",
+          waited_ms: 0,
+          active_owner: owner_state.active.owner,
+          active_holder_class: "release",
+        },
+      }
+    }
+  }
+  let acquire = host_lease_acquire(harness.host_lease, options)
+  if acquire.status == "acquired" {
+    return acquired_workspace_lease(acquire, holder_class, false)
+  }
+  const active = acquire.defer?.active
+  const active_class = active_holder_class(acquire)
+  if holder_class == "audit" {
+    return {
+      state: "fallback",
+      decision: {
+        action: "fallback",
+        holder_class: holder_class,
+        reason: "reusable workspace is already leased",
+        waited_ms: acquire.waited_ms,
+        active_owner: active?.owner ?? "another process",
+        active_holder_class: active_class,
+      },
+    }
+  }
+  if active_class != "audit" {
+    throw "release workspace lease is held by ${active?.owner ?? "another process"} with invalid holder class '${active_class}'"
+  }
+  harness.stdio.println(
+    "   workspace lease: waiting for audit ${active?.owner ?? "another process"} to finish",
+  )
+  const wait_timeout_ms = cfg.release_workspace_lease_wait_ms ?? RELEASE_WORKSPACE_WAIT_MS
+  if wait_timeout_ms <= 0 {
+    throw "release workspace lease wait must be positive for a live release"
+  }
+  const started_ms = harness.clock.monotonic_ms()
+  while acquire.status == "deferred" {
+    const elapsed_ms = harness.clock.monotonic_ms() - started_ms
+    const remaining_ms = wait_timeout_ms - elapsed_ms
+    if remaining_ms <= 0 {
+      throw "timed out waiting for audit ${active?.owner ?? "another process"} to release the reusable workspace"
+    }
+    const slice_ms = min(RELEASE_WORKSPACE_WAIT_SLICE_MS, remaining_ms)
+    // A bounded clock suspension yields to a sibling task in the same Harn VM;
+    // a blocking host call would freeze the audit task that needs to release.
+    harness.clock.sleep_ms(slice_ms)
+    acquire = host_lease_acquire(harness.host_lease, options)
+    if acquire.status == "deferred" && active_holder_class(acquire) != "audit" {
+      throw "release workspace lease changed to a non-audit holder while the release waited"
+    }
+  }
+  return acquired_workspace_lease(
+    acquire,
+    holder_class,
+    true,
+    harness.clock.monotonic_ms() - started_ms,
+  )
+}
+
+pub fn release_workspace_lease_shared(lease: ReleaseWorkspaceLease) -> bool {
+  return lease.state == "owned"
+}
+
+/** Release the exact workspace authority after retention or removal completes. */
+pub fn release_workspace_lease_finish(
+  host_lease: HarnessHostLease,
+  lease: ReleaseWorkspaceLease,
+) -> ReleaseWorkspaceLeaseFinish? {
+  if lease.state != "owned" {
+    return nil
+  }
+  const released = host_lease_release(host_lease, lease.acquire)
+  return {
+    released: released.released,
+    holder_class: lease.decision.holder_class,
+    lease_id: lease.handle.lease_id,
+    domain: lease.handle.domain,
+  }
+}

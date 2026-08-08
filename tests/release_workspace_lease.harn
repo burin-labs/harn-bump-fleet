@@ -1,0 +1,98 @@
+import { release_owner_guard_acquire, release_owner_guard_finish } from "../lib/release_owner_guard"
+import {
+  release_workspace_lease_acquire,
+  release_workspace_lease_finish,
+  release_workspace_lease_options,
+  release_workspace_lease_shared,
+} from "../lib/release_workspace_lease"
+
+fn domains(random: HarnessRandom) -> dict {
+  const suffix = random.uuid_v7()
+  return {
+    mode: "audit",
+    mock: false,
+    yes_live_release: false,
+    release_workspace_lease_domain: "release-workspace-test-" + suffix,
+    owner_guard_domain: "release-owner-test-" + suffix,
+    release_workspace_lease_wait_ms: 5000,
+  }
+}
+
+pipeline test_workspace_lease_options_type_priority_and_holder(task) {
+  const cfg = {mode: "audit", release_workspace_lease_domain: "release-workspace-test"}
+  const audit = release_workspace_lease_options(cfg, "audit", "audit-run")
+  assert_eq(audit.domain, "release-workspace-test")
+  assert_eq(audit.priority_class, "deferrable")
+  assert_eq(audit.metadata.holder_class, "audit")
+  const release = release_workspace_lease_options(cfg, "release", "release-run")
+  assert_eq(release.domain, audit.domain)
+  assert_eq(release.priority_class, "interactive")
+  assert_eq(release.metadata.holder_class, "release")
+}
+
+@serial(group: "host-lease-store")
+pipeline test_a_second_audit_falls_back_instead_of_racing_the_shared_path(harness: Harness, task) {
+  const cfg = domains(harness.random)
+  const lease_harness = {clock: harness.clock, host_lease: harness.host_lease, stdio: harness.stdio}
+  const first = release_workspace_lease_acquire(lease_harness, cfg, "audit-a", "audit")
+  assert_eq(first.state, "owned")
+  assert_eq(release_workspace_lease_shared(first), true)
+  const second = release_workspace_lease_acquire(lease_harness, cfg, "audit-b", "audit")
+  assert_eq(second.state, "fallback")
+  assert_eq(second.decision.active_holder_class, "audit")
+  assert_eq(release_workspace_lease_shared(second), false)
+  assert_eq(release_workspace_lease_finish(harness.host_lease, second), nil)
+  assert_eq(release_workspace_lease_finish(harness.host_lease, first)?.released, true)
+}
+
+@serial(group: "host-lease-store")
+pipeline test_new_audit_yields_as_soon_as_a_live_release_claims_its_lane(harness: Harness, task) {
+  const cfg = domains(harness.random)
+  const owner = release_owner_guard_acquire(
+    harness.host_lease,
+    {mode: "ship-pr", yes_live_release: true, owner_guard_domain: cfg.owner_guard_domain},
+    {},
+    "release-run",
+  )
+  assert_eq(owner.state, "owned")
+  const audit = release_workspace_lease_acquire(
+    {clock: harness.clock, host_lease: harness.host_lease, stdio: harness.stdio},
+    cfg,
+    "audit-run",
+    "audit",
+  )
+  assert_eq(audit.state, "fallback")
+  assert_eq(audit.decision.active_holder_class, "release")
+  assert(contains(audit.decision.reason, "release lane"))
+  release_owner_guard_finish(harness.host_lease, owner, "ok", true)
+}
+
+@serial(group: "host-lease-store")
+pipeline test_live_release_waits_for_audit_then_inherits_shared_authority(harness: Harness, task) {
+  const cfg = domains(harness.random)
+  const lease_harness = {clock: harness.clock, host_lease: harness.host_lease, stdio: harness.stdio}
+  const audit_ready = harness.runtime.shared_cell(
+    {scope: "task_group", key: "audit-ready-" + harness.random.uuid_v7(), initial: false},
+  )
+  const results = parallel each ["audit", "release"] with { max_concurrent: 2 } { kind ->
+    if kind == "audit" {
+      const audit = release_workspace_lease_acquire(lease_harness, cfg, "audit-run", "audit")
+      assert_eq(audit.state, "owned")
+      harness.runtime.shared_set(audit_ready, true)
+      harness.clock.sleep_ms(100)
+      release_workspace_lease_finish(harness.host_lease, audit)
+      return {kind: kind}
+    }
+    while !harness.runtime.shared_get(audit_ready) {
+      harness.clock.sleep_ms(10)
+    }
+    const release = release_workspace_lease_acquire(lease_harness, cfg, "release-run", "release")
+    assert_eq(release.state, "owned")
+    const decision = release.decision
+    release_workspace_lease_finish(harness.host_lease, release)
+    return {kind: kind, decision: decision}
+  }
+  const release_result = results.filter({ result -> result.kind == "release" }).to_list()[0]
+  assert_eq(release_result.decision.action, "waited_for_audit")
+  assert(contains(release_result.decision.reason, "kept the reusable path"))
+}
