@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Release tag creation checks, post-publish recovery, and exact-ref sweeping now
+  verify signatures against Harn's tracked allowed-signers policy instead of an
+  operator machine's ambient Git configuration.
 - Release audits now materialize the resolved `--at-sha` commit in an isolated
   detached worktree, record that snapshot identity, and remove the exact
   run-owned worktree on success or failure instead of mixing pinned history
