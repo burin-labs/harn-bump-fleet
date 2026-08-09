@@ -666,8 +666,8 @@ landed after it froze — so a gate the fix was meant to satisfy keeps failing.
 `abandon_release_attempts.harn` is the escape:
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
-scripts/with_env.sh harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox --approve-risky git.push abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
 ```
 
 A tag claims only the exact OID it recovers. When a release tags one candidate
