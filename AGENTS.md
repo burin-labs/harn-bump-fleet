@@ -93,9 +93,9 @@ Common harness runs:
 ```sh
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
-scripts/with_env.sh harn run --no-sandbox release_harn.harn
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/run_harn_release.sh
+scripts/run_harn_release.sh --mock --agent --mode ship-pr
+scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
@@ -106,18 +106,21 @@ scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --c
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
 are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
-The operation harnesses need `--no-sandbox` because they inspect sibling
-checkouts, run local Git commands, and let read-only diagnostic agents inspect
-authenticated GitHub state.
+Release and watch runs use `scripts/run_harn_release.sh` and
+`scripts/watch_harn_release.sh`. Those launchers retain Harn's worktree sandbox
+and grant the selected Harn checkout, shared leases, toolchain caches, network,
+and the existing `gh` login at one audited boundary. Other fleet operations
+still need `--no-sandbox` until they have an equivalent typed root inventory.
 
 Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
 installs the pinned CLI into this repo's ignored `.harn/bin`.
 `scripts/with_env.sh` and `scripts/harn_shielded.sh` prefer that binary over a
 stale global `harn` on `PATH`.
 
-Use `scripts/with_env.sh harn ...` for every documented harness invocation. It
-installs and selects the repo-pinned runtime before Harn parses the program, and
-loads the provider environment without putting secrets on the command line.
+Use the release/watch launchers for their entrypoints and
+`scripts/with_env.sh harn ...` for other documented harness invocations. They
+install and select the repo-pinned runtime before Harn parses the program and
+load the provider environment without putting secrets on the command line.
 Direct ambient `harn` invocations are not a supported release path. Hosted and
 local releases are alternative owners of the same lane, not parallel fallbacks:
 do not start one while the other is active. Run only one live release watcher;

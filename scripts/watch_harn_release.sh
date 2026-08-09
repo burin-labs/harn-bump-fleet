@@ -9,12 +9,12 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
+target_repo="${HARN_RELEASE_REPO:-${HOME}/projects/harn}"
 
-exec "${script_dir}/with_env.sh" \
-  "${script_dir}/harn_shielded.sh" \
-  run \
+exec "${script_dir}/harn_confined.sh" \
+  "$target_repo" \
   --approve-risky git.push \
-  --no-sandbox \
+  -- \
   "${repo_root}/watch_harn_release.harn" \
   -- \
   "$@"

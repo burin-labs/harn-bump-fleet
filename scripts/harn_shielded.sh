@@ -21,7 +21,7 @@ set -euo pipefail
 #
 # Usage:
 #   scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
-#   scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
+#   scripts/run_harn_release.sh --mode ship-pr
 #   scripts/harn_shielded.sh --version
 
 self="$(/usr/bin/env -i PATH=/usr/bin:/bin readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"

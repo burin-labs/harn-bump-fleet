@@ -17,7 +17,7 @@ auto-merge method, and source checks. Audit mode writes a receipt and does not
 change GitHub state.
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- \
+scripts/run_harn_release.sh \
   --mode audit \
   --queue-critical-pr 5947 \
   --queue-critical-pr 5955 \
@@ -39,7 +39,7 @@ owns the queue.
 Pass the same `--queue-critical-pr` values to `ship-pr`:
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- \
+scripts/run_harn_release.sh \
   --mode ship-pr \
   --agent \
   --yes-live-release \
