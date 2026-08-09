@@ -27,12 +27,30 @@ esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 harn_bin="${repo_root}/.harn/bin/harn"
-if [ ! -x "$harn_bin" ]; then
-  harn_bin="$(command -v harn || true)"
+pin_file="${repo_root}/.harn-version"
+install_harn="${repo_root}/scripts/install_harn.sh"
+if [ ! -f "$pin_file" ]; then
+  echo "harn-project: missing ${pin_file}" >&2
+  exit 2
 fi
-if [ -z "$harn_bin" ]; then
-  echo "harn-project: harn is not installed; run scripts/install_harn.sh" >&2
-  exit 127
+expected_version="$(tr -d '[:space:]' < "$pin_file")"
+expected_version="${expected_version#v}"
+installed_version=""
+if [ -x "$harn_bin" ]; then
+  installed_version="$("$harn_bin" --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+fi
+if [ "$installed_version" != "$expected_version" ]; then
+  if [ ! -x "$install_harn" ]; then
+    echo "harn-project: pinned harn ${expected_version} is missing; run scripts/install_harn.sh" >&2
+    exit 127
+  fi
+  echo "harn-project: installing pinned harn ${expected_version} (found ${installed_version:-none})" >&2
+  "$install_harn" "$expected_version" >&2
+  installed_version="$("$harn_bin" --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+  if [ "$installed_version" != "$expected_version" ]; then
+    echo "harn-project: install produced ${installed_version:-no version}, expected ${expected_version}" >&2
+    exit 1
+  fi
 fi
 
 if [ "$action" = "test" ]; then
