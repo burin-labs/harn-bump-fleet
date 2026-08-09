@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Internal boundary for native release automations that need one sibling checkout.
+# Usage: harn_confined.sh TARGET_REPO [HARN_RUN_OPTIONS...] -- SCRIPT [ARGS...]
+
+if [ "$#" -lt 3 ]; then
+  echo "usage: harn_confined.sh TARGET_REPO [HARN_RUN_OPTIONS...] -- SCRIPT [ARGS...]" >&2
+  exit 2
+fi
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
+target_repo="$1"
+shift
+
+run_args=()
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  run_args+=("$1")
+  shift
+done
+if [ "$#" -eq 0 ]; then
+  echo "harn_confined: missing -- before the Harn script" >&2
+  exit 2
+fi
+shift
+if [ "$#" -eq 0 ]; then
+  echo "harn_confined: missing Harn script" >&2
+  exit 2
+fi
+
+script_args=("$@")
+repo_arg_seen=0
+for ((index = 0; index < ${#script_args[@]}; index++)); do
+  case "${script_args[$index]}" in
+    --repo)
+      if ((index + 1 >= ${#script_args[@]})); then
+        echo "harn_confined: --repo requires a path" >&2
+        exit 2
+      fi
+      target_repo="${script_args[$((index + 1))]}"
+      repo_arg_seen=1
+      ;;
+    --repo=*)
+      target_repo="${script_args[$index]#--repo=}"
+      repo_arg_seen=1
+      ;;
+  esac
+done
+
+if [ ! -d "$target_repo" ]; then
+  echo "harn_confined: target checkout does not exist: $target_repo" >&2
+  exit 2
+fi
+target_repo="$(cd -- "$target_repo" && pwd)"
+if [ "$repo_arg_seen" -eq 0 ]; then
+  script_args+=(--repo "$target_repo")
+fi
+
+sandbox_args=(
+  --allow-process-network
+  --write-root "$target_repo"
+)
+
+add_harn_write_root() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    sandbox_args+=(--write-root "$path")
+  fi
+}
+
+add_process_root() {
+  local access="$1"
+  local path="$2"
+  if [ -e "$path" ]; then
+    sandbox_args+=("--sandbox-${access}-root" "$path")
+  fi
+}
+
+# Git signs through the inherited agent but reads these public configuration
+# files. Cargo and sccache need mutable caches; Harn builtins do not.
+add_process_root read "${HOME}/.gitconfig"
+add_process_root read "${HOME}/.ssh/id_ed25519.pub"
+add_process_root read "${HOME}/.ssh/codex_allowed_signers"
+add_process_root read "${HOME}/.config/gh"
+add_process_root read "${RUSTUP_HOME:-${HOME}/.rustup}"
+add_process_root write "${CARGO_HOME:-${HOME}/.cargo}"
+add_process_root write "${SCCACHE_DIR:-${HOME}/Library/Caches/Mozilla.sccache}"
+add_harn_write_root "${HARN_HOST_LEASE_ROOT:-${HARN_HOME:-${HOME}/.harn}/host-leases}"
+add_harn_write_root "${HARN_CACHE_DIR:-${HOME}/Library/Caches/harn}"
+
+cd "$repo_root"
+exec "${script_dir}/with_env.sh" \
+  "${script_dir}/with_github_auth.sh" \
+  "${script_dir}/harn_shielded.sh" \
+  run \
+  "${run_args[@]}" \
+  "${sandbox_args[@]}" \
+  "${script_args[@]}"

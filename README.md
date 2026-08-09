@@ -190,11 +190,11 @@ apply a fix to the harness or release artifacts mid-debrief if you ask.
 
 ```sh
 # Disable chat even when at a TTY.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_EXT_CHAT=0`
+scripts/run_harn_release.sh --no-chat        # or `HARN_EXT_CHAT=0`
 
 # Skip the pipeline; open the loop over a prior run.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only --chat-run <run-id>   # direct
+scripts/run_harn_release.sh --chat-only                       # carousel
+scripts/run_harn_release.sh --chat-only --chat-run <run-id>   # direct
 
 # Change the start-typing timeout (default 60s).
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --chat-timeout-s 120
@@ -222,12 +222,12 @@ Slash commands inside the chat loop:
 During the pre-release gate, the chat also accepts `/approve` and
 `/abort` to resolve the decision and return to the main pipeline.
 
-### Local config and API keys (`scripts/with_env.sh`)
+### Local config and API keys
 
 The cloud-by-default planner/binder pair (see "Planner + tool binder" below)
 needs provider API keys in env. Harn does not auto-load `.env`, so the
-launcher script `scripts/with_env.sh` sources one or more local env files
-before exec'ing the rest of the command. It also prepends the repo-local
+release launcher sources one or more local env files before starting Harn. Its
+underlying `scripts/with_env.sh` seam also prepends the repo-local
 `.harn/bin` directory when present, so `scripts/install_harn.sh` keeps the
 harness on the version pinned in `.harn-version` instead of whatever `harn`
 appears first on the ambient `PATH`:
@@ -236,11 +236,11 @@ appears first on the ambient `PATH`:
 # Sources ~/projects/burin-code/.env (override with HARN_EXT_BUMP_FLEET_ENV_FILE),
 # then ./.env and ./.env.local from the repo root, then runs the harness.
 scripts/install_harn.sh
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Verbose mode prints which files were sourced.
-HARN_EXT_ENV_VERBOSE=1 scripts/with_env.sh harn run --no-sandbox release_harn.harn
+HARN_EXT_ENV_VERBOSE=1 scripts/run_harn_release.sh
 ```
 
 Discovery order (later entries override earlier ones):
@@ -252,6 +252,12 @@ Discovery order (later entries override earlier ones):
 
 Missing files are silently skipped. All `.env*` files are gitignored
 locally; never commit secrets.
+
+The release and watch launchers keep Harn's worktree sandbox active. They grant
+only the selected Harn checkout, shared lease state, Harn/Cargo/sccache caches,
+public signing configuration, process networking, and the existing `gh` login.
+`--repo` changes both the harness target and the granted checkout; the two
+cannot drift apart.
 
 ### Planner + tool binder
 
@@ -299,7 +305,7 @@ The default release Cargo target is
 `$HOME/.cache/harn-bump-fleet/release-harn-target` when `XDG_CACHE_HOME` is
 unset. Override it only when a release lane needs an isolated cache.
 
-`scripts/with_env.sh harn run --no-sandbox release_harn.harn` prints a `planner` + `binder` line
+`scripts/run_harn_release.sh` prints a `planner` + `binder` line
 at the top of every run summarizing the resolved route.
 
 ### AMFI-shielded launcher (macOS)
@@ -317,7 +323,7 @@ changes, so warm runs cost ~50ms.
 
 ```sh
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
-scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox release_harn.harn -- --mode ship-pr
+scripts/run_harn_release.sh --mode ship-pr
 ```
 
 Drop-in for any `harn ...` invocation. CI environments don't need it
@@ -343,7 +349,7 @@ auto-selected), set `HARN_PLANNER_PROVIDER=ollama` and pull the model:
 
 ```sh
 ollama pull qwen3.6:35b-a3b-coding-nvfp4
-HARN_PLANNER_PROVIDER=ollama scripts/with_env.sh harn run --no-sandbox release_harn.harn
+HARN_PLANNER_PROVIDER=ollama scripts/run_harn_release.sh
 ```
 
 ## CI
@@ -490,26 +496,26 @@ failure stops publication before the tag reaches the remote.
 Default mode is read-only audit:
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox release_harn.harn
+scripts/run_harn_release.sh
 ```
 
 Useful rehearsals:
 
 ```sh
 # Fully mocked vX.Y.Z -> vX.Y.(Z+1) audit. No repo/GitHub writes.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock
+scripts/run_harn_release.sh --mock
 
 # Mocked agent/tool loop using Harn's mock LLM provider.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent
+scripts/run_harn_release.sh --mock --agent
 
 # Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/run_harn_release.sh --mock --agent --mode ship-pr
 
 # Run the scheduled fail-collect rehearsal matrix. This uses the safe mock
 # release path under adversarial operator environments and writes JSON/Markdown
 # reports under .harn-runs/release-rehearsal/.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --rehearsal --no-chat
+scripts/run_harn_release.sh --rehearsal --no-chat
 ```
 
 Real release cuts should have a green release rehearsal from the previous
@@ -538,10 +544,10 @@ titles.
 ```sh
 # The source checkout may be on any branch or dirty; release work is isolated.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
+scripts/run_harn_release.sh --mode prepare --yes-live-release
 
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
+scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 
 # Resume the independent post-tag monitor. Safe to stop and rerun.
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
