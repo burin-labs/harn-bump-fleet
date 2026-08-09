@@ -747,12 +747,15 @@ bare SHA, certification publishes a second write-once
 The controller dispatches `windows-nightly.yml` and `macos-nightly.yml` against
 that branch through the typed GitHub Actions connector and retains the exact
 run IDs returned by GitHub. Those hosted runs execute concurrently with Harn's
-contract-owned local source lanes and the exact-candidate Linux release-size
-workflow. No workflow-run listing or timestamp correlation is used.
-Dispatching on a moving base branch is deliberately avoided: a busy `main`
-would otherwise race the identity check between source capture and run
-creation. Standalone `prepare` mode retains the composed prepare audit because
-it does not continue into immutable publication and tag gates.
+contract-owned local source lanes, the exact-candidate Linux release-size
+workflow, and the full five-target `candidate_only` archive matrix on
+`build-release-binaries.yml`. Nightly test binaries are not release archives;
+only the archive lane's signed/notarized receipts may be promoted. No
+workflow-run listing or timestamp correlation is used. Dispatching on a moving
+base branch is deliberately avoided: a busy `main` would otherwise race the
+identity check between source capture and run creation. Standalone `prepare`
+mode retains the composed prepare audit because it does not continue into
+immutable publication and tag gates.
 
 Each hosted proof must preserve the expected workflow path, event, source SHA,
 run attempt, run URL, complete jobs page, and one successful required job.
@@ -771,13 +774,14 @@ The closed hosted/local receipt is immutable at
 `.harn-runs/release-harn/<run-id>/platform-certification-receipt.json`. It
 records both hosted proofs, the local source lanes, wall-clock timings and
 critical path, and the SHA-256 of the exact-candidate Harn CLI. The joined
-candidate receipt also preserves the independent Linux size-run identity and
-verdict. The harness passes the hosted/local receipt and binary to Harn, which
-validates them again and runs only the residual generated-content, docs,
-grammar, security, smoke, and publish checks. Signed tag creation remains
-impossible until the hosted/local lane, Linux size lane, and residual audit are
-all green. `--local-audit` remains useful for read-only diagnosis but cannot
-bypass hosted certification for live preparation.
+candidate receipt also preserves the independent Linux size-run identity,
+the candidate-archive run identity, and their verdicts. Signed tag creation
+remains impossible until the hosted/local lane, Linux size lane, archive lane,
+and residual audit are all green. After the tag is pushed, the harness
+dispatches `promote_only` with the bound candidate run id so those exact
+archive digests attach without recompilation; `force_rebuild` is audited
+recovery only. `--local-audit` remains useful for read-only diagnosis but
+cannot bypass hosted certification for live preparation.
 
 Options:
 
