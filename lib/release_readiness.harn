@@ -91,8 +91,32 @@ pub fn missing_release_assets(
   return required.filter({ name -> !asset_names.any({ asset -> asset == name }) }).to_list()
 }
 
+/** Source-bearing sentinel plus one independent cross-check crate. */
+pub const HARN_REGISTRY_IMMUTABILITY_CRATES: list<string> = ["harn-vm", "harn-cli"]
+
+pub type CargoVcsInfo = {sha1: string, path_in_vcs: string, dirty: bool}
+
+pub type RegistryVersionIdentityState = "unpublished" \
+  | "matched" \
+  | "missing_vcs" \
+  | "conflict" \
+  | "unknown"
+
+/** Registry proof for one release version, independent of GitHub ref state. */
+pub type RegistryVersionProbe = {
+  version: string,
+  visibility: CrateVisibility,
+  identity_state: RegistryVersionIdentityState,
+  source_oid: string,
+  crates: list<string>,
+}
+
 pub fn crates_io_version_url(crate_name: string, version_no_v: string) -> string {
   return "https://crates.io/api/v1/crates/${crate_name}/${version_no_v}"
+}
+
+pub fn crates_io_crate_archive_url(crate_name: string, version_no_v: string) -> string {
+  return "https://static.crates.io/crates/${crate_name}/${crate_name}-${version_no_v}.crate"
 }
 
 pub fn crate_visibility_from_response(response: CrateVisibilityResponse) -> CrateVisibility {
@@ -103,6 +127,116 @@ pub fn crate_visibility_from_response(response: CrateVisibilityResponse) -> Crat
     return {published: false, state: "not_found"}
   }
   return {published: false, state: "unknown"}
+}
+
+/**
+ * Parse `.cargo_vcs_info.json` from a crate archive. The git SHA is the
+ * immutable packaged source; `dirty` is informational and may differ across
+ * crates that embed generated payloads.
+ */
+pub fn cargo_vcs_info_from_json(text: string) -> CargoVcsInfo? {
+  const parsed = try {
+    json_parse(text)
+  }
+  if is_err(parsed) {
+    return nil
+  }
+  const root = unwrap(parsed)
+  const sha1 = lowercase(trim(to_string(root?.git?.sha1 ?? "")))
+  if len(regex_captures("^[0-9a-f]{40}$", sha1)) != 1 {
+    return nil
+  }
+  return {
+    sha1: sha1,
+    path_in_vcs: trim(to_string(root?.path_in_vcs ?? "")),
+    dirty: root?.git?.dirty ?? false,
+  }
+}
+
+/** Locate and parse `.cargo_vcs_info.json` inside a `.crate` (gzip+tar) body. */
+pub fn cargo_vcs_info_from_crate_bytes(
+  archive_bytes: bytes,
+  crate_name: string,
+  version_no_v: string,
+) -> CargoVcsInfo? {
+  const expected = "${crate_name}-${version_no_v}/.cargo_vcs_info.json"
+  const entries = tar_extract(gzip_decode(archive_bytes))
+  for entry in entries {
+    if trim(to_string(entry.path ?? "")) == expected {
+      return cargo_vcs_info_from_json(bytes_to_string(entry.content))
+    }
+  }
+  return nil
+}
+
+/** Collapse per-crate VCS identities into one fail-closed probe result. */
+pub fn registry_version_probe_from_identities(
+  version_no_v: string,
+  visibility: CrateVisibility,
+  identities: list<{crate_name: string, info: CargoVcsInfo?}>,
+) -> RegistryVersionProbe {
+  const version = trim(version_no_v)
+  if visibility.state == "unknown" {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "unknown",
+      source_oid: "",
+      crates: identities.map({ entry -> entry.crate_name }).to_list(),
+    }
+  }
+  if !visibility.published {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "unpublished",
+      source_oid: "",
+      crates: [],
+    }
+  }
+  let source_oid = ""
+  let crates: list<string> = []
+  for entry in identities {
+    crates = crates + [entry.crate_name]
+    if entry.info == nil {
+      return {
+        version: version,
+        visibility: visibility,
+        identity_state: "missing_vcs",
+        source_oid: "",
+        crates: crates,
+      }
+    }
+    if source_oid == "" {
+      source_oid = entry.info.sha1
+      continue
+    }
+    if entry.info.sha1 != source_oid {
+      return {
+        version: version,
+        visibility: visibility,
+        identity_state: "conflict",
+        source_oid: "",
+        crates: crates,
+      }
+    }
+  }
+  if source_oid == "" {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "missing_vcs",
+      source_oid: "",
+      crates: crates,
+    }
+  }
+  return {
+    version: version,
+    visibility: visibility,
+    identity_state: "matched",
+    source_oid: source_oid,
+    crates: crates,
+  }
 }
 
 fn crate_version_visibility(
@@ -139,6 +273,79 @@ pub fn harn_crate_published(
   version_no_v: string,
 ) -> bool {
   return crate_version_published(harness, "harn-cli", version_no_v)
+}
+
+fn download_crate_archive_bytes(
+  harness: {fs: HarnessFs, net: HarnessNet, random: HarnessRandom},
+  crate_name: string,
+  version_no_v: string,
+) -> bytes? {
+  const dir = path_join(harness.fs.temp_dir(), "registry-immutability-" + harness.random.uuid_v7())
+  harness.fs.mkdir(dir, true)
+  const path = path_join(dir, "${crate_name}-${version_no_v}.crate")
+  const downloaded = try {
+    harness.net.download(
+      crates_io_crate_archive_url(crate_name, version_no_v),
+      path,
+      {
+        headers: {"User-Agent": "harn-bump-fleet release-readiness"},
+        retry: {max: 1, backoff_ms: 0},
+      },
+    )
+  }
+  if is_err(downloaded) {
+    return nil
+  }
+  const receipt = unwrap(downloaded)
+  if !(receipt.ok ?? false) {
+    return nil
+  }
+  const body = try {
+    harness.fs.read_bytes(path)
+  }
+  if is_err(body) {
+    return nil
+  }
+  return unwrap(body)
+}
+
+fn crate_archive_vcs_identity(
+  harness: {fs: HarnessFs, net: HarnessNet, random: HarnessRandom},
+  crate_name: string,
+  version_no_v: string,
+) -> CargoVcsInfo? {
+  const archive = download_crate_archive_bytes(harness, crate_name, version_no_v)
+  if archive == nil {
+    return nil
+  }
+  return cargo_vcs_info_from_crate_bytes(archive, crate_name, version_no_v)
+}
+
+/**
+ * Ask crates.io whether `version` is already immutable, and when possible
+ * recover the packaged source OID from sentinel crate archives.
+ */
+pub fn probe_registry_version_immutability(
+  harness: {clock: HarnessClock, fs: HarnessFs, net: HarnessNet, random: HarnessRandom},
+  version_no_v: string,
+) -> RegistryVersionProbe {
+  const version = trim(version_no_v)
+  const visibility = crate_version_visibility(
+    harness,
+    HARN_REGISTRY_IMMUTABILITY_CRATES[0],
+    version,
+  )
+  if visibility.state == "unknown" || !visibility.published {
+    return registry_version_probe_from_identities(version, visibility, [])
+  }
+  let identities: list<{crate_name: string, info: CargoVcsInfo?}> = []
+  for crate_name in HARN_REGISTRY_IMMUTABILITY_CRATES {
+    identities = identities
+      + [
+      {crate_name: crate_name, info: crate_archive_vcs_identity(harness, crate_name, version)},
+    ]
+  }
+  return registry_version_probe_from_identities(version, visibility, identities)
 }
 
 /** Normalize the connector result once; unknown provider state fails closed. */

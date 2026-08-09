@@ -5,6 +5,7 @@ import {
   release_attempt_for_version,
   release_publications_from_remote_refs,
 } from "./release_publication"
+import { RegistryVersionProbe } from "./release_readiness"
 import { ReleaseAnalysis } from "release_analysis"
 import { ReleaseConfig, ReleaseNotesScope, run_git } from "release_runtime"
 
@@ -39,6 +40,155 @@ pub type ReleaseRecoveryPreference = {
 }
 
 pub type ReleaseRecoveryAncestry = fn(string, string) -> bool
+
+pub type RegistryImmutabilityAction = "allow" | "refuse" | "recover_published"
+
+/** Fail-closed gate once crates.io already owns the release version. */
+pub type RegistryImmutabilityDecision = {
+  action: RegistryImmutabilityAction,
+  message: string,
+  source_oid: string,
+}
+
+/**
+ * Decide whether a live run may mint a fresh/superseded candidate or must
+ * recover the registry-published source. GitHub tag/PR/asset absence never
+ * authorizes a re-cut once the registry has accepted the version.
+ */
+pub fn registry_immutability_decision(
+  probe: RegistryVersionProbe,
+  pin_sha_input: string,
+  pin_sha: string,
+  recovered_head_oid: string,
+  would_supersede: bool,
+) -> RegistryImmutabilityDecision {
+  if probe.identity_state == "unpublished" {
+    return {action: "allow", message: "", source_oid: ""}
+  }
+  if probe.identity_state == "unknown" {
+    return {
+      action: "refuse",
+      message:
+        "refusing to prepare v${probe.version}: crates.io visibility for the release version is unknown; retry when the registry probe succeeds",
+      source_oid: "",
+    }
+  }
+  if probe.identity_state == "missing_vcs" {
+    return {
+      action: "refuse",
+      message:
+        "refusing to prepare v${probe.version}: crates.io already has this version, but the packaged `.cargo_vcs_info.json` source identity could not be recovered; restore the published tag/attempt from registry evidence rather than rebuilding",
+      source_oid: "",
+    }
+  }
+  if probe.identity_state == "conflict" {
+    return {
+      action: "refuse",
+      message: "refusing to prepare v${probe.version}: crates.io crate archives disagree on the packaged git SHA ("
+        + join(
+        probe.crates,
+        ", ",
+      )
+        + "); refuse to choose a source",
+      source_oid: "",
+    }
+  }
+  const source_oid = lowercase(trim(probe.source_oid))
+  const recovered = lowercase(trim(recovered_head_oid))
+  const requested = lowercase(trim(pin_sha))
+  if recovered == "" {
+    // Fresh-cut path: an explicit pin that is not the packaged source is the
+    // recut hazard from #723. Matching the packaged OID still cannot authorize
+    // a rebuild — GitHub refs must be restored to that OID first.
+    if trim(pin_sha_input) != "" && requested != source_oid {
+      return {
+        action: "refuse",
+        message:
+          "refusing to prepare v${probe.version}: crates.io already published this version from ${source_oid}, which disagrees with requested --at-sha ${requested}; recover the original immutable source, never rebuild",
+        source_oid: source_oid,
+      }
+    }
+    return {
+      action: "refuse",
+      message: "refusing to prepare a fresh v${probe.version} candidate: crates.io already has this version from ${source_oid} ("
+        + join(
+        probe.crates,
+        ", ",
+      )
+        + "); the version is immutable and must be recovered (restore tag/attempt to that OID), never rebuilt",
+      source_oid: source_oid,
+    }
+  }
+  if recovered != source_oid {
+    return {
+      action: "refuse",
+      message:
+        "refusing to recover v${probe.version} from ${recovered}: crates.io packaged ${source_oid}; restore the tag/attempt to the registry source before continuing",
+      source_oid: source_oid,
+    }
+  }
+  if would_supersede {
+    return {
+      action: "refuse",
+      message:
+        "refusing to supersede v${probe.version}: crates.io already published this version from ${source_oid}; recover that immutable source instead of minting a new candidate",
+      source_oid: source_oid,
+    }
+  }
+  return {
+    action: "recover_published",
+    message:
+      "crates.io already published v${probe.version} from ${source_oid}; routing to post-publish recovery of that immutable source",
+    source_oid: source_oid,
+  }
+}
+
+/** Prefer the registry-packaged attempt OID when crates.io already owns the version. */
+pub fn registry_preferred_attempt_oid(
+  probe: RegistryVersionProbe,
+  recovery_preference_oid: string,
+) -> string {
+  if probe.identity_state == "matched" && trim(probe.source_oid) != "" {
+    return probe.source_oid
+  }
+  return trim(recovery_preference_oid)
+}
+
+/** Throw when the registry forbids the planned route; otherwise return the decision. */
+pub fn require_registry_immutability_gate(
+  probe: RegistryVersionProbe,
+  pin_sha_input: string,
+  pin_sha: string,
+  recovered_head_oid: string,
+  would_supersede: bool,
+) -> RegistryImmutabilityDecision {
+  const decision = registry_immutability_decision(
+    probe,
+    pin_sha_input,
+    pin_sha,
+    recovered_head_oid,
+    would_supersede,
+  )
+  if decision.action == "refuse" {
+    throw decision.message
+  }
+  return decision
+}
+
+/**
+ * Registry publication demotes a pre-tag resume into post-publish paperwork so
+ * the run cannot certify and re-tag a version crates.io already accepted.
+ */
+pub fn registry_adjusted_checkpoint_flags(
+  checkpoint_route: ReleaseRecoveryCheckpointRoute,
+  registry_gate: RegistryImmutabilityDecision,
+) -> {pre_tag_resume: bool, pre_tag_supersede: bool} {
+  return {
+    pre_tag_resume: checkpoint_route == "resume_pre_tag"
+      && registry_gate.action != "recover_published",
+    pre_tag_supersede: checkpoint_route == "supersede_pre_tag",
+  }
+}
 
 /** Select which source tree owns the recovered release notes. */
 pub fn release_recovery_notes_scope(tag_exists: bool) -> ReleaseNotesScope {
@@ -358,13 +508,17 @@ pub fn with_fixup_state(cfg: ReleaseConfig, fixup: ReleaseFixupState?) -> Releas
     return out
   }
   out["fixup_mode"] = true
-  out["skip_tag"] = fixup.tag_exists
+  // Registry publication proves the artifact already shipped even when the
+  // GitHub tag or release-asset set was deleted; never re-tag that version.
+  out["skip_tag"] = fixup.tag_exists || fixup.release_exists
   out["fixup_tag"] = fixup.tag
   out["fixup_pr_url"] = fixup.pr_url
   out["fixup_publication"] = fixup.publication
   out["fixup_pin_unreleased"] = fixup.pin_unreleased
   out["fixup_release_body_source"] = fixup.release_body_source ?? ""
-  out["release_notes_scope"] = release_recovery_notes_scope(fixup.tag_exists)
+  out["release_notes_scope"] = release_recovery_notes_scope(
+    fixup.tag_exists || fixup.release_exists,
+  )
   out["pre_tag_supersede"] = fixup.pre_tag_supersede ?? false
   return out
 }
@@ -399,7 +553,9 @@ pub fn analysis_with_fixup_state(
   out["fixup_pr_url"] = fixup.pr_url
   out["fixup_publication"] = fixup.publication
   out["fixup_release_exists"] = fixup.release_exists
-  out["release_notes_scope"] = release_recovery_notes_scope(fixup.tag_exists)
+  out["release_notes_scope"] = release_recovery_notes_scope(
+    fixup.tag_exists || fixup.release_exists,
+  )
   out["fixup_missing_assets"] = fixup.missing_assets ?? []
   out["pre_tag_supersede"] = fixup.pre_tag_supersede ?? false
   return out
