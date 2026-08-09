@@ -4,6 +4,7 @@ import {
   github_actions_run,
   github_actions_run_jobs,
   github_enable_auto_merge,
+  github_pr_list,
   github_pr_view,
   github_workflow_dispatch,
   github_workflow_runs,
@@ -25,6 +26,7 @@ import {
   ReleaseWatchWarmCacheObservation,
   ReleaseWatchWarmCacheRun,
   release_watch_apply_warm_cache_transition,
+  release_watch_receipt_retarget_pr,
   release_watch_receipt_write,
   release_watch_record_recovery_dispatch,
   release_watch_record_warm_cache_dispatch,
@@ -58,6 +60,7 @@ pub type ReleaseWatchRuntimeAdapter = {
   warm_run: fn(string, int, int) -> ReleaseWatchConnectorResult,
   warm_jobs: fn(string, int, int) -> ReleaseWatchConnectorResult,
   pr_probe: fn(string, string) -> ReleaseWatchConnectorResult,
+  replacement_prs?: fn(string, string, int) -> ReleaseWatchConnectorResult,
   enable_auto_merge: fn(string, dict) -> ReleaseWatchConnectorResult,
 }
 
@@ -112,6 +115,18 @@ fn default_watch_adapter(harness: Harness) -> ReleaseWatchRuntimeAdapter {
     ) },
     pr_probe:
       fn(slug, pr_url) { return github_adapter_result(github_pr_view(harness, slug, pr_url)) },
+    replacement_prs: fn(slug, branch, _poll) {
+      const listed = github_pr_list(
+        harness,
+        slug,
+        {base: "main", head: branch, state: "all", limit: 20},
+      )
+      return if is_err(listed) {
+        Err(unwrap_err(listed))
+      } else {
+        {pull_requests: unwrap(listed)}
+      }
+    },
     enable_auto_merge: fn(slug, pr) { return github_adapter_result(
       github_enable_auto_merge(harness, slug, pr.number, pr.head.sha, "squash"),
     ) },
@@ -145,6 +160,87 @@ fn keep_release_pr_armed(adapter, receipt: ReleaseWatchReceipt) {
     return {action: "failed", reason: "auto_merge_rearm_failed", error: unwrap_err(armed)}
   }
   return {action: "rearmed", reason: "auto_merge_rearmed"}
+}
+
+/** Select one exact-branch replacement without trusting connector-side filtering. */
+pub fn release_watch_replacement_pr(
+  receipt: ReleaseWatchReceipt,
+  pull_requests: list<dict>,
+) -> dict {
+  const prefix = "https://github.com/${receipt.slug}/pull/"
+  let candidates: list<dict> = []
+  for pull_request in pull_requests {
+    const url = trim(to_string(pull_request?.url ?? ""))
+    const active = (pull_request?.merged ?? false)
+      || lowercase(
+      trim(to_string(pull_request?.github_state ?? "")),
+    )
+      == "open"
+    if url != receipt.pr_url
+      && url.starts_with(prefix)
+      && trim(to_string(pull_request?.base?.ref ?? "")) == "main"
+      && trim(
+      to_string(pull_request?.head?.ref ?? ""),
+    )
+      == receipt.publication.local_branch
+      && active {
+      candidates = candidates + [pull_request]
+    }
+  }
+  if len(candidates) == 0 {
+    return {action: "wait", reason: "replacement_release_pr_not_found"}
+  }
+  if len(candidates) > 1 {
+    return {
+      action: "fail",
+      reason: "multiple replacement release PRs match ${receipt.publication.local_branch}",
+      urls: candidates.map({ candidate -> candidate.url }).to_list().sorted(),
+    }
+  }
+  return {action: "retarget", reason: "replacement_release_pr_found", pull_request: candidates[0]}
+}
+
+fn reconcile_replacement_release_pr(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  watchdog: dict,
+  observed_at: string,
+  poll: int,
+  enabled: bool,
+) -> dict {
+  if !enabled
+    || watchdog.action != "skip"
+    || watchdog.reason != "release_pr_not_open"
+    || adapter.replacement_prs == nil {
+    return {receipt: receipt, watchdog: watchdog}
+  }
+  const replacements = adapter.replacement_prs(receipt.slug, receipt.publication.local_branch, poll)
+  if is_err(replacements) {
+    return {
+      receipt: receipt,
+      watchdog: {
+        action: "skip",
+        reason: "replacement_release_pr_probe_failed",
+        error: unwrap_err(replacements),
+      },
+    }
+  }
+  const replacement = release_watch_replacement_pr(receipt, replacements?.pull_requests ?? [])
+  if replacement.action == "fail" {
+    throw replacement.reason
+  }
+  if replacement.action != "retarget" {
+    return {receipt: receipt, watchdog: watchdog}
+  }
+  const retargeted = release_watch_receipt_retarget_pr(
+    receipt,
+    replacement.pull_request.url,
+    observed_at,
+  )
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, retargeted)
+  return {receipt: retargeted, watchdog: keep_release_pr_armed(adapter, retargeted)}
 }
 
 fn readiness_observation(readiness, runs, observed_at) -> ReleaseWatchObservation {
@@ -368,6 +464,18 @@ pub fn run_release_watch(
     } else {
       {action: "skip", reason: "pull_request_watchdog_disabled"}
     }
+    const reconciliation = reconcile_replacement_release_pr(
+      {fs: harness.fs, random: harness.random},
+      adapter,
+      receipt,
+      receipt_path,
+      last_watchdog,
+      observed_at,
+      poll,
+      keep_pr_armed,
+    )
+    receipt = reconciliation.receipt
+    last_watchdog = reconciliation.watchdog
     const runs = collect_runs(adapter, receipt, poll)
     last_progress = release_watch_progress_for_receipt(
       receipt,
