@@ -65,6 +65,13 @@ scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
 # Report every remote fleet-owned file that drifts from fleet.toml.
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 
+# Scope a check or repair to exact manifest-owned paths. Repeat the flag for
+# several files; an unknown path fails before any pull request is changed.
+scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- \
+  --check --only burin-labs/burin-code \
+  --only-path scripts/agent_shell_guard.harn \
+  --only-path scripts/agent_shell_guard_policy.harn
+
 # Propose the repair as one pull request per drifted repository.
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --apply
 
@@ -106,6 +113,10 @@ the three violations that describe bytes drifting from a projection; a typed
 violation names a workflow the fleet does not render, so no correct content
 exists to propose. The local `sync_*` harnesses remain the way to converge a
 checkout you already have; this is how the fleet converges without one.
+`--only-path` narrows that remote repair to exact target paths after `--only`
+repository admission. It is repeatable and fails closed if any requested path
+is not owned by the selected manifest slice, preventing task-scoped repairs
+from absorbing unrelated projection drift.
 
 Nothing in that path writes a default branch or merges anything itself. It does
 arm auto-merge on each proposal, leased to the exact commit it just published,
