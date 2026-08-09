@@ -1,0 +1,170 @@
+// Fleet-owned TTY input and presentation loop over Harn's canonical agent plane.
+import { agent_loop } from "std/agent/loop"
+
+pub type InteractiveChatDecision = {
+  kind: "send" | "handled" | "exit",
+  message?: string,
+  reason?: string,
+  command?: string,
+  state?: dict,
+  ...rest,
+}
+
+pub type InteractiveChatResult = {
+  session_id: string,
+  turns: int,
+  input_events: int,
+  stop_reason: string,
+  last_result?: dict,
+  state: dict,
+}
+
+pub type InteractiveAgentChatConfig = {
+  session_id: string,
+  system_prompt?: string,
+  agent_options?: dict,
+  state?: dict,
+  max_turns?: int,
+  max_input_events?: int,
+  on_user_input: fn(dict) -> InteractiveChatDecision,
+  on_model_turn?: fn(dict, dict) -> dict?,
+}
+
+fn chat_state(state, session_id: string, turns: int, input_events: int, last_result = nil) {
+  const current = if type_of(state) == "dict" {
+    state
+  } else {
+    {}
+  }
+  let next = current + {session_id: session_id, turns: turns, input_events: input_events}
+  if last_result != nil {
+    next = next + {last_result: last_result}
+  }
+  return next
+}
+
+fn default_help(handlers) -> string {
+  let commands = ["/exit", "/quit", "/help", "/?"]
+  if type_of(handlers) == "dict" {
+    for key in handlers.keys() {
+      if starts_with(key, "/") && !commands.contains(key) {
+        commands = commands + [key]
+      }
+    }
+  }
+  return "Commands: " + join(commands, ", ")
+}
+
+/** Route one host-owned input line without consulting time or the model. */
+pub fn route_interactive_chat_input(line, state = nil, handlers = nil) -> InteractiveChatDecision {
+  const current = if type_of(state) == "dict" {
+    state
+  } else {
+    {}
+  }
+  const text = trim(to_string(line ?? ""))
+  if text == "" {
+    return {kind: "handled", state: current}
+  }
+  if !starts_with(text, "/") {
+    return {kind: "send", message: text, state: current}
+  }
+  const parts = split(text, " ")
+  const command = parts[0]
+  if command == "/exit" || command == "/quit" {
+    return {kind: "exit", reason: "operator_exit", command: command, state: current}
+  }
+  if command == "/help" || command == "/?" {
+    return {kind: "handled", command: command, message: default_help(handlers), state: current}
+  }
+  const handler = if type_of(handlers) == "dict" {
+    handlers[command]
+  } else {
+    nil
+  }
+  if handler == nil {
+    return {
+      kind: "handled",
+      command: command,
+      message: "Unknown command: " + command,
+      state: current,
+    }
+  }
+  if type_of(handler) != "closure" {
+    throw "interactive chat handler for ${command} must be a closure"
+  }
+  const decision = handler({line: text, command: command, args: parts.slice(1), state: current})
+  if type_of(decision) != "dict" {
+    throw "interactive chat handler for ${command} must return a decision"
+  }
+  return decision + {state: decision.state ?? current}
+}
+
+/**
+ * Own one interactive host loop while delegating every model turn to
+ * `agent_loop`. Input and rendering callbacks remain product policy; Harn owns
+ * session execution, tool dispatch, transcripts, and terminal outcomes.
+ */
+pub fn run_interactive_agent_chat(
+  harness: Harness,
+  config: InteractiveAgentChatConfig,
+) -> InteractiveChatResult {
+  const session_id = harness.agent.open(config.session_id)
+  const max_turns = config.max_turns ?? 0
+  const max_input_events = config.max_input_events ?? 0
+  let turns = 0
+  let input_events = 0
+  let last_result = nil
+  let state = chat_state(config.state, session_id, turns, input_events)
+  let stop_reason = "operator_exit"
+  while max_turns <= 0 || turns < max_turns {
+    if max_input_events > 0 && input_events >= max_input_events {
+      stop_reason = "input_exhausted"
+      break
+    }
+    const decision = config.on_user_input(state)
+    input_events = input_events + 1
+    state = chat_state(decision?.state ?? state, session_id, turns, input_events, last_result)
+    if decision?.kind == "exit" {
+      stop_reason = decision?.reason ?? "operator_exit"
+      break
+    }
+    if decision?.kind == "handled" || trim(to_string(decision?.message ?? "")) == "" {
+      continue
+    }
+    if decision?.kind != "send" {
+      harness.agent.close(session_id, {reason: "error"})
+      throw "interactive chat input kind must be send, handled, or exit"
+    }
+    const options = (config.agent_options ?? {}) + {session_id: session_id}
+    const result = try {
+      agent_loop(harness, to_string(decision.message), config.system_prompt ?? "", options)
+    } catch (error) {
+      harness.agent.close(session_id, {reason: "error", detail: to_string(error)})
+      throw error
+    }
+    turns = turns + 1
+    last_result = result
+    state = chat_state(state, session_id, turns, input_events, result)
+    if config.on_model_turn != nil {
+      const update = config.on_model_turn(result, state)
+      if update?.state != nil {
+        state = chat_state(update.state, session_id, turns, input_events, result)
+      } else if type_of(update) == "dict" {
+        state = chat_state(state + update, session_id, turns, input_events, result)
+      }
+    }
+  }
+  if max_turns > 0 && turns >= max_turns {
+    stop_reason = "max_turns"
+  }
+  harness.agent.close(session_id, {reason: stop_reason})
+  return {
+    session_id: session_id,
+    turns: turns,
+    input_events: input_events,
+    stop_reason: stop_reason,
+    last_result: last_result,
+    state: state,
+  }
+}

@@ -163,8 +163,9 @@ Prefer the Harn stdlib over local helpers:
 - `std/git` for checkout cleanup and base-branch sync.
 - `std/poll`, `std/settled`, `std/jsonl`, and `std/config` for polling,
   settled-result handling, JSONL, and env parsing.
-- `std/agent/chat::agent_chat_loop` plus `std/tui` and `std/io` for TTY-aware
-  operator chat.
+- `std/agent/loop::agent_loop` for each model turn. Fleet's
+  `lib/interactive_agent_chat.harn` owns TTY input, slash commands, and
+  presentation; do not rebuild an orchestration plane around it.
 
 When adding a prompt or run artifact, keep deterministic facts separate from
 model-authored text. Generated artifacts under `.harn-runs/` and `.harn/` stay
