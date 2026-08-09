@@ -557,12 +557,12 @@ opens the release PR, so a release needs no local step.
 
 Tags are signed by a dedicated release bot key that exists only in the
 workflow's `release` environment. The maintainer's personal signing key is
-deliberately not reachable from any runner. The public half is committed at
-`.github/release-bot-allowed-signers`, so anyone can check a release tag
-against this repository alone:
+deliberately not reachable from any runner. Harn owns the public trust root at
+`.github/release-bot-allowed-signers`, so signing and artifact publication use
+one contract. From a directory containing the Harn checkout:
 
 ```sh
-git -c gpg.ssh.allowedSignersFile=.github/release-bot-allowed-signers \
+git -c gpg.ssh.allowedSignersFile=harn/.github/release-bot-allowed-signers \
   verify-tag v0.10.53
 ```
 
