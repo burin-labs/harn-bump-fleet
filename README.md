@@ -896,12 +896,15 @@ fixup mode the harness:
   release notes. No `BEGIN_DRAFT_CHANGELOG` block is expected or
   accepted.
 
-To bypass auto-detection (e.g. to advance the pin and re-tag because the
-original publish failed before the GitHub release was created), close the
-open release PR or delete the tag manually before rerunning. Detection
-requires both signals (the required release assets + open PR) so it cannot
-misfire on a tag or empty GitHub release page that exists without the
-corresponding shipped artifacts.
+Deleting the GitHub tag, closing the release PR, or removing an immutable
+attempt ref never authorizes re-cutting a version that crates.io already
+accepted. The harness probes the registry independently; if `harn-vm` (and a
+cross-check crate) already expose that version, it refuses a fresh or
+superseded candidate and requires recovery of the packaged source OID from
+`.cargo_vcs_info.json`. Post-publish paperwork can still proceed from that
+immutable source when GitHub assets or refs were lost. Only a version that
+never reached the registry may be prepared again after those GitHub signals
+are cleared.
 
 Changed prepared content publishes a fresh immutable attempt ref and opens a
 new PR; the prior attempt stays inspectable and is never force-updated.
