@@ -625,8 +625,9 @@ repeating release preparation, tag creation, binary recovery dispatch, or an
 accepted warm-cache run. One cancellation-safe host lease makes the full
 read-transition-write loop, recovery dispatch, queue restoration, and ref
 cleanup single-writer; a second local watcher fails before reading the receipt.
-A normal invocation continues after release health is
-proven until the release PR merges and the warm matrix completes or fails. The
+A normal invocation continues after release health is proven until the release
+PR merges. `--warm-cache` additionally dispatches the five-target hosted warm
+and continues until that matrix completes or fails. The
 watcher prints semantic workflow/job transitions plus a five-minute heartbeat,
 including the active job step and receipt path, so a slow platform build remains
 visibly live without repeating identical state every 30 seconds. After terminal
@@ -647,8 +648,9 @@ GitHub, which may differ from the release commit after squash merge or later
 mainline changes. Hitting `--max-polls` returns a durable pending receipt;
 rerunning the command resumes the exact run ID. An all-skipped warm is recorded
 as suppressed and retried only after overlapping release/recovery work clears.
-`--no-warm-cache` is the explicit release-only escape hatch. A release is
-healthy only when crates.io and all five archives plus `SHA256SUMS` and
+Post-publish warming is opt-in because it repeats the full hosted target matrix;
+use it only when measured release latency justifies that incremental spend. A
+release is healthy only when crates.io and all five archives plus `SHA256SUMS` and
 `release-assets.json` are present; a cache is warm only after the exact five-job
 release matrix completes successfully.
 
