@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Live Harn releases now restart in a fresh process after bump-fleet updates
+  itself, and release their exact cross-host version lane on every terminal
+  path without masking the primary release verdict.
 - Release tag creation checks, post-publish recovery, and exact-ref sweeping now
   verify signatures against Harn's tracked allowed-signers policy instead of an
   operator machine's ambient Git configuration.
