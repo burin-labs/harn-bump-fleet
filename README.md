@@ -721,11 +721,14 @@ It renames each unclaimed attempt to `release-failed/vX.Y.Z/<oid>-abandoned`
 rather than deleting it, so the commit stays on origin and the sweep still
 inventories it through the normal proof path. Archiving always precedes the
 delete, so an interruption leaves a recoverable copy instead of losing the
-attempt. An attempt claimed by a tag, a published release, or an open PR is
-retained, and a live claim blocks the whole operation: pre-tag, freeing a subset
-would leave recovery wedged on the remainder. A tag-recovered attempt is the
-exception — it is terminal and the sweep retires it, so it does not block the
-orphans beside it.
+attempt. The archive step fetches the advertised source ref into the operator
+clone and verifies its content-addressed OID before pushing the second name;
+recovery therefore works from a clean clone and a ref that moved after the
+inventory fails closed. An attempt claimed by a tag, a published release, or
+an open PR is retained, and a live claim blocks the whole operation: pre-tag,
+freeing a subset would leave recovery wedged on the remainder. A tag-recovered
+attempt is the exception — it is terminal and the sweep retires it, so it does
+not block the orphans beside it.
 
 Every claim above is terminal, and a release that has not tagged yet has none
 of them: its in-flight candidate looks exactly like an unclaimed orphan. So
