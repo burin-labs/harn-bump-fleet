@@ -254,7 +254,8 @@ Missing files are silently skipped. All `.env*` files are gitignored
 locally; never commit secrets.
 
 The release and watch launchers keep Harn's worktree sandbox active. They grant
-only the selected Harn checkout, shared lease state, Harn/Cargo/sccache caches,
+only the selected Harn checkout, its dedicated sibling
+`<repo>-release-workspaces` root, shared lease state, Harn/Cargo/sccache caches,
 public signing configuration, process networking, and the existing `gh` login.
 `--repo` changes both the harness target and the granted checkout; the two
 cannot drift apart.
@@ -526,7 +527,8 @@ must report every failed leg in one pass.
 Live modes require the explicit guard flag. The checkout passed through
 `--repo` is only the source Git database: the harness refreshes the exact
 `origin/<base>` ref, freezes its pin, and creates a detached worktree under the
-checkout's sibling `<repo>-worktrees/release-<run-id>` directory. It verifies
+dedicated sibling `<repo>-release-workspaces` root (`release` for the leased
+live lane or `release-<run-id>` for an isolated audit). It verifies
 that creating the worktree did not change the source checkout's branch, HEAD,
 index, or working tree, then routes analysis, agent tools, release-branch
 creation, preparation, tagging, and publication through the isolated path.

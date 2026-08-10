@@ -108,8 +108,9 @@ are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
 Release and watch runs use `scripts/run_harn_release.sh` and
 `scripts/watch_harn_release.sh`. Those launchers retain Harn's worktree sandbox
-and grant the selected Harn checkout, shared leases, toolchain caches, network,
-and the existing `gh` login at one audited boundary. Other fleet operations
+and grant the selected Harn checkout, its dedicated sibling release-workspace
+root, shared leases, toolchain caches, network, and the existing `gh` login at
+one audited boundary. Other fleet operations
 still need `--no-sandbox` until they have an equivalent typed root inventory.
 
 Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
