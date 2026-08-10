@@ -52,14 +52,33 @@ if [ ! -d "$target_repo" ]; then
   echo "harn_confined: target checkout does not exist: $target_repo" >&2
   exit 2
 fi
-target_repo="$(cd -- "$target_repo" && pwd)"
+target_repo="$(cd -- "$target_repo" && pwd -P)"
 if [ "$repo_arg_seen" -eq 0 ]; then
   script_args+=(--repo "$target_repo")
 fi
 
+# Release worktrees live in one dedicated sibling root. Granting that root
+# keeps the source checkout immutable without authorizing unrelated worktrees
+# or the checkout's parent directory. This projection intentionally mirrors
+# lib/release_workspace.harn; the Harn contract test guards both spellings.
+git_common_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
+if [ "$(basename -- "$git_common_dir")" != ".git" ]; then
+  echo "harn_confined: target does not resolve to a non-bare Git checkout: $target_repo" >&2
+  exit 2
+fi
+primary_checkout="$(dirname -- "$git_common_dir")"
+release_workspace_root="$(dirname -- "$primary_checkout")/$(basename -- "$primary_checkout")-release-workspaces"
+if [ -L "$release_workspace_root" ]; then
+  echo "harn_confined: release workspace root must not be a symlink: $release_workspace_root" >&2
+  exit 2
+fi
+mkdir -p -- "$release_workspace_root"
+release_workspace_root="$(cd -- "$release_workspace_root" && pwd -P)"
+
 sandbox_args=(
   --allow-process-network
   --write-root "$target_repo"
+  --write-root "$release_workspace_root"
 )
 
 add_harn_write_root() {
