@@ -1,0 +1,1 @@
+- Route authorized live macOS releases to the hosted Linux owner before local compilation, because a default-deny Seatbelt parent cannot run the nested sandbox certification exercised by Harn's release audit. The handoff translates only the hosted workflow's typed inputs and rejects unsupported flags.

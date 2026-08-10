@@ -568,6 +568,14 @@ local release moves off the operator machine. On a measured v0.10.53 run,
 certification gate; the model agent accounted for 0.3 minutes, so the LLM is
 not the expensive part of a release.
 
+On macOS, the canonical launcher automatically dispatches an authorized live
+`prepare` or `ship-pr` invocation to this hosted workflow before compilation.
+Candidate certification intentionally exercises nested OS sandboxes, which
+Seatbelt cannot apply beneath Harn's default-deny outer sandbox. Read-only
+audits, mocks, and rehearsals remain local. The handoff accepts only the
+workflow's typed inputs and fails before dispatch when a local-only release
+flag cannot be represented.
+
 Dispatch it from the Actions tab or with `gh`:
 
 ```sh
