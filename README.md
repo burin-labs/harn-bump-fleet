@@ -551,6 +551,9 @@ scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 
 # Resume the independent post-tag monitor. Safe to stop and rerun.
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
+
+# Import one hosted release run's receipt, then watch it through the same path.
+scripts/watch_harn_release.sh --tag vX.Y.Z --hosted-run RUN_ID --yes-live-release
 ```
 
 ### Running the release on hosted runners
@@ -641,7 +644,15 @@ warm-cache run identity and outcome.
 `watch_harn_release.harn` validates that receipt at the JSON boundary, rewrites
 it through rename-into-place after every snapshot, and may be restarted without
 repeating release preparation, tag creation, binary recovery dispatch, or an
-accepted warm-cache run. One cancellation-safe host lease makes the full
+accepted warm-cache run.
+
+Pass `--hosted-run RUN_ID` after a hosted `ship-pr` run. The watcher downloads
+that run's artifact, validates the same typed receipt, and publishes it to the
+normal local path before monitoring starts. A valid local receipt always wins,
+so rerunning the command cannot replace newer watch state with the older hosted
+handoff.
+
+One cancellation-safe host lease makes the full
 read-transition-write loop, recovery dispatch, queue restoration, and ref
 cleanup single-writer; a second local watcher fails before reading the receipt.
 A normal invocation continues after release health is proven until the release
