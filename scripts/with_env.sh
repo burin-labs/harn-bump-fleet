@@ -134,9 +134,11 @@ fi
 
 # `release_harn.harn` may fast-forward this checkout after Harn has already
 # parsed its modules. Exit 75 (EX_TEMPFAIL) is the typed handoff asking this
-# process-owning boundary to load the updated source in one fresh process.
-# Other commands retain ordinary `exec` semantics, and the guard makes a
-# persistently stale checkout fail closed instead of looping.
+# process-owning boundary to reload the wrapper itself. Re-exec runs the pinned
+# runtime check again as well as loading the updated source: fleet main may have
+# advanced `.harn-version` while a hosted run waited for approval. Other
+# commands retain ordinary `exec` semantics, and the guard makes a persistently
+# stale checkout fail closed instead of looping.
 fleet_restart_exit_code=75
 fleet_restart_guard="${HARN_EXT_FLEET_RESTARTED:-0}"
 release_harn_command=0
@@ -164,6 +166,6 @@ while :; do
     exit "$fleet_restart_exit_code"
   fi
   echo "with_env.sh: bump-fleet updated; restarting release harness with freshly parsed code" >&2
-  fleet_restart_guard=1
   export HARN_EXT_FLEET_RESTARTED=1
+  exec "${BASH_SOURCE[0]}" "$@"
 done
