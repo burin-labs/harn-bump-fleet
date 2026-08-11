@@ -58,6 +58,9 @@ scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/h
 
 # Repair only manifest-admitted failed bump PRs in an isolated fleet root.
 # The hosted workflow invokes this automatically after a terminal failure.
+# By default every admitted manifest consumer is considered; use
+# --max-repositories N for an explicitly narrower rehearsal. The Harn cost
+# budget remains the global live-spend ceiling.
 scripts/with_env.sh harn run --no-sandbox repair_fleet_convergence.harn -- \
   --fleet-root /absolute/path/to/materialized-fleet vX.Y.Z
 
