@@ -110,6 +110,7 @@ add_harn_write_root "${HARN_CACHE_DIR:-${HOME}/Library/Caches/harn}"
 
 cd "$repo_root"
 exec "${script_dir}/with_env.sh" \
+  "${script_dir}/with_github_api_egress.sh" \
   "${script_dir}/with_github_auth.sh" \
   "${script_dir}/harn_shielded.sh" \
   run \
