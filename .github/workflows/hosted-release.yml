@@ -75,6 +75,12 @@ on:
           origin/main when the run starts.
         type: string
         default: ""
+      converge_fleet:
+        description: >-
+          After a successful ship-pr release, prove publication and converge
+          every manifest-owned Harn consumer on the new tag.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -86,6 +92,10 @@ concurrency:
 jobs:
   release:
     name: ${{ inputs.mode }} v-next (${{ inputs.bump }})
+    outputs:
+      tag: ${{ steps.shipped-release.outputs.tag }}
+      fleet_run_id: ${{ steps.dispatch-fleet.outputs.run_id }}
+      fleet_run_url: ${{ steps.dispatch-fleet.outputs.run_url }}
     # Source certification owns three internally parallel heavy lanes: Rust,
     # Harn, and package audit. The release gate partitions a host with at least
     # six CPUs into bounded per-lane pools; GitHub's four-vCPU runner correctly
@@ -401,6 +411,77 @@ jobs:
           ./scripts/with_env.sh harn run --no-sandbox release_harn.harn -- "${args[@]}" \
             | tee .harn-runs/hosted-release.md
 
+      - name: Resolve shipped release receipt
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        id: shipped-release
+        working-directory: harn-bump-fleet
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t receipts < <(find .harn-runs/release-harn/watches -type f -name 'v*.json' -print)
+          if [[ "${#receipts[@]}" -ne 1 ]]; then
+            echo "expected one shipped release watch receipt, found ${#receipts[@]}" >&2
+            exit 1
+          fi
+          tag="$(jq -er '.tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$"))' "${receipts[0]}")"
+          printf 'tag=%s\nreceipt=%s\n' "$tag" "${receipts[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Prove hosted release publication
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_TAG: ${{ steps.shipped-release.outputs.tag }}
+          RELEASE_RECEIPT: ${{ steps.shipped-release.outputs.receipt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/refresh_hosted_release_credentials.sh
+          (
+            while true; do
+              sleep 2400
+              ./scripts/refresh_hosted_release_credentials.sh \
+                || echo "::warning::release-watch credential refresh failed"
+            done
+          ) &
+          refresher=$!
+          trap 'kill "${refresher}" 2>/dev/null || true' EXIT
+          ./scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn -- \
+            --tag "$RELEASE_TAG" \
+            --receipt "$RELEASE_RECEIPT" \
+            --repo "${GITHUB_WORKSPACE}/harn" \
+            --yes-live-release \
+            --json \
+            | tee .harn-runs/hosted-release-watch.json
+
+      - name: Mint fleet orchestration token
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        id: fleet-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          repositories: harn-bump-fleet
+          permission-actions: write
+          permission-contents: read
+
+      - name: Dispatch fleet convergence
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        id: dispatch-fleet
+        working-directory: harn-bump-fleet
+        env:
+          GH_TOKEN: ${{ steps.fleet-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.fleet-token.outputs.token }}
+          RELEASE_TAG: ${{ steps.shipped-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ./scripts/with_env.sh harn run --no-sandbox dispatch_fleet_convergence.harn -- \
+            --no-wait "$RELEASE_TAG" \
+            | tee .harn-runs/hosted-fleet-dispatch.json
+          run_id="$(jq -er '.run_id | select(. > 0)' .harn-runs/hosted-fleet-dispatch.json)"
+          run_url="$(jq -er '.run_url | select(startswith("https://github.com/"))' .harn-runs/hosted-fleet-dispatch.json)"
+          printf 'run_id=%s\nrun_url=%s\n' "$run_id" "$run_url" >> "$GITHUB_OUTPUT"
+
       # A warm Rust cache is the only lever left on this job's wall clock that
       # costs nothing, and GitHub caps a repository at 10 GB. Whether the
       # release build fits under that cap is a question about this workspace on
@@ -449,3 +530,43 @@ jobs:
           path: harn-bump-fleet/.harn-runs/**
           retention-days: 14
           if-no-files-found: warn
+
+  fleet:
+    name: Converge Harn consumer fleet
+    needs: release
+    if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out release harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@e9e3f14e7cd07aa25daa3a0cac55832cc79ea092
+
+      - name: Install locked Harn dependencies
+        run: harn install --locked
+
+      - name: Prove exact fleet convergence run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          FLEET_RUN_ID: ${{ needs.release.outputs.fleet_run_id }}
+          FLEET_RUN_URL: ${{ needs.release.outputs.fleet_run_url }}
+        run: |
+          set -euo pipefail
+          harn run --no-sandbox watch_fleet_convergence_run.harn -- \
+            --run-id "$FLEET_RUN_ID" --run-url "$FLEET_RUN_URL" "$RELEASE_TAG" \
+            | tee hosted-fleet-convergence.json
+
+      - name: Upload fleet convergence receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-fleet-convergence-${{ github.run_id }}
+          path: hosted-fleet-convergence.json
+          if-no-files-found: error
