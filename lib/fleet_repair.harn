@@ -1,0 +1,496 @@
+import { agent_host_tools } from "std/agent/host_tools"
+import { agent_loop } from "std/agent/loop"
+import { agent_preset } from "std/agent/presets"
+import { workflow_run_repair } from "std/workflow/repair"
+import { FleetConvergenceRow, FleetConvergenceSnapshot } from "./fleet_convergence"
+import { FleetRepository } from "./fleet_manifest"
+import { github_enable_auto_merge, github_worktree_commit } from "./github"
+import { install_binder, planner_defaults } from "./llm_defaults"
+import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
+
+const BUMP_BRANCH = "automation/bump-harn-runtime"
+
+const REPAIR_INSPECTION_ARGV_PREFIXES = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "blame"],
+  ["git", "rev-parse"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "view"],
+  ["rg"],
+  ["head"],
+  ["tail"],
+]
+
+pub type FleetRepairPolicy = {max_repositories: int, max_attempts: int, max_tokens_per_attempt: int}
+
+pub type FleetRepairCandidate = {
+  repo: string,
+  directory: string,
+  pr_number: int,
+  pr_url: string,
+  head_sha: string,
+  validation_command: string,
+  failing_checks: list<dict>,
+}
+
+pub type FleetRepairPlan = {
+  target: string,
+  candidates: list<FleetRepairCandidate>,
+  refused: list<{repo: string, reason: string}>,
+}
+
+pub type FleetRepairAttempt = {
+  attempt: int,
+  validation_ok: bool,
+  validation_output: string,
+  agent_status: string,
+}
+
+pub type FleetRepairResult = {
+  repo: string,
+  status: "repaired" | "refused" | "failed" | "no_change",
+  reason: string,
+  pr_number?: int,
+  old_head_sha?: string,
+  new_head_sha?: string,
+  attempts: list<FleetRepairAttempt>,
+}
+
+pub type FleetRepairReceipt = {
+  schema_version: "harn_bump_fleet.repair.v1",
+  target: string,
+  ok: bool,
+  policy: FleetRepairPolicy,
+  results: list<FleetRepairResult>,
+}
+
+fn repository_for(repositories: list<FleetRepository>, slug: string) -> FleetRepository? {
+  for repo in repositories {
+    if repo.slug == slug {
+      return repo
+    }
+  }
+  return nil
+}
+
+fn repair_refusal(row: FleetConvergenceRow, reason: string) {
+  return {repo: row.repo, reason: reason}
+}
+
+/**
+ * Admit only exact failed bump PRs with a manifest-owned validator.
+ *
+ * Provider/API failures, missing PRs, conflicts, drafts, and green-but-blocked
+ * branches are control-plane states rather than code failures. Sending those
+ * to a model would turn an operational problem into an unbounded edit request.
+ */
+pub fn fleet_repair_plan(
+  snapshot: FleetConvergenceSnapshot,
+  repositories: list<FleetRepository>,
+  policy: FleetRepairPolicy,
+) -> FleetRepairPlan {
+  let candidates: list<FleetRepairCandidate> = []
+  let refused: list<{repo: string, reason: string}> = []
+  for row in snapshot.repositories {
+    if row.state != "failed" {
+      continue
+    }
+    const repo = repository_for(repositories, row.repo)
+    if repo == nil {
+      refused = refused + [repair_refusal(row, "repository_not_in_manifest")]
+      continue
+    }
+    if row.reason != "checks_failing" {
+      refused = refused + [repair_refusal(row, "failure_not_code_repairable:" + row.reason)]
+      continue
+    }
+    if (row.pr_number ?? 0) <= 0 || trim(row.head_sha ?? "") == "" {
+      refused = refused + [repair_refusal(row, "missing_pull_request_lease")]
+      continue
+    }
+    if trim(repo.bump_validate_command ?? "") == "" {
+      refused = refused + [repair_refusal(row, "missing_manifest_validator")]
+      continue
+    }
+    if len(candidates) >= policy.max_repositories {
+      refused = refused + [repair_refusal(row, "repository_budget_exhausted")]
+      continue
+    }
+    candidates = candidates
+      + [
+      {
+        repo: row.repo,
+        directory: repo.directory,
+        pr_number: row.pr_number ?? 0,
+        pr_url: row.pr_url ?? "",
+        head_sha: row.head_sha ?? "",
+        validation_command: repo.bump_validate_command ?? "",
+        failing_checks: row.failing_checks ?? [],
+      },
+    ]
+  }
+  return {target: snapshot.target, candidates: candidates, refused: refused}
+}
+
+fn command_detail(result) -> string {
+  const text = trim(result.stderr ?? result.stdout ?? "")
+  return if len(text) <= 12000 {
+    text
+  } else {
+    text[len(text) - 12000:]
+  }
+}
+
+fn run_git(process: HarnessProcess, repo_dir: string, args: list<string>) {
+  return process.run({program: "git", args: args, cwd: repo_dir})
+}
+
+fn prepare_checkout(process: HarnessProcess, candidate: FleetRepairCandidate) -> string? {
+  const fetched = run_git(process, candidate.directory, ["fetch", "--quiet", "origin", BUMP_BRANCH])
+  if !fetched.success {
+    return "fetch_failed: " + command_detail(fetched)
+  }
+  const checked = run_git(
+    process,
+    candidate.directory,
+    ["checkout", "--quiet", "--detach", candidate.head_sha],
+  )
+  if !checked.success {
+    return "checkout_failed: " + command_detail(checked)
+  }
+  const observed = run_git(process, candidate.directory, ["rev-parse", "HEAD"])
+  if !observed.success || lowercase(trim(observed.stdout)) != lowercase(candidate.head_sha) {
+    return "checkout_lease_mismatch"
+  }
+  const clean = run_git(process, candidate.directory, ["status", "--porcelain"])
+  if !clean.success || trim(clean.stdout) != "" {
+    return "checkout_not_clean"
+  }
+  return nil
+}
+
+fn repair_tools(harness: Harness, repo_dir: string) {
+  return agent_host_tools(
+    harness,
+    nil,
+    {
+      root: repo_dir,
+      cwd: repo_dir,
+      max_inline_bytes: 12000,
+      read_bytes: 12000,
+      tail_bytes: 12000,
+      search_max_matches: 160,
+      exclude_globs: [".git/**", "target/**", "node_modules/**", ".build/**"],
+      allow_argv_prefixes: REPAIR_INSPECTION_ARGV_PREFIXES,
+      names: {
+        read_file: "repair_read",
+        read_file_tail: "repair_read_tail",
+        search_files: "repair_search",
+        git_inspect: "repair_git",
+        run_command: "repair_inspect",
+        read_command_output: "repair_inspect_output",
+        read_command_output_tail: "repair_inspect_tail",
+        edit_file: "repair_edit",
+        write_file: "repair_write",
+      },
+      descriptions: {
+        read_file: "Read one UTF-8 file under the isolated downstream bump checkout.",
+        search_files:
+          "Search the isolated downstream bump checkout; narrow broad searches with path or glob.",
+        git_inspect:
+          "Inspect status, diff, log, show, blame, branches, or remotes without mutating git state.",
+        run_command:
+          "Run one bounded read-only inspection command. Pass argv as a list; shell strings are not accepted.",
+        edit_file: "Apply one exact-text edit inside the isolated downstream bump checkout.",
+        write_file: "Replace one tracked UTF-8 file inside the isolated downstream bump checkout.",
+      },
+      output_format: "json",
+    },
+  )
+}
+
+fn repair_prompt(
+  fs: HarnessFs,
+  candidate: FleetRepairCandidate,
+  target: string,
+  prior_findings: list<string>,
+) -> string {
+  return fs.render_prompt(
+    "@prompts/fleet_repair_user.harn.prompt",
+    {
+      repo: candidate.repo,
+      target: target,
+      pr_number: candidate.pr_number,
+      pr_url: candidate.pr_url,
+      head_sha: candidate.head_sha,
+      failing_checks_json: json_stringify(candidate.failing_checks),
+      prior_findings: join(prior_findings, "\n"),
+    },
+  )
+}
+
+fn run_repair_agent(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+  target: string,
+  attempt: int,
+  prior_findings: list<string>,
+  policy: FleetRepairPolicy,
+) {
+  const planner = planner_defaults(harness.env, "HARN_FLEET_REPAIR")
+  const binder = install_binder(harness, harness.clock, repair_tools(harness, candidate.directory))
+  const session_id = "fleet-repair-" + replace(candidate.repo, "/", "-") + "-" + to_string(attempt)
+  const transcript_dir = path_join(
+    harness.fs.cwd(),
+    ".harn-runs/fleet-repair",
+    replace(target, "/", "-"),
+    replace(candidate.repo, "/", "-"),
+    "attempt-" + to_string(attempt),
+  )
+  harness.fs.mkdir(transcript_dir, true)
+  const result = agent_loop(
+    harness,
+    repair_prompt(harness.fs, candidate, target, prior_findings),
+    harness.fs.render_prompt("@prompts/fleet_repair_system.harn.prompt", {}),
+    agent_preset(
+      harness,
+      "repair",
+      {
+        provider: planner.provider,
+        model: planner.model,
+        max_tokens: policy.max_tokens_per_attempt,
+        temperature: 0.0,
+        tools: binder.tools,
+        tool_caller: binder.tool_caller,
+        timeout_ms: 900000,
+        idle_timeout_ms: 180000,
+        iteration_budget: {mode: "adaptive", initial: 6, max: 12, extend_by: 2},
+        require_successful_tools: ["repair_read"],
+        turn_policy: {allow_done_sentinel: false, max_prose_chars: 12000},
+        compaction: {
+          strategy: "hybrid",
+          keep_last_n: 10,
+          policy: release_compaction_policy("validation_repair"),
+        },
+        transcript_projection: tool_repair_projection_policy(),
+        session_id: session_id,
+        llm_transcript_dir: transcript_dir,
+      },
+    ),
+  )
+  try {
+    harness.agent.close(session_id, {reason: result?.status ?? "completed"})
+  } catch (_close_error) {
+    nil
+  }
+  return result
+}
+
+fn validate_candidate(process: HarnessProcess, candidate: FleetRepairCandidate) {
+  const result = process.shell_at(candidate.directory, candidate.validation_command)
+  return {ok: result.success, output: command_detail(result)}
+}
+
+fn changed_paths(process: HarnessProcess, candidate: FleetRepairCandidate) -> list<string> {
+  const result = run_git(
+    process,
+    candidate.directory,
+    ["diff", "--name-only", "--diff-filter=ACDMRTUXB", candidate.head_sha, "--"],
+  )
+  if !result.success {
+    throw "changed-path inventory failed: " + command_detail(result)
+  }
+  let paths = []
+  for raw in split(result.stdout, "\n") {
+    const path = trim(raw)
+    if path == "" {
+      continue
+    }
+    if starts_with(path, "/") || len(regex_captures("(^|/)\\.\\.(/|$)", path)) > 0
+      || contains(
+      path,
+      "\t",
+    ) {
+      throw "repair produced unsafe path: " + path
+    }
+    paths = paths + [path]
+  }
+  return paths
+}
+
+fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
+  // The repair agent may modify only files already tracked by the exact bump
+  // head. Build output and newly invented files never cross the publisher.
+  const staged = run_git(harness.process, candidate.directory, ["add", "-u"])
+  if !staged.success {
+    throw "repair staging failed: " + command_detail(staged)
+  }
+  const published = github_worktree_commit(
+    harness,
+    {
+      slug: candidate.repo,
+      branch: BUMP_BRANCH,
+      headline: "Repair Harn runtime bump validation",
+      repo_dir: candidate.directory,
+      source: "index",
+      base_oid: candidate.head_sha,
+      expected_branch_oid: candidate.head_sha,
+    },
+  )
+  if is_err(published) {
+    throw "repair publication failed: " + to_string(unwrap_err(published))
+  }
+  const new_head = trim(to_string(unwrap(published)?.commit_oid ?? ""))
+  if new_head == "" {
+    throw "repair publication returned no commit oid"
+  }
+  const armed = github_enable_auto_merge(
+    harness,
+    candidate.repo,
+    candidate.pr_number,
+    new_head,
+    "squash",
+  )
+  if is_err(armed) {
+    throw "repair published but auto-merge re-arm failed: " + to_string(unwrap_err(armed))
+  }
+  return new_head
+}
+
+/** Repair one exact downstream bump PR under a bounded validate/repair loop. */
+pub fn repair_fleet_candidate(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+  target: string,
+  policy: FleetRepairPolicy,
+) -> FleetRepairResult {
+  const checkout_error = prepare_checkout(harness.process, candidate)
+  if checkout_error != nil {
+    return {
+      repo: candidate.repo,
+      status: "refused",
+      reason: checkout_error ?? "checkout_refused",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+    }
+  }
+  const executor = { ctx ->
+    const result = run_repair_agent(
+      harness,
+      candidate,
+      target,
+      ctx.attempt,
+      ctx.prior_findings ?? [],
+      policy,
+    )
+    const validation = validate_candidate(harness.process, candidate)
+    return {
+      result: result,
+      verification: {
+        ok: validation.ok,
+        output: validation.output,
+        agent_status: result?.status ?? "completed",
+      },
+      findings: if validation.ok {
+        []
+      } else {
+        [validation.output]
+      },
+      branch: if validation.ok {
+        nil
+      } else {
+        "failed"
+      },
+      outcome: "completed",
+    }
+  }
+  const out = workflow_run_repair(
+    harness,
+    {task: "repair downstream Harn bump", executor: executor, max_attempts: policy.max_attempts},
+  )
+  let attempts: list<FleetRepairAttempt> = []
+  for {index, value} in (out.attempts ?? out.run?.stages[0]?.attempts ?? []).enumerate() {
+    attempts = attempts
+      + [
+      {
+        attempt: index + 1,
+        validation_ok: value?.verification?.ok ?? false,
+        validation_output: value?.verification?.output ?? value?.error ?? "",
+        agent_status: value?.verification?.agent_status ?? "unknown",
+      },
+    ]
+  }
+  if len(attempts) == 0 || !(attempts[len(attempts) - 1]?.validation_ok ?? false) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "validation_attempts_exhausted",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: attempts,
+    }
+  }
+  const paths = changed_paths(harness.process, candidate)
+  if len(paths) == 0 {
+    return {
+      repo: candidate.repo,
+      status: "no_change",
+      reason: "validator_passed_without_repair_delta",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: attempts,
+    }
+  }
+  const new_head = try {
+    publish_candidate(harness, candidate)
+  } catch (error) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: to_string(error),
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: attempts,
+    }
+  }
+  return {
+    repo: candidate.repo,
+    status: "repaired",
+    reason: "validated_published_and_auto_merge_armed",
+    pr_number: candidate.pr_number,
+    old_head_sha: candidate.head_sha,
+    new_head_sha: new_head,
+    attempts: attempts,
+  }
+}
+
+/** Execute one bounded plan and preserve every refusal in the typed receipt. */
+pub fn repair_fleet_plan(
+  harness: Harness,
+  plan: FleetRepairPlan,
+  policy: FleetRepairPolicy,
+) -> FleetRepairReceipt {
+  let results: list<FleetRepairResult> = plan.refused.map(
+    { row -> {repo: row.repo, status: "refused", reason: row.reason, attempts: []} },
+  )
+    .to_list()
+  for candidate in plan.candidates {
+    results = results + [repair_fleet_candidate(harness, candidate, plan.target, policy)]
+  }
+  const failed = results.filter(
+    { result -> result.status != "repaired" && result.status != "no_change" },
+  )
+    .to_list()
+  return {
+    schema_version: "harn_bump_fleet.repair.v1",
+    target: plan.target,
+    ok: len(failed) == 0,
+    policy: policy,
+    results: results,
+  }
+}
