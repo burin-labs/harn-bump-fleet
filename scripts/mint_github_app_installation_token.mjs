@@ -9,12 +9,14 @@
 //   RELEASE_APP_CLIENT_ID   — App client id (JWT iss)
 //   RELEASE_APP_PRIVATE_KEY — PEM private key
 //   RELEASE_APP_OWNER       — org/user that owns the installation (default burin-labs)
-//   RELEASE_APP_REPO        — repository name (default harn)
+//   RELEASE_APP_REPO        — repository used to resolve the installation (default harn)
+//   RELEASE_APP_TOKEN_PROFILE — reviewed repository/permission profile (default harn-release)
 //
 // Prints the token on stdout and nothing else.
 
 import crypto from "node:crypto";
 import process from "node:process";
+import { installationTokenRequest } from "./github_app_token_profiles.mjs";
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -62,6 +64,7 @@ async function githubJson(url, token, init = {}) {
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "harn-bump-fleet-hosted-release",
       ...(init.headers ?? {}),
@@ -85,6 +88,7 @@ const clientId = requireEnv("RELEASE_APP_CLIENT_ID");
 const privateKey = requireEnv("RELEASE_APP_PRIVATE_KEY").replace(/\\n/g, "\n");
 const owner = process.env.RELEASE_APP_OWNER?.trim() || "burin-labs";
 const repo = process.env.RELEASE_APP_REPO?.trim() || "harn";
+const profile = process.env.RELEASE_APP_TOKEN_PROFILE?.trim() || "harn-release";
 
 const jwt = mintJwt(clientId, privateKey);
 const installation = await githubJson(
@@ -98,7 +102,10 @@ if (installation?.id == null) {
 const access = await githubJson(
   `https://api.github.com/app/installations/${installation.id}/access_tokens`,
   jwt,
-  { method: "POST" },
+  {
+    method: "POST",
+    body: JSON.stringify(installationTokenRequest(profile)),
+  },
 );
 const token = access?.token;
 if (typeof token !== "string" || token.trim() === "") {
