@@ -1,0 +1,141 @@
+#!/usr/bin/env harn
+//
+// Promote the reusable bump workflow to the exact Harn commit that was just
+// released, then wait for every manifest-owned adapter to merge before a fleet
+// bump can be dispatched. The staged wait is the safety boundary: a new runtime
+// never reaches a consumer through an older orchestration contract.
+import { ParserSpec } from "std/cli/argparse"
+import { poll_until } from "std/poll"
+import {
+  bump_workflow_promotion_targets,
+  promote_bump_workflow_manifest,
+  promote_bump_workflow_manifest_text,
+} from "lib/bump_workflow_promotion"
+import { cli_options } from "lib/cli_options"
+import { read_fleet_manifest } from "lib/fleet_manifest"
+import {
+  fleet_projection_sources,
+  fleet_projection_targets,
+  group_projection_targets_by_repository,
+  projection_source_key,
+} from "lib/fleet_projection_targets"
+import { github_file_text_at_ref } from "lib/github"
+import { load_prerequisite_pr } from "lib/prerequisite_prs"
+import { RemoteConvergenceResult, converge_remote_repository } from "lib/remote_projection"
+
+type Options = {commit_oid: string, timeout_s: int, interval_s: int}
+
+const ARG_SPEC: ParserSpec = {
+  name: "promote-bump-workflow",
+  args: [
+    {kind: "positional", name: "commit_oid", required: true},
+    {kind: "flag", name: "timeout_s", long: "--timeout-s", parse: "int", default: 10800},
+    {kind: "flag", name: "interval_s", long: "--interval-s", parse: "int", default: 20},
+  ],
+}
+
+fn require_convergence(result: RemoteConvergenceResult) {
+  if result.status == "error" || result.status == "drift" {
+    throw "projection convergence failed for ${result.slug}: ${result.error ?? result.status}"
+  }
+}
+
+fn wait_for_proposal(harness: Harness, result: RemoteConvergenceResult, options: Options) {
+  if result.status == "clean" {
+    return
+  }
+  const number = result.pull_request ?? 0
+  const head_oid = result.commit ?? ""
+  if number <= 0 || regex_match("^[0-9a-f]{40}$", head_oid) == nil {
+    throw "projection for ${result.slug} omitted its pull request or exact head lease"
+  }
+  const merged = poll_until(
+    harness.clock,
+    fn() {
+      const observed = load_prerequisite_pr(harness, result.slug, number, head_oid)
+      if observed.status == "unexpected_head" || observed.status == "github_error"
+        || observed.status
+        == "missing_pull_request" {
+        throw "projection prerequisite failed for ${result.slug}#${number}: ${observed.detail}"
+      }
+      return if observed.ok {
+        observed
+      } else {
+        nil
+      }
+    },
+    {timeout_ms: options.timeout_s * 1000, interval_ms: options.interval_s * 1000},
+  )
+  if merged == nil {
+    throw "timed out waiting for projection ${result.slug}#${number} at ${head_oid}"
+  }
+}
+
+fn resolved_sources(harness: Harness, manifest) -> dict {
+  let sources = {}
+  for source in fleet_projection_sources(manifest) {
+    const key = projection_source_key(source.slug, source.path)
+    const text = github_file_text_at_ref(
+      harness,
+      source.slug,
+      source.path,
+      manifest.fleet.default_branch,
+    )
+    if text == nil {
+      throw "projection source is missing on ${manifest.fleet.default_branch}: ${key}"
+    }
+    sources[key] = text ?? ""
+  }
+  return sources
+}
+
+pipeline main(harness: Harness) -> int {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  if options.timeout_s < 1 || options.interval_s < 1 {
+    throw "promotion polling bounds must be positive"
+  }
+  const source = harness.fs.read_text("fleet.toml")
+  const current = read_fleet_manifest(harness.fs)
+  const manifest = promote_bump_workflow_manifest(current, options.commit_oid)
+  const promoted_text = promote_bump_workflow_manifest_text(source, current, options.commit_oid)
+  const self_result = converge_remote_repository(
+    harness,
+    "burin-labs/harn-bump-fleet",
+    manifest.fleet.default_branch,
+    bump_workflow_promotion_targets(manifest, promoted_text),
+    true,
+    true,
+  )
+  require_convergence(self_result)
+  wait_for_proposal(harness, self_result, options)
+  let results = []
+  const targets = fleet_projection_targets(manifest, resolved_sources(harness, manifest))
+  for group in group_projection_targets_by_repository(targets) {
+    const result = converge_remote_repository(
+      harness,
+      group.slug,
+      manifest.fleet.default_branch,
+      group.targets,
+      true,
+      true,
+    )
+    require_convergence(result)
+    results = results + [result]
+  }
+  for result in results {
+    wait_for_proposal(harness, result, options)
+  }
+  harness.stdio.println(
+    json_stringify_pretty(
+      {
+        schema_version: "harn.bump-workflow-promotion.v1",
+        ok: true,
+        released_commit_oid: options.commit_oid,
+        workflow_reference: manifest.policy.bump_workflow,
+        policy: self_result,
+        repositories: results,
+      },
+    ),
+  )
+  return 0
+}
