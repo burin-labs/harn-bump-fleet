@@ -56,6 +56,11 @@ scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 # Run on one repo only.
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
+# Repair only manifest-admitted failed bump PRs in an isolated fleet root.
+# The hosted workflow invokes this automatically after a terminal failure.
+scripts/with_env.sh harn run --no-sandbox repair_fleet_convergence.harn -- \
+  --fleet-root /absolute/path/to/materialized-fleet vX.Y.Z
+
 # Check fleet-owned package CI adapters without writing them.
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 
@@ -300,6 +305,7 @@ Knobs (all `env_str`-style, all optional):
 | `HARN_EXT_RELEASE_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `release_harn` (`0` = uncapped) |
 | `HARN_EXT_RELEASE_CARGO_TARGET_DIR` | user cache dir | Cargo target cache for live `release_harn` prepare/audit |
 | `HARN_EXT_BUMP_FLEET_COST_LIMIT_USD` | `1.00` | Per-run LLM spend ceiling for `bump_fleet` (`0` = uncapped) |
+| `HARN_EXT_FLEET_REPAIR_COST_LIMIT_USD` | `1.00` | Per-run ceiling for bounded downstream bump repair; hosted runs set `$0.25` |
 
 The default release Cargo target is
 `$XDG_CACHE_HOME/harn-bump-fleet/release-harn-target`, or
