@@ -36,7 +36,9 @@ The entry points are:
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
-  machine holding all twenty-six checkouts. Dry-run first; `--apply` writes.
+  machine holding all twenty-six checkouts. Pin-only package CI is derived from
+  current default-branch bytes and preserves repository-owned jobs. Dry-run
+  first; `--apply` writes.
   `--apply` also arms auto-merge, leased to the commit it published, so each
   repair lands once that repository's own checks pass. `--no-auto-merge` holds
   arming; it never merges anything itself.
