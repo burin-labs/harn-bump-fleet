@@ -70,7 +70,7 @@ scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 # Check fleet-owned runtime-bump adapters without writing them.
 scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
 
-# Report every remote fleet-owned file that drifts from fleet.toml.
+# Report every remote fleet-owned file or package pin that drifts from fleet.toml.
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 
 # Scope a check or repair to exact manifest-owned paths. Repeat the flag for
@@ -80,7 +80,9 @@ scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- \
   --only-path scripts/agent_shell_guard.harn \
   --only-path scripts/agent_shell_guard_policy.harn
 
-# Propose the repair as one pull request per drifted repository.
+# Propose the repair as one pull request per drifted repository. Pin-only CI
+# keeps every repository-owned job and changes only the structurally selected
+# package workflow and status-action references.
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --apply
 
 # Inspect unsigned bot dependency PRs that are blocked by required signatures.
