@@ -12,15 +12,26 @@ import {
 import { GithubClientOptions } from "harn-github-connector/default"
 
 /**
- * The branch every repository's projection proposal lives on.
+ * Prefix for repository projection proposal branches.
  *
- * One stable name per repository is what makes a scheduled run idempotent: the
- * same drift converges onto the same branch and refreshes the same pull
- * request, instead of opening a new one every night until someone notices.
+ * One stable name per exact rendered projection keeps a scheduled run
+ * idempotent while parenting each new projection from current main. Reusing
+ * one branch forever makes its pull request conflict as main advances.
  */
-pub const REMOTE_PROJECTION_BRANCH: string = "automation/fleet-projections"
+pub const REMOTE_PROJECTION_BRANCH_PREFIX: string = "automation/fleet-projections"
 
 const PROJECTION_HEADLINE = "chore: restore fleet-owned projections"
+
+/** One fresh, idempotent branch for one exact rendered projection. */
+pub fn remote_projection_branch(targets: list<FleetProjectionTarget>) -> string {
+  const identity = json_stringify(
+    targets.sort_by({ target -> target.path }).map(
+      { target -> {path: target.path, expected: target.expected} },
+    )
+      .to_list(),
+  )
+  return REMOTE_PROJECTION_BRANCH_PREFIX + "-" + substring(sha256(identity), 0, 12)
+}
 
 /**
  * Outcome of converging one repository's fleet-owned files.
@@ -100,22 +111,22 @@ fn drifted_targets(
 }
 
 /**
- * Whether the proposal branch already carries every byte this run would write.
+ * Whether this exact projection branch already carries every byte this run would write.
  *
- * A branch that survived from an earlier run holds an open pull request. Adding
- * an identical commit to it would publish a no-op every night, so the check is
- * what separates "already proposed" from "proposed something else".
+ * A branch that survived from another run for the same rendered identity holds
+ * an open pull request. Adding an identical commit would publish a no-op, so
+ * the check separates "already proposed" from hash collision or corruption.
  */
 fn branch_already_proposes(
   harness: Harness,
   slug: string,
+  branch: string,
   targets: list<FleetProjectionTarget>,
   options: GithubClientOptions,
 ) -> bool {
   for target in targets {
-    if github_file_text_at_ref(harness, slug, target.path, REMOTE_PROJECTION_BRANCH, options)
-      != target
-      .expected {
+    if github_file_text_at_ref(harness, slug, target.path, branch, options)
+      != target.expected {
       return false
     }
   }
@@ -178,6 +189,7 @@ fn converge_repository(
   apply: bool,
   arm: bool,
   options: GithubClientOptions,
+  retry_stale_pull: bool = true,
 ) -> RemoteConvergenceResult {
   const drifted = drifted_targets(harness, slug, default_branch, targets, options)
   const paths = drifted.map({ target -> target.path }).to_list()
@@ -191,11 +203,12 @@ fn converge_repository(
     github_branch_head(harness, slug, default_branch, options),
     "branch head lookup failed",
   )
+  const branch = remote_projection_branch(drifted)
   const claim = unwrap_or_throw(
     github_claim_ref(
       harness,
       slug,
-      "refs/heads/" + REMOTE_PROJECTION_BRANCH,
+      "refs/heads/" + branch,
       {oid: to_string(head?.oid ?? "")},
       options,
     ),
@@ -203,9 +216,10 @@ fn converge_repository(
   )
   const branch_oid = to_string(claim?.oid ?? "")
   const body = proposal_body(slug, drifted)
-  if !(claim?.claimed ?? false) && branch_already_proposes(harness, slug, drifted, options) {
-    // The branch already says what this run would say, so it must not commit
-    // again: that duplicate is exactly what one stable branch name prevents.
+  if !(claim?.claimed ?? false)
+    && branch_already_proposes(harness, slug, branch, drifted, options) {
+    // The identity branch already says what this run would say, so it must not
+    // commit again: that duplicate is exactly what the stable digest prevents.
     // Arming is still retried, because a run that published a commit but could
     // not arm it has to recover on its own. Leaving that proposal unarmed
     // forever would rebuild the pile-up this loop exists to prevent, one
@@ -215,7 +229,7 @@ fn converge_repository(
         slug: slug,
         status: "pending",
         drifted: paths,
-        branch: REMOTE_PROJECTION_BRANCH,
+        branch: branch,
         commit: branch_oid,
         auto_merge: {state: "held"},
       }
@@ -223,7 +237,7 @@ fn converge_repository(
     const listed = github_pr_list(
       harness,
       slug,
-      {state: "open", head: REMOTE_PROJECTION_BRANCH, base: default_branch},
+      {state: "open", head: branch, base: default_branch},
       options,
     )
     if is_err(listed) {
@@ -234,20 +248,14 @@ fn converge_repository(
     // but reopening the pull request nightly would overrule a human decision
     // with a cron job. The next byte change proposes again on its own.
     if len(open) == 0 {
-      return {
-        slug: slug,
-        status: "pending",
-        drifted: paths,
-        branch: REMOTE_PROJECTION_BRANCH,
-        commit: branch_oid,
-      }
+      return {slug: slug, status: "pending", drifted: paths, branch: branch, commit: branch_oid}
     }
     const open_number = to_int(open[0]?.number) ?? 0
     return {
       slug: slug,
       status: "pending",
       drifted: paths,
-      branch: REMOTE_PROJECTION_BRANCH,
+      branch: branch,
       commit: branch_oid,
       pull_request: open_number,
       auto_merge: arm_or_hold(harness, slug, open_number, branch_oid, arm, options),
@@ -258,7 +266,7 @@ fn converge_repository(
       harness,
       {
         slug: slug,
-        branch: REMOTE_PROJECTION_BRANCH,
+        branch: branch,
         expected_head_oid: branch_oid,
         headline: PROJECTION_HEADLINE,
         body: body,
@@ -269,27 +277,34 @@ fn converge_repository(
     "projection commit failed",
   )
   const head_oid = to_string(commit?.oid ?? "")
-  const pull = unwrap_or_throw(
-    github_pr_upsert(
-      harness,
-      {
-        slug: slug,
-        head: REMOTE_PROJECTION_BRANCH,
-        base: default_branch,
-        title: PROJECTION_HEADLINE,
-        body: body,
-        expected_head_oid: head_oid,
-      },
-      options,
-    ),
-    "projection pull request failed",
+  const pull_attempt = github_pr_upsert(
+    harness,
+    {
+      slug: slug,
+      head: branch,
+      base: default_branch,
+      title: PROJECTION_HEADLINE,
+      body: body,
+      expected_head_oid: head_oid,
+    },
+    options,
   )
+  if is_err(pull_attempt)
+    && retry_stale_pull
+    && to_string(unwrap_err(pull_attempt)?.code ?? "") == "stale_head" {
+    // Another convergence run can publish the same projection between our
+    // signed commit and PR upsert. Re-enter once from fresh remote facts. The
+    // normal fixed-point path verifies the branch bytes and adopts its current
+    // head without adding another commit; a second race still fails closed.
+    return converge_repository(harness, slug, default_branch, targets, apply, arm, options, false)
+  }
+  const pull = unwrap_or_throw(pull_attempt, "projection pull request failed")
   const pull_number = to_int(pull?.number) ?? 0
   return {
     slug: slug,
     status: "applied",
     drifted: paths,
-    branch: REMOTE_PROJECTION_BRANCH,
+    branch: branch,
     commit: head_oid,
     pull_request: pull_number,
     url: to_string(pull?.url ?? ""),
