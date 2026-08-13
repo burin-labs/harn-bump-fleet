@@ -571,10 +571,15 @@ scripts/watch_harn_release.sh --tag vX.Y.Z --hosted-run RUN_ID --yes-live-releas
 
 ### Running the release on hosted runners
 
-`.github/workflows/hosted-release.yml` runs the same harness on a
-GitHub-hosted runner. Both this repository and `burin-labs/harn` are public,
-so the runner minutes cost nothing, and the Rust compilation that dominates a
-local release moves off the operator machine. On a measured v0.10.53 run,
+`.github/workflows/hosted-release.yml` runs the same harness on hosted Linux
+capacity, normally an eight-CPU Blacksmith runner. If that provider cannot
+assign a runner, set the repository variable
+`HARN_CI_DISABLE_BLACKSMITH_LINUX=true` and replay the dispatch receipt. The
+replacement uses `ubuntu-latest` and declares the matching Harn runner tier;
+unset or set the variable to `false` after Blacksmith recovers. Both this
+repository and `burin-labs/harn` are public, so GitHub-hosted fallback minutes
+cost nothing. The Rust compilation that dominates a local release moves off
+the operator machine. On a measured v0.10.53 run,
 `prepare` and `release-cli-aot` accounted for 17 of the 24 minutes before the
 certification gate; the model agent accounted for 0.3 minutes, so the LLM is
 not the expensive part of a release.
