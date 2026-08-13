@@ -1,0 +1,1 @@
+Fleet convergence observation now retries only typed transient network failures on the exact dispatched run, uses a monotonic timeout, and records observation attempts. Authorization, schema, and run-identity failures still stop immediately, and no retry can redispatch or substitute a workflow run.
