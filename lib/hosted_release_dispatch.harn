@@ -1,0 +1,331 @@
+import { read_json_typed_result, write_json } from "std/fs"
+import {
+  GithubWorkflowCancelReceipt,
+  GithubWorkflowDispatchReceipt,
+  GithubWorkflowRun,
+} from "harn-github-connector/default"
+
+pub type HostedReleaseMode = "prepare" | "ship-pr"
+
+pub type HostedReleaseBump = "patch" \
+  | "minor" \
+  | "major" \
+  | "premajor" \
+  | "preminor" \
+  | "prepatch" \
+  | "prerelease"
+
+/** The complete closed input tuple accepted by hosted-release.yml. */
+pub type HostedReleaseInputs = {
+  mode: HostedReleaseMode,
+  bump: HostedReleaseBump,
+  prerelease_identifier: string,
+  at_sha: string,
+  converge_fleet: bool,
+}
+
+pub type HostedReleaseReplacement = {
+  previous_run_id: int,
+  previous_run_url: string,
+  previous_status: "queued" | "waiting",
+  cancellation: GithubWorkflowCancelReceipt,
+}
+
+/** Durable proof of the inputs and exact GitHub run accepted for one dispatch. */
+pub type HostedReleaseDispatchReceipt = {
+  schema_version: "harn_bump_fleet.hosted_release_dispatch.v1",
+  repo: string,
+  workflow: string,
+  ref: string,
+  inputs: HostedReleaseInputs,
+  run_id: int,
+  run_url: string,
+  workflow_path: string,
+  head_sha: string,
+  head_branch: string,
+  event: "workflow_dispatch",
+  created_at: string?,
+  replacement: HostedReleaseReplacement?,
+}
+
+pub type HostedReleaseDispatchErrorCode = "invalid_inputs" \
+  | "prior_receipt_mismatch" \
+  | "previous_run_lookup_failed" \
+  | "previous_run_not_replaceable" \
+  | "dispatch_failed" \
+  | "replacement_race" \
+  | "replacement_cancel_failed"
+
+pub type HostedReleaseDispatchError = {
+  code: HostedReleaseDispatchErrorCode,
+  message: string,
+  previous_run_id: int?,
+  replacement_run_id: int?,
+  cause: unknown?,
+  rollback: GithubWorkflowCancelReceipt?,
+}
+
+pub type HostedReleaseDispatchAdapter = {
+  dispatch: fn(HostedReleaseInputs) -> Result<GithubWorkflowDispatchReceipt, unknown>,
+  run: fn(int) -> Result<GithubWorkflowRun, unknown>,
+  cancel: fn(int) -> Result<GithubWorkflowCancelReceipt, unknown>,
+}
+
+const PRERELEASE_BUMPS = ["premajor", "preminor", "prepatch", "prerelease"]
+
+fn failure(
+  code: HostedReleaseDispatchErrorCode,
+  message: string,
+  extra: {
+    previous_run_id?: int,
+    replacement_run_id?: int,
+    cause?: unknown,
+    rollback?: GithubWorkflowCancelReceipt?,
+  } = {},
+) -> HostedReleaseDispatchError {
+  return {
+    code: code,
+    message: message,
+    previous_run_id: extra.previous_run_id,
+    replacement_run_id: extra.replacement_run_id,
+    cause: extra.cause,
+    rollback: extra.rollback,
+  }
+}
+
+/** Validate semantic constraints not expressible in the closed structural type. */
+pub fn hosted_release_inputs_validate(
+  inputs: HostedReleaseInputs,
+) -> Result<HostedReleaseInputs, HostedReleaseDispatchError> {
+  const preid = trim(inputs.prerelease_identifier)
+  const prerelease = contains(PRERELEASE_BUMPS, inputs.bump)
+  if prerelease && preid == "" {
+    return Err(failure("invalid_inputs", "${inputs.bump} requires a prerelease identifier"))
+  }
+  if !prerelease && preid != "" {
+    return Err(
+      failure("invalid_inputs", "a prerelease identifier is valid only for prerelease bumps"),
+    )
+  }
+  const sha = lowercase(trim(inputs.at_sha))
+  if sha != "" && len(regex_captures("^[0-9a-f]{40}$", sha)) == 0 {
+    return Err(failure("invalid_inputs", "at_sha must be a full 40-character lowercase commit SHA"))
+  }
+  const normalized: HostedReleaseInputs = {
+    mode: inputs.mode,
+    bump: inputs.bump,
+    prerelease_identifier: preid,
+    at_sha: sha,
+    converge_fleet: inputs.converge_fleet,
+  }
+  return Ok(normalized)
+}
+
+fn receipt_from_dispatch(
+  repo: string,
+  workflow: string,
+  ref: string,
+  inputs: HostedReleaseInputs,
+  run: GithubWorkflowDispatchReceipt,
+  replacement: HostedReleaseReplacement? = nil,
+) -> HostedReleaseDispatchReceipt {
+  const schema_version: "harn_bump_fleet.hosted_release_dispatch.v1" =
+    "harn_bump_fleet.hosted_release_dispatch.v1"
+  const event: "workflow_dispatch" = "workflow_dispatch"
+  const receipt: HostedReleaseDispatchReceipt = {
+    schema_version: schema_version,
+    repo: repo,
+    workflow: workflow,
+    ref: ref,
+    inputs: inputs,
+    run_id: run.run_id,
+    run_url: run.url,
+    workflow_path: run.workflow_path,
+    head_sha: lowercase(run.head_sha),
+    head_branch: run.head_branch,
+    event: event,
+    created_at: run.created_at,
+    replacement: replacement,
+  }
+  return receipt
+}
+
+/** Dispatch once and retain the full input tuple beside the exact run identity. */
+pub fn hosted_release_dispatch(
+  repo: string,
+  workflow: string,
+  ref: string,
+  inputs: HostedReleaseInputs,
+  adapter: HostedReleaseDispatchAdapter,
+) -> Result<HostedReleaseDispatchReceipt, HostedReleaseDispatchError> {
+  const checked = hosted_release_inputs_validate(inputs)
+  if is_err(checked) {
+    return Err(unwrap_err(checked))
+  }
+  const normalized = unwrap(checked)
+  const dispatched = adapter.dispatch(normalized)
+  if is_err(dispatched) {
+    return Err(
+      failure(
+        "dispatch_failed",
+        "hosted release workflow dispatch failed",
+        {cause: unwrap_err(dispatched)},
+      ),
+    )
+  }
+  return Ok(receipt_from_dispatch(repo, workflow, ref, normalized, unwrap(dispatched)))
+}
+
+fn same_run_identity(receipt: HostedReleaseDispatchReceipt, run: GithubWorkflowRun) -> bool {
+  return run.id == receipt.run_id
+    && run.workflow_path == receipt.workflow_path
+    && run.event == receipt.event
+    && run.head_branch == receipt.head_branch
+    && lowercase(run.head_sha) == lowercase(receipt.head_sha)
+}
+
+fn replaceable_status(status: string) -> bool {
+  return status == "queued" || status == "waiting"
+}
+
+fn rollback_replacement(
+  adapter: HostedReleaseDispatchAdapter,
+  run_id: int,
+) -> GithubWorkflowCancelReceipt? {
+  const rolled_back = adapter.cancel(run_id)
+  return if is_ok(rolled_back) {
+    unwrap(rolled_back)
+  } else {
+    nil
+  }
+}
+
+/**
+ * Replace one queued/waiting run by replaying its receipt-owned input tuple.
+ * The new run is acquired first. The concurrency group keeps it behind the
+ * previous run until the previous identity is rechecked and cancelled.
+ */
+pub fn hosted_release_replace(
+  prior: HostedReleaseDispatchReceipt,
+  adapter: HostedReleaseDispatchAdapter,
+) -> Result<HostedReleaseDispatchReceipt, HostedReleaseDispatchError> {
+  const checked = hosted_release_inputs_validate(prior.inputs)
+  if is_err(checked) {
+    return Err(
+      failure(
+        "prior_receipt_mismatch",
+        "prior hosted release receipt contains invalid inputs",
+        {previous_run_id: prior.run_id, cause: unwrap_err(checked)},
+      ),
+    )
+  }
+  const before = adapter.run(prior.run_id)
+  if is_err(before) {
+    return Err(
+      failure(
+        "previous_run_lookup_failed",
+        "could not inspect the previous hosted release run",
+        {previous_run_id: prior.run_id, cause: unwrap_err(before)},
+      ),
+    )
+  }
+  const previous = unwrap(before)
+  if !same_run_identity(prior, previous) || !replaceable_status(previous.status) {
+    return Err(
+      failure(
+        "previous_run_not_replaceable",
+        "previous hosted release run is not the same queued or waiting run recorded by the receipt",
+        {previous_run_id: prior.run_id},
+      ),
+    )
+  }
+  const dispatched = adapter.dispatch(unwrap(checked))
+  if is_err(dispatched) {
+    return Err(
+      failure(
+        "dispatch_failed",
+        "replacement hosted release workflow dispatch failed",
+        {previous_run_id: prior.run_id, cause: unwrap_err(dispatched)},
+      ),
+    )
+  }
+  const replacement = unwrap(dispatched)
+  const after = adapter.run(prior.run_id)
+  if is_err(after)
+    || !same_run_identity(prior, unwrap(after))
+    || !replaceable_status(unwrap(after).status) {
+    return Err(
+      failure(
+        "replacement_race",
+        "previous hosted release run changed while its replacement was acquired",
+        {
+          previous_run_id: prior.run_id,
+          replacement_run_id: replacement.run_id,
+          cause: if is_err(after) {
+            unwrap_err(after)
+          } else {
+            nil
+          },
+          rollback: rollback_replacement(adapter, replacement.run_id),
+        },
+      ),
+    )
+  }
+  const cancelled = adapter.cancel(prior.run_id)
+  if is_err(cancelled) {
+    return Err(
+      failure(
+        "replacement_cancel_failed",
+        "could not cancel the previous hosted release run; the replacement was rolled back",
+        {
+          previous_run_id: prior.run_id,
+          replacement_run_id: replacement.run_id,
+          cause: unwrap_err(cancelled),
+          rollback: rollback_replacement(adapter, replacement.run_id),
+        },
+      ),
+    )
+  }
+  const cancellation = unwrap(cancelled)
+  return Ok(
+    receipt_from_dispatch(
+      prior.repo,
+      prior.workflow,
+      prior.ref,
+      unwrap(checked),
+      replacement,
+      {
+        previous_run_id: prior.run_id,
+        previous_run_url: prior.run_url,
+        previous_status: previous.status,
+        cancellation: cancellation,
+      },
+    ),
+  )
+}
+
+pub fn hosted_release_receipt_read(fs: HarnessFs, path: string) -> HostedReleaseDispatchReceipt? {
+  const loaded = read_json_typed_result<HostedReleaseDispatchReceipt>(
+    fs,
+    path,
+    schema_of(HostedReleaseDispatchReceipt),
+  )
+  return if is_ok(loaded) {
+    unwrap(loaded)
+  } else {
+    nil
+  }
+}
+
+/** Atomically persist the exact input/run receipt for later safe replacement. */
+pub fn hosted_release_receipt_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  receipt: HostedReleaseDispatchReceipt,
+) -> string {
+  harness.fs.mkdir(dirname(path), true)
+  const temporary = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+  return path
+}
