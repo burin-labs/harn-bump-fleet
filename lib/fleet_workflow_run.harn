@@ -1,4 +1,9 @@
-import { github_actions_run } from "./github"
+import { github_actions_run, github_is_transient_read_error } from "./github"
+import { GithubConnectorResult, GithubWorkflowRun } from "harn-github-connector/default"
+
+const FLEET_REPO = "burin-labs/harn-bump-fleet"
+
+const MAX_CONSECUTIVE_TRANSIENT_RETRIES = 3
 
 pub type FleetWorkflowReceipt = {
   schema_version: "harn_bump_fleet.hosted_dispatch.v1",
@@ -8,9 +13,120 @@ pub type FleetWorkflowReceipt = {
   status: string,
   conclusion: string,
   elapsed_ms: int,
+  observation_attempts: int,
+  transient_retries: int,
 }
 
-/** Wait for one exact fleet run; never substitute a newer run on the branch. */
+/** Exact-run read and monotonic time primitives for deterministic observation policy tests. */
+pub type FleetWorkflowRunAdapter = {
+  now_ms: fn() -> int,
+  run: fn(int) -> GithubConnectorResult<GithubWorkflowRun>,
+  wait: fn(int) -> nil,
+}
+
+fn fleet_workflow_receipt(
+  target: string,
+  run_id: int,
+  run_url: string,
+  status: string,
+  conclusion: string,
+  elapsed_ms: int,
+  observation_attempts: int,
+  transient_retries: int,
+) -> FleetWorkflowReceipt {
+  return {
+    schema_version: "harn_bump_fleet.hosted_dispatch.v1",
+    target: target,
+    run_id: run_id,
+    run_url: run_url,
+    status: status,
+    conclusion: conclusion,
+    elapsed_ms: elapsed_ms,
+    observation_attempts: observation_attempts,
+    transient_retries: transient_retries,
+  }
+}
+
+/**
+ * Observe one exact fleet run through a bounded transport-retry policy.
+ * Authorization, schema, semantic, and run-identity failures remain fail-closed.
+ */
+pub fn wait_fleet_workflow_run_with_adapter(
+  target: string,
+  run_id: int,
+  run_url: string,
+  timeout_s: int,
+  interval_s: int,
+  adapter: FleetWorkflowRunAdapter,
+) -> FleetWorkflowReceipt {
+  if trim(target) == "" || run_id < 1 || trim(run_url) == "" {
+    throw "fleet workflow observation requires a target, exact run ID, and run URL"
+  }
+  if timeout_s < 1 || interval_s < 1 {
+    throw "fleet workflow timeout and interval must be positive"
+  }
+  const started = adapter.now_ms()
+  const stop_at = started + timeout_s * 1000
+  let observation_attempts = 0
+  let transient_retries = 0
+  let consecutive_transient_retries = 0
+  let last_status = ""
+  let last_conclusion = ""
+  while true {
+    const observed = adapter.run(run_id)
+    observation_attempts = observation_attempts + 1
+    if is_err(observed) {
+      const error = unwrap_err(observed)
+      if !github_is_transient_read_error(error) {
+        throw "fleet workflow observation failed: " + to_string(error)
+      }
+      transient_retries = transient_retries + 1
+      consecutive_transient_retries = consecutive_transient_retries + 1
+      if consecutive_transient_retries > MAX_CONSECUTIVE_TRANSIENT_RETRIES {
+        throw "fleet workflow observation exhausted transient network retries"
+      }
+      if adapter.now_ms() >= stop_at {
+        if last_status == "" {
+          throw "fleet workflow observation timed out before the first valid response"
+        }
+        return fleet_workflow_receipt(
+          target,
+          run_id,
+          run_url,
+          last_status,
+          last_conclusion,
+          adapter.now_ms() - started,
+          observation_attempts,
+          transient_retries,
+        )
+      }
+      adapter.wait(interval_s * 1000)
+      continue
+    }
+    const run = unwrap(observed)
+    if run.id != run_id {
+      throw "fleet workflow exact-run lookup returned another run ID"
+    }
+    consecutive_transient_retries = 0
+    last_status = run.status
+    last_conclusion = to_string(run.conclusion ?? "")
+    if run.status == "completed" || adapter.now_ms() >= stop_at {
+      return fleet_workflow_receipt(
+        target,
+        run_id,
+        run_url,
+        last_status,
+        last_conclusion,
+        adapter.now_ms() - started,
+        observation_attempts,
+        transient_retries,
+      )
+    }
+    adapter.wait(interval_s * 1000)
+  }
+}
+
+/** Wait for one exact fleet run; never substitute or redispatch another run. */
 pub fn wait_fleet_workflow_run(
   harness: Harness,
   target: string,
@@ -19,26 +135,17 @@ pub fn wait_fleet_workflow_run(
   timeout_s: int,
   interval_s: int,
 ) -> FleetWorkflowReceipt {
-  const started = harness.clock.now_ms()
-  const stop_at = started + timeout_s * 1000
-  let observed = github_actions_run(harness, "burin-labs/harn-bump-fleet", run_id)
-  while !is_err(observed) && unwrap(observed).status != "completed"
-    && harness.clock.now_ms()
-    < stop_at {
-    harness.clock.sleep_ms(interval_s * 1000)
-    observed = github_actions_run(harness, "burin-labs/harn-bump-fleet", run_id)
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return harness.clock.monotonic_ms() },
+    run: fn(exact_run_id) { return github_actions_run(harness, FLEET_REPO, exact_run_id) },
+    wait: fn(delay_ms) { harness.clock.sleep_ms(delay_ms) },
   }
-  if is_err(observed) {
-    throw "fleet workflow observation failed: " + to_string(unwrap_err(observed))
-  }
-  const final = unwrap(observed)
-  return {
-    schema_version: "harn_bump_fleet.hosted_dispatch.v1",
-    target: target,
-    run_id: run_id,
-    run_url: run_url,
-    status: final.status,
-    conclusion: final.conclusion,
-    elapsed_ms: harness.clock.now_ms() - started,
-  }
+  return wait_fleet_workflow_run_with_adapter(
+    target,
+    run_id,
+    run_url,
+    timeout_s,
+    interval_s,
+    adapter,
+  )
 }
