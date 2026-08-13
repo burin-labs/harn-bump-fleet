@@ -2,7 +2,8 @@ import { read_json_result, write_json } from "std/fs"
 import { GitRemoteRef } from "std/git"
 import { git_push_ref_plumbing } from "./git"
 import { github_file_text_at_ref } from "./github"
-import { release_git_remote_refs } from "./release_runtime"
+import { release_git_remote_refs, retry_release_git_remote_observation } from "./release_runtime"
+import { release_output_tail } from "./release_step_output"
 import { ReleaseWatchReceipt } from "./release_watch_state"
 
 pub type ReleaseRefCleanupState = "pending" | "deleted" | "absent" | "mismatch" | "failed"
@@ -25,6 +26,7 @@ pub type ReleaseRefCleanupReceipt = {
   message: string,
   refs: list<ReleaseRefCleanupEntry>,
   updated_at: string,
+  error_category?: string,
 }
 
 pub type ReleaseRefCleanupAdapter = {
@@ -159,9 +161,22 @@ fn default_adapter(harness: Harness) -> ReleaseRefCleanupAdapter {
   return {
     now: fn() { return harness.clock.date_iso() },
     remote_refs: fn(repo, refs) {
-      const observed = release_git_remote_refs(harness.process, {repo: repo, mock: false}, refs)
+      const observed = retry_release_git_remote_observation(
+        harness.clock,
+        fn() { return release_git_remote_refs(harness.process, {repo: repo, mock: false}, refs) },
+      )
       if !observed.success {
-        throw "could not inspect transient release refs: " + trim(observed.stderr)
+        throw {
+          category: if (observed.transient_retries ?? 0) > 0 {
+            "transient_network_exhausted"
+          } else {
+            "git_remote_observation"
+          },
+          message: "could not inspect transient release refs after ${observed.attempts ?? 1} attempt(s): "
+            + trim(
+            observed.stderr,
+          ),
+        }
       }
       return observed.refs
     },
@@ -337,7 +352,7 @@ fn cleanup_receipt_with_refs(
 }
 
 /** Delete exact transient refs only after the watch receipt carries terminal hosted proof. */
-pub fn run_release_ref_cleanup(
+fn run_release_ref_cleanup_inner(
   harness: Harness,
   receipt: ReleaseWatchReceipt,
   watch_receipt_path: string,
@@ -428,6 +443,59 @@ pub fn run_release_ref_cleanup(
     write_cleanup_receipt({fs: harness.fs, random: harness.random}, path, cleanup)
   }
   return cleanup
+}
+
+/** Preserve terminal release authority when post-terminal cleanup cannot be observed safely. */
+fn release_ref_cleanup_failure_receipt(
+  harness: Harness,
+  receipt: ReleaseWatchReceipt,
+  watch_receipt_path: string,
+  error: unknown,
+) -> ReleaseRefCleanupReceipt {
+  const path = cleanup_receipt_path(watch_receipt_path)
+  const prior = try {
+    parse_prior_receipt(harness.fs, path, receipt.tag)
+  } catch (_error) {
+    nil
+  }
+  const category = trim(to_string(error?.category ?? "housekeeping_error"))
+  const detail = release_output_tail(to_string(error?.message ?? error))
+  const blocked: ReleaseRefCleanupReceipt = {
+    schema_version: "release_harn.ref_cleanup.v1",
+    tag: receipt.tag,
+    watch_receipt_path: watch_receipt_path,
+    terminal_proof_at: if receipt.warm_cache.state == "completed" {
+      receipt.warm_cache.finished_at
+    } else {
+      receipt.updated_at
+    },
+    state: "blocked",
+    message: "terminal release proof remains authoritative; ref cleanup could not complete: "
+      + detail,
+    refs: prior?.refs ?? [],
+    updated_at: harness.clock.date_iso(),
+    error_category: category,
+  }
+  write_cleanup_receipt({fs: harness.fs, random: harness.random}, path, blocked)
+  return blocked
+}
+
+/**
+ * Delete exact transient refs after terminal proof. Cleanup failures are typed
+ * blocked housekeeping, never a replacement verdict for the shipped release.
+ */
+pub fn run_release_ref_cleanup(
+  harness: Harness,
+  receipt: ReleaseWatchReceipt,
+  watch_receipt_path: string,
+  repo: string,
+  injected_adapter: ReleaseRefCleanupAdapter? = nil,
+) -> ReleaseRefCleanupReceipt {
+  return try {
+    run_release_ref_cleanup_inner(harness, receipt, watch_receipt_path, repo, injected_adapter)
+  } catch (error) {
+    release_ref_cleanup_failure_receipt(harness, receipt, watch_receipt_path, error)
+  }
 }
 
 pub fn release_ref_cleanup_receipt_path(watch_receipt_path: string) -> string {
