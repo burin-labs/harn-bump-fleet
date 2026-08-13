@@ -3,9 +3,11 @@ import { GitRemoteRef } from "std/git"
 import { parse_release, version_from_release_branch } from "std/semver"
 import { git_worktree_path_for_branch } from "./git_worktrees"
 import { release_tag_verify_git_args } from "./release_execution"
+import { retry_release_git_remote_observation } from "./release_git_remote_retry"
 import { harn_release_readiness, release_readiness_detail } from "./release_readiness"
 import { delete_remote_ref_with_lease, release_ref_deletion_decision } from "./release_ref_cleanup"
 import { release_git_remote_refs, run_git } from "./release_runtime"
+import { release_failure_evidence } from "./release_step_output"
 import { release_tag_identity_verification } from "./release_tag_identity"
 import { release_withdrawal_binding } from "./release_withdrawals"
 
@@ -49,6 +51,7 @@ pub type ReleaseRefSweepReceipt = {
   message: string,
   refs: list<ReleaseRefSweepEntry>,
   updated_at: string,
+  error_category?: string,
 }
 
 pub type ReleaseRefSweepAdapter = {
@@ -330,13 +333,26 @@ fn default_adapter(harness: Harness, repo: string) -> ReleaseRefSweepAdapter {
   return {
     now: fn() { return harness.clock.date_iso() },
     remote_refs: fn(checkout) {
-      const observed = release_git_remote_refs(
-        harness.process,
-        {repo: checkout, mock: false},
-        ["refs/heads/release*"],
+      const observed = retry_release_git_remote_observation(
+        harness.clock,
+        fn() { return release_git_remote_refs(
+          harness.process,
+          {repo: checkout, mock: false},
+          ["refs/heads/release*"],
+        ) },
       )
       if !observed.success {
-        throw "could not inventory remote release refs: " + trim(observed.stderr)
+        throw {
+          category: if (observed.transient_retries ?? 0) > 0 {
+            "transient_network_exhausted"
+          } else {
+            "git_remote_observation"
+          },
+          message: "could not inventory remote release refs after ${observed.attempts ?? 1} attempt(s): "
+            + trim(
+            observed.stderr,
+          ),
+        }
       }
       return observed.refs
     },
@@ -613,7 +629,7 @@ fn sweep_message(state: string) {
 }
 
 /** Inventory every release-prefixed ref, optionally applying only exact planned deletions. */
-pub fn run_release_ref_sweep(
+fn run_release_ref_sweep_inner(
   harness: Harness,
   options: ReleaseRefSweepOptions,
   injected_adapter: ReleaseRefSweepAdapter? = nil,
@@ -702,4 +718,49 @@ pub fn run_release_ref_sweep(
     write_receipt({fs: harness.fs, random: harness.random}, options.receipt_path, receipt)
   }
   return receipt
+}
+
+/** Preserve prior inventory when historical cleanup cannot be observed safely. */
+fn release_ref_sweep_failure_receipt(
+  harness: Harness,
+  options: ReleaseRefSweepOptions,
+  error: unknown,
+) -> ReleaseRefSweepReceipt {
+  const prior = try {
+    prior_receipt(harness.fs, options.receipt_path)
+  } catch (_error) {
+    nil
+  }
+  const evidence = release_failure_evidence(error, "housekeeping_error")
+  const blocked: ReleaseRefSweepReceipt = {
+    schema_version: "release_harn.ref_sweep.v1",
+    mode: options.mode ?? "dry_run",
+    slug: options.slug ?? "burin-labs/harn",
+    repo: options.repo,
+    state: "blocked",
+    message: "terminal release proof remains authoritative; historical ref sweep could not complete: "
+      + evidence
+      .detail,
+    refs: prior?.refs ?? [],
+    updated_at: harness.clock.date_iso(),
+    error_category: evidence.category,
+  }
+  write_receipt({fs: harness.fs, random: harness.random}, options.receipt_path, blocked)
+  return blocked
+}
+
+/**
+ * Inventory and sweep release refs. Observation and deletion failures become a
+ * durable blocked housekeeping receipt instead of replacing release success.
+ */
+pub fn run_release_ref_sweep(
+  harness: Harness,
+  options: ReleaseRefSweepOptions,
+  injected_adapter: ReleaseRefSweepAdapter? = nil,
+) -> ReleaseRefSweepReceipt {
+  return try {
+    run_release_ref_sweep_inner(harness, options, injected_adapter)
+  } catch (error) {
+    release_ref_sweep_failure_receipt(harness, options, error)
+  }
 }
