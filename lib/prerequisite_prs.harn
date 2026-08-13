@@ -1,4 +1,9 @@
-import { github_pr_view } from "./github"
+import {
+  github_file_text_at_ref,
+  github_pr_commits,
+  github_pr_files,
+  github_pr_view,
+} from "./github"
 
 pub type PrerequisitePrStatus = "satisfied" \
   | "missing_pull_request" \
@@ -20,6 +25,7 @@ pub type PrerequisitePrDecision = {
   merge_state?: string,
   merged_at?: string,
   merge_commit_oid?: string,
+  head_verification?: "exact" | "projection_equivalent" | "unexpected",
   detail: string,
 }
 
@@ -42,6 +48,26 @@ pub type PrerequisitePr = {
   ...rest,
 }
 
+pub type PrerequisiteProjectionFile = {path: string, contents: string}
+
+pub type PrerequisiteProjectionLease = {
+  head_ref: string,
+  base_ref: string,
+  files: list<PrerequisiteProjectionFile>,
+}
+
+pub type PrerequisiteProjectionEvidence = {
+  commits_head_oid: string,
+  final_head_oid: string,
+  commits: list<{sha: string, signature?: {verified?: bool, ...rest}, ...rest}>,
+  changed_paths: list<string>,
+  files_complete: bool,
+  head_contents: dict,
+  missing_paths: list<string>,
+}
+
+pub type PrerequisiteHeadVerification = {ok: bool, detail: string}
+
 fn text_or_empty(value) -> string {
   if value == nil {
     return ""
@@ -51,6 +77,14 @@ fn text_or_empty(value) -> string {
 
 fn pr_head_oid(pr) -> string {
   return text_or_empty(pr?.head?.sha ?? pr?.head_oid)
+}
+
+fn pr_head_ref(pr) -> string {
+  return text_or_empty(pr?.head?.ref)
+}
+
+fn pr_base_ref(pr) -> string {
+  return text_or_empty(pr?.base?.ref)
 }
 
 fn pr_state(pr) -> string {
@@ -77,6 +111,7 @@ fn decision(
   status: PrerequisitePrStatus,
   detail: string,
   expected_head_oid: string = "",
+  head_verification: "exact" | "projection_equivalent" | "unexpected" = "exact",
 ) -> PrerequisitePrDecision {
   return {
     ok: ok,
@@ -91,7 +126,65 @@ fn decision(
     merge_state: pr_merge_state(pr),
     merged_at: text_or_empty(pr?.merged_at ?? pr?.mergedAt),
     merge_commit_oid: pr_merge_commit_oid(pr),
+    head_verification: head_verification,
     detail: detail,
+  }
+}
+
+/**
+ * Prove that an advanced PR head still represents exactly one fleet projection.
+ *
+ * A protected branch may merge its current base into an open automation branch
+ * while checks run. The proposal commit then remains in the ordered PR history,
+ * but the head lease advances. Accept that descendant only when the connector
+ * observed one stable, signed commit list and the final PR patch still contains
+ * exactly the owned paths with exactly the rendered bytes.
+ */
+pub fn verify_projection_equivalent_head(
+  pr: PrerequisitePr,
+  expected_head_oid: string,
+  lease: PrerequisiteProjectionLease,
+  evidence: PrerequisiteProjectionEvidence,
+) -> PrerequisiteHeadVerification {
+  const observed = pr_head_oid(pr)
+  if pr_head_ref(pr) != lease.head_ref || pr_base_ref(pr) != lease.base_ref {
+    return {ok: false, detail: "pull request branch or base no longer matches the projection lease"}
+  }
+  if evidence.commits_head_oid != observed || evidence.final_head_oid != observed {
+    return {ok: false, detail: "pull request head changed while projection evidence was read"}
+  }
+  if !evidence.files_complete || len(evidence.missing_paths) > 0 {
+    return {ok: false, detail: "projection file evidence is incomplete"}
+  }
+  let expected_seen = false
+  for commit in evidence.commits {
+    if commit.sha == expected_head_oid {
+      expected_seen = true
+    }
+    if expected_seen && !(commit?.signature?.verified ?? false) {
+      return {ok: false, detail: "projection descendant contains an unverified commit"}
+    }
+  }
+  if !expected_seen {
+    return {ok: false, detail: "expected projection commit is not in the pull request history"}
+  }
+  const expected_paths = lease.files.map({ file -> file.path }).to_list().sort()
+  const changed_paths = evidence.changed_paths.sort()
+  if len(expected_paths) != len(changed_paths)
+    || json_stringify(expected_paths)
+    != json_stringify(
+    changed_paths,
+  ) {
+    return {ok: false, detail: "pull request patch widened beyond the owned projection paths"}
+  }
+  for file in lease.files {
+    if evidence.head_contents[file.path] != file.contents {
+      return {ok: false, detail: "projected bytes changed at " + file.path}
+    }
+  }
+  return {
+    ok: true,
+    detail: "advanced head preserves the signed proposal and exact owned projection patch",
   }
 }
 
@@ -107,6 +200,7 @@ pub fn classify_prerequisite_pr(
   number: int,
   pr: PrerequisitePr?,
   expected_head_oid: string = "",
+  equivalent_head: bool = false,
 ) -> PrerequisitePrDecision {
   if pr == nil {
     return decision(
@@ -121,7 +215,16 @@ pub fn classify_prerequisite_pr(
   }
   const head_oid = pr_head_oid(pr)
   const expected = text_or_empty(expected_head_oid)
-  if expected != "" && head_oid != expected {
+  const head_verification: "exact" | "projection_equivalent" | "unexpected" = if expected == ""
+    || head_oid
+    == expected {
+    "exact"
+  } else if equivalent_head {
+    "projection_equivalent"
+  } else {
+    "unexpected"
+  }
+  if head_verification == "unexpected" {
     return decision(
       repo,
       number,
@@ -130,6 +233,7 @@ pub fn classify_prerequisite_pr(
       "unexpected_head",
       "pull request head ${head_oid} does not match expected ${expected}",
       expected,
+      "unexpected",
     )
   }
   if !pr_is_merged(pr) {
@@ -141,6 +245,7 @@ pub fn classify_prerequisite_pr(
       "not_merged",
       "pull request is ${pr_state(pr)}, not merged",
       expected,
+      head_verification,
     )
   }
   const merged_at = text_or_empty(pr?.merged_at ?? pr?.mergedAt)
@@ -154,6 +259,7 @@ pub fn classify_prerequisite_pr(
       "missing_merge_evidence",
       "merged pull request is missing merged_at or merge_commit_oid evidence",
       expected,
+      head_verification,
     )
   }
   return decision(
@@ -162,8 +268,70 @@ pub fn classify_prerequisite_pr(
     pr,
     true,
     "satisfied",
-    "pull request is merged at ${merged_at} with merge commit ${merge_commit}",
+    "pull request is merged at ${merged_at} with merge commit ${merge_commit} and ${head_verification} head evidence",
     expected,
+    head_verification,
+  )
+}
+
+fn load_projection_head_verification(
+  harness: Harness,
+  repo: string,
+  number: int,
+  pr: PrerequisitePr,
+  expected_head_oid: string,
+  lease: PrerequisiteProjectionLease,
+) -> PrerequisiteHeadVerification {
+  const observed = pr_head_oid(pr)
+  const commits = github_pr_commits(harness, repo, number, observed)
+  if is_err(commits) {
+    return {ok: false, detail: "GitHub PR commit proof failed: " + to_string(unwrap_err(commits))}
+  }
+  const files = github_pr_files(harness, repo, number, 1, 100)
+  if is_err(files) {
+    return {ok: false, detail: "GitHub PR file proof failed: " + to_string(unwrap_err(files))}
+  }
+  const commit_evidence = unwrap(commits)
+  const file_evidence = unwrap(files)
+  let head_contents = {}
+  let missing_paths: list<string> = []
+  for file in lease.files {
+    const read = try {
+      github_file_text_at_ref(harness, repo, file.path, observed)
+    }
+    if is_err(read) {
+      return {
+        ok: false,
+        detail: "GitHub projection content proof failed: " + to_string(unwrap_err(read)),
+      }
+    }
+    const contents = unwrap(read)
+    if contents == nil {
+      missing_paths = missing_paths + [file.path]
+    } else {
+      head_contents[file.path] = contents ?? ""
+    }
+  }
+  const final_view = github_pr_view(harness, repo, number)
+  if is_err(final_view) {
+    return {
+      ok: false,
+      detail: "GitHub final PR head proof failed: " + to_string(unwrap_err(final_view)),
+    }
+  }
+  return verify_projection_equivalent_head(
+    pr,
+    expected_head_oid,
+    lease,
+    {
+      commits_head_oid: commit_evidence.head_sha,
+      final_head_oid: pr_head_oid(unwrap(final_view)),
+      commits: commit_evidence.commits,
+      changed_paths: file_evidence.files.map({ file -> file.filename }).to_list(),
+      files_complete: len(file_evidence.files) < 100,
+      head_contents: head_contents,
+      missing_paths: missing_paths,
+    },
   )
 }
 
@@ -173,6 +341,7 @@ pub fn load_prerequisite_pr(
   repo: string,
   number: int,
   expected_head_oid: string = "",
+  projection: PrerequisiteProjectionLease? = nil,
 ) -> PrerequisitePrDecision {
   const pr = github_pr_view(harness, repo, number)
   if is_err(pr) {
@@ -185,5 +354,30 @@ pub fn load_prerequisite_pr(
       detail: "GitHub PR view failed: " + to_string(unwrap_err(pr)),
     }
   }
-  return classify_prerequisite_pr(repo, number, unwrap(pr), expected_head_oid)
+  const observed = unwrap(pr)
+  let equivalent_head = false
+  if expected_head_oid != "" && pr_head_oid(observed) != expected_head_oid && projection != nil {
+    const verification = load_projection_head_verification(
+      harness,
+      repo,
+      number,
+      observed,
+      expected_head_oid,
+      projection ?? {head_ref: "", base_ref: "", files: []},
+    )
+    if !verification.ok {
+      return decision(
+        repo,
+        number,
+        observed,
+        false,
+        "unexpected_head",
+        verification.detail,
+        expected_head_oid,
+        "unexpected",
+      )
+    }
+    equivalent_head = true
+  }
+  return classify_prerequisite_pr(repo, number, observed, expected_head_oid, equivalent_head)
 }
