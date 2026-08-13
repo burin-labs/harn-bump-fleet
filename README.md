@@ -585,13 +585,26 @@ Candidate certification intentionally exercises nested OS sandboxes, which
 Seatbelt cannot apply beneath Harn's default-deny outer sandbox. Read-only
 audits, mocks, and rehearsals remain local. The handoff accepts only the
 workflow's typed inputs and fails before dispatch when a local-only release
-flag cannot be represented.
+flag cannot be represented. It writes an atomic
+`.harn-runs/hosted-release-dispatch-<run-id>.json` receipt containing the full
+non-secret input tuple and exact Actions run identity.
 
-Dispatch it from the Actions tab or with `gh`:
+Dispatch it from the Actions tab or through the typed launcher:
 
 ```sh
-gh workflow run hosted-release.yml --repo burin-labs/harn-bump-fleet \
-  -f bump=patch -f mode=audit
+scripts/dispatch_hosted_release.sh --bump patch --mode ship-pr \
+  --at-sha <40-character-origin-main-sha>
+```
+
+If a queued or environment-waiting run must be replaced, replay its receipt.
+The replacement command does not accept release input flags: it dispatches the
+recorded tuple, rechecks the old run, and records both run IDs. If the old run
+started or changed identity, the command cancels the new run and refuses the
+replacement.
+
+```sh
+scripts/dispatch_hosted_release.sh \
+  --replace-receipt .harn-runs/hosted-release-dispatch-<run-id>.json
 ```
 
 `mode: audit` is read-only. `mode: prepare` builds and certifies the candidate
