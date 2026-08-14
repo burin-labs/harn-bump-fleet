@@ -4,7 +4,7 @@ import { agent_preset } from "std/agent/presets"
 import { workflow_run_repair } from "std/workflow/repair"
 import { FleetConvergenceRow, FleetConvergenceSnapshot } from "./fleet_convergence"
 import { FleetRepository } from "./fleet_manifest"
-import { github_enable_auto_merge, github_worktree_commit } from "./github"
+import { github_enable_auto_merge, github_pr_upsert, github_worktree_commit } from "./github"
 import { install_binder, planner_defaults } from "./llm_defaults"
 import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
 
@@ -39,9 +39,12 @@ pub type FleetRepairCandidate = {
 
 pub type FleetRepairPlan = {
   target: string,
+  recoveries: list<FleetRecoveryCandidate>,
   candidates: list<FleetRepairCandidate>,
   refused: list<{repo: string, reason: string}>,
 }
+
+pub type FleetRecoveryCandidate = {repo: string, head_sha: string, branch_pin: string}
 
 pub type FleetRepairAttempt = {
   attempt: int,
@@ -104,6 +107,7 @@ pub fn fleet_repair_plan(
   policy: FleetRepairPolicy,
 ) -> FleetRepairPlan {
   let candidates: list<FleetRepairCandidate> = []
+  let recoveries: list<FleetRecoveryCandidate> = []
   let refused: list<{repo: string, reason: string}> = []
   for row in snapshot.repositories {
     if row.state != "failed" {
@@ -112,6 +116,19 @@ pub fn fleet_repair_plan(
     const repo = repository_for(repositories, row.repo)
     if repo == nil {
       refused = refused + [repair_refusal(row, "repository_not_in_manifest")]
+      continue
+    }
+    if row.reason == "target_branch_missing_pull_request" {
+      if trim(row.head_sha ?? "") == "" || trim(row.branch_pin ?? "") == "" {
+        refused = refused + [repair_refusal(row, "missing_target_branch_lease")]
+      } else if len(candidates) + len(recoveries) >= policy.max_repositories {
+        refused = refused + [repair_refusal(row, "repository_budget_exhausted")]
+      } else {
+        recoveries = recoveries
+          + [
+          {repo: row.repo, head_sha: row.head_sha ?? "", branch_pin: row.branch_pin ?? ""},
+        ]
+      }
       continue
     }
     if row.reason != "checks_failing" {
@@ -143,7 +160,59 @@ pub fn fleet_repair_plan(
       },
     ]
   }
-  return {target: snapshot.target, candidates: candidates, refused: refused}
+  return {target: snapshot.target, recoveries: recoveries, candidates: candidates, refused: refused}
+}
+
+/** Recover a signed target branch that the bump producer failed to present. */
+fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) -> FleetRepairResult {
+  const upsert = github_pr_upsert(
+    harness,
+    {
+      slug: candidate.repo,
+      head: BUMP_BRANCH,
+      base: "main",
+      title: "Bump Harn runtime",
+      body:
+        "Automated Harn runtime bump. The fleet controller recovered the exact signed target branch after the producer's post-publication comparison returned a false no-op. Merges through the normal queue.",
+      expected_head_oid: candidate.head_sha,
+    },
+  )
+  if is_err(upsert) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "pull_request_recovery_failed:" + to_string(unwrap_err(upsert)),
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+    }
+  }
+  const pr = unwrap(upsert)
+  const armed = github_enable_auto_merge(
+    harness,
+    candidate.repo,
+    pr.number,
+    candidate.head_sha,
+    "squash",
+  )
+  if is_err(armed) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_failed:" + to_string(unwrap_err(armed)),
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+    }
+  }
+  return {
+    repo: candidate.repo,
+    status: "repaired",
+    reason: "target_branch_presented_and_auto_merge_armed",
+    pr_number: pr.number,
+    old_head_sha: candidate.head_sha,
+    new_head_sha: candidate.head_sha,
+    attempts: [],
+  }
 }
 
 fn command_detail(result) -> string {
@@ -489,6 +558,9 @@ pub fn repair_fleet_plan(
     { row -> {repo: row.repo, status: "refused", reason: row.reason, attempts: []} },
   )
     .to_list()
+  for recovery in plan.recoveries {
+    results = results + [recover_target_branch(harness, recovery)]
+  }
   for candidate in plan.candidates {
     results = results + [repair_fleet_candidate(harness, candidate, plan.target, policy)]
   }
