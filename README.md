@@ -598,7 +598,7 @@ Dispatch it from the Actions tab or through the typed launcher:
 
 ```sh
 scripts/dispatch_hosted_release.sh --bump patch --mode ship-pr \
-  --at-sha <40-character-origin-main-sha>
+  --at-sha <40-character-origin-main-sha> --expect-pr <number>
 ```
 
 If a queued or environment-waiting run must be replaced, replay its receipt.
