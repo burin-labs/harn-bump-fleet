@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Private downstream update proof now uses the connector's exact-head Actions
+  projection when the release App cannot read GitHub's Checks rollup, without
+  widening the App's permissions or weakening the green-head requirement.
 - Live Harn releases now restart in a fresh process after bump-fleet updates
   itself, and release their exact cross-host version lane on every terminal
   path without masking the primary release verdict.
