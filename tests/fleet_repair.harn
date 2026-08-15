@@ -2,19 +2,167 @@ import { FleetConvergenceSnapshot } from "../lib/fleet_convergence"
 import { FleetRepository } from "../lib/fleet_manifest"
 import {
   FleetRepairPolicy,
+  fleet_repair_authorized_new_file_path,
+  fleet_repair_new_file_allowed,
   fleet_repair_plan,
   fleet_repair_repository_limit,
+  fleet_repair_route,
+  fleet_repair_safe_attempt_limit,
+  fleet_repair_session_id,
+  fleet_repair_validation_findings,
 } from "../lib/fleet_repair"
 
 const POLICY: FleetRepairPolicy = {
   max_repositories: 1,
-  max_attempts: 2,
+  max_rounds: 4,
+  max_attempts_per_repository: 2,
   max_tokens_per_attempt: 4000,
+  max_cost_per_attempt_usd: 0.3,
+  max_cost_per_repository_usd: 0.6,
+  max_cost_per_run_usd: 4.0,
+  runtime_provenance: {
+    harn_version: "v0.10.96",
+    controller_revision: "test",
+    repair_contract_revision: "harn-update-repair-v4",
+  },
+  provider_secret_reference: "CEREBRAS_API_KEY",
+}
+
+fn thrown(callback) -> string {
+  return try {
+    callback()
+    ""
+  } catch (error) {
+    to_string(error)
+  }
 }
 
 pipeline test_default_repository_limit_covers_the_manifest() {
   assert_eq(fleet_repair_repository_limit(nil, 4), 4)
   assert_eq(fleet_repair_repository_limit(2, 4), 2)
+}
+
+pipeline test_each_attempt_reserves_all_remaining_retry_budget() {
+  const policy = POLICY + {max_attempts_per_repository: 3, max_cost_per_attempt_usd: 0.6}
+  const first_limit = fleet_repair_safe_attempt_limit(policy, 0.0, 0.0)
+  const late_limit = fleet_repair_safe_attempt_limit(policy, 0.0, 3.7)
+  assert(first_limit > 0.199 && first_limit < 0.201)
+  assert(late_limit > 0.099 && late_limit < 0.101)
+}
+
+pipeline test_new_files_require_one_exact_manifest_authorization(task) {
+  const allowed = ["changelog.d/harn-update.fixed.md"]
+  assert_eq(fleet_repair_new_file_allowed("changelog.d/harn-update.fixed.md", allowed), true)
+  assert_eq(fleet_repair_new_file_allowed("changelog.d/other.fixed.md", allowed), false)
+  assert_eq(fleet_repair_new_file_allowed("../secrets", allowed), false)
+  const candidate = {
+    repo: "burin-labs/pkg",
+    directory: "/tmp/isolated-checkout",
+    pr_number: 42,
+    pr_url: "https://example.test/pkg/42",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    validation_command: "harn package verify .",
+    failing_checks: [],
+    allowed_new_files: allowed,
+  }
+  assert_eq(
+    fleet_repair_authorized_new_file_path(candidate, "changelog.d/harn-update.fixed.md"),
+    "/tmp/isolated-checkout/changelog.d/harn-update.fixed.md",
+  )
+  assert(
+    contains(
+      thrown(
+        { -> fleet_repair_authorized_new_file_path(candidate, "changelog.d/not-authorized.md") },
+      ),
+      "manifest-authorized",
+    ),
+  )
+}
+
+pipeline test_repair_sessions_are_anchored_to_checkout_head_route_and_contract(task) {
+  const candidate = {
+    repo: "burin-labs/pkg",
+    directory: "/tmp/one",
+    pr_number: 42,
+    pr_url: "https://example.test/pkg/42",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    validation_command: "harn package verify .",
+    failing_checks: [],
+    allowed_new_files: [],
+  }
+  const value = fleet_repair_route(POLICY, 1, [])
+  const strong = fleet_repair_route(POLICY + {route_override: "strong"}, 1, [])
+  const key = fleet_repair_session_id(
+    candidate,
+    POLICY.runtime_provenance,
+    value,
+    "openrouter",
+    "qwen/value",
+    1,
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+      candidate + {directory: "/tmp/two"},
+      POLICY.runtime_provenance,
+      value,
+      "openrouter",
+      "qwen/value",
+      1,
+    ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+      candidate + {head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+      POLICY.runtime_provenance,
+      value,
+      "openrouter",
+      "qwen/value",
+      1,
+    ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+      candidate,
+      POLICY.runtime_provenance,
+      strong,
+      "openrouter",
+      "qwen/value",
+      1,
+    ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+      candidate,
+      POLICY.runtime_provenance,
+      value,
+      "openrouter",
+      "openai/strong",
+      1,
+    ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+      candidate,
+      POLICY.runtime_provenance + {controller_revision: "other"},
+      value,
+      "openrouter",
+      "qwen/value",
+      1,
+    ),
+  )
+  assert_eq(strong.reason, "explicit_rehearsal_route")
+}
+
+pipeline test_failed_validation_is_carried_to_the_next_repair_attempt(task) {
+  const findings = fleet_repair_validation_findings(false, "clippy: exact failure")
+  assert_eq(findings, ["clippy: exact failure"])
+  assert_eq(fleet_repair_route(POLICY, 2, findings).tier, "strong")
+  assert_eq(fleet_repair_validation_findings(true, "ignored"), [])
 }
 
 fn repo(slug: string, validator: string? = "harn package verify .") -> FleetRepository {
@@ -166,12 +314,12 @@ pipeline test_repository_budget_refuses_later_candidates(task) {
   assert_eq(plan.refused[0]?.reason, "repository_budget_exhausted")
 }
 
-pipeline test_waiting_and_converged_rows_are_noops(task) {
+pipeline test_waiting_and_proven_rows_are_noops(task) {
   const plan = fleet_repair_plan(
     snapshot(
       [
         {repo: "burin-labs/one", state: "waiting", reason: "checks_pending"},
-        {repo: "burin-labs/two", state: "converged", reason: "default_branch_pinned"},
+        {repo: "burin-labs/two", state: "proven", reason: "exact_green_update_merged"},
       ],
     ),
     [repo("burin-labs/one"), repo("burin-labs/two")],

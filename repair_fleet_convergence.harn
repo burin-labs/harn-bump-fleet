@@ -1,16 +1,19 @@
 #!/usr/bin/env harn
 import { ParserSpec } from "std/cli/argparse"
+import { env_str } from "std/config"
 import { cli_options } from "lib/cli_options"
 import { fleet_convergence_snapshot } from "lib/fleet_convergence"
 import { read_fleet_manifest, scoped_harn_bump_repositories } from "lib/fleet_manifest"
 import {
   FleetRepairPolicy,
+  REPAIR_CONTRACT_REVISION,
   fleet_repair_plan,
   fleet_repair_repository_limit,
   repair_fleet_plan,
 } from "lib/fleet_repair"
 import { github_latest_release_tag } from "lib/github"
-import { cost_budget_audit_line, install_cost_budget } from "lib/llm_defaults"
+import { harn_update_runtime_provenance, harn_update_runtime_readiness } from "lib/harn_update"
+import { cost_budget_audit_line } from "lib/llm_defaults"
 
 type Options = {
   target?: string,
@@ -18,6 +21,10 @@ type Options = {
   max_repositories?: int,
   max_attempts: int,
   max_tokens_per_attempt: int,
+  max_cost_per_attempt_usd: float,
+  max_cost_per_repository_usd: float,
+  max_cost_per_run_usd: float,
+  startup_receipt: string,
   only?: string,
 }
 
@@ -28,6 +35,33 @@ const ARG_SPEC: ParserSpec = {
     {kind: "flag", name: "fleet_root", long: "--fleet-root", required: true},
     {kind: "flag", name: "max_repositories", long: "--max-repositories", parse: "int"},
     {kind: "flag", name: "max_attempts", long: "--max-attempts", parse: "int", default: 2},
+    {
+      kind: "flag",
+      name: "max_cost_per_attempt_usd",
+      long: "--max-cost-per-attempt-usd",
+      parse: "float",
+      default: 0.3,
+    },
+    {
+      kind: "flag",
+      name: "max_cost_per_repository_usd",
+      long: "--max-cost-per-repository-usd",
+      parse: "float",
+      default: 0.6,
+    },
+    {
+      kind: "flag",
+      name: "max_cost_per_run_usd",
+      long: "--max-cost-per-run-usd",
+      parse: "float",
+      default: 4.0,
+    },
+    {
+      kind: "flag",
+      name: "startup_receipt",
+      long: "--startup-receipt",
+      default: "fleet-repair-startup-receipt.json",
+    },
     {kind: "flag", name: "only", long: "--only"},
     {
       kind: "flag",
@@ -44,28 +78,84 @@ pipeline main(harness: Harness) {
   if !starts_with(options.fleet_root, "/") {
     throw "--fleet-root must be absolute"
   }
+  const runtime = harn_update_runtime_provenance(
+    {env: harness.env, runtime: harness.runtime},
+    REPAIR_CONTRACT_REVISION,
+  )
+  const requested_target = options.target ?? "latest-release"
+  // This immutable startup receipt deliberately precedes even an optional
+  // latest-release lookup, provider resolution, model call, subprocess,
+  // checkout change, or tool installation.
+  const startup_receipt = {
+    schema_version: "harn_bump_fleet.harn_update_startup.v1",
+    status: "prepared",
+    requested_target: requested_target,
+    runtime_provenance: runtime,
+    authority: {
+      decider: "Harn repair startup preparation",
+      requested: [
+        "runtime:exact-target=" + requested_target,
+        "provider:repair-agent",
+        "process:validator",
+      ],
+      granted: [],
+      used: [],
+      denied: [],
+      unused: ["provider:repair-agent", "process:validator"],
+    },
+  }
+  harness.fs.write_text(options.startup_receipt, json_stringify_pretty(startup_receipt) + "\n")
   const manifest = read_fleet_manifest(harness.fs)
   let repositories = scoped_harn_bump_repositories(manifest, options.only)
+  const target = options.target ?? github_latest_release_tag(harness, "burin-labs/harn")
+  const runtime_readiness = harn_update_runtime_readiness(target, runtime)
+  if !runtime_readiness.ready {
+    const receipt = {
+      schema_version: "harn_bump_fleet.harn_update_startup.v1",
+      status: "blocked",
+      target: target,
+      reason: runtime_readiness.reason,
+      runtime_provenance: runtime,
+      authority: {
+        decider: "Harn runtime readiness",
+        requested: ["runtime:exact-target=" + target],
+        granted: [],
+        used: [],
+        denied: ["provider:repair-agent", "process:validator", "tool:repair_edit"],
+        unused: [],
+      },
+    }
+    harness.stdio.println(json_stringify_pretty(receipt))
+    return 1
+  }
   const policy: FleetRepairPolicy = {
     max_repositories: fleet_repair_repository_limit(options.max_repositories, len(repositories)),
-    max_attempts: options.max_attempts,
+    max_rounds: 4,
+    max_attempts_per_repository: options.max_attempts,
     max_tokens_per_attempt: options.max_tokens_per_attempt,
+    max_cost_per_attempt_usd: options.max_cost_per_attempt_usd,
+    max_cost_per_repository_usd: options.max_cost_per_repository_usd,
+    max_cost_per_run_usd: options.max_cost_per_run_usd,
+    runtime_provenance: runtime,
+    provider_secret_reference: env_str(harness.env, "HARN_UPDATE_PROVIDER_SECRET_REFERENCE"),
   }
-  if policy.max_repositories < 1 || policy.max_attempts < 1
-    || policy.max_tokens_per_attempt
-    < 256 {
+  if policy.max_repositories < 1 || policy.max_attempts_per_repository < 1
+    || policy
+    .max_tokens_per_attempt
+    < 256
+    || policy.max_cost_per_attempt_usd <= 0.0
+    || policy.max_cost_per_repository_usd
+    < policy
+    .max_cost_per_attempt_usd
+    || policy.max_cost_per_run_usd < policy.max_cost_per_attempt_usd {
     throw "repair budgets must be positive and max tokens must be at least 256"
   }
-  const cost_limit = install_cost_budget(
-    {env: harness.env, llm: harness.llm},
-    "HARN_EXT_FLEET_REPAIR_COST_LIMIT_USD",
-  )
-  harness.stdio.eprintln(cost_budget_audit_line(cost_limit))
+  harness.stdio.eprintln(cost_budget_audit_line(policy.max_cost_per_run_usd))
+  harness.llm.budget(policy.max_cost_per_run_usd)
   repositories = repositories.map(
     { repo -> repo + {directory: path_join(options.fleet_root, repo.directory)} },
   )
     .to_list()
-  const target = options.target ?? github_latest_release_tag(harness, "burin-labs/harn")
   const snapshot = fleet_convergence_snapshot(harness, repositories, target)
   const receipt = repair_fleet_plan(
     harness,
