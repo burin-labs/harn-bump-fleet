@@ -620,6 +620,16 @@ scripts/dispatch_hosted_release.sh \
 and then stops before the tag. `mode: ship-pr` signs and pushes the tag and
 opens the release PR, so a release needs no local step.
 
+With `update_fleet: true`, the hosted run also follows the complete bounded
+repository-update chain, not just its first Actions run. Each continuation has
+the same release run ID in its display name and must run from the same exact
+controller revision. Success means every repository proves the target pin on
+`main` with green checks; an independently opened PR is accepted when its
+merged commit supplies that same immutable proof. The terminal artifact
+`hosted-release-and-update-cost-receipt.json` combines the release and every
+update round. It reports a numeric model cost only when every contributing Harn
+receipt is exact and fully priced; missing or unpriced usage fails closed.
+
 Tags are signed by a dedicated release bot key that exists only in the
 workflow's `release` environment. The maintainer's personal signing key is
 deliberately not reachable from any runner. Harn owns the public trust root at
