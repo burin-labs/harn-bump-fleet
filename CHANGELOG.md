@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Hosted update artifacts now aggregate every Harn runtime record into one
+  exact or explicitly incomplete cost receipt, so summary and repair model
+  spend cannot disappear behind a green workflow step.
 - Private downstream update proof now uses the connector's exact-head Actions
   projection when the release App cannot read GitHub's Checks rollup, without
   widening the App's permissions or weakening the green-head requirement.
