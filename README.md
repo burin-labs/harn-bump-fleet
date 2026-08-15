@@ -622,8 +622,11 @@ opens the release PR, so a release needs no local step.
 
 With `update_fleet: true`, the hosted run also follows the complete bounded
 repository-update chain, not just its first Actions run. Each continuation has
-the same release run ID in its display name and must run from the same exact
-controller revision. Success means every repository proves the target pin on
+the same release run ID in its display name. The first incomplete round leases
+an exact-OID `harn-update-chain/<release-run-id>` branch; later rounds dispatch
+only from that immutable controller, and the terminal round releases it under
+the same lease. Installing the requested Harn release remains a separate,
+explicit startup step. Success means every repository proves the target pin on
 `main` with green checks; an independently opened PR is accepted when its
 merged commit supplies that same immutable proof. The terminal artifact
 `hosted-release-and-update-cost-receipt.json` combines the release and every
