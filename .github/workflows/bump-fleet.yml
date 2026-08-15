@@ -1,4 +1,4 @@
-name: Bump Harn Fleet
+name: Update repositories for a Harn release
 
 on:
   workflow_dispatch:
@@ -11,11 +11,21 @@ on:
         description: "Optional owner/repo target."
         required: false
         type: string
-      enable-agent-repair:
-        description: "Run bounded agent repair when a downstream bump PR has failing checks."
+      enable_repair:
+        description: "Allow bounded agent repair when a downstream update fails checks."
         required: false
         type: boolean
         default: true
+      update_round:
+        description: "Automatic follow-up round; leave at 1 for a new update."
+        required: false
+        type: string
+        default: "1"
+      max_rounds:
+        description: "Maximum hosted rounds for one Harn version."
+        required: false
+        type: string
+        default: "4"
   schedule:
     - cron: "43 9 * * *"
 
@@ -27,16 +37,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  converge:
+  update:
     runs-on: ubuntu-latest
+    # This protected-branch environment holds the two brokered provider
+    # references. Without it GitHub expands both secret expressions to empty
+    # strings, so a repair can never reach a model despite looking configured.
+    environment: release
     timeout-minutes: 180
     env:
       # GitHub App installation tokens live for one hour. Keep each polling
-      # epoch comfortably below that boundary and mint a token per epoch.
+      # period comfortably below that boundary and mint a fresh token per wait.
       FLEET_TOKEN_EPOCH_TIMEOUT_S: "3000"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve exact update target and bounded round
+        id: update-plan
+        env:
+          REQUESTED_TARGET: ${{ inputs.version }}
+          REQUESTED_ROUND: ${{ inputs.update_round || '1' }}
+          REQUESTED_MAX_ROUNDS: ${{ inputs.max_rounds || '4' }}
+          REQUESTED_REPAIR: ${{ inputs.enable_repair }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$REQUESTED_TARGET"
+          if [[ -z "$target" ]]; then
+            target="$(gh api repos/burin-labs/harn/releases/latest --jq .tag_name)"
+          fi
+          if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Harn target must be an exact vX.Y.Z release tag, got '$target'" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_ROUND" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$REQUESTED_MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] \
+            || (( REQUESTED_ROUND > REQUESTED_MAX_ROUNDS )); then
+            echo "update round must be a positive integer no greater than max rounds" >&2
+            exit 1
+          fi
+          repair="${REQUESTED_REPAIR:-true}"
+          if [[ "$repair" != "true" && "$repair" != "false" ]]; then
+            echo "enable_repair must resolve to true or false" >&2
+            exit 1
+          fi
+          {
+            echo "target=$target"
+            echo "round=$REQUESTED_ROUND"
+            echo "max_rounds=$REQUESTED_MAX_ROUNDS"
+            echo "repair_enabled=$repair"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Mint fleet GitHub App token
         id: app-token
@@ -52,8 +102,10 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Install pinned Harn
+      - name: Install exact target Harn
         uses: burin-labs/harn/.github/actions/setup-harn@e9e3f14e7cd07aa25daa3a0cac55832cc79ea092
+        with:
+          version: ${{ steps.update-plan.outputs.target }}
 
       - name: Install locked Harn dependencies
         run: harn install --locked
@@ -84,20 +136,21 @@ jobs:
           harn run --no-sandbox materialize_fleet.harn -- "${args[@]}" \
             | tee fleet-checkout-receipt.json
 
-      - name: Mint consumer convergence GitHub App token
+      - name: Mint repository update GitHub App token
         id: converge-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with: *fleet-app-token
 
-      - name: Converge Harn consumers
+      - name: Start Harn updates
         # A downstream failure is the input to observe/repair, not the final
         # job verdict. `Prove fleet convergence` remains the authoritative gate.
+        if: steps.update-plan.outputs.round == '1'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.converge-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.converge-token.outputs.token }}
           FLEET_ROOT: ${{ runner.temp }}/harn-bump-fleet
-          TARGET: ${{ inputs.version }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
           ONLY: ${{ inputs.only }}
         shell: bash
         run: |
@@ -107,9 +160,7 @@ jobs:
             args+=(--only "$ONLY")
           fi
           args+=(--fleet-root "$FLEET_ROOT" --harn-repo "$FLEET_ROOT/harn" --retry-failed 1 --no-chat)
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
+          args+=("$TARGET")
           harn run --no-sandbox bump_fleet.harn -- "${args[@]}" \
             | tee fleet-bump-receipt.md
 
@@ -118,13 +169,13 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with: *fleet-app-token
 
-      - name: Observe fleet convergence
+      - name: Check Harn updates
         id: observe-convergence
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.observe-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.observe-token.outputs.token }}
-          TARGET: ${{ inputs.version }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
           ONLY: ${{ inputs.only }}
         shell: bash
         run: |
@@ -133,9 +184,7 @@ jobs:
           if [[ -n "$ONLY" ]]; then
             args+=(--only "$ONLY")
           fi
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
+          args+=("$TARGET")
           harn run --no-sandbox wait_fleet_convergence.harn -- "${args[@]}" \
             | tee fleet-convergence-receipt.json
 
@@ -143,34 +192,36 @@ jobs:
         id: repair-token
         if: >-
           steps.observe-convergence.outcome == 'failure' &&
-          (github.event_name == 'schedule' || inputs.enable-agent-repair)
+          steps.update-plan.outputs.repair_enabled == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with: *fleet-app-token
 
-      - name: Repair failed downstream bump pull requests
+      - name: Repair failed Harn updates
         if: >-
           steps.observe-convergence.outcome == 'failure' &&
-          (github.event_name == 'schedule' || inputs.enable-agent-repair)
+          steps.update-plan.outputs.repair_enabled == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.repair-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.repair-token.outputs.token }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          HARN_EXT_FLEET_REPAIR_COST_LIMIT_USD: "0.25"
+          HARN_UPDATE_PROVIDER_SECRET_REFERENCE: CEREBRAS_API_KEY
+          HARN_UPDATE_VALUE_PROVIDER: cerebras
+          HARN_UPDATE_VALUE_MODEL: gpt-oss-120b
+          HARN_UPDATE_STRONG_PROVIDER: cerebras
+          HARN_UPDATE_STRONG_MODEL: zai-glm-4.7
+          HARN_UPDATE_CONTROLLER_REVISION: ${{ github.sha }}
           FLEET_ROOT: ${{ runner.temp }}/harn-bump-fleet
-          TARGET: ${{ inputs.version }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
           ONLY: ${{ inputs.only }}
         shell: bash
         run: |
           set -euo pipefail
-          args=(--fleet-root "$FLEET_ROOT" --max-attempts 2)
+          args=(--fleet-root "$FLEET_ROOT" --max-attempts 3 --max-cost-per-attempt-usd 0.30 --max-cost-per-repository-usd 0.90 --max-cost-per-run-usd 4.00)
           if [[ -n "$ONLY" ]]; then
             args+=(--only "$ONLY")
           fi
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
+          args+=("$TARGET")
           harn run --no-sandbox repair_fleet_convergence.harn -- "${args[@]}" \
             | tee fleet-repair-receipt.json
 
@@ -180,14 +231,14 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with: *fleet-app-token
 
-      - name: Prove fleet convergence
+      - name: Prove Harn updates
         id: prove-convergence
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.proof-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.proof-token.outputs.token }}
-          TARGET: ${{ inputs.version }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
           ONLY: ${{ inputs.only }}
         shell: bash
         run: |
@@ -196,70 +247,29 @@ jobs:
           if [[ -n "$ONLY" ]]; then
             args+=(--only "$ONLY")
           fi
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
+          args+=("$TARGET")
           harn run --no-sandbox wait_fleet_convergence.harn -- "${args[@]}" \
-            | tee fleet-convergence-final-receipt.json
+            | tee fleet-convergence-proof-receipt.json
 
-      - name: Refresh proof GitHub App token
-        id: second-repair-token
-        if: steps.prove-convergence.outcome == 'failure'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with: *fleet-app-token
-
-      - name: Continue semantic migration after downstream CI
-        if: >-
-          steps.prove-convergence.outcome == 'failure' &&
-          (github.event_name == 'schedule' || inputs.enable-agent-repair)
-        continue-on-error: true
+      - name: Schedule the next hosted round when proof is still incomplete
+        if: always()
         env:
-          GH_TOKEN: ${{ steps.second-repair-token.outputs.token }}
-          GITHUB_TOKEN: ${{ steps.second-repair-token.outputs.token }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          HARN_EXT_FLEET_REPAIR_COST_LIMIT_USD: "0.25"
-          FLEET_ROOT: ${{ runner.temp }}/harn-bump-fleet
-          TARGET: ${{ inputs.version }}
+          GH_TOKEN: ${{ steps.proof-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.proof-token.outputs.token }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ROUND: ${{ steps.update-plan.outputs.round }}
+          MAX_ROUNDS: ${{ steps.update-plan.outputs.max_rounds }}
+          ENABLE_REPAIR: ${{ steps.update-plan.outputs.repair_enabled }}
           ONLY: ${{ inputs.only }}
         shell: bash
         run: |
           set -euo pipefail
-          args=(--fleet-root "$FLEET_ROOT" --max-attempts 2)
+          args=(--target "$TARGET" --proof-receipt fleet-convergence-proof-receipt.json --update-round "$ROUND" --max-rounds "$MAX_ROUNDS" --enable-repair "$ENABLE_REPAIR")
           if [[ -n "$ONLY" ]]; then
             args+=(--only "$ONLY")
           fi
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
-          harn run --no-sandbox repair_fleet_convergence.harn -- "${args[@]}" \
-            | tee fleet-second-repair-receipt.json
-
-      - name: Refresh final proof GitHub App token
-        id: refreshed-proof-token
-        if: steps.prove-convergence.outcome == 'failure'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with: *fleet-app-token
-
-      - name: Prove fleet convergence after bounded migration loop
-        if: steps.prove-convergence.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ steps.refreshed-proof-token.outputs.token }}
-          GITHUB_TOKEN: ${{ steps.refreshed-proof-token.outputs.token }}
-          TARGET: ${{ inputs.version }}
-          ONLY: ${{ inputs.only }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(--timeout-s "$FLEET_TOKEN_EPOCH_TIMEOUT_S" --interval-s 30)
-          if [[ -n "$ONLY" ]]; then
-            args+=(--only "$ONLY")
-          fi
-          if [[ -n "$TARGET" ]]; then
-            args+=("$TARGET")
-          fi
-          harn run --no-sandbox wait_fleet_convergence.harn -- "${args[@]}" \
-            | tee fleet-convergence-final-receipt.json
+          harn run --no-sandbox continue_harn_update.harn -- "${args[@]}" \
+            | tee fleet-update-continuation-receipt.json
 
       - name: Mint projection verification GitHub App token
         id: projection-token
@@ -292,14 +302,27 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: harn-bump-fleet-convergence
+          name: harn-update-receipts
           path: |
             fleet-checkout-receipt.json
             fleet-convergence-receipt.json
-            fleet-convergence-final-receipt.json
+            fleet-convergence-proof-receipt.json
             fleet-repair-receipt.json
-            fleet-second-repair-receipt.json
+            fleet-repair-startup-receipt.json
+            fleet-update-continuation-receipt.json
             .harn-runs/fleet-repair/
             fleet-policy-receipt.json
             fleet-bump-receipt.md
           if-no-files-found: error
+
+      - name: Require exact update proof
+        if: always()
+        env:
+          PROOF_OUTCOME: ${{ steps.prove-convergence.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PROOF_OUTCOME" != "success" ]]; then
+            echo "Harn update is not proven in this hosted round; the bounded continuation receipt names any successor." >&2
+            exit 1
+          fi
