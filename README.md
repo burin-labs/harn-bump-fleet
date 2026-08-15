@@ -118,7 +118,11 @@ repository-local workflow templates or duplicate runtime bootstrap.
 `converge_fleet_projections.harn` is the repair for what that check reports. It
 renders the same byte-exact projections, compares them against the same remote
 default branches, and proposes the difference as one pull request per drifted
-repository on a stable `automation/fleet-projections` branch. It repairs only
+repository on an `automation/fleet-projections-<digest>` branch named for the
+exact bytes it carries. Each run also retires the proposals it has moved past:
+an open projection pull request on any other such branch is proposing bytes the
+manifest no longer says, so it is closed with the reason rather than left to
+conflict behind an auto-merge that can never fire. It repairs only
 the three violations that describe bytes drifting from a projection; a typed
 violation names a workflow the fleet does not render, so no correct content
 exists to propose. The local `sync_*` harnesses remain the way to converge a

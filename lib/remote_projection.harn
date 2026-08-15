@@ -6,6 +6,7 @@ import {
   github_connector_options,
   github_enable_auto_merge,
   github_file_text_at_ref,
+  github_pr_close,
   github_pr_list,
   github_pr_upsert,
 } from "./github"
@@ -52,7 +53,34 @@ pub type RemoteConvergenceResult = {
   url?: string,
   error?: string,
   auto_merge?: AutoMergeOutcome,
+  sweep?: ProposalSweep,
 }
+
+/**
+ * One superseded proposal, and what this run did about it.
+ *
+ * `would_close` is what `--check` reports, so a dry run names every proposal it
+ * would retire without retiring one. `refused` is GitHub declining, recorded
+ * rather than raised for the same reason a refused arming is: housekeeping that
+ * fails must not turn a successful repair into a failed run.
+ */
+pub type SweptProposal = {
+  pull_request: int,
+  branch: string,
+  url: string,
+  state: "closed" | "would_close" | "refused",
+  error?: string,
+}
+
+/**
+ * What the sweep found in one repository.
+ *
+ * `error` is the sweep itself failing — the listing this run could not read.
+ * It is separate from a per-proposal refusal because it means the opposite
+ * thing: not "this proposal resisted closing" but "this run cannot say whether
+ * any superseded proposal is open." Silence would read like a clean fleet.
+ */
+pub type ProposalSweep = {superseded: list<SweptProposal>, error?: string}
 
 /**
  * What arming asked GitHub for, and what GitHub said.
@@ -202,6 +230,112 @@ fn arm_or_hold(
   return arm_auto_merge(harness, slug, pull_number, commit_oid, options)
 }
 
+/** Say why this proposal is being retired, to a reader who has only its diff. */
+fn superseded_comment(
+  slug: string,
+  branch: string,
+  keep: string,
+  default_branch: string,
+) -> string {
+  const reason = if keep == "" {
+    "`${default_branch}` already carries every fleet-owned projection `fleet.toml` renders, so this proposal has no drift left to repair."
+  } else {
+    "`fleet.toml` now renders this projection on `${keep}`, so the bytes on `${branch}` are no longer what the manifest says."
+  }
+  return join(
+    [
+      "Closing as superseded.",
+      "",
+      reason,
+      "",
+      "`fleet.toml` in `burin-labs/harn-bump-fleet` owns these bytes. Merging this",
+      "proposal now would restore a projection the manifest has already moved past.",
+      "",
+      "Closing costs nothing: the next byte change proposes again on its own.",
+      "",
+      "Repository: `${slug}`.",
+    ],
+    "\n",
+  )
+}
+
+/**
+ * Retire the projection proposals this run has already moved past.
+ *
+ * Every proposal lives on a branch named for the exact bytes it carries, so one
+ * whose branch is not the branch this run renders is proposing bytes the
+ * manifest no longer says. Nothing else in this loop ever looks at it again —
+ * the next render opens its own branch, and the only lookup here is scoped to
+ * that branch. What it leaves behind is not idle: a superseded proposal keeps an
+ * armed auto-merge that can never fire once its pull request conflicts, so it
+ * reads like active work forever.
+ *
+ * Two guards keep this to the automation's own leavings. The branch must carry
+ * the projection prefix, which also reaches proposals left on the single stable
+ * branch this loop used before each render got its own. The title must still be
+ * the one this loop writes: a proposal someone renamed is a proposal someone is
+ * holding, and closing it would be the same overreach as reopening one they
+ * closed.
+ */
+fn sweep_superseded_proposals(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  keep: string,
+  apply: bool,
+  options: GithubClientOptions,
+) -> ProposalSweep {
+  const listed = github_pr_list(
+    harness,
+    slug,
+    {state: "open", base: default_branch, per_page: 100},
+    options,
+  )
+  if is_err(listed) {
+    return {superseded: [], error: to_string(unwrap_err(listed))}
+  }
+  let superseded = []
+  for pull in unwrap(listed) {
+    const ref = to_string(pull?.head?.ref ?? "")
+    const title = to_string(pull?.title ?? "")
+    if !starts_with(ref, REMOTE_PROJECTION_BRANCH_PREFIX) || title != PROJECTION_HEADLINE {
+      continue
+    }
+    if ref == keep {
+      continue
+    }
+    const number = to_int(pull?.number) ?? 0
+    const url = to_string(pull?.url ?? "")
+    if !apply {
+      superseded = superseded
+        + [{pull_request: number, branch: ref, url: url, state: "would_close"}]
+      continue
+    }
+    const closed = github_pr_close(
+      harness,
+      slug,
+      number,
+      superseded_comment(slug, ref, keep, default_branch),
+      options,
+    )
+    superseded = superseded
+      + [
+      if closed.ok {
+        {pull_request: number, branch: ref, url: url, state: "closed"}
+      } else {
+        {
+          pull_request: number,
+          branch: ref,
+          url: url,
+          state: "refused",
+          error: to_string(closed.error),
+        }
+      },
+    ]
+  }
+  return {superseded: superseded}
+}
+
 fn converge_repository(
   harness: Harness,
   slug: string,
@@ -214,17 +348,34 @@ fn converge_repository(
 ) -> RemoteConvergenceResult {
   const drifted = drifted_targets(harness, slug, default_branch, targets, options)
   const paths = drifted.map({ target -> target.path }).to_list()
+  // Empty when nothing drifted: there is no branch for this run to render, so
+  // every open proposal is superseded by the default branch itself.
+  const branch = if len(drifted) == 0 {
+    ""
+  } else {
+    remote_projection_branch(drifted)
+  }
+  // The sweep runs before the repair and for every repository, drifting or not.
+  // A repository whose projections are already correct is exactly the one whose
+  // open proposal has nothing left to propose, so gating this on drift would
+  // miss the case that produces the most debris. The retry below re-enters this
+  // function from fresh remote facts and inherits this result: a second listing
+  // would only re-report what the first already closed.
+  const sweep = if retry_stale_pull {
+    sweep_superseded_proposals(harness, slug, default_branch, branch, apply, options)
+  } else {
+    {superseded: []}
+  }
   if len(drifted) == 0 {
-    return {slug: slug, status: "clean", drifted: []}
+    return {slug: slug, status: "clean", drifted: [], sweep: sweep}
   }
   if !apply {
-    return {slug: slug, status: "drift", drifted: paths}
+    return {slug: slug, status: "drift", drifted: paths, sweep: sweep}
   }
   const head = unwrap_or_throw(
     github_branch_head(harness, slug, default_branch, options),
     "branch head lookup failed",
   )
-  const branch = remote_projection_branch(drifted)
   const claim = unwrap_or_throw(
     github_claim_ref(
       harness,
@@ -253,6 +404,7 @@ fn converge_repository(
         branch: branch,
         commit: branch_oid,
         auto_merge: {state: "held"},
+        sweep: sweep,
       }
     }
     const listed = github_pr_list(
@@ -269,7 +421,14 @@ fn converge_repository(
     // but reopening the pull request nightly would overrule a human decision
     // with a cron job. The next byte change proposes again on its own.
     if len(open) == 0 {
-      return {slug: slug, status: "pending", drifted: paths, branch: branch, commit: branch_oid}
+      return {
+        slug: slug,
+        status: "pending",
+        drifted: paths,
+        branch: branch,
+        commit: branch_oid,
+        sweep: sweep,
+      }
     }
     const open_number = to_int(open[0]?.number) ?? 0
     return {
@@ -280,6 +439,7 @@ fn converge_repository(
       commit: branch_oid,
       pull_request: open_number,
       auto_merge: arm_or_hold(harness, slug, open_number, branch_oid, arm, options),
+      sweep: sweep,
     }
   }
   if !(claim?.claimed ?? false) {
@@ -322,6 +482,9 @@ fn converge_repository(
     // normal fixed-point path verifies the branch bytes and adopts its current
     // head without adding another commit; a second race still fails closed.
     return converge_repository(harness, slug, default_branch, targets, apply, arm, options, false)
+      + {
+      sweep: sweep,
+    }
   }
   const pull = unwrap_or_throw(pull_attempt, "projection pull request failed")
   const pull_number = to_int(pull?.number) ?? 0
@@ -334,6 +497,7 @@ fn converge_repository(
     pull_request: pull_number,
     url: to_string(pull?.url ?? ""),
     auto_merge: arm_or_hold(harness, slug, pull_number, head_oid, arm, options),
+    sweep: sweep,
   }
 }
 
