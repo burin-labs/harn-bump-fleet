@@ -1,0 +1,1 @@
+The exact-pin Harn CLI is no longer rebuilt from cold on a release's second warm. The build-script output refresh runs once per release run instead of once per warm, so the second warm reuses the first one's compiled crates.
