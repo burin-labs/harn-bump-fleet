@@ -1,9 +1,14 @@
 import {
-  github_file_text_at_ref,
+  GithubConnectorError,
+  github_connector_options,
+  github_file_text_at_ref_result,
+  github_is_rate_limited_read_error,
+  github_is_transient_read_error,
   github_pr_commits,
   github_pr_files,
   github_pr_view,
 } from "./github"
+import { GithubClientOptions } from "harn-github-connector/default"
 
 pub type PrerequisitePrStatus = "satisfied" \
   | "missing_pull_request" \
@@ -26,6 +31,10 @@ pub type PrerequisitePrDecision = {
   merged_at?: string,
   merge_commit_oid?: string,
   head_verification?: "exact" | "projection_equivalent" | "unexpected",
+  github_error_code?: string,
+  github_error_category?: string,
+  github_http_status?: int?,
+  github_retryable?: bool,
   detail: string,
 }
 
@@ -66,7 +75,35 @@ pub type PrerequisiteProjectionEvidence = {
   missing_paths: list<string>,
 }
 
-pub type PrerequisiteHeadVerification = {ok: bool, detail: string}
+pub type PrerequisiteHeadVerification = {
+  ok: bool,
+  detail: string,
+  github_error?: GithubConnectorError,
+}
+
+fn github_error_decision(
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  prefix: string,
+  error: GithubConnectorError,
+) -> PrerequisitePrDecision {
+  const error_status: PrerequisitePrStatus = "github_error"
+  const decision: PrerequisitePrDecision = {
+    ok: false,
+    status: error_status,
+    repo: repo,
+    number: number,
+    expected_head_oid: expected_head_oid,
+    github_error_code: error.code,
+    github_error_category: error.category,
+    github_http_status: error.http_status,
+    github_retryable: github_is_transient_read_error(error)
+      || github_is_rate_limited_read_error(error),
+    detail: prefix + ": " + to_string(error),
+  }
+  return decision
+}
 
 fn text_or_empty(value) -> string {
   if value == nil {
@@ -281,28 +318,39 @@ fn load_projection_head_verification(
   pr: PrerequisitePr,
   expected_head_oid: string,
   lease: PrerequisiteProjectionLease,
+  options: GithubClientOptions,
 ) -> PrerequisiteHeadVerification {
   const observed = pr_head_oid(pr)
-  const commits = github_pr_commits(harness, repo, number, observed)
+  const commits = github_pr_commits(harness, repo, number, observed, 100, options)
   if is_err(commits) {
-    return {ok: false, detail: "GitHub PR commit proof failed: " + to_string(unwrap_err(commits))}
+    const error = unwrap_err(commits)
+    return {
+      ok: false,
+      detail: "GitHub PR commit proof failed: " + to_string(error),
+      github_error: error,
+    }
   }
-  const files = github_pr_files(harness, repo, number, 1, 100)
+  const files = github_pr_files(harness, repo, number, 1, 100, options)
   if is_err(files) {
-    return {ok: false, detail: "GitHub PR file proof failed: " + to_string(unwrap_err(files))}
+    const error = unwrap_err(files)
+    return {
+      ok: false,
+      detail: "GitHub PR file proof failed: " + to_string(error),
+      github_error: error,
+    }
   }
   const commit_evidence = unwrap(commits)
   const file_evidence = unwrap(files)
   let head_contents = {}
   let missing_paths: list<string> = []
   for file in lease.files {
-    const read = try {
-      github_file_text_at_ref(harness, repo, file.path, observed)
-    }
+    const read = github_file_text_at_ref_result(harness, repo, file.path, observed, options)
     if is_err(read) {
+      const error = unwrap_err(read)
       return {
         ok: false,
-        detail: "GitHub projection content proof failed: " + to_string(unwrap_err(read)),
+        detail: "GitHub projection content proof failed: " + to_string(error),
+        github_error: error,
       }
     }
     const contents = unwrap(read)
@@ -312,11 +360,13 @@ fn load_projection_head_verification(
       head_contents[file.path] = contents ?? ""
     }
   }
-  const final_view = github_pr_view(harness, repo, number)
+  const final_view = github_pr_view(harness, repo, number, options)
   if is_err(final_view) {
+    const error = unwrap_err(final_view)
     return {
       ok: false,
-      detail: "GitHub final PR head proof failed: " + to_string(unwrap_err(final_view)),
+      detail: "GitHub final PR head proof failed: " + to_string(error),
+      github_error: error,
     }
   }
   return verify_projection_equivalent_head(
@@ -342,17 +392,17 @@ pub fn load_prerequisite_pr(
   number: int,
   expected_head_oid: string = "",
   projection: PrerequisiteProjectionLease? = nil,
+  options: GithubClientOptions = github_connector_options(),
 ) -> PrerequisitePrDecision {
-  const pr = github_pr_view(harness, repo, number)
+  const pr = github_pr_view(harness, repo, number, options)
   if is_err(pr) {
-    return {
-      ok: false,
-      status: "github_error",
-      repo: repo,
-      number: number,
-      expected_head_oid: expected_head_oid,
-      detail: "GitHub PR view failed: " + to_string(unwrap_err(pr)),
-    }
+    return github_error_decision(
+      repo,
+      number,
+      expected_head_oid,
+      "GitHub PR view failed",
+      unwrap_err(pr),
+    )
   }
   const observed = unwrap(pr)
   let equivalent_head = false
@@ -364,8 +414,23 @@ pub fn load_prerequisite_pr(
       observed,
       expected_head_oid,
       projection ?? {head_ref: "", base_ref: "", files: []},
+      options,
     )
     if !verification.ok {
+      if verification.github_error != nil {
+        return github_error_decision(
+          repo,
+          number,
+          expected_head_oid,
+          "GitHub projection equivalence proof failed",
+          verification.github_error
+            ?? {
+            code: "invalid_response",
+            category: "schema_drift",
+            message: verification.detail,
+          },
+        )
+      }
       return decision(
         repo,
         number,

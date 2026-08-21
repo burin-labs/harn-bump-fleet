@@ -1,0 +1,221 @@
+import { PrerequisitePrDecision, load_prerequisite_pr } from "../lib/prerequisite_prs"
+import {
+  PrerequisiteWaitAdapter,
+  prerequisite_wait_not_required,
+  wait_prerequisite_with_adapter,
+} from "../lib/prerequisite_wait"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const REPO = "octo-org/octo-repo"
+
+const NUMBER = 42
+
+const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const API = "https://github.test"
+
+fn decision(fields = {}) -> PrerequisitePrDecision {
+  return {
+    ok: false,
+    status: "not_merged",
+    repo: REPO,
+    number: NUMBER,
+    expected_head_oid: HEAD,
+    detail: "pull request is open, not merged",
+  }
+    + fields
+}
+
+fn transient_503() -> PrerequisitePrDecision {
+  return decision(
+    {
+      status: "github_error",
+      github_error_code: "network",
+      github_error_category: "network",
+      github_http_status: 503,
+      github_retryable: true,
+      detail: "GitHub PR view failed with status 503",
+    },
+  )
+}
+
+fn satisfied() -> PrerequisitePrDecision {
+  return decision(
+    {
+      ok: true,
+      status: "satisfied",
+      github_state: "merged",
+      merged_at: "2026-08-21T00:00:00Z",
+      merge_commit_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      detail: "pull request is merged",
+    },
+  )
+}
+
+pipeline test_transient_503_then_success_preserves_retry_receipt(task) {
+  let now_ms = 0
+  let attempts = 0
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return now_ms },
+    observe: fn() {
+      attempts = attempts + 1
+      return if attempts == 1 {
+        transient_503()
+      } else {
+        satisfied()
+      }
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 10000, 1000, adapter)
+  assert_eq(receipt.ok, true)
+  assert_eq(receipt.status, "satisfied")
+  assert_eq(receipt.attempts, 2)
+  assert_eq(receipt.retry_count, 1)
+  assert_eq(receipt.last_status, "satisfied")
+  assert_eq(receipt.elapsed_ms, 1000)
+}
+
+pipeline test_persistent_503_exhausts_the_single_wall_clock_budget(task) {
+  let now_ms = 0
+  let attempts = 0
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return now_ms },
+    observe: fn() {
+      attempts = attempts + 1
+      return transient_503()
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 2000, 1000, adapter)
+  assert_eq(receipt.ok, false)
+  assert_eq(receipt.status, "timeout")
+  assert_eq(receipt.attempts, 3)
+  assert_eq(receipt.retry_count, 3)
+  assert_eq(receipt.last_http_status, 503)
+  assert_eq(receipt.elapsed_ms, 2000)
+}
+
+pipeline test_permanent_403_fails_without_waiting(task) {
+  let attempts = 0
+  let waits = 0
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return 0 },
+    observe: fn() {
+      attempts = attempts + 1
+      return decision(
+        {
+          status: "github_error",
+          github_error_code: "permission",
+          github_error_category: "permission",
+          github_http_status: 403,
+          github_retryable: false,
+          detail: "GitHub PR view failed with status 403",
+        },
+      )
+    },
+    wait: fn(_delay_ms) { waits = waits + 1 },
+  }
+  const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 10000, 1000, adapter)
+  assert_eq(receipt.ok, false)
+  assert_eq(receipt.status, "terminal_error")
+  assert_eq(receipt.attempts, 1)
+  assert_eq(receipt.retry_count, 0)
+  assert_eq(receipt.last_http_status, 403)
+  assert_eq(waits, 0)
+}
+
+pipeline test_not_required_receipt_performs_no_observation(task) {
+  const receipt = prerequisite_wait_not_required(REPO, HEAD)
+  assert_eq(receipt.ok, true)
+  assert_eq(receipt.status, "not_required")
+  assert_eq(receipt.attempts, 0)
+}
+
+fn connector_options(max_attempts: int) -> GithubClientOptions {
+  return {
+    api_base_url: API,
+    installation_token: "prerequisite-test-token",
+    retry: {max_attempts: max_attempts, base_ms: 1, cap_ms: 1, respect_retry_after: false},
+  }
+}
+
+fn pull_api_body() -> dict {
+  return {
+    number: NUMBER,
+    title: "Projection",
+    state: "closed",
+    merged: true,
+    merged_at: "2026-08-21T00:00:00Z",
+    merge_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    html_url: "https://github.test/octo-org/octo-repo/pull/42",
+    base: {ref: "main", sha: "cccccccccccccccccccccccccccccccccccccccc"},
+    head: {ref: "automation/projection", sha: HEAD},
+  }
+}
+
+pipeline test_connector_safe_read_retries_503_before_classification(harness: Harness, task) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    API + "/repos/octo-org/octo-repo/pulls/42",
+    {
+      responses: [
+        {status: 503, body: json_stringify({message: "unavailable"})},
+        {status: 200, body: json_stringify(pull_api_body())},
+      ],
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    API + "/repos/octo-org/octo-repo/branches/main/protection",
+    {status: 403, body: json_stringify({message: "Resource not accessible by integration"})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    API + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            repository: {
+              pullRequest: {number: NUMBER, autoMergeRequest: nil, mergeQueueEntry: nil},
+            },
+          },
+        },
+      ),
+    },
+  )
+  const observed = load_prerequisite_pr(harness, REPO, NUMBER, HEAD, nil, connector_options(2))
+  assert_eq(observed.ok, true)
+  assert_eq(observed.status, "satisfied")
+  const pull_reads = harness.testing.http_mock_calls().filter(
+    { call -> call.url == API + "/repos/octo-org/octo-repo/pulls/42" },
+  )
+    .to_list()
+  // The current connector performs one post-view identity read for merge-queue
+  // evidence; the first two calls are the 503 and its successful retry.
+  assert_eq(len(pull_reads), 3)
+}
+
+pipeline test_503_429_and_403_keep_typed_connector_dispositions(harness: Harness, task) {
+  for fixture in [
+    {status: 503, code: "network", category: "network", retryable: true},
+    {status: 429, code: "rate_limited", category: "rate_limit", retryable: true},
+    {status: 403, code: "permission", category: "permission", retryable: false},
+  ] {
+    harness.testing.http_mock_clear()
+    harness.testing.http_mock(
+      "GET",
+      API + "/repos/octo-org/octo-repo/pulls/42",
+      {status: fixture.status, body: json_stringify({message: "failure"})},
+    )
+    const observed = load_prerequisite_pr(harness, REPO, NUMBER, HEAD, nil, connector_options(1))
+    assert_eq(observed.status, "github_error")
+    assert_eq(observed.github_http_status, fixture.status)
+    assert_eq(observed.github_error_code, fixture.code)
+    assert_eq(observed.github_error_category, fixture.category)
+    assert_eq(observed.github_retryable, fixture.retryable)
+  }
+}
