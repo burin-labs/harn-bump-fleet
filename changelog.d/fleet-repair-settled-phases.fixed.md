@@ -1,1 +1,1 @@
-Fleet repair now settles GitHub's pull-request head after publishing before it re-arms auto-merge, and completes every zero-cost deterministic migration before a provider-backed source repair can consume or make the run budget uncertain.
+Fleet repair now settles GitHub's pull-request head after publishing before it re-arms auto-merge, completes every zero-cost deterministic migration before a provider-backed source repair can consume or make the run budget uncertain, and refuses inference when the validator reports an environment failure rather than a code verdict.
