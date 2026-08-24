@@ -13,8 +13,10 @@ The entry points are:
 - `release_harn.harn`: mirrors the human `/release-harn` flow for
   `~/projects/harn`. Default mode is read-only audit. Live prepare/ship-pr
   requires `--yes-live-release`.
-- `watch_harn_release.harn`: resumes post-tag publish monitoring from the typed
-  receipt written by `release_harn`. It never repeats preparation or tagging.
+- `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
+  written by `release_harn`. It waits for the exact PR to merge, signs and
+  pushes the merged-main tag, then monitors publication without repeating
+  preparation.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
@@ -64,8 +66,10 @@ Release implementation changes belong in the stage that owns the behavior:
   plus their manifest and artifact writer
 - `release_modes`: prepare execution, thin ship-phase composition, and cleanup
 - `release_ship_prepare`: prepared commit and immutable attempt publication
-- `release_ship_tag`: cutoff, binary, and signed-tag gates
+- `release_ship_certify`: cutoff and exact-candidate certification gates
 - `release_ship_pr`: PR publication and watch-receipt handoff
+- `release_main_tag`: merged-main verification, signed-tag publication, and
+  write-once receipt binding
 - `release_preflight`: interactive flags, planner/fleet/sccache checks, and
   build-lock lifecycle
 
@@ -188,10 +192,12 @@ pre-bump parent. Hosted Windows/macOS and local source proof runs concurrently
 with the Linux release-size gate; residual generated-content proof follows the
 join. A write-once `release-certify/<candidate-oid>` branch lets GitHub dispatch
 the exact commit while `main` keeps merging. Any missing, stale, moved, or red
-lane blocks the signed tag. An explicit startup pin remains load-bearing for
-parent ancestry, base fast-forward suppression, and the pre-tag drift probe.
-The pushed `vX.Y.Z` tag is the source for publish/build workflows, so later
-base-branch commits cannot leak into the published artifact.
+lane blocks the release PR. An explicit startup pin remains load-bearing for
+parent ancestry, base fast-forward suppression, and the pre-merge drift probe.
+After that exact PR squash-merges, the watcher verifies the merge commit on
+`origin/main`, signs and pushes `vX.Y.Z` at that commit, and binds the receipt
+to it once. Publish/build workflows derive from the immutable tag; no
+candidate archive is promoted as the release artifact.
 
 A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
 rebuilds that candidate on fresh base, the fresh base is part of the artifact.

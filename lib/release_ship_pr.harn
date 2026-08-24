@@ -1,7 +1,11 @@
 import { command_result_fail, command_result_ok } from "std/command"
 import { ReleaseAgentReviewResult, logged_github_operation_step } from "./release_agent"
 import { execution_failed, recorded_step } from "./release_execution"
-import { release_publication_pr_decision, superseded_release_attempts } from "./release_publication"
+import {
+  ReleasePublication,
+  release_publication_pr_decision,
+  superseded_release_attempts,
+} from "./release_publication"
 import { append_pr_auto_merge_steps, write_pr_body } from "./release_reporting"
 import {
   ReleaseConfig,
@@ -10,27 +14,87 @@ import {
   release_github_pr_create,
   release_github_pr_edit,
   release_github_pr_list,
+  release_log_event,
+  release_repo_slug,
+  release_run_root,
 } from "./release_runtime"
-import { ReleaseShipTagReady } from "./release_ship_tag"
-import { persist_release_watch_receipt } from "./release_tag"
+import { ReleaseShipCertified } from "./release_ship_certify"
+import {
+  release_watch_receipt,
+  release_watch_receipt_path,
+  release_watch_receipt_write,
+} from "./release_watch_state"
 
 pub type ReleaseShipPrResult = {steps: list<dict>, handed_off: bool, pr_url: string}
+
+/** Persist the handoff that lets another process wait for merge, tag, and publish. */
+fn persist_release_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  version: string,
+  publication: ReleasePublication,
+  steps: list<dict>,
+  run_id: string,
+  pr_url: string,
+) -> list<dict> {
+  if cfg.mock {
+    return steps
+  }
+  const tag = "v${version}"
+  const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  const path = release_watch_receipt_path(release_run_root(harness.fs), tag)
+  const receipt = release_watch_receipt(
+    {
+      tag: tag,
+      slug: slug,
+      pin_sha: cfg.pin_sha,
+      publication: publication,
+      pr_url: pr_url,
+      created_at: harness.clock.date_iso(),
+    },
+  )
+  const written = try {
+    release_watch_receipt_write({fs: harness.fs, random: harness.random}, path, receipt)
+  }
+  const result = if is_ok(written) {
+    command_result_ok("durable release watch receipt: " + unwrap(written) + "\n")
+  } else {
+    command_result_fail(
+      2,
+      "could not persist release watch receipt: " + to_string(unwrap_err(written)),
+    )
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_watch_receipt_written",
+    {
+      tag: tag,
+      path: path,
+      success: result.success,
+      pr_url: pr_url,
+      remote_ref: publication.remote_ref,
+    },
+  )
+  return steps
+    + [recorded_step("persist-release-watch", "persist resumable merge/tag watch receipt", result)]
+}
 
 @complexity(allow)
 pub fn release_ship_pr_phase(
   harness: Harness,
   cfg: ReleaseConfig,
-  tagged: ReleaseShipTagReady,
+  certified: ReleaseShipCertified,
   agent_review_result: ReleaseAgentReviewResult,
   run_id: string,
 ) -> ReleaseShipPrResult {
-  let steps = tagged.steps
-  const version = tagged.version
-  const publication = tagged.publication
+  let steps = certified.steps
+  const version = certified.version
+  const publication = certified.publication
   const body_path = write_pr_body(
     harness.fs,
     run_id,
-    tagged.analysis,
+    certified.analysis,
     agent_review_result,
     steps,
     publication,
@@ -142,15 +206,10 @@ pub fn release_ship_pr_phase(
       return {steps: steps, handed_off: false, pr_url: ""}
     }
   }
-  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication)
-  steps = merge_handoff.steps
-  if !merge_handoff.success {
-    return {steps: steps, handed_off: false, pr_url: ""}
-  }
   const final_body_path = write_pr_body(
     harness.fs,
     run_id,
-    tagged.analysis,
+    certified.analysis,
     agent_review_result,
     steps,
     publication,
@@ -173,16 +232,21 @@ pub fn release_ship_pr_phase(
   if !final_edit.success {
     return {steps: steps, handed_off: false, pr_url: ""}
   }
-  // Tag + immutable attempt ref + PR are durable. Persist the independent monitor handoff and
-  // return immediately; `watch_harn_release.harn` resumes from this receipt.
-  const final_steps = persist_release_watch_receipt(
-    harness,
-    cfg,
-    version,
-    publication,
-    steps,
-    run_id,
-    pr_url,
-  )
-  return {steps: final_steps, handed_off: !execution_failed(final_steps), pr_url: pr_url}
+  // Persist recovery state before arming the merge. Once the PR can merge, the
+  // watcher receipt must already be durable so an immediate squash cannot
+  // strand an untagged release commit after a local write failure.
+  steps = persist_release_watch_receipt(harness, cfg, version, publication, steps, run_id, pr_url)
+  if execution_failed(steps) {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const merge_handoff = append_pr_auto_merge_steps(harness, cfg, steps, pr_url, run_id, publication)
+  return {
+    steps: merge_handoff.steps,
+    handed_off: merge_handoff.success,
+    pr_url: if merge_handoff.success {
+      pr_url
+    } else {
+      ""
+    },
+  }
 }
