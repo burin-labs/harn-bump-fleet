@@ -796,6 +796,11 @@ attempt ref when one is available. Recover by recreating the fold content from
 the published tag on fresh `origin/<base>`, merging that PR, and rerunning the
 release; do not start the next version from an orphaned fold.
 
+After the development-version cutover, the workspace instead names the exact
+next patch as `X.Y.Z-dev`. Release analysis accepts that state only when
+`vX.Y.(Z-1)` is the latest tag, and the patch release strips `-dev`; a stale
+development target or a request to reinterpret it as another bump fails closed.
+
 Every non-mock run first freezes the release parent (`--at-sha` /
 `HARN_EXT_RELEASE_PIN_SHA` / `origin/<base>` HEAD) and materializes that exact commit
 in a detached managed worktree. Audit, version, changelog, diff, generated
