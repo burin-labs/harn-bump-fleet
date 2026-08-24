@@ -21,7 +21,7 @@ const BUMP_BRANCH = "automation/bump-harn-runtime"
 // Change this when the repair prompt, tool surface, or receipt meaning changes.
 // A resumable agent session is evidence for one immutable repair contract, not
 // a cache that may outlive the checkout or the policy that created it.
-pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v7"
+pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v8"
 
 // The repair controller itself needs GitHub and one model provider. Keep this
 // host-seeded allowlist exact: Harn's in-process clients must fail closed before
@@ -189,6 +189,7 @@ pub fn fleet_repair_authority_audit(
     requested = requested
       + [
         "filesystem:checkout-root=" + candidate.directory,
+        "process:canonical-formatter=" + candidate.repo,
         "process:validator=" + candidate.repo,
         "agent:repair=" + candidate.repo,
       ]
@@ -207,20 +208,38 @@ pub fn fleet_repair_authority_audit(
   let unused: list<string> = []
   for candidate in plan.candidates {
     const result = results.find({ value -> value.repo == candidate.repo })
-    if len(result?.attempts ?? []) == 0 {
+    if result == nil || result.status == "refused" {
+      unused = unused
+        + [
+          "process:canonical-formatter=" + candidate.repo,
+          "process:validator=" + candidate.repo,
+          "agent:repair=" + candidate.repo,
+        ]
+      continue
+    }
+    used = used + ["process:validator=" + candidate.repo]
+    if result.reason == "leased_checkout_already_valid" {
+      unused = unused + ["process:canonical-formatter=" + candidate.repo]
+    } else {
+      used = used + ["process:canonical-formatter=" + candidate.repo]
+    }
+    if len(result.attempts) == 0 {
       unused = unused + ["agent:repair=" + candidate.repo]
       if len(candidate.allowed_new_files) > 0 {
         unused = unused + ["tool:repair_write=" + candidate.repo]
       }
+      if result.status == "repaired" {
+        used = used + ["github:publish=" + candidate.repo]
+      }
       continue
     }
-    used = used + ["agent:repair=" + candidate.repo, "process:validator=" + candidate.repo]
-    for attempt in result?.attempts ?? [] {
+    used = used + ["agent:repair=" + candidate.repo]
+    for attempt in result.attempts {
       if attempt.provider != "unknown" && attempt.model != "unknown" {
         used = used + ["provider:" + attempt.provider + "/" + attempt.model]
       }
     }
-    if result?.status == "repaired" {
+    if result.status == "repaired" {
       used = used + ["github:publish=" + candidate.repo]
     }
   }
@@ -669,6 +688,17 @@ fn validate_candidate(process: HarnessProcess, candidate: FleetRepairCandidate) 
   return {ok: result.success, output: command_detail(result)}
 }
 
+/**
+ * Apply Harn's canonical, behavior-preserving formatter before spending a
+ * model call. Runtime bumps can legitimately change the target formatter, and
+ * formatting is a deterministic projection of that exact runtime rather than
+ * a source repair that benefits from agent judgment.
+ */
+fn format_candidate(process: HarnessProcess, candidate: FleetRepairCandidate) {
+  const result = process.run({program: "harn", args: ["fmt", "."], cwd: candidate.directory})
+  return {ok: result.success, output: command_detail(result)}
+}
+
 /** Shape deterministic validator output into the workflow's retry vocabulary. */
 pub fn fleet_repair_validation_findings(validation_ok: bool, output: string) -> list<string> {
   return if validation_ok || trim(output) == "" {
@@ -812,15 +842,97 @@ pub fn repair_fleet_candidate_in_checkout(
   target: string,
   policy: FleetRepairPolicy,
 ) -> FleetRepairResult {
+  const initial_validation = try {
+    validate_candidate(harness.process, candidate)
+  } catch (error) {
+    {
+      ok: false,
+      output: "validator could not start under prepared process authority: " + to_string(error),
+    }
+  }
+  if initial_validation.ok {
+    return {
+      repo: candidate.repo,
+      status: "no_change",
+      reason: "leased_checkout_already_valid",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const formatted = try {
+    format_candidate(harness.process, candidate)
+  } catch (error) {
+    {ok: false, output: "canonical formatter could not start: " + to_string(error)}
+  }
+  const formatted_paths = changed_paths(harness.process, candidate)
+  const formatted_validation = if len(formatted_paths) == 0 {
+    initial_validation
+  } else {
+    try {
+      validate_candidate(harness.process, candidate)
+    } catch (error) {
+      {
+        ok: false,
+        output: "validator could not start under prepared process authority: " + to_string(error),
+      }
+    }
+  }
+  if formatted_validation.ok && len(formatted_paths) > 0 {
+    const new_head = try {
+      publish_candidate(harness, candidate)
+    } catch (error) {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: to_string(error),
+        pr_number: candidate.pr_number,
+        old_head_sha: candidate.head_sha,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+    return {
+      repo: candidate.repo,
+      status: "repaired",
+      reason: "canonical_format_validated_published_and_auto_merge_armed",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      new_head_sha: new_head,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const initial_findings = fleet_repair_validation_findings(
+    false,
+    join(
+      [
+        if formatted.ok || trim(formatted.output) == "" {
+          ""
+        } else {
+          "canonical formatter failed:\n" + formatted.output
+        },
+        if len(formatted_paths) == 0 {
+          initial_validation.output
+        } else {
+          formatted_validation.output
+        },
+      ]
+        .filter({ finding -> trim(finding) != "" }),
+      "\n\n",
+    ),
+  )
   const executor = { ctx ->
-    const result = run_repair_agent(
-      harness,
-      candidate,
-      target,
-      ctx.attempt,
-      ctx.prior_findings ?? [],
-      policy,
-    )
+    const findings = if len(ctx.prior_findings ?? []) > 0 {
+      ctx.prior_findings ?? []
+    } else {
+      initial_findings
+    }
+    const result = run_repair_agent(harness, candidate, target, ctx.attempt, findings, policy)
     const validation = try {
       validate_candidate(harness.process, candidate)
     } catch (error) {
