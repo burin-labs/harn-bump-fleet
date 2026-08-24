@@ -1,0 +1,1 @@
+Added `check_release_contract.harn`, a read-only check that evaluates the release-semantics gates against a target repository's real current version, tag, and changelog, so orchestrator drift fails in CI instead of at a live cut.

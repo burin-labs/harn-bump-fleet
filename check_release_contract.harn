@@ -1,0 +1,164 @@
+#!/usr/bin/env harn
+//
+// check_release_contract.harn — evaluate this orchestrator's release-semantics
+// gates against a target repository's REAL current state.
+//
+// The mock release path pins a fixed version pair, so it cannot reach any
+// invariant that depends on the target repo's actual version, tag, or
+// changelog shape. Every drift between this orchestrator's copy of the release
+// semantics and the target repo's own therefore surfaced for the first time at
+// a live cut.
+//
+// This check closes that gap without a live run. The gates it exercises are
+// pure decision functions over gathered evidence, so it can gather the real
+// evidence and assert the real decision while touching nothing:
+//
+//   * the prior-release fold gate      (workspace + changelog prove the fold)
+//   * the release-target resolver      (what this cut would be named)
+//   * the published-release resolver   (which release the body gate inspects)
+//
+// It performs no writes, requires no credentials, and never dispatches. Run it
+// from the target repo's CI on any change to release scripts, release
+// workflows, or the version scheme.
+//
+// Usage: harn run check_release_contract.harn -- --repo /path/to/target
+import { compare_release, version_from_tag } from "std/semver"
+import {
+  changelog_top_from_text,
+  last_published_release_version,
+  next_release_version,
+  release_body_gate_version,
+  workspace_version_from_manifest,
+} from "lib/release_analysis"
+import {
+  prior_release_fold_base_evidence,
+  prior_release_fold_decision,
+} from "lib/release_preflight"
+
+fn flag_value(args: list<string>, name: string, fallback: string) -> string {
+  let index = 0
+  for arg in args {
+    if arg == name && index + 1 < len(args) {
+      return trim(args[index + 1])
+    }
+    index = index + 1
+  }
+  return fallback
+}
+
+fn git_capture(process: HarnessProcess, repo: string, args: list<string>) -> string {
+  const result = process.run({program: "git", args: ["-C", repo] + args})
+  if !result.success {
+    throw "git ${args.join(" ")} failed in ${repo}:\n${trim(result.stderr)}"
+  }
+  return result.stdout
+}
+
+/** Resolve the newest `vX.Y.Z` tag the target repo's origin advertises. */
+fn latest_origin_release_tag(process: HarnessProcess, repo: string) -> string {
+  const listed = git_capture(
+    process,
+    repo,
+    ["ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"],
+  )
+  let best = ""
+  for line in split(trim(listed), "\n") {
+    const parts = split(trim(line), "refs/tags/")
+    if len(parts) < 2 {
+      continue
+    }
+    const tag = trim(parts[len(parts) - 1])
+    if len(regex_captures("^v[0-9]+[.][0-9]+[.][0-9]+$", tag)) == 0 {
+      continue
+    }
+    if best == "" || compare_release(tag, best) > 0 {
+      best = tag
+    }
+  }
+  if best == "" {
+    throw "no vX.Y.Z tags found on origin in ${repo}; cannot evaluate the release contract"
+  }
+  return best
+}
+
+pipeline main(harness: Harness) {
+  const repo = flag_value(argv, "--repo", "")
+  const base = flag_value(argv, "--base", "main")
+  if repo == "" {
+    harness.stdio.println("usage: harn run check_release_contract.harn -- --repo PATH [--base REF]")
+    return 2
+  }
+  harness.stdio.println("== release contract check")
+  harness.stdio.println("   repo : ${repo}")
+  harness.stdio.println("   base : origin/${base}")
+  // Gather the SAME evidence the live gate gathers, from the same places.
+  const latest_tag = latest_origin_release_tag(harness.process, repo)
+  const cargo_toml = git_capture(harness.process, repo, ["show", "origin/${base}:Cargo.toml"])
+  const changelog = git_capture(harness.process, repo, ["show", "origin/${base}:CHANGELOG.md"])
+  const workspace_version = workspace_version_from_manifest(cargo_toml)
+  const changelog_top = changelog_top_from_text(changelog)
+  harness.stdio.println("   tag  : ${latest_tag}")
+  harness.stdio.println("   workspace : ${workspace_version}")
+  harness.stdio.println("   changelog : v${changelog_top}")
+  let failures = []
+  // 1. The prior-release fold gate. This is the gate that stopped a live cut
+  //    when the target repo adopted post-release development versions.
+  const evidence = prior_release_fold_base_evidence(
+    "origin/${base}",
+    latest_tag,
+    cargo_toml,
+    changelog,
+  )
+  const fold = prior_release_fold_decision(evidence)
+  if fold.proceed {
+    harness.stdio.println("   ✓ prior-release fold: ${fold.reason}")
+  } else {
+    harness.stdio.println("   ✗ prior-release fold: ${fold.reason}")
+    failures = failures + ["prior-release fold gate would refuse this base: ${fold.detail}"]
+  }
+  // 2. The release-target resolver. A version scheme this orchestrator does not
+  //    understand throws here rather than at the cut.
+  let next_version = ""
+  try {
+    next_version = next_release_version(workspace_version, latest_tag, "patch", "")
+    harness.stdio.println("   ✓ release target: ${workspace_version} -> ${next_version}")
+  } catch (error) {
+    harness.stdio.println("   ✗ release target: ${error.message}")
+    failures = failures
+      + ["release-target resolver rejects the current workspace: ${error.message}"]
+  }
+  // 3. The published-release resolver. The body-integrity gate looks up a
+  //    GitHub release by this name, so it must name a tag that EXISTS. A
+  //    resolver that returns the raw workspace version names `X.Y.Z-dev`,
+  //    which is never published.
+  const published = last_published_release_version(workspace_version, latest_tag)
+  const body_target = release_body_gate_version(workspace_version, next_version, latest_tag, false)
+  if published == version_from_tag(latest_tag) {
+    harness.stdio.println("   ✓ published release: ${published}")
+  } else {
+    harness.stdio.println(
+      "   ✗ published release: resolved ${published}, expected ${version_from_tag(latest_tag)}",
+    )
+    failures = failures
+      + [
+        "published-release resolver returned ${published}, which is not the latest tag ${latest_tag}; the release-body gate would look up a release that does not exist",
+      ]
+  }
+  if body_target != published {
+    failures = failures
+      + ["release-body gate would inspect ${body_target} instead of the published ${published}"]
+  }
+  if len(failures) == 0 {
+    harness.stdio.println("== contract holds")
+    return 0
+  }
+  harness.stdio.println("== contract VIOLATED")
+  for failure in failures {
+    harness.stdio.println("   - ${failure}")
+  }
+  harness.stdio.println(
+    "\nThis orchestrator's release semantics disagree with the target repo's"
+      + " current shape. Fix the orchestrator before dispatching a release.",
+  )
+  return 1
+}
