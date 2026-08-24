@@ -38,8 +38,8 @@ Harn sandboxes `harn run` by default. These local ops harnesses inspect
 `~/projects`, local Git state, and authenticated GitHub connector state, so use
 `scripts/with_env.sh harn run --no-sandbox` for real local release and bump
 runs. The wrapper verifies the repo-pinned runtime before Harn parses the
-program and loads the configured provider environment. Mock release rehearsals
-can stay sandboxed.
+program and loads the configured provider environment. Mock release runs can
+stay sandboxed.
 
 ## Usage
 
@@ -514,7 +514,7 @@ Default mode is read-only audit:
 scripts/run_harn_release.sh
 ```
 
-Useful rehearsals:
+Useful mock runs:
 
 ```sh
 # Fully mocked vX.Y.Z -> vX.Y.(Z+1) audit. No repo/GitHub writes.
@@ -526,17 +526,13 @@ scripts/run_harn_release.sh --mock --agent
 # Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
 scripts/run_harn_release.sh --mock --agent --mode ship-pr
-
-# Run the scheduled fail-collect rehearsal matrix. This uses the safe mock
-# release path under adversarial operator environments and writes JSON/Markdown
-# reports under .harn-runs/release-rehearsal/.
-scripts/run_harn_release.sh --rehearsal --no-chat
 ```
 
-Real release cuts should have a green release rehearsal from the previous
-24 hours. If the latest rehearsal is red, read the full failure-set report
-before starting `--mode ship-pr`; real releases stay fail-fast, but rehearsal
-must report every failed leg in one pass.
+The mock release path runs on every pull request as the required
+`Release harness integration` CI job, including under a poisoned operator
+environment. It exercises the orchestrator's control flow against fixed
+version fixtures, so it cannot reach any invariant that depends on the target
+repo's real current version, tag, or changelog shape.
 
 Live modes require the explicit guard flag. The checkout passed through
 `--repo` is only the source Git database: the harness refreshes the exact
@@ -592,7 +588,7 @@ On macOS, the canonical launcher automatically dispatches an authorized live
 `prepare` or `ship-pr` invocation to this hosted workflow before compilation.
 Candidate certification intentionally exercises nested OS sandboxes, which
 Seatbelt cannot apply beneath Harn's default-deny outer sandbox. Read-only
-audits, mocks, and rehearsals remain local. The handoff accepts only the
+audits and mocks remain local. The handoff accepts only the
 workflow's typed inputs and fails before dispatch when a local-only release
 flag cannot be represented. It writes an atomic
 `.harn-runs/hosted-release-dispatch-<run-id>.json` receipt containing the full

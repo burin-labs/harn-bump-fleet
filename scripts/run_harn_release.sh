@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Canonical release boundary. Read-only, mock, rehearsal, and non-macOS runs
+# Canonical release boundary. Read-only, mock, and non-macOS runs
 # keep Harn's worktree sandbox. A live macOS prepare/ship cannot certify that
 # source correctly: the release audit intentionally exercises nested OS
 # sandboxes, and Seatbelt rejects a second sandbox-exec profile under Harn's
@@ -36,7 +36,7 @@ while [ "$index" -lt "${#args[@]}" ]; do
       ;;
     --at-sha=*) at_sha="${arg#--at-sha=}" ;;
     --yes-live-release) live_release=1 ;;
-    --mock|--rehearsal) local_only=1 ;;
+    --mock) local_only=1 ;;
   esac
   index=$((index + 1))
 done
