@@ -14,6 +14,7 @@ import {
   harn_update_usage,
 } from "./harn_update"
 import { install_binder, planner_defaults } from "./llm_defaults"
+import { await_published_head, load_pr_signature_metadata } from "./signed_bot_prs"
 import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
 
 const BUMP_BRANCH = "automation/bump-harn-runtime"
@@ -21,7 +22,7 @@ const BUMP_BRANCH = "automation/bump-harn-runtime"
 // Change this when the repair prompt, tool surface, or receipt meaning changes.
 // A resumable agent session is evidence for one immutable repair contract, not
 // a cache that may outlive the checkout or the policy that created it.
-pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v8"
+pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v9"
 
 // The repair controller itself needs GitHub and one model provider. Keep this
 // host-seeded allowlist exact: Harn's in-process clients must fail closed before
@@ -72,6 +73,7 @@ pub type FleetRepairPolicy = HarnUpdateBudgetPolicy \
   runtime_provenance: HarnUpdateRuntimeProvenance,
   provider_secret_reference?: string,
   route_override?: "value" | "strong",
+  deterministic_only?: bool,
 }
 
 /**
@@ -708,6 +710,23 @@ pub fn fleet_repair_validation_findings(validation_ok: bool, output: string) -> 
   }
 }
 
+/** Refuse inference when the local validator produced no code-level verdict. */
+pub fn fleet_repair_validation_environment_blocked(output: string) -> bool {
+  const detail = trim(output)
+  return contains(detail, "category: environment")
+    || starts_with(detail, "validator could not start under prepared process authority:")
+}
+
+fn fleet_repair_pre_agent_refusal(policy: FleetRepairPolicy, validation_output: string) -> string? {
+  if fleet_repair_validation_environment_blocked(validation_output) {
+    return "validator_environment_unavailable"
+  }
+  if policy.deterministic_only ?? false {
+    return "agent_repair_required"
+  }
+  return nil
+}
+
 fn changed_paths(process: HarnessProcess, candidate: FleetRepairCandidate) -> list<string> {
   const result = run_git(
     process,
@@ -791,6 +810,14 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
   const new_head = trim(to_string(unwrap(published)?.commit_oid ?? ""))
   if new_head == "" {
     throw "repair publication returned no commit oid"
+  }
+  const settled = await_published_head(
+    harness.clock,
+    { -> load_pr_signature_metadata(harness, candidate.repo, candidate.pr_number) },
+    new_head,
+  )
+  if !settled.settled {
+    throw "repair published but pull request head did not settle: " + settled.detail
   }
   const armed = github_enable_auto_merge(
     harness,
@@ -902,6 +929,19 @@ pub fn repair_fleet_candidate_in_checkout(
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
       new_head_sha: new_head,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const pre_agent_refusal = fleet_repair_pre_agent_refusal(policy, formatted_validation.output)
+  if pre_agent_refusal != nil {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: pre_agent_refusal ?? "agent_repair_required",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -1070,9 +1110,43 @@ pub fn repair_fleet_plan(
   for recovery in plan.recoveries {
     results = results + [recover_target_branch(harness, recovery)]
   }
+  // Give every candidate the exact target formatter and local validator before
+  // any provider call. An opaque provider cost or one genuine source failure
+  // must not strand later deterministic migrations that cost nothing.
+  let agent_candidates: list<FleetRepairCandidate> = []
+  for candidate in plan.candidates {
+    const checkout_error = prepare_checkout(harness.process, candidate)
+    if checkout_error != nil {
+      results = results
+        + [
+          {
+            repo: candidate.repo,
+            status: "refused",
+            reason: checkout_error ?? "checkout_refused",
+            pr_number: candidate.pr_number,
+            old_head_sha: candidate.head_sha,
+            attempts: [],
+            known_cost_usd: 0.0,
+            cost_status: "exact",
+          },
+        ]
+      continue
+    }
+    const deterministic = repair_fleet_candidate_in_checkout(
+      harness,
+      candidate,
+      plan.target,
+      policy + {deterministic_only: true},
+    )
+    if deterministic.reason == "agent_repair_required" {
+      agent_candidates = agent_candidates + [candidate]
+    } else {
+      results = results + [deterministic]
+    }
+  }
   let run_cost_usd = 0.0
   let stopped_reason = nil
-  for candidate in plan.candidates {
+  for candidate in agent_candidates {
     if stopped_reason != nil {
       results = results
         + [
@@ -1119,11 +1193,15 @@ pub fn repair_fleet_plan(
         ]
       continue
     }
-    const result = repair_fleet_candidate(
+    const result = repair_fleet_candidate_in_checkout(
       harness,
       candidate,
       plan.target,
-      policy + {max_cost_per_attempt_usd: min(budget.attempt_limit_usd, attempt_limit_usd)},
+      policy
+        + {
+          deterministic_only: false,
+          max_cost_per_attempt_usd: min(budget.attempt_limit_usd, attempt_limit_usd),
+        },
     )
     results = results + [result]
     run_cost_usd = run_cost_usd + result.known_cost_usd
