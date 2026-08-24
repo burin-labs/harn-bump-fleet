@@ -1,0 +1,295 @@
+import { github_enable_auto_merge, github_pr_view } from "./github"
+import { execution_failed } from "./release_execution"
+import { remote_tag_target_sha } from "./release_repin"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ensure_release_tag_pushed_at } from "./release_tag"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+
+pub type ReleaseMainTagAction = "wait" | "rearm" | "tag" | "reuse" | "abort"
+
+pub type ReleaseMainTagDecision = {action: ReleaseMainTagAction, reason: string, merge_sha: string}
+
+pub type ReleaseMainTagPullRequest = {
+  number: int,
+  merged: bool,
+  merge_commit_oid: string?,
+  github_state: string,
+  auto_merge_armed: bool,
+  in_merge_queue: bool?,
+  base: {ref: string, ...rest},
+  head: {ref: string, sha: string, ...rest},
+  ...rest,
+}
+
+pub type ReleaseMainTagAdapter = {
+  pull_request: fn(int) -> ReleaseMainTagPullRequest?,
+  remote_tag_target: fn(int) -> string,
+  rearm: fn(ReleaseMainTagPullRequest) -> bool,
+  merged_main_ancestor: fn(string) -> bool,
+  push_tag: fn(string) -> list<dict>,
+  now: fn(int) -> string,
+  wait: fn(int) -> nil,
+}
+
+pub type ReleaseMainTagResult = {
+  status: int,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+  steps: list<dict>,
+  polls: int,
+}
+
+fn main_tag_decision(
+  action: ReleaseMainTagAction,
+  reason: string,
+  merge_sha = "",
+) -> ReleaseMainTagDecision {
+  return {action: action, reason: reason, merge_sha: merge_sha}
+}
+
+fn exact_commit(value) {
+  return regex_match("^[0-9a-f]{40}$", lowercase(trim(to_string(value ?? "")))) != nil
+}
+
+/**
+ * Decide whether the immutable public tag may be born. The release PR and its
+ * exact candidate head are the authority: an open PR can only be kept moving,
+ * while a merged PR may tag its squash commit or reuse that exact remote tag.
+ */
+pub fn release_main_tag_decision(
+  receipt: ReleaseWatchReceipt,
+  pull_request: ReleaseMainTagPullRequest?,
+  remote_tag_target_sha: string,
+) -> ReleaseMainTagDecision {
+  const remote_target = lowercase(trim(remote_tag_target_sha))
+  if remote_target != "" && !exact_commit(remote_target) {
+    return main_tag_decision("abort", "remote release tag target is not an exact commit SHA")
+  }
+  if pull_request == nil {
+    if remote_target != "" {
+      return main_tag_decision(
+        "abort",
+        "release tag exists but the owning pull request cannot be proved",
+      )
+    }
+    return main_tag_decision("wait", "release pull request is not observable yet")
+  }
+  const expected_head = receipt.publication.head_oid
+  const actual_head = lowercase(trim(to_string(pull_request?.head?.sha ?? "")))
+  const expected_ref = receipt.publication.remote_ref
+  const actual_ref = trim(to_string(pull_request?.head?.ref ?? ""))
+  const base_ref = trim(to_string(pull_request?.base?.ref ?? ""))
+  if actual_head != expected_head || actual_ref != expected_ref || base_ref != "main" {
+    return main_tag_decision(
+      "abort",
+      "release pull request identity does not match ${expected_ref}@${expected_head} -> main",
+    )
+  }
+  const merged = pull_request?.merged ?? false
+  const github_state = lowercase(trim(to_string(pull_request?.github_state ?? "")))
+  if !merged && github_state != "merged" {
+    if remote_target != "" {
+      return main_tag_decision("abort", "release tag became public before the release PR merged")
+    }
+    if github_state != "open" {
+      return main_tag_decision(
+        "abort",
+        "release pull request is ${github_state}; only an open or merged PR can own the tag",
+      )
+    }
+    if (pull_request?.in_merge_queue ?? false) || (pull_request?.auto_merge_armed ?? false) {
+      return main_tag_decision("wait", "release pull request is awaiting its main merge")
+    }
+    return main_tag_decision("rearm", "release pull request lost merge-queue handoff")
+  }
+  const merge_sha = lowercase(trim(to_string(pull_request?.merge_commit_oid ?? "")))
+  if !exact_commit(merge_sha) {
+    return main_tag_decision("abort", "merged release pull request has no exact merge commit SHA")
+  }
+  if receipt.release_commit_oid != "" && receipt.release_commit_oid != merge_sha {
+    return main_tag_decision(
+      "abort",
+      "release receipt is bound to ${receipt.release_commit_oid}, not merged main commit ${merge_sha}",
+      merge_sha,
+    )
+  }
+  if remote_target == "" {
+    return main_tag_decision("tag", "release PR merged; mint the tag on its main commit", merge_sha)
+  }
+  if remote_target == merge_sha {
+    return main_tag_decision("reuse", "release tag already names the merged main commit", merge_sha)
+  }
+  return main_tag_decision(
+    "abort",
+    "release tag target ${remote_target} does not match merged main commit ${merge_sha}",
+    merge_sha,
+  )
+}
+
+fn default_release_main_tag_adapter(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+) -> ReleaseMainTagAdapter {
+  return {
+    pull_request: fn(_poll) {
+      const viewed = github_pr_view(harness, receipt.slug, receipt.pr_url)
+      if is_err(viewed) {
+        throw "GitHub PR view failed: " + to_string(unwrap_err(viewed))
+      }
+      return unwrap(viewed)
+    },
+    remote_tag_target: fn(_poll) {
+      const observed = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/tags/${receipt.tag}", "refs/tags/${receipt.tag}^{}"],
+      )
+      if !observed.success {
+        throw "could not inspect immutable release tag ${receipt.tag}: ${observed.stderr}"
+      }
+      return remote_tag_target_sha(observed.refs)
+    },
+    rearm: fn(pull_request) {
+      const armed = github_enable_auto_merge(
+        harness,
+        receipt.slug,
+        pull_request.number,
+        pull_request.head.sha,
+        "squash",
+      )
+      if is_err(armed) {
+        throw "could not re-arm release PR auto-merge: " + to_string(unwrap_err(armed))
+      }
+      return true
+    },
+    merged_main_ancestor: fn(merge_sha) {
+      const fetched = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["fetch", "origin", "--quiet", "main"],
+      )
+      if !fetched.success {
+        return false
+      }
+      return run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["merge-base", "--is-ancestor", merge_sha, "origin/main"],
+      ).success
+    },
+    push_tag: fn(merge_sha) { return ensure_release_tag_pushed_at(
+      harness,
+      cfg,
+      receipt.tag.substring(1),
+      merge_sha,
+      [],
+      "release-main-tag-${receipt.tag}",
+    ) },
+    now: fn(_poll) { return harness.clock.date_iso() },
+    wait: fn(delay_ms) { return harness.clock.sleep_ms(delay_ms) },
+  }
+}
+
+/** Wait for the exact release PR to merge, then create or verify its immutable tag. */
+pub fn run_release_main_tag(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  options: {max_polls: int, interval_ms: int},
+  injected_adapter: ReleaseMainTagAdapter? = nil,
+) -> ReleaseMainTagResult {
+  const adapter = injected_adapter ?? default_release_main_tag_adapter(harness, cfg, receipt)
+  let poll = 0
+  while poll < options.max_polls {
+    const pull_request = adapter.pull_request(poll)
+    const decision = release_main_tag_decision(
+      receipt,
+      pull_request,
+      adapter.remote_tag_target(poll),
+    )
+    if decision.action == "abort" {
+      return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
+    }
+    if decision.action == "rearm" {
+      if pull_request == nil || !adapter.rearm(pull_request) {
+        return {
+          status: 2,
+          reason: "release PR auto-merge rearm failed",
+          receipt: receipt,
+          steps: [],
+          polls: poll + 1,
+        }
+      }
+    } else if decision.action == "tag" || decision.action == "reuse" {
+      if !adapter.merged_main_ancestor(decision.merge_sha) {
+        return {
+          status: 2,
+          reason: "merged release commit ${decision.merge_sha} is not reachable from origin/main",
+          receipt: receipt,
+          steps: [],
+          polls: poll + 1,
+        }
+      }
+      const steps = if decision.action == "tag" {
+        adapter.push_tag(decision.merge_sha)
+      } else {
+        []
+      }
+      if execution_failed(steps) {
+        return {
+          status: 2,
+          reason: "release tag push failed",
+          receipt: receipt,
+          steps: steps,
+          polls: poll + 1,
+        }
+      }
+      const bound = release_watch_receipt_bind_main_commit(
+        receipt,
+        decision.merge_sha,
+        adapter.now(poll),
+      )
+      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, bound)
+      return {status: 0, reason: decision.reason, receipt: bound, steps: steps, polls: poll + 1}
+    }
+    poll = poll + 1
+    if poll < options.max_polls && options.interval_ms > 0 {
+      adapter.wait(options.interval_ms)
+    }
+  }
+  return {
+    status: 3,
+    reason: "release PR did not merge within ${options.max_polls} polls",
+    receipt: receipt,
+    steps: [],
+    polls: options.max_polls,
+  }
+}
+
+pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMainTagAdapter {
+  const merge_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  return {
+    pull_request: fn(_poll) { return {
+      number: 1,
+      merged: true,
+      merge_commit_oid: merge_sha,
+      github_state: "merged",
+      auto_merge_armed: false,
+      in_merge_queue: false,
+      base: {ref: "main"},
+      head: {ref: receipt.publication.remote_ref, sha: receipt.publication.head_oid},
+    } },
+    remote_tag_target: fn(_poll) { return "" },
+    rearm: fn(_pr) { return true },
+    merged_main_ancestor: fn(sha) { return sha == merge_sha },
+    push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
+    now: fn(_poll) { return "2026-07-13T00:00:01Z" },
+    wait: fn(_delay_ms) { return nil },
+  }
+}

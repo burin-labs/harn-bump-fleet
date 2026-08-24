@@ -496,18 +496,17 @@ the host harn binary.
 
 `release_harn.harn` is the matching Harn-native harness for the
 `~/projects/harn` `/release-harn` skill workflow. It does not publish
-directly. The live flow mirrors the skill: prepare one `Release vX.Y.Z` PR,
-push `vX.Y.Z` at the pinned commit before auto-merge, then let the
-tag-triggered `publish-release` and `build-release-binaries` workflows ship
-from that tag. **Pin model:** the release branch is parented at `origin/<base>`
-HEAD captured at run start (or whatever `--at-sha` resolves to), and is
-NOT rebased before push. The pushed tag is the source of truth for what
-ships, so any commits that land on `<base>` between PR-open and merge
-cannot leak into the published artifact.
+directly. The live flow prepares and certifies one `Release vX.Y.Z` PR. After
+that exact PR squash-merges, the watcher proves its commit is on `origin/main`,
+signs and pushes `vX.Y.Z` at that commit, and lets the tag-triggered
+`publish-release` and `build-release-binaries` workflows ship from it. The tag
+therefore names the commit that actually landed on main, not an orphaned
+release-attempt commit.
 
-The harness creates the release tag with Git's configured signing key and
-verifies its signature locally before pushing. A signing or verification
-failure stops publication before the tag reaches the remote.
+The watcher creates the release tag with Git's configured signing key and
+verifies its signature locally before pushing. A merge-identity, ancestry,
+signing, or verification failure stops publication before the tag reaches the
+remote. Existing tags are never moved.
 
 Default mode is read-only audit:
 
@@ -566,7 +565,8 @@ scripts/run_harn_release.sh --mode prepare --yes-live-release
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
 scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 
-# Resume the independent post-tag monitor. Safe to stop and rerun.
+# Resume the post-PR handoff through merged-main tagging and publication.
+# Safe to stop and rerun.
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 
 # Import one hosted release run's receipt, then watch it through the same path.
@@ -616,9 +616,10 @@ scripts/dispatch_hosted_release.sh \
   --replace-receipt .harn-runs/hosted-release-dispatch-<run-id>.json
 ```
 
-`mode: audit` is read-only. `mode: prepare` builds and certifies the candidate
-and then stops before the tag. `mode: ship-pr` signs and pushes the tag and
-opens the release PR, so a release needs no local step.
+`mode: audit` is read-only. `mode: prepare` builds and certifies the candidate.
+`mode: ship-pr` opens the release PR and hands its receipt to the watcher. The
+watcher waits for merge, tags the exact merged-main commit, and monitors
+publication, so a release needs no local step.
 
 With `update_fleet: true`, the hosted run also follows the complete bounded
 repository-update chain, not just its first Actions run. Each continuation has
@@ -850,11 +851,11 @@ The closed hosted/local receipt is immutable at
 records both hosted proofs, the local source lanes, wall-clock timings and
 critical path, and the SHA-256 of the exact-candidate Harn CLI. The joined
 candidate receipt also preserves the independent Linux size-run identity,
-the candidate-archive run identity, and their verdicts. Signed tag creation
-remains impossible until the hosted/local lane, Linux size lane, archive lane,
-and residual audit are all green. After the tag is pushed, the harness
-dispatches `promote_only` with the bound candidate run id so those exact
-archive digests attach without recompilation; `force_rebuild` is audited
+the candidate-archive run identity, and their verdicts. The release PR remains
+impossible until the hosted/local lane, Linux size lane, archive lane, and
+residual audit are all green. After merge, the tag-derived workflows build the
+merged-main source directly; the pre-merge candidate archive is certification
+evidence, not a publishable substitute. `force_rebuild` remains audited
 recovery only. `--local-audit` remains useful for read-only diagnosis but
 cannot bypass hosted certification for live preparation.
 
@@ -868,10 +869,10 @@ Options:
 - `--at-sha SHA` overrides the auto-resolved pin (`origin/<base>` HEAD
   at run start). The local release branch is parented at this commit, an
   OID-qualified immutable `release-attempt/...` ref is published from the
-  prepared head, the tag is pushed pointing here, and `latest_tag..<pin>` bounds every
-  changelog/audit walk. Use to ship an older known-good commit while
-  newer commits sit on the base. Honors `HARN_EXT_RELEASE_PIN_SHA` env var
-  as a fallback.
+  prepared head, and `latest_tag..<pin>` bounds every changelog/audit walk.
+  The eventual tag still selects the PR's merged-main commit; this option pins
+  preparation evidence, not a divergent publish commit. Honors
+  `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
   `HARN_RELEASE_*`, then shared planner env, then the OpenRouter cloud cell in
@@ -899,16 +900,16 @@ and before/after SHA-256 digests in `release-body-integrity.json`; body-only
 drift never creates a source commit or PR, while independent changelog drift
 continues through the paperwork-PR path below.
 
-### Pre-tag checkpoint resume
+### Certified-candidate resume
 
 If `ship-pr` stops after publishing its immutable `release-attempt/...` ref but
-before pushing the tag, rerun the same foreground command. The harness fetches
+before creating the PR, rerun the same foreground command. The harness fetches
 the unique attempt for that version, restores its original certified pin, and
 re-verifies the remote ref, signed commit, sole parent, cutoff ancestry, and
 exact-SHA Linux size gate. A previous successful gate run is reused only when
 its workflow, event, branch, head SHA, target job, and required size step all
-match. The harness then pushes the tag and creates the PR without rebuilding or
-re-signing the release commit.
+match. The harness then creates the PR without rebuilding or re-signing the
+candidate; the watcher tags only its later merged-main commit.
 
 If an explicit pin makes that checkpoint ineligible for direct resume, the
 harness supersedes it with a newly certified candidate on fresh base. That
@@ -930,10 +931,10 @@ If a live `--mode ship-pr` run starts and the harness detects:
 - the required GitHub release assets for `v<next_version>`, and
 - an open `release/v<next_version>` PR on `<base>`,
 
-it switches into **post-publish fixup mode** automatically. The release
-artifact has already shipped from the originally-pushed tag; the open PR is
-paperwork that exists to land the Cargo.toml/CHANGELOG bump on `<base>`. In
-fixup mode the harness:
+it switches into **post-publish fixup mode** automatically. This is recovery
+for a historical or interrupted release whose immutable artifact already
+shipped while its source PR remains open. The open PR is paperwork that lands
+the Cargo.toml/CHANGELOG bump on `<base>`. In fixup mode the harness:
 
 - Skips the audit and the publish dry-run (the merge-queue CI of the PR
   re-runs the same gates).
