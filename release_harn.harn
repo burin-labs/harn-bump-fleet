@@ -22,6 +22,10 @@ pub import { prepare_repair_changed } from "lib/release_agent"
 import { agent_artifact_paths, release_repair_tools } from "lib/release_agent_tools"
 pub import { agent_review_attempt_selection } from "lib/release_agent_tools"
 import { analyze_release, release_body_gate_version } from "lib/release_analysis"
+import {
+  audit_findings_are_availability_only,
+  audit_findings_are_loop_status_only,
+} from "lib/release_audit"
 import { release_body_integrity_gate } from "lib/release_body_integrity"
 import { write_crystallization_fixture } from "lib/release_crystallization"
 import {
@@ -42,6 +46,7 @@ import { execute_prepare, execute_ship_pr, write_report } from "lib/release_mode
 import {
   detect_fixup_state,
   detect_post_merge_drift,
+  deterministic_release_notes_available,
   live_release_notes_blocker,
   post_merge_drift_deterministic_findings,
   release_run_session_view_gate,
@@ -667,6 +672,9 @@ pipeline main(harness: Harness) {
       validation_findings: [],
       draft_changelog: nil,
       artifacts: {},
+      // A skipped review gathered no evidence. This must default false so the
+      // loop-status relaxation can never fire on a review that never ran.
+      evidence_complete: false,
     }
     if cfg.agent && !(effective_cfg.pre_tag_resume ?? false) {
       require_release_repo_path(harness.fs, effective_cfg, "agent review")
@@ -803,20 +811,78 @@ pipeline main(harness: Harness) {
           effective_cfg,
           analysis,
         )
+        // A review that never arrived is a provider availability failure, not a
+        // verdict on the release. When deterministic notes already exist —
+        // `## Unreleased` bullets or folded `changelog.d` fragments — the cut
+        // does not need the model's draft, so record the gap as advisory
+        // evidence and proceed. A review that DID arrive and proposes a
+        // malformed draft still blocks: that content would reach CHANGELOG.md.
+        const review_findings = agent_review_result.validation_findings
+        const review_gate_applies = cfg.agent && !(effective_cfg.pre_tag_resume ?? false)
+          && cfg.mode != "audit"
+          && len(review_findings) > 0
+        const review_unavailable_only = review_gate_applies
+          && audit_findings_are_availability_only(review_findings)
+        const review_unavailable_advisory = review_unavailable_only
+          && deterministic_release_notes_available(
+            {fs: harness.fs, process: harness.process},
+            effective_cfg,
+            analysis,
+          )
+        // A loop that ran out of turns says nothing about the audit itself, so
+        // a well-formed EVIDENCED audit is not worth failing a release over.
+        // The evidence check is load-bearing and not redundant: a repair
+        // attempt that makes no tool calls yields a polished audit whose only
+        // finding is this one, resting on no observation at all. Relaxing on
+        // "it was the only finding" would ship exactly those.
+        const review_loop_status_advisory = review_gate_applies
+          && audit_findings_are_loop_status_only(review_findings)
+          && (agent_review_result.evidence_complete ?? false)
+        const review_advisory = review_unavailable_advisory || review_loop_status_advisory
+        if review_advisory {
+          const reason = if review_loop_status_advisory {
+            "the review loop ended early but its audit is complete and evidenced"
+          } else {
+            "the review never arrived; proceeding on deterministic release notes"
+          }
+          harness.stdio.println("!! release-readiness review degraded: ${reason}")
+          release_log_event(
+            {clock: harness.clock, fs: harness.fs},
+            run_id,
+            "release_readiness_review_degraded",
+            {
+              findings: review_findings,
+              reason: reason,
+              evidence_complete: agent_review_result.evidence_complete ?? false,
+              proceeded_on: if review_loop_status_advisory {
+                "evidenced_agent_audit"
+              } else {
+                "deterministic_release_notes"
+              },
+              next_version: analysis.next_version,
+            },
+          )
+        }
         if view_blocker != nil {
           execution = [view_blocker]
-        } else if cfg.agent && !(effective_cfg.pre_tag_resume ?? false)
-          && cfg.mode != "audit"
-          && len(agent_review_result.validation_findings)
-            > 0 {
+        } else if review_gate_applies && !review_advisory {
           execution = [
             recorded_step(
               "agent-review-validation",
               "validate local-model release audit before live release side effects",
               command_result_fail(
                 2,
-                "agent review failed validation:\n"
-                  + agent_review_result.validation_findings.join("\n"),
+                if review_unavailable_only {
+                  "the release-readiness review produced no audit and `## Unreleased`"
+                    + " carries no bullets, so this cut has no release notes to ship:\n"
+                    + review_findings.join("\n")
+                } else if audit_findings_are_loop_status_only(review_findings) {
+                  "the release-readiness review ended early AND did not close its"
+                    + " evidence contract, so its audit rests on no observation:\n"
+                    + review_findings.join("\n")
+                } else {
+                  "agent review failed validation:\n" + review_findings.join("\n")
+                },
               ),
             ),
           ]
