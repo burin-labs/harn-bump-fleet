@@ -11,8 +11,9 @@ The entry points are:
   `.github/workflows/bump-harn.yml`, dispatches Harn runtime bump workflows,
   polls them, and enables auto-merge on the resulting PRs.
 - `release_harn.harn`: mirrors the human `/release-harn` flow for
-  `~/projects/harn`. Default mode is read-only audit. Live prepare/ship-pr
-  requires `--yes-live-release`.
+  `~/projects/harn`. The launcher dispatches its default read-only audit to the
+  same hosted workflow as a live release. `--local-audit` is diagnosis only.
+  Live prepare/ship-pr requires `--yes-live-release`.
 - `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
   written by `release_harn`. It waits for the exact PR to merge, signs and
   pushes the merged-main tag, then monitors publication without repeating
