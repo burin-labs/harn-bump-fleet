@@ -8,18 +8,18 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-refresh_script="${HARN_HOSTED_RELEASE_REFRESH_SCRIPT:-${script_dir}/refresh_hosted_release_credentials.sh}"
-watch_script="${HARN_HOSTED_RELEASE_WATCH_SCRIPT:-${script_dir}/watch_harn_release.sh}"
-segment_polls="${HARN_HOSTED_RELEASE_SEGMENT_POLLS:-60}"
-interval_seconds="${HARN_HOSTED_RELEASE_INTERVAL_SECONDS:-30}"
+refresh_script="${HARN_EXT_HOSTED_RELEASE_REFRESH_SCRIPT:-${script_dir}/refresh_hosted_release_credentials.sh}"
+watch_script="${HARN_EXT_HOSTED_RELEASE_WATCH_SCRIPT:-${script_dir}/watch_harn_release.sh}"
+segment_polls="${HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS:-60}"
+interval_seconds="${HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS:-30}"
 max_segment_seconds=2700
 
 if [[ ! "$segment_polls" =~ ^[1-9][0-9]*$ ]]; then
-  echo "HARN_HOSTED_RELEASE_SEGMENT_POLLS must be a positive integer" >&2
+  echo "HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS must be a positive integer" >&2
   exit 2
 fi
 if [[ ! "$interval_seconds" =~ ^[0-9]+$ ]]; then
-  echo "HARN_HOSTED_RELEASE_INTERVAL_SECONDS must be a non-negative integer" >&2
+  echo "HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS must be a non-negative integer" >&2
   exit 2
 fi
 if (( segment_polls * interval_seconds > max_segment_seconds )); then

@@ -10,7 +10,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-target_repo="${HARN_RELEASE_REPO:-${HOME}/projects/harn}"
+target_repo="${HARN_EXT_RELEASE_REPO:-${HOME}/projects/harn}"
 
 mode="audit"
 live_release=0
@@ -55,23 +55,24 @@ done
 # missing in exactly the case where you most want it: a dispatch that failed
 # somewhere the operator did not see.
 #
-# stderr is unconditional. The file sink is opt-in via HARN_RELEASE_ANNOUNCE_FILE
+# stderr is unconditional. The file sink is opt-in via
+# HARN_EXT_RELEASE_ANNOUNCE_FILE
 # because where a fleet keeps its board is local configuration, not something
 # this repository should hardcode a path for.
 announce_release_boundary() {
   local route="$1"
   local stamp
   stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  local actor="${HARN_RELEASE_ACTOR:-${USER:-unknown}@$(hostname -s 2>/dev/null || echo unknown-host)}"
+  local actor="${HARN_EXT_RELEASE_ACTOR:-${USER:-unknown}@$(hostname -s 2>/dev/null || echo unknown-host)}"
   local line
   line="$(printf 'harn-release-dispatch ts=%s actor=%s mode=%s route=%s live=%s at_sha=%s repo=%s' \
     "$stamp" "$actor" "$mode" "$route" "$live_release" "${at_sha:-<unpinned>}" "$target_repo")"
   printf '%s\n' "$line" >&2
-  if [ -n "${HARN_RELEASE_ANNOUNCE_FILE:-}" ]; then
+  if [ -n "${HARN_EXT_RELEASE_ANNOUNCE_FILE:-}" ]; then
     # Never let an unwritable board stop a release; report and continue.
-    if ! printf '%s\n' "$line" >> "${HARN_RELEASE_ANNOUNCE_FILE}" 2>/dev/null; then
+    if ! printf '%s\n' "$line" >> "${HARN_EXT_RELEASE_ANNOUNCE_FILE}" 2>/dev/null; then
       printf 'warning: could not append release announcement to %s\n' \
-        "${HARN_RELEASE_ANNOUNCE_FILE}" >&2
+        "${HARN_EXT_RELEASE_ANNOUNCE_FILE}" >&2
     fi
   fi
 }
@@ -82,7 +83,7 @@ if [ "$(uname -s)" = "Darwin" ] \
   && { [ "$mode" = "prepare" ] || [ "$mode" = "ship-pr" ]; }; then
   canonical_repo="${HOME}/projects/harn"
   if [ "$target_repo" != "$canonical_repo" ]; then
-    printf 'error: macOS hosted release handoff cannot represent HARN_RELEASE_REPO=%s; expected canonical checkout %s\n' \
+    printf 'error: macOS hosted release handoff cannot represent HARN_EXT_RELEASE_REPO=%s; expected canonical checkout %s\n' \
       "$target_repo" "$canonical_repo" >&2
     exit 2
   fi
