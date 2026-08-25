@@ -96,6 +96,8 @@ add_process_root() {
   fi
 }
 
+identity_material=()
+
 # Git signs through the inherited agent but reads these public configuration
 # files. Cargo and sccache need mutable caches; Harn builtins do not.
 add_process_root read "${HOME}/.gitconfig"
@@ -111,7 +113,7 @@ add_process_root read "${HOME}/.config/gh"
 # this surface only after the release commit had already merged.
 signing_key_root="$("${script_dir}/release_signing_key_root.sh")"
 if [ -n "$signing_key_root" ]; then
-  sandbox_args+=(--sandbox-read-root "$signing_key_root")
+  identity_material+=("$signing_key_root")
 fi
 
 # The push that publishes the tag authenticates through a file-backed
@@ -124,8 +126,16 @@ fi
 credential_store_roots="$("${script_dir}/release_credential_store_root.sh")"
 while IFS= read -r credential_store_root; do
   [ -n "$credential_store_root" ] || continue
-  sandbox_args+=(--sandbox-read-root "$credential_store_root")
+  identity_material+=("$credential_store_root")
 done <<< "$credential_store_roots"
+
+# Grant the identity material as roots, collapsed to the runner's secret
+# scratch directory when that is where it lives. `release_identity_roots.sh`
+# owns that decision and explains why a file-scoped grant is the fragile form.
+while IFS= read -r identity_root; do
+  [ -n "$identity_root" ] || continue
+  sandbox_args+=(--sandbox-read-root "$identity_root")
+done < <("${script_dir}/release_identity_roots.sh" ${identity_material[@]+"${identity_material[@]}"})
 add_process_root read "${RUSTUP_HOME:-${HOME}/.rustup}"
 add_process_root write "${CARGO_HOME:-${HOME}/.cargo}"
 add_process_root write "${SCCACHE_DIR:-${HOME}/Library/Caches/Mozilla.sccache}"
