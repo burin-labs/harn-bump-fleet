@@ -102,6 +102,17 @@ add_process_root read "${HOME}/.gitconfig"
 add_process_root read "${HOME}/.ssh/id_ed25519.pub"
 add_process_root read "${HOME}/.ssh/codex_allowed_signers"
 add_process_root read "${HOME}/.config/gh"
+
+# The entries above only ever reach a signing key under `$HOME`, which is the
+# operator's layout. A hosted runner keeps its key outside every checkout, so
+# nothing above grants it and the confined `git tag -s` cannot read it.
+# `release_signing_key_root.sh` owns that resolution for both layouts and fails
+# loudly rather than skipping an unreachable key -- a silent skip is what let
+# this surface only after the release commit had already merged.
+signing_key_root="$("${script_dir}/release_signing_key_root.sh")"
+if [ -n "$signing_key_root" ]; then
+  sandbox_args+=(--sandbox-read-root "$signing_key_root")
+fi
 add_process_root read "${RUSTUP_HOME:-${HOME}/.rustup}"
 add_process_root write "${CARGO_HOME:-${HOME}/.cargo}"
 add_process_root write "${SCCACHE_DIR:-${HOME}/Library/Caches/Mozilla.sccache}"
