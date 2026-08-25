@@ -1,0 +1,252 @@
+name: Recover release publication
+
+# Publication-only recovery for a release that merged but never tagged.
+#
+# The release commit reaches the default branch before the tag exists, so a
+# failure in between strands the version in a state no other entry point
+# admits: the fold gate refuses a fresh cut because the workspace is already
+# folded, and re-running the original job would re-enter that same gate. This
+# workflow owns that gap and nothing else. It does not certify, build a
+# candidate, or open a pull request.
+#
+# It resumes the durable receipt the stranded run already wrote, so the tag,
+# the GitHub release, and the crates publication all go through the same
+# machinery a normal release uses. Publication itself cascades from the signed
+# tag: pushing it is what triggers Harn's own publish workflows.
+#
+# Idempotence is a refusal, not a retry. The job verifies the exact merge
+# commit is on the default branch and that the tag either does not exist or
+# already points at that same commit. Anything else stops the run. A recovery
+# that could publish a second time would be worse than the state it repairs.
+#
+# Secret exposure follows the release workflow: `workflow_dispatch` only, the
+# `release` environment, read-only top-level permissions, free text crossing
+# into `run:` through the environment, and every third-party action pinned by
+# commit SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, including the leading v.
+        type: string
+        required: true
+      merge_oid:
+        description: >-
+          Full 40-character merge commit on the default branch that this tag
+          must point at.
+        type: string
+        required: true
+      hosted_run:
+        description: >-
+          Hosted release run whose durable watch receipt should be resumed.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Deliberately the release group. Recovery publishes a tag, so it must never
+# run beside a live release attempt for any version.
+concurrency:
+  group: hosted-harn-release
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: recover ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: release
+    env:
+      HARN_RUNNER_TIER: github-hosted
+
+    steps:
+      - name: Check out release harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: harn-bump-fleet
+          persist-credentials: false
+
+      - name: Mint scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          repositories: harn
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+
+      # Full history: the watcher reconciles tags and walks the merge commit
+      # back against the default branch. `persist-credentials: false` for the
+      # same reason the release job sets it -- a persisted credential leaves an
+      # `include.path` pointing into $RUNNER_TEMP, and git treats an unreadable
+      # include as fatal under the sandbox.
+      - name: Check out harn
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          path: harn
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Arm git push credentials
+        uses: burin-labs/harn/.github/actions/git-push-credentials@e9e3f14e7cd07aa25daa3a0cac55832cc79ea092
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Arm gh auth for API calls
+        env:
+          RELEASE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          env -u GH_TOKEN -u GITHUB_TOKEN \
+            printf '%s\n' "${RELEASE_TOKEN}" \
+            | env -u GH_TOKEN -u GITHUB_TOKEN \
+              gh auth login --with-token --hostname github.com
+          env -u GH_TOKEN -u GITHUB_TOKEN \
+            gh auth token --hostname github.com >/dev/null
+
+      # Identical to the release job's signer. The tag this workflow pushes has
+      # to carry the same bot identity as one cut by a normal release, or the
+      # published artifact would not verify against the Harn-owned trust root.
+      - name: Identify and arm the release signer
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          ALLOWED_SIGNERS: ${{ github.workspace }}/harn/.github/release-bot-allowed-signers
+        run: |
+          set -euo pipefail
+
+          key_path="${RUNNER_TEMP}/release-signing-key"
+          umask 077
+          printf '%s\n' "${RELEASE_SIGNING_KEY}" > "${key_path}"
+          chmod 600 "${key_path}"
+
+          git config --global user.name "harn-release-bot[bot]"
+          git config --global user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git config --global gpg.format ssh
+          git config --global user.signingkey "${key_path}"
+          git config --global gpg.ssh.allowedSignersFile "${ALLOWED_SIGNERS}"
+
+          probe="${RUNNER_TEMP}/signing-probe"
+          rm -rf "${probe}" && mkdir -p "${probe}"
+          git -C "${probe}" init -q
+          git -C "${probe}" commit -q --allow-empty --no-gpg-sign -m probe
+          git -C "${probe}" tag -s probe-tag -m probe HEAD
+          git -C "${probe}" verify-tag probe-tag
+          rm -rf "${probe}"
+
+      # The refusal gate. Recovery is only ever legitimate for a version whose
+      # release commit is already on the default branch and whose tag is either
+      # absent or already correct. Everything else is a state this workflow
+      # must not touch.
+      - name: Refuse unless the release is genuinely stranded
+        id: guard
+        working-directory: harn
+        env:
+          TAG: ${{ inputs.tag }}
+          MERGE_OID: ${{ inputs.merge_oid }}
+        run: |
+          set -euo pipefail
+
+          case "${TAG}" in
+            v*) ;;
+            *) echo "::error::tag must include the leading v (got ${TAG})"; exit 1 ;;
+          esac
+
+          if ! printf '%s' "${MERGE_OID}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::merge_oid must be a full 40-character lowercase commit SHA"
+            exit 1
+          fi
+
+          base="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+          git fetch --no-tags --quiet origin "${base#origin/}"
+
+          if ! git merge-base --is-ancestor "${MERGE_OID}" "${base}"; then
+            echo "::error::${MERGE_OID} is not on ${base}; nothing to recover"
+            exit 1
+          fi
+          echo "verified ${MERGE_OID} is on ${base}"
+
+          published=false
+          existing="$(git ls-remote origin "refs/tags/${TAG}" | awk '{print $1}' | head -n 1)"
+          if [ -n "${existing}" ]; then
+            # Annotated tags resolve through the tag object to the commit.
+            target="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk '{print $1}' | head -n 1)"
+            target="${target:-${existing}}"
+            if [ "${target}" = "${MERGE_OID}" ]; then
+              echo "::notice::${TAG} already points at ${MERGE_OID}; nothing to recover"
+              published=true
+            else
+              echo "::error::${TAG} already exists at ${target}, not ${MERGE_OID}; refusing"
+              exit 1
+            fi
+          else
+            echo "verified ${TAG} does not exist yet"
+          fi
+          echo "already_published=${published}" >> "${GITHUB_OUTPUT}"
+
+      # Resumes the receipt the stranded run wrote, through the segmented
+      # watcher so a long publication outlives a single token lifetime.
+      - name: Resume publication from the durable receipt
+        if: steps.guard.outputs.already_published != 'true'
+        working-directory: harn-bump-fleet
+        env:
+          TAG: ${{ inputs.tag }}
+          HOSTED_RUN: ${{ inputs.hosted_run }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${HOSTED_RUN}" | grep -Eq '^[0-9]+$'; then
+            echo "::error::hosted_run must be a numeric GitHub Actions run ID"
+            exit 1
+          fi
+          mkdir -p .harn-runs
+          ./scripts/watch_hosted_harn_release.sh \
+            --tag "$TAG" \
+            --hosted-run "$HOSTED_RUN" \
+            --repo "${GITHUB_WORKSPACE}/harn" \
+            --github-app-signer \
+            --yes-live-release \
+            --json \
+            | tee .harn-runs/recover-release-watch.json
+
+      # Publication is only proven by the published artifacts, never by the
+      # watcher's own exit status.
+      - name: Verify the published release
+        working-directory: harn
+        env:
+          TAG: ${{ inputs.tag }}
+          MERGE_OID: ${{ inputs.merge_oid }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet origin
+
+          target="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk '{print $1}' | head -n 1)"
+          if [ -z "${target}" ]; then
+            target="$(git ls-remote origin "refs/tags/${TAG}" | awk '{print $1}' | head -n 1)"
+          fi
+          if [ "${target}" != "${MERGE_OID}" ]; then
+            echo "::error::${TAG} resolves to ${target:-<missing>}, expected ${MERGE_OID}"
+            exit 1
+          fi
+          echo "tag ${TAG} points at ${MERGE_OID}"
+
+          git -c gpg.ssh.allowedSignersFile=.github/release-bot-allowed-signers \
+            verify-tag "${TAG}"
+          echo "tag signature verifies against the release trust root"
+
+      - name: Upload recovery artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recover-release-${{ github.run_id }}
+          path: harn-bump-fleet/.harn-runs/**
+          if-no-files-found: ignore
+          retention-days: 14
