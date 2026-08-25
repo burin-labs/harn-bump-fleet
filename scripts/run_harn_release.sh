@@ -20,6 +20,9 @@ mode="audit"
 live_release=0
 mock_run=0
 local_audit=0
+case "${HARN_EXT_RELEASE_LOCAL_AUDIT:-}" in
+  1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy]) local_audit=1 ;;
+esac
 at_sha=""
 args=("$@")
 index=0
@@ -88,6 +91,7 @@ if { [ "$mode" = "audit" ] \
     && [ "$local_audit" -eq 0 ]; } \
   || { [ "$(uname -s)" = "Darwin" ] \
     && [ "$live_release" -eq 1 ] \
+    && [ "$mock_run" -eq 0 ] \
     && { [ "$mode" = "prepare" ] || [ "$mode" = "ship-pr" ]; }; }; then
   canonical_repo="${HOME}/projects/harn"
   if [ "$target_repo" != "$canonical_repo" ]; then
