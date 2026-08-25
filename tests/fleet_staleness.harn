@@ -1,0 +1,138 @@
+import {
+  parse_pin_staleness_args,
+  resolve_max_releases_behind,
+} from "../check_fleet_pin_staleness.harn"
+import {
+  pin_staleness_verdict,
+  releases_behind,
+  stale_rows,
+  staleness_issue_body,
+  staleness_issue_marker,
+} from "../lib/fleet_staleness"
+import { github_open_issues_query } from "../lib/github"
+
+// A synthetic series with a deliberate hole at v0.10.112. The real Harn series
+// is dense today, but a failed or yanked publication leaves exactly this shape,
+// and it is the case where counting differs from arithmetic.
+const GAPPED = ["v0.10.115", "v0.10.114", "v0.10.113", "v0.10.111", "v0.10.110"]
+
+// The real series at the time of the incident below, which is dense.
+const REAL_SERIES = ["v0.10.115", "v0.10.114", "v0.10.113", "v0.10.112", "v0.10.111"]
+
+pipeline test_releases_behind_counts_published_releases_not_version_arithmetic() {
+  // Three published releases are newer than 0.10.111 in the gapped series.
+  // Subtracting patch numbers would say four and name a release nobody could
+  // ever have adopted.
+  assert_eq(releases_behind("0.10.111", GAPPED), 3)
+  assert_eq(releases_behind("0.10.115", GAPPED), 0)
+  assert_eq(releases_behind("v0.10.114", GAPPED), 1)
+}
+
+/**
+ * A pin the check could not read must not round down to "healthy". A repo that
+ * has fallen out of the fleet's reach is the failure being hunted, not a pass.
+ */
+pipeline test_an_unreadable_pin_counts_as_maximally_behind() {
+  assert_eq(releases_behind(nil, GAPPED), len(GAPPED))
+  assert_eq(releases_behind("", GAPPED), len(GAPPED))
+  const verdict = pin_staleness_verdict(nil, "v0.10.115", 5, 1)
+  assert_eq(verdict.state, "unknown")
+  assert(verdict.stale, "an unreadable pin must alarm")
+}
+
+pipeline test_a_current_or_ahead_pin_does_not_alarm() {
+  const current = pin_staleness_verdict("0.10.115", "v0.10.115", 0, 1)
+  assert_eq(current.state, "current")
+  assert(!current.stale)
+  const ahead = pin_staleness_verdict("0.10.116", "v0.10.115", 0, 1)
+  assert_eq(ahead.state, "ahead")
+  assert(!ahead.stale, "a consumer ahead of the release is not stale")
+}
+
+/**
+ * The threshold is the whole design: one release behind is the normal window
+ * between a release publishing and the daily bump landing, so alarming there
+ * would train people to ignore this. Two is a pipeline that already failed.
+ */
+pipeline test_one_release_behind_is_tolerated_and_two_is_not() {
+  const tolerated = pin_staleness_verdict("0.10.114", "v0.10.115", 1, 1)
+  assert_eq(tolerated.state, "behind")
+  assert(!tolerated.stale, "one release behind is the adoption window")
+  const alarming = pin_staleness_verdict("0.10.113", "v0.10.115", 2, 1)
+  assert_eq(alarming.state, "behind")
+  assert(alarming.stale, "two releases behind means a bump already failed")
+}
+
+/**
+ * The incident this check exists for: a consumer pinned 0.10.111 while
+ * v0.10.115 was published, after three bump runs failed without paging anyone.
+ * A live dry run against the fleet reproduced exactly this row.
+ */
+pipeline test_the_four_release_regression_alarms() {
+  const behind = releases_behind("0.10.111", REAL_SERIES)
+  const verdict = pin_staleness_verdict("0.10.111", "v0.10.115", behind, 1)
+  assert(verdict.stale, "a consumer stuck on 0.10.111 must alarm")
+  assert_eq(verdict.releases_behind, 4)
+  assert(contains(verdict.detail, "0.10.111"), verdict.detail)
+  const rows = stale_rows(
+    [
+      verdict + {slug: "burin-labs/stuck", pin: "0.10.111"},
+      pin_staleness_verdict("0.10.115", "v0.10.115", 0, 1)
+        + {slug: "burin-labs/fine", pin: "0.10.115"},
+    ],
+  )
+  assert_eq(len(rows), 1)
+  assert_eq(rows[0].slug, "burin-labs/stuck")
+}
+
+/**
+ * The marker is the upsert key. If the body ever stops carrying it, the check
+ * silently opens a fresh issue every morning instead of refreshing one, and
+ * the alarm becomes the noise it was built to avoid.
+ */
+pipeline test_the_issue_body_carries_its_upsert_marker() {
+  const row = pin_staleness_verdict("0.10.111", "v0.10.115", 4, 1)
+    + {slug: "burin-labs/stuck", pin: "0.10.111"}
+  const body = staleness_issue_body(row, "v0.10.115", "https://example.test/run/1")
+  assert(contains(body, staleness_issue_marker("burin-labs/stuck")), body)
+  assert(contains(body, "0.10.111"), body)
+  assert(contains(body, "v0.10.115"), body)
+  assert(contains(body, "https://example.test/run/1"), body)
+  assert(!contains(staleness_issue_body(row, "v0.10.115", nil), "Detected by"))
+}
+
+pipeline test_open_issue_query_is_scoped_to_open_labelled_issues() {
+  assert_eq(
+    github_open_issues_query("harn-pin-staleness"),
+    {labels: "harn-pin-staleness", state: "open", per_page: 100},
+  )
+}
+
+fn thrown(callback) -> string {
+  const result = try {
+    callback()
+  }
+  return to_string(unwrap_err(result))
+}
+
+pipeline test_pin_staleness_cli_boundary() {
+  const parsed = parse_pin_staleness_args(["--dry-run", "--max-releases-behind", "2", "v1.2.3"])
+  assert_eq(parsed.dry_run, true)
+  assert_eq(resolve_max_releases_behind(parsed.max_releases_behind), 2)
+  assert_eq(parsed.target, "v1.2.3")
+  assert_eq(parsed.only, nil)
+  const defaults = parse_pin_staleness_args([])
+  assert_eq(resolve_max_releases_behind(defaults.max_releases_behind), 1)
+  assert_eq(defaults.dry_run, false)
+}
+
+/**
+ * A threshold that silently parsed to nothing would read as "no consumer is
+ * ever stale" — the alarm disarmed by a typo, which is the failure mode this
+ * whole check exists to prevent. It must refuse instead.
+ */
+pipeline test_a_non_numeric_threshold_is_refused_rather_than_ignored() {
+  assert(contains(thrown({ -> resolve_max_releases_behind("two") }), "non-negative integer"))
+  assert(contains(thrown({ -> resolve_max_releases_behind("-1") }), "non-negative integer"))
+  assert_eq(resolve_max_releases_behind("0"), 0)
+}
