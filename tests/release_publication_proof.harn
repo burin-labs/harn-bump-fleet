@@ -1,0 +1,240 @@
+import {
+  ReleasePublicationEvidence,
+  post_publication_follow_through,
+  post_publication_outcome,
+  release_publication_proof,
+} from "../lib/release_publication_proof"
+import { release_watch_receipt, release_watch_transition } from "../lib/release_watch_state"
+
+const TAG = "v1.2.3"
+
+const REQUIRED_ASSETS = [
+  "harn-aarch64-apple-darwin.tar.gz",
+  "harn-aarch64-unknown-linux-gnu.tar.gz",
+  "harn-x86_64-apple-darwin.tar.gz",
+  "harn-x86_64-pc-windows-msvc.zip",
+  "harn-x86_64-unknown-linux-gnu.tar.gz",
+  "SHA256SUMS",
+  "release-assets.json",
+]
+
+/** One deviation at a time from a release that genuinely published. */
+type EvidenceOverrides = {
+  tag_present?: bool,
+  tag_signature_verified?: bool,
+  release_found?: bool,
+  release_draft?: bool,
+  release_prerelease?: bool,
+  missing_assets?: list<string>,
+  packages_published?: bool,
+}
+
+fn evidence(overrides: EvidenceOverrides = {}) -> ReleasePublicationEvidence {
+  return {
+    tag: TAG,
+    tag_present: overrides.tag_present ?? true,
+    tag_signature_verified: overrides.tag_signature_verified ?? true,
+    release_found: overrides.release_found ?? true,
+    release_draft: overrides.release_draft ?? false,
+    release_prerelease: overrides.release_prerelease ?? false,
+    expected_prerelease: false,
+    required_assets: REQUIRED_ASSETS,
+    missing_assets: overrides.missing_assets ?? [],
+    packages_published: overrides.packages_published ?? true,
+  }
+}
+
+pipeline test_publication_proof_reads_the_release_not_a_conclusion(task: any) {
+  const published = release_publication_proof(evidence())
+  assert_eq(published.published, true)
+  assert_eq(published.reasons, [])
+  assert_eq(contains(published.detail, "7 expected asset(s) attached"), true)
+  // Every unmet condition is named, so "not published" says which part is
+  // missing rather than asserting a bare negative.
+  const unsigned = release_publication_proof(evidence({tag_signature_verified: false}))
+  assert_eq(unsigned.published, false)
+  assert_eq(unsigned.reasons, ["the release tag ${TAG} does not carry a verified signature"])
+  // An absent tag cannot also be unsigned; reporting both would read as two
+  // independent defects.
+  const untagged = release_publication_proof(
+    evidence({tag_present: false, tag_signature_verified: false}),
+  )
+  assert_eq(untagged.reasons, ["the release tag ${TAG} does not exist"])
+  const draft = release_publication_proof(evidence({release_draft: true}))
+  assert_eq(draft.reasons, ["the release at ${TAG} is still a draft"])
+  const prerelease = release_publication_proof(evidence({release_prerelease: true}))
+  assert_eq(
+    prerelease.reasons,
+    ["the release at ${TAG} has prerelease true where the version expects false"],
+  )
+  const absent = release_publication_proof(evidence({release_found: false}))
+  assert_eq(absent.reasons, ["no published release exists at ${TAG}"])
+  const partial = release_publication_proof(
+    evidence({missing_assets: ["SHA256SUMS", "release-assets.json"]}),
+  )
+  assert_eq(
+    partial.reasons,
+    ["the release at ${TAG} is missing expected assets: SHA256SUMS, release-assets.json"],
+  )
+  const unpublished_packages = release_publication_proof(evidence({packages_published: false}))
+  assert_eq(
+    unpublished_packages.reasons,
+    ["the packages released at ${TAG} are not visible in the registry"],
+  )
+}
+
+/**
+ * FALSIFIER for the whole change.
+ *
+ * The observed incident: a release published correctly — signed tag, prerelease
+ * false, every expected asset attached, packages live — while the publication
+ * prover step concluded `failure`. Every tail step after it was skipped,
+ * including the orchestration anchor's only writer.
+ *
+ * The claim under test is that the tail keys on the release's own verified
+ * state and not on the prover step's conclusion. Revert that arm — make the
+ * follow-through halt whenever the prover is not green — and this case fails on
+ * `action` and `reason`, naming the cause rather than a count.
+ */
+pipeline test_failed_prover_never_halts_a_proven_publication(task: any) {
+  const proof = release_publication_proof(evidence())
+  assert_eq(proof.published, true)
+  const follow_through = post_publication_follow_through(proof, "failure")
+  assert_eq(follow_through.action, "promote")
+  assert_eq(follow_through.reason, "publication_proven_prover_unconfirmed")
+  // Proceeding is not the same as staying quiet: the divergence between a red
+  // prover and a published release is itself worth reporting.
+  assert_eq(follow_through.alarm, true)
+  assert_eq(contains(follow_through.message, "concluded failure"), true)
+  assert_eq(contains(follow_through.message, "verified published from its own state"), true)
+  // Having run the tail, the terminal verdict is green.
+  const ran = post_publication_outcome(follow_through, "success")
+  assert_eq(ran.status, 0)
+  assert_eq(contains(ran.headline, "completed"), true)
+  // A green prover promotes without an alarm, so the alarm above is caused by
+  // the prover's failure and is not raised unconditionally.
+  const green = post_publication_follow_through(proof, "success")
+  assert_eq(green.action, "promote")
+  assert_eq(green.reason, "publication_proven")
+  assert_eq(green.alarm, false)
+}
+
+pipeline test_unproven_publication_halts_the_tail(task: any) {
+  // A release that is genuinely incomplete halts, and says which part is
+  // missing. This is the control for the case above: the tail is keyed on the
+  // release, so an unpublished release must still stop it even when the prover
+  // is green.
+  const proof = release_publication_proof(evidence({missing_assets: ["SHA256SUMS"]}))
+  const halted = post_publication_follow_through(proof, "success")
+  assert_eq(halted.action, "halt")
+  assert_eq(halted.reason, "publication_not_proven")
+  assert_eq(halted.alarm, true)
+  assert_eq(contains(halted.message, "missing expected assets: SHA256SUMS"), true)
+  // A proof that could not be produced at all is evidential nothing, not
+  // permission to promote.
+  const unproven = post_publication_follow_through(nil, "failure")
+  assert_eq(unproven.action, "halt")
+  assert_eq(unproven.reason, "publication_unproven")
+  assert_eq(unproven.alarm, true)
+}
+
+pipeline test_a_promotion_that_did_not_run_fails_loudly(task: any) {
+  // The anchor has one writer. A promotion that did not run must fail at the
+  // moment it is skipped, because afterwards a never-written anchor and one
+  // that merely trails are indistinguishable.
+  const proof = release_publication_proof(evidence())
+  const follow_through = post_publication_follow_through(proof, "failure")
+  for promotion in ["skipped", "failure", "cancelled", ""] {
+    const outcome = post_publication_outcome(follow_through, promotion)
+    assert_eq(outcome.status, 2)
+    assert_eq(outcome.alarm, true)
+    assert_eq(contains(outcome.headline, "did NOT run"), true)
+    assert_eq(
+      contains(
+        to_string(outcome.lines[3] ?? ""),
+        "an anchor that was never written is indistinguishable from one that is merely trailing",
+      ),
+      true,
+    )
+  }
+  // A halted tail that correctly did not promote is still loud.
+  const halted = post_publication_follow_through(nil, "failure")
+  const halted_outcome = post_publication_outcome(halted, "skipped")
+  assert_eq(halted_outcome.status, 2)
+  assert_eq(halted_outcome.alarm, true)
+}
+
+/**
+ * The incident's publication run, verbatim: publication succeeded and only the
+ * independent post-release development bump failed, observed while five of the
+ * seven expected assets were still uploading.
+ *
+ * The red verdict short-circuited a watch that was otherwise still pending, so
+ * this pins both halves — the run is not read as failed, and the watch keeps
+ * waiting for assets instead of terminating.
+ */
+pipeline test_ancillary_job_failure_does_not_terminate_a_pending_watch(task: any) {
+  const receipt = release_watch_receipt(
+    {
+      tag: TAG,
+      slug: "burin-labs/harn",
+      pin_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      publication: {
+        version: "1.2.3",
+        local_branch: "release/${TAG}",
+        remote_ref: "release-attempt/${TAG}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        head_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+      pr_url: "https://github.com/burin-labs/harn/pull/1",
+      required_workflows: ["publish-release.yml", "build-release-binaries.yml"],
+      created_at: "2026-07-13T00:00:00Z",
+    },
+  )
+  const transition = release_watch_transition(
+    receipt,
+    {
+      runs: [
+        {
+          id: 1,
+          workflow: "publish-release.yml",
+          status: "completed",
+          conclusion: "failure",
+          head_branch: TAG,
+          created_at: "2026-07-13T00:03:06Z",
+          url: "https://github.com/burin-labs/harn/actions/runs/1",
+          jobs_observed: true,
+          jobs: [
+            {id: 11, name: "Detect tag drift", status: "completed", conclusion: "success"},
+            {id: 12, name: "Publish release", status: "completed", conclusion: "success"},
+            {
+              id: 13,
+              name: "Open post-release development bump",
+              status: "completed",
+              conclusion: "failure",
+            },
+          ],
+        },
+        {
+          id: 2,
+          workflow: "build-release-binaries.yml",
+          status: "in_progress",
+          conclusion: "",
+          head_branch: TAG,
+          created_at: "2026-07-13T00:03:10Z",
+        },
+      ],
+      assets_ready: false,
+      missing_assets: [
+        "harn-aarch64-apple-darwin.tar.gz",
+        "harn-aarch64-unknown-linux-gnu.tar.gz",
+        "harn-x86_64-pc-windows-msvc.zip",
+        "SHA256SUMS",
+        "release-assets.json",
+      ],
+      observed_at: "2026-07-13T00:04:00Z",
+    },
+  )
+  assert_eq(transition.action, "wait")
+  assert_eq(transition.receipt.state, "pending")
+  assert_eq(contains(transition.receipt.message, "waiting on"), true)
+}
