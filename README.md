@@ -508,11 +508,15 @@ verifies its signature locally before pushing. A merge-identity, ancestry,
 signing, or verification failure stops publication before the tag reaches the
 remote. Existing tags are never moved.
 
-Default mode is read-only audit:
+Default mode dispatches a read-only audit through the hosted release workflow:
 
 ```sh
 scripts/run_harn_release.sh
 ```
+
+The hosted route gives the audit the same runner, checkout, credential, and
+confinement setup as a live release. Use `--local-audit` only to diagnose local
+source lanes; a local result does not certify hosted release readiness.
 
 Useful mock runs:
 
@@ -584,11 +588,12 @@ the operator machine. On a measured v0.10.53 run,
 certification gate; the model agent accounted for 0.3 minutes, so the LLM is
 not the expensive part of a release.
 
-On macOS, the canonical launcher automatically dispatches an authorized live
-`prepare` or `ship-pr` invocation to this hosted workflow before compilation.
+The canonical launcher dispatches every non-mock audit to this workflow. On
+macOS it also dispatches an authorized live `prepare` or `ship-pr` invocation
+before compilation.
 Candidate certification intentionally exercises nested OS sandboxes, which
 Seatbelt cannot apply beneath Harn's default-deny outer sandbox. Read-only
-audits and mocks remain local. The handoff accepts only the
+`--local-audit` diagnosis and mocks remain local. The handoff accepts only the
 workflow's typed inputs and fails before dispatch when a local-only release
 flag cannot be represented. It writes an atomic
 `.harn-runs/hosted-release-dispatch-<run-id>.json` receipt containing the full
