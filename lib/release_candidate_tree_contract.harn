@@ -1,11 +1,13 @@
 import { ChangelogFragment } from "std/changelog"
-import { workspace_version_from_manifest } from "./release_analysis"
+import { GitRemoteRef } from "std/git"
+import { parse_release } from "std/semver"
 import {
   CandidateTreeFoldConfig,
   CandidateTreeReleaseNoteFold,
   assemble_fragment_records,
   fold_candidate_release_note_text,
 } from "./release_note_fold"
+import { release_publications_from_remote_refs } from "./release_publication"
 import { read_repo_file } from "./release_runtime"
 
 pub type ReleaseCandidateTreeDecision = {applicable: bool, proceed: bool, reason: string}
@@ -15,7 +17,6 @@ pub type CandidateFragmentPartition = {owned: list<string>, deferred: list<strin
 pub type CandidateRangeEvidence = {
   commit: string,
   resolved: bool,
-  version: string,
   detail: string,
   fragment_paths: list<string>,
 }
@@ -23,8 +24,17 @@ pub type CandidateRangeEvidence = {
 pub type CandidateTreeRangeScope = {
   owned: list<string>,
   deferred: list<string>,
+  scoped: bool,
+  detail: string,
   scoped_changed: bool,
 }
+
+/**
+ * The one file a release candidate rewrites and nothing else on the default
+ * branch touches between cuts. It is the artifact that identifies which
+ * candidate a checked-out tree was built from.
+ */
+const CANDIDATE_RELEASE_NOTES_PATH = "CHANGELOG.md"
 
 fn stable_development_target(version: string) -> string {
   const clean = trim(version)
@@ -52,8 +62,7 @@ fn fragment_names(paths: list<string>) -> list<string> {
 }
 
 /**
- * Split the fragments that survive the exact-tree fold by which side of the
- * checked-out tree introduced them.
+ * Split the fragments that survive the exact-tree fold by what introduced them.
  *
  * `fragment_paths` are the working-tree paths the fold collected;
  * `candidate_fragment_paths` are the paths recorded in the candidate's own
@@ -62,9 +71,9 @@ fn fragment_names(paths: list<string>) -> list<string> {
  * repository-relative one.
  *
  * A fragment the candidate carries proves the candidate did not fold itself. A
- * fragment the candidate does not carry reached this tree from the other side
- * of the merge — it was authored after the candidate's base — so it belongs to
- * the release that follows this one.
+ * fragment the candidate does not carry came from the default branch — it was
+ * authored after the candidate's base — so it belongs to the release that
+ * follows this one.
  */
 pub fn partition_candidate_fragments(
   fragment_paths: list<string>,
@@ -98,89 +107,130 @@ fn git_read(process: HarnessProcess, repo: string, args: list<string>) {
   return {success: true, stdout: result.stdout, lines: lines, detail: ""}
 }
 
+fn unresolved_range(detail: string) -> CandidateRangeEvidence {
+  return {commit: "", resolved: false, detail: detail, fragment_paths: []}
+}
+
+/** Decode the immutable attempt refs this clone holds for one release version. */
+fn candidate_attempt_refs(
+  process: HarnessProcess,
+  repo: string,
+  version: string,
+) -> list<GitRemoteRef> {
+  const listed = git_read(
+    process,
+    repo,
+    [
+      "for-each-ref",
+      "--format=%(objectname) %(refname)",
+      "refs/heads/release-attempt/v${version}/*",
+      "refs/remotes/*/release-attempt/v${version}/*",
+    ],
+  )
+  if !listed.success {
+    return []
+  }
+  let refs: list<GitRemoteRef> = []
+  for line in listed.lines {
+    const fields = split(line, " ")
+    if len(fields) < 2 {
+      continue
+    }
+    const oid = trim(fields[0])
+    const name = trim(fields[1])
+    // A remote-tracking copy of an attempt head is the same published ref.
+    // Restate it under `refs/heads/` so the publication decoder, which owns
+    // the canonical attempt-ref shape, sees the ref it published.
+    const marker = "release-attempt/"
+    const at = name.index_of(marker)
+    if at < 0 {
+      continue
+    }
+    const canonical = "refs/heads/" + name.substring(at)
+    refs = refs + [{oid: oid, ref: canonical, name: canonical, peeled: false}]
+  }
+  return refs
+}
+
+fn blob_id(process: HarnessProcess, repo: string, rev: string, path: string) -> string {
+  const read = git_read(process, repo, ["rev-parse", "--verify", "${rev}:${path}"])
+  return read.success && len(read.lines) > 0 ? read.lines[0] : ""
+}
+
 /**
- * Resolve the commit whose range this contract covers, and read the changelog
- * fragments that commit records.
+ * Identify the release candidate this checked-out tree was built from, and
+ * read the changelog fragments that candidate's own commit records.
  *
- * A merge queue checks out a synthetic merge of the candidate with the default
- * branch, so the checked-out tree is not the candidate. Parent count names the
- * two shapes: a merge commit's second parent is the pull-request side, and a
- * non-merge HEAD is the candidate itself.
+ * Commit identity does not survive the trip into a queue. A pull-request
+ * checkout is a merge of the candidate with the default branch, and a merge
+ * queue that squashes produces a commit that is neither the candidate nor a
+ * descendant of it. Parent walking answers the first shape and silently
+ * mis-answers the second, so this resolves by content instead.
  *
- * Deferring a fragment is only sound when the resolved commit really is the
- * candidate, so the resolution is confirmed against that commit's own
- * workspace version. An unresolved range reports why and defers nothing.
+ * A candidate is the only thing that rewrites the release notes, and the
+ * default branch does not touch that file between cuts, so whichever
+ * combination built this tree, the tree carries the candidate's release-notes
+ * blob verbatim. Matching that blob against the published immutable attempts
+ * for this version names the candidate on every trigger, and distinguishes a
+ * regenerated candidate from the superseded attempt it replaced.
+ *
+ * The answer must be exactly one attempt. No match and several matches both
+ * mean the range is unproven, and an unproven range defers nothing.
  */
 pub fn candidate_range_evidence(
   process: HarnessProcess,
   cfg: CandidateTreeFoldConfig,
   candidate_version: string,
 ) -> CandidateRangeEvidence {
+  const version = trim(candidate_version)
   if cfg.mock {
-    return {
-      commit: "",
-      resolved: false,
-      version: "",
-      detail: "mock mode reads no git range",
-      fragment_paths: [],
+    return unresolved_range("mock mode reads no candidate range")
+  }
+  if parse_release(version) == nil {
+    return unresolved_range("${version} is not a release version")
+  }
+  const tree_notes = blob_id(process, cfg.repo, "HEAD", CANDIDATE_RELEASE_NOTES_PATH)
+  if tree_notes == "" {
+    return unresolved_range("cannot read HEAD:${CANDIDATE_RELEASE_NOTES_PATH}")
+  }
+  const decoded = try {
+    release_publications_from_remote_refs(
+      version,
+      candidate_attempt_refs(process, cfg.repo, version),
+    )
+  } catch (error) {
+    return unresolved_range("attempt refs for v${version} are not canonical: ${error.message}")
+  }
+  if len(decoded) == 0 {
+    return unresolved_range("no immutable release attempt for v${version} is present in this clone")
+  }
+  let matched: list<string> = []
+  for publication in decoded {
+    if blob_id(process, cfg.repo, publication.head_oid, CANDIDATE_RELEASE_NOTES_PATH)
+      == tree_notes {
+      matched = matched + [publication.head_oid]
     }
   }
-  const parents = git_read(process, cfg.repo, ["rev-list", "--parents", "-n", "1", "HEAD"])
-  if !parents.success || len(parents.lines) == 0 {
-    return {
-      commit: "",
-      resolved: false,
-      version: "",
-      detail: "cannot read HEAD parents: ${parents.detail}",
-      fragment_paths: [],
-    }
+  if len(matched) == 0 {
+    return unresolved_range(
+      "none of the ${len(decoded)} immutable attempt(s) for v${version} carries this tree's ${CANDIDATE_RELEASE_NOTES_PATH}",
+    )
   }
-  // One commit id plus its parent ids. Three or more fields means HEAD merges
-  // the candidate onto the default branch.
-  const fields = split(parents.lines[0], " ")
-  const commit = len(fields) >= 3 ? "HEAD^2" : "HEAD"
-  const manifest = git_read(process, cfg.repo, ["show", "${commit}:Cargo.toml"])
-  if !manifest.success {
-    return {
-      commit: commit,
-      resolved: false,
-      version: "",
-      detail: "cannot read ${commit}:Cargo.toml: ${manifest.detail}",
-      fragment_paths: [],
-    }
+  if len(matched) > 1 {
+    return unresolved_range(
+      "${len(matched)} immutable attempts for v${version} carry this tree's ${CANDIDATE_RELEASE_NOTES_PATH}",
+    )
   }
-  const version = workspace_version_from_manifest(manifest.stdout)
-  if version != trim(candidate_version) {
-    return {
-      commit: commit,
-      resolved: false,
-      version: version,
-      detail:
-        "${commit} declares workspace version ${version}, not the candidate ${trim(candidate_version)}",
-      fragment_paths: [],
-    }
-  }
+  const candidate = matched[0] ?? ""
   const fragments = git_read(
     process,
     cfg.repo,
-    ["ls-tree", "-r", "--name-only", commit, "--", "changelog.d"],
+    ["ls-tree", "-r", "--name-only", candidate, "--", "changelog.d"],
   )
   if !fragments.success {
-    return {
-      commit: commit,
-      resolved: false,
-      version: version,
-      detail: "cannot list ${commit} changelog fragments: ${fragments.detail}",
-      fragment_paths: [],
-    }
+    return unresolved_range("cannot list changelog fragments in candidate ${candidate}")
   }
-  return {
-    commit: commit,
-    resolved: true,
-    version: version,
-    detail: "",
-    fragment_paths: fragments.lines,
-  }
+  return {commit: candidate, resolved: true, detail: "", fragment_paths: fragments.lines}
 }
 
 fn fragments_for_paths(
@@ -222,12 +272,25 @@ pub fn candidate_tree_range_scope(
 ) -> CandidateTreeRangeScope {
   if !evidence.resolved {
     // Nothing proves which fragments this candidate introduced, so none may be
-    // deferred. Every surviving fragment counts as the candidate's own.
-    return {owned: fold.fragment_paths, deferred: [], scoped_changed: fold.changed}
+    // deferred. Every surviving fragment is treated as unscoped, and the
+    // decision says so rather than claiming a range it does not have.
+    return {
+      owned: fold.fragment_paths,
+      deferred: [],
+      scoped: false,
+      detail: evidence.detail,
+      scoped_changed: fold.changed,
+    }
   }
   const partition = partition_candidate_fragments(fold.fragment_paths, evidence.fragment_paths)
   if len(partition.deferred) == 0 {
-    return {owned: partition.owned, deferred: [], scoped_changed: fold.changed}
+    return {
+      owned: partition.owned,
+      deferred: [],
+      scoped: true,
+      detail: "",
+      scoped_changed: fold.changed,
+    }
   }
   const scoped = fold_candidate_release_note_text(
     read_repo_file(fs, cfg, "CHANGELOG.md"),
@@ -238,6 +301,8 @@ pub fn candidate_tree_range_scope(
   return {
     owned: partition.owned,
     deferred: partition.deferred,
+    scoped: true,
+    detail: "",
     scoped_changed: !scoped.success || scoped.changed,
   }
 }
@@ -257,9 +322,14 @@ pub fn candidate_tree_range_scope(
  *
  * A fragment that reached this tree after the candidate's base is a different
  * fact. It cannot be folded into this release without rewriting the immutable
- * candidate, and on a branch that keeps merging there is no base at which it
- * stops arriving. It is deferred to the next release and named in the reason,
- * because a deferred note lands one release later than its author expects.
+ * candidate, and on a branch that keeps landing work there is no base at which
+ * it stops arriving. It is deferred to the next release and named in the
+ * reason, because a deferred note lands one release later than its author
+ * expects.
+ *
+ * When the candidate cannot be identified the range is unproven. Nothing is
+ * deferred, every surviving fragment still rejects, and the reason says the
+ * range could not be scoped rather than implying that it was.
  */
 pub fn release_candidate_tree_decision(
   base_version: string,
@@ -284,6 +354,14 @@ pub fn release_candidate_tree_decision(
       proceed: false,
       reason: "exact release tree has an invalid v${candidate_version} section: "
         + fold.findings.join("; "),
+    }
+  }
+  if len(scope.owned) > 0 && !scope.scoped {
+    return {
+      applicable: true,
+      proceed: false,
+      reason:
+        "exact release tree still needs changelog folding (${len(scope.owned)} fragment(s): ${fragment_names(scope.owned).join(", ")}); this candidate's range could not be identified (${scope.detail}), so no fragment was deferred; regenerate the immutable candidate from the current base before merge",
     }
   }
   if len(scope.owned) > 0 {
