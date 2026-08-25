@@ -1,0 +1,238 @@
+import { AlarmReconciliation, reconcile_alarm } from "../check_fleet_pin_staleness.harn"
+import {
+  PinStalenessRow,
+  pin_staleness_verdict,
+  staleness_issue_marker,
+} from "../lib/fleet_staleness"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+// Every request is answered from this fake origin, so no test here can reach
+// GitHub or read an ambient credential.
+const BASE = "https://github.test"
+
+const SLUG = "burin-labs/stuck"
+
+const ISSUES = BASE + "/repos/burin-labs/stuck/issues"
+
+fn options() -> GithubClientOptions {
+  return {api_base_url: BASE, installation_token: "staleness-write-path-token"}
+}
+
+fn plan(dry_run: bool = false) {
+  return {max_releases_behind: "1", dry_run: dry_run, target: nil, only: nil, run_url: nil}
+}
+
+fn stale_row() -> PinStalenessRow {
+  return pin_staleness_verdict("0.10.111", "v0.10.115", 4, 1) + {slug: SLUG, pin: "0.10.111"}
+}
+
+fn current_row() -> PinStalenessRow {
+  return pin_staleness_verdict("0.10.115", "v0.10.115", 0, 1) + {slug: SLUG, pin: "0.10.115"}
+}
+
+/** The one open alarm a repository may already have, as GitHub would return it. */
+fn existing_alarm() -> dict {
+  return {
+    number: 42,
+    title: "Harn runtime pin is stale: ${SLUG} is behind v0.10.114",
+    body: staleness_issue_marker(SLUG) + "\n\nolder body",
+    state: "open",
+  }
+}
+
+fn mock_open_issues(harness: Harness, issues: list<dict>) {
+  harness.testing.http_mock(
+    "GET",
+    ISSUES + "?labels=harn-pin-staleness&per_page=100&state=open",
+    {status: 200, body: json_stringify(issues)},
+  )
+}
+
+fn reconcile(harness: Harness, row: PinStalenessRow, dry_run: bool = false) -> AlarmReconciliation {
+  return reconcile_alarm(harness, row, "v0.10.115", plan(dry_run), options())
+}
+
+/**
+ * A stuck repository with no alarm open gets one opened, carrying the label the
+ * next run looks for and the marker that makes this an upsert.
+ */
+pipeline test_a_new_alarm_is_opened_with_its_label_and_marker(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [])
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: json_stringify({number: 7})})
+  const result = reconcile(harness, stale_row())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "opened")
+  const posts =
+    harness.testing.http_mock_calls().filter({ call -> call.method == "POST" }).to_list()
+  assert_eq(len(posts), 1, "exactly one issue is created")
+  const sent = json_parse(posts[0].body)
+  assert_eq(sent.labels, ["harn-pin-staleness"])
+  assert(contains(sent.title, "0.10.115"), sent.title)
+  assert(contains(sent.body, staleness_issue_marker(SLUG)), sent.body)
+}
+
+/**
+ * The upsert. A repository still stuck the next morning must have its existing
+ * alarm refreshed, never a second one opened — a daily duplicate is how an
+ * alarm becomes noise people filter out.
+ */
+pipeline test_an_existing_alarm_is_refreshed_rather_than_duplicated(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [existing_alarm()])
+  harness.testing.http_mock(
+    "PATCH",
+    ISSUES + "/42",
+    {status: 200, body: json_stringify({number: 42})},
+  )
+  const result = reconcile(harness, stale_row())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "refreshed")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method == "POST" }).to_list()),
+    0,
+    "refreshing must not open a second issue",
+  )
+  const patches = harness.testing.http_mock_calls().filter({ call -> call.method == "PATCH" })
+    .to_list()
+  assert_eq(len(patches), 1)
+  const sent = json_parse(patches[0].body)
+  assert(contains(sent.title, "v0.10.115"), "the title follows the newest target")
+  assert(contains(sent.body, "4 release(s) behind"), sent.body)
+}
+
+/**
+ * The self-closing half. Without it the alarm would accumulate issues for
+ * repositories that recovered, which is the same noise problem from the other
+ * direction.
+ */
+pipeline test_a_recovered_repository_has_its_alarm_closed(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [existing_alarm()])
+  harness.testing.http_mock(
+    "PATCH",
+    ISSUES + "/42",
+    {status: 200, body: json_stringify({number: 42})},
+  )
+  const result = reconcile(harness, current_row())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "closed")
+  const patches = harness.testing.http_mock_calls().filter({ call -> call.method == "PATCH" })
+    .to_list()
+  assert_eq(len(patches), 1)
+  assert_eq(json_parse(patches[0].body).state, "closed")
+}
+
+/** A healthy repository with no alarm open must write nothing at all. */
+pipeline test_a_healthy_repository_writes_nothing(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [])
+  const result = reconcile(harness, current_row())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "none")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method != "GET" }).to_list()),
+    0,
+    "a healthy repository is read-only",
+  )
+}
+
+/**
+ * GitHub's issues endpoint returns pull requests too. An unrelated PR carrying
+ * the label must not be mistaken for this alarm's own issue, or the check would
+ * PATCH a pull request instead of opening the alarm.
+ */
+pipeline test_a_labelled_pull_request_is_not_mistaken_for_the_alarm(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(
+    harness,
+    [
+      {
+        number: 99,
+        title: "some pull request",
+        body: staleness_issue_marker(SLUG),
+        state: "open",
+        pull_request: {url: BASE + "/repos/burin-labs/stuck/pulls/99"},
+      },
+    ],
+  )
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: json_stringify({number: 8})})
+  const result = reconcile(harness, stale_row())
+  assert_eq(result.action, "opened", "the pull request must not be adopted as the alarm")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method == "PATCH" }).to_list()),
+    0,
+    "nothing may PATCH a pull request",
+  )
+}
+
+/**
+ * A marker for a different repository must not match. The marker is per-slug
+ * precisely so one repository's alarm cannot be reused as another's.
+ */
+pipeline test_another_repositorys_marker_does_not_match(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(
+    harness,
+    [
+      {
+        number: 51,
+        title: "Harn runtime pin is stale: burin-labs/other is behind v0.10.115",
+        body: staleness_issue_marker("burin-labs/other"),
+        state: "open",
+      },
+    ],
+  )
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: json_stringify({number: 9})})
+  assert_eq(reconcile(harness, stale_row()).action, "opened")
+}
+
+/** Dry run is the mode I verified live against the fleet; it must write nothing. */
+pipeline test_dry_run_decides_without_writing(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [])
+  const result = reconcile(harness, stale_row(), true)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "would_open")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method != "GET" }).to_list()),
+    0,
+    "a dry run never writes",
+  )
+}
+
+/**
+ * An alarm that cannot raise itself must fail the run rather than report a
+ * quiet success. Reporting ok here would rebuild the exact silence this check
+ * exists to break.
+ */
+pipeline test_a_failed_write_is_reported_not_swallowed(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_open_issues(harness, [])
+  harness.testing.http_mock(
+    "POST",
+    ISSUES,
+    {status: 403, body: json_stringify({message: "Resource not accessible by integration"})},
+  )
+  const result = reconcile(harness, stale_row())
+  assert(!result.ok, "a refused issue write must not report success")
+  assert_eq(result.action, "open_failed")
+}
+
+/** Likewise for the read: an unreadable issue list is not "no alarm open". */
+pipeline test_a_failed_issue_probe_is_reported_not_treated_as_empty(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    ISSUES + "?labels=harn-pin-staleness&per_page=100&state=open",
+    {status: 500, body: json_stringify({message: "server error"})},
+  )
+  const result = reconcile(harness, stale_row())
+  assert(!result.ok, "a failed probe must not read as an empty issue list")
+  assert_eq(result.action, "probe_failed")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method == "POST" }).to_list()),
+    0,
+    "a failed probe must not fall through into opening a duplicate",
+  )
+}
