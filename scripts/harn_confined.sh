@@ -113,6 +113,19 @@ signing_key_root="$("${script_dir}/release_signing_key_root.sh")"
 if [ -n "$signing_key_root" ]; then
   sandbox_args+=(--sandbox-read-root "$signing_key_root")
 fi
+
+# The push that publishes the tag authenticates through a file-backed
+# credential helper whose store also lives outside every checkout on a hosted
+# runner. Same shape as the signing key, one step later: every confined git
+# call succeeds until the transport consults the helper, and the unreadable
+# store surfaces as "could not read Username" on the tag push itself.
+# `release_credential_store_root.sh` resolves whatever store git is configured
+# to use and fails loudly when it is unreachable.
+credential_store_roots="$("${script_dir}/release_credential_store_root.sh")"
+while IFS= read -r credential_store_root; do
+  [ -n "$credential_store_root" ] || continue
+  sandbox_args+=(--sandbox-read-root "$credential_store_root")
+done <<< "$credential_store_roots"
 add_process_root read "${RUSTUP_HOME:-${HOME}/.rustup}"
 add_process_root write "${CARGO_HOME:-${HOME}/.cargo}"
 add_process_root write "${SCCACHE_DIR:-${HOME}/Library/Caches/Mozilla.sccache}"
