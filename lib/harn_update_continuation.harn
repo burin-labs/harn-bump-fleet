@@ -1,0 +1,450 @@
+import {
+  fleet_chain_branch,
+  fleet_chain_preflight_ref,
+  fleet_chain_ref,
+  require_fleet_chain_claim,
+  require_fleet_controller_claim,
+} from "./fleet_chain_ref"
+import { decode_github_workflow } from "./github_workflow"
+import { HarnUpdateContinuation, harn_update_continuation } from "./harn_update"
+import {
+  GithubConnectorError,
+  GithubConnectorResult,
+  GithubRefClaim,
+  GithubRefRelease,
+  GithubWorkflowDispatchReceipt,
+} from "harn-github-connector/default"
+
+pub type HarnUpdateContinuationFailure = {
+  operation: "claim" | "release" | "dispatch" | "validate_claim",
+  code: string,
+  category: string,
+  message: string,
+  http_status?: int,
+}
+
+pub type HarnUpdateContinuationAuthorizationAdapter = {
+  claim: fn(string, string) -> GithubConnectorResult<GithubRefClaim>,
+  release: fn(string, string) -> GithubConnectorResult<GithubRefRelease>,
+}
+
+pub type HarnUpdateContinuationAuthorizationReceipt = {
+  schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+  status: "authorized" | "blocked",
+  authorized: bool,
+  chain_id: string,
+  controller_revision: string,
+  controller_ref: string,
+  claim_attempts: int,
+  release_attempts: int,
+  dispatch_attempts: int,
+  claim?: GithubRefClaim,
+  release?: GithubRefRelease,
+  failure?: HarnUpdateContinuationFailure,
+}
+
+pub type HarnUpdateContinuationRequest = {
+  target: string,
+  proof_complete: bool,
+  update_round: int,
+  max_rounds: int,
+  repair_enabled: bool,
+  only?: string,
+  chain_id: string,
+  controller_revision: string,
+}
+
+pub type HarnUpdateContinuationAdapter = HarnUpdateContinuationAuthorizationAdapter \
+  & {dispatch: fn(dict, string) -> GithubConnectorResult<GithubWorkflowDispatchReceipt>}
+
+pub type HarnUpdateContinuationReceipt = {
+  schema_version: "harn_bump_fleet.harn_update_continuation.v3",
+  status: "complete" | "continued" | "blocked",
+  target: string,
+  update_round: int,
+  max_rounds: int,
+  proof_complete: bool,
+  continuation: HarnUpdateContinuation,
+  controller_revision: string,
+  controller_ref: string,
+  claim_attempts: int,
+  release_attempts: int,
+  dispatch_attempts: int,
+  chain_claim?: GithubRefClaim,
+  chain_release?: GithubRefRelease,
+  dispatch?: GithubWorkflowDispatchReceipt,
+  failure?: HarnUpdateContinuationFailure,
+}
+
+pub type HarnUpdateContinuationWorkflowProbe = {ok: bool, reason: string}
+
+fn connector_failure(
+  operation: "claim" | "release" | "dispatch" | "validate_claim",
+  error: GithubConnectorError,
+) -> HarnUpdateContinuationFailure {
+  let failure: HarnUpdateContinuationFailure = {
+    operation: operation,
+    code: error.code,
+    category: error.category,
+    message: error.message,
+  }
+  if error.http_status != nil {
+    failure.http_status = error.http_status
+  }
+  return failure
+}
+
+fn validation_failure(message: string) -> HarnUpdateContinuationFailure {
+  return {
+    operation: "validate_claim",
+    code: "controller_claim_mismatch",
+    category: "lease",
+    message: message,
+  }
+}
+
+fn held_release_failure() -> HarnUpdateContinuationFailure {
+  return {
+    operation: "release",
+    code: "controller_ref_moved",
+    category: "lease",
+    message: "controller ref moved before its exact release",
+  }
+}
+
+/**
+ * Prove the active credential can create and release a ref at the exact
+ * workflow-bearing controller commit before any fleet work or provider spend.
+ */
+pub fn preflight_harn_update_continuation_with_adapter(
+  chain_id: string,
+  controller_revision: string,
+  adapter: HarnUpdateContinuationAuthorizationAdapter,
+) -> HarnUpdateContinuationAuthorizationReceipt {
+  const controller_ref = fleet_chain_preflight_ref(chain_id)
+  const claimed = adapter.claim(controller_ref, controller_revision)
+  if is_err(claimed) {
+    return {
+      schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+      status: "blocked",
+      authorized: false,
+      chain_id: chain_id,
+      controller_revision: controller_revision,
+      controller_ref: controller_ref,
+      claim_attempts: 1,
+      release_attempts: 0,
+      dispatch_attempts: 0,
+      failure: connector_failure("claim", unwrap_err(claimed)),
+    }
+  }
+  const exact_claim: GithubRefClaim = try {
+    require_fleet_controller_claim(unwrap(claimed), controller_ref, controller_revision)
+  } catch (error) {
+    return {
+      schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+      status: "blocked",
+      authorized: false,
+      chain_id: chain_id,
+      controller_revision: controller_revision,
+      controller_ref: controller_ref,
+      claim_attempts: 1,
+      release_attempts: 0,
+      dispatch_attempts: 0,
+      claim: unwrap(claimed),
+      failure: validation_failure(to_string(error)),
+    }
+  }
+  const released = adapter.release(controller_ref, controller_revision)
+  if is_err(released) {
+    return {
+      schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+      status: "blocked",
+      authorized: false,
+      chain_id: chain_id,
+      controller_revision: controller_revision,
+      controller_ref: controller_ref,
+      claim_attempts: 1,
+      release_attempts: 1,
+      dispatch_attempts: 0,
+      claim: exact_claim,
+      failure: connector_failure("release", unwrap_err(released)),
+    }
+  }
+  const release: GithubRefRelease = unwrap(released)
+  if release.reason == "held_by_another" {
+    return {
+      schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+      status: "blocked",
+      authorized: false,
+      chain_id: chain_id,
+      controller_revision: controller_revision,
+      controller_ref: controller_ref,
+      claim_attempts: 1,
+      release_attempts: 1,
+      dispatch_attempts: 0,
+      claim: exact_claim,
+      release: release,
+      failure: held_release_failure(),
+    }
+  }
+  return {
+    schema_version: "harn_bump_fleet.harn_update_continuation_authorization.v1",
+    status: "authorized",
+    authorized: true,
+    chain_id: chain_id,
+    controller_revision: controller_revision,
+    controller_ref: controller_ref,
+    claim_attempts: 1,
+    release_attempts: 1,
+    dispatch_attempts: 0,
+    claim: exact_claim,
+    release: release,
+  }
+}
+
+fn blocked_continuation(
+  request: HarnUpdateContinuationRequest,
+  continuation: HarnUpdateContinuation,
+  failure: HarnUpdateContinuationFailure,
+  claim_attempts: int,
+  release_attempts: int,
+  dispatch_attempts: int,
+  chain_claim: GithubRefClaim? = nil,
+  chain_release: GithubRefRelease? = nil,
+) -> HarnUpdateContinuationReceipt {
+  let receipt: HarnUpdateContinuationReceipt = {
+    schema_version: "harn_bump_fleet.harn_update_continuation.v3",
+    status: "blocked",
+    target: request.target,
+    update_round: request.update_round,
+    max_rounds: request.max_rounds,
+    proof_complete: request.proof_complete,
+    continuation: continuation,
+    controller_revision: request.controller_revision,
+    controller_ref: fleet_chain_ref(request.chain_id),
+    claim_attempts: claim_attempts,
+    release_attempts: release_attempts,
+    dispatch_attempts: dispatch_attempts,
+    failure: failure,
+  }
+  if chain_claim != nil {
+    receipt.chain_claim = unwrap(chain_claim)
+  }
+  if chain_release != nil {
+    receipt.chain_release = unwrap(chain_release)
+  }
+  return receipt
+}
+
+/** Claim one immutable controller and dispatch at most one exact successor. */
+pub fn continue_harn_update_with_adapter(
+  request: HarnUpdateContinuationRequest,
+  adapter: HarnUpdateContinuationAdapter,
+) -> HarnUpdateContinuationReceipt {
+  const continuation = harn_update_continuation(
+    request.update_round,
+    request.max_rounds,
+    request.proof_complete,
+    request.repair_enabled,
+  )
+  if continuation.continue {
+    const claimed = adapter.claim(fleet_chain_ref(request.chain_id), request.controller_revision)
+    if is_err(claimed) {
+      return blocked_continuation(
+        request,
+        continuation,
+        connector_failure("claim", unwrap_err(claimed)),
+        1,
+        0,
+        0,
+      )
+    }
+    const chain_claim: GithubRefClaim = try {
+      require_fleet_chain_claim(unwrap(claimed), request.chain_id, request.controller_revision)
+    } catch (error) {
+      return blocked_continuation(
+        request,
+        continuation,
+        validation_failure(to_string(error)),
+        1,
+        0,
+        0,
+        unwrap(claimed),
+      )
+    }
+    let fields = {
+      version: request.target,
+      update_round: to_string(continuation.next_round ?? 0),
+      max_rounds: to_string(request.max_rounds),
+      enable_repair: request.repair_enabled,
+      chain_id: request.chain_id,
+    }
+    if trim(request.only ?? "") != "" {
+      fields.only = request.only
+    }
+    const started = adapter.dispatch(fields, fleet_chain_branch(request.chain_id))
+    if is_err(started) {
+      const released = adapter.release(
+        fleet_chain_ref(request.chain_id),
+        request.controller_revision,
+      )
+      if is_err(released) {
+        return blocked_continuation(
+          request,
+          continuation,
+          connector_failure("release", unwrap_err(released)),
+          1,
+          1,
+          1,
+          chain_claim,
+        )
+      }
+      const release: GithubRefRelease = unwrap(released)
+      if release.reason == "held_by_another" {
+        return blocked_continuation(
+          request,
+          continuation,
+          held_release_failure(),
+          1,
+          1,
+          1,
+          chain_claim,
+          release,
+        )
+      }
+      return blocked_continuation(
+        request,
+        continuation,
+        connector_failure("dispatch", unwrap_err(started)),
+        1,
+        1,
+        1,
+        chain_claim,
+        release,
+      )
+    }
+    return {
+      schema_version: "harn_bump_fleet.harn_update_continuation.v3",
+      status: "continued",
+      target: request.target,
+      update_round: request.update_round,
+      max_rounds: request.max_rounds,
+      proof_complete: request.proof_complete,
+      continuation: continuation,
+      controller_revision: request.controller_revision,
+      controller_ref: fleet_chain_ref(request.chain_id),
+      claim_attempts: 1,
+      release_attempts: 0,
+      dispatch_attempts: 1,
+      chain_claim: chain_claim,
+      dispatch: unwrap(started),
+    }
+  }
+  const released = adapter.release(fleet_chain_ref(request.chain_id), request.controller_revision)
+  if is_err(released) {
+    return blocked_continuation(
+      request,
+      continuation,
+      connector_failure("release", unwrap_err(released)),
+      0,
+      1,
+      0,
+    )
+  }
+  const release: GithubRefRelease = unwrap(released)
+  if release.reason == "held_by_another" {
+    return blocked_continuation(
+      request,
+      continuation,
+      held_release_failure(),
+      0,
+      1,
+      0,
+      nil,
+      release,
+    )
+  }
+  return {
+    schema_version: "harn_bump_fleet.harn_update_continuation.v3",
+    status: "complete",
+    target: request.target,
+    update_round: request.update_round,
+    max_rounds: request.max_rounds,
+    proof_complete: request.proof_complete,
+    continuation: continuation,
+    controller_revision: request.controller_revision,
+    controller_ref: fleet_chain_ref(request.chain_id),
+    claim_attempts: 0,
+    release_attempts: 1,
+    dispatch_attempts: 0,
+    chain_release: release,
+  }
+}
+
+fn app_token_step_has_controller_scopes(step: any) -> bool {
+  const config = step?.with ?? {}
+  return starts_with(step?.uses ?? "", "actions/create-github-app-token@")
+    && config.get("permission-actions") == "write"
+    && config.get("permission-contents") == "write"
+    && config.get("permission-workflows") == "write"
+}
+
+/** Static proof that both controller calls receive the scoped App token. */
+pub fn harn_update_continuation_workflow_probe(
+  source: string,
+) -> HarnUpdateContinuationWorkflowProbe {
+  const workflow = try {
+    decode_github_workflow(source)
+  } catch (error) {
+    return {ok: false, reason: "workflow_decode_failed: " + to_string(error)}
+  }
+  const steps = workflow.jobs.get("update")?.steps ?? []
+  let app_token = nil
+  let proof_token = nil
+  let preflight = nil
+  let continuation = nil
+  let preflight_index = -1
+  let materialize_index = -1
+  let index = 0
+  for step in steps {
+    if step.id == "app-token" {
+      app_token = step
+    }
+    if step.id == "proof-token" {
+      proof_token = step
+    }
+    if step.name == "Preflight continuation controller authority" {
+      preflight = step
+      preflight_index = index
+    }
+    if contains(step.run ?? "", "materialize_fleet.harn") {
+      materialize_index = index
+    }
+    if step.name == "Schedule the next hosted round when proof is still incomplete" {
+      continuation = step
+    }
+    index = index + 1
+  }
+  if !app_token_step_has_controller_scopes(app_token) {
+    return {ok: false, reason: "startup App token lacks controller lease scopes"}
+  }
+  if !app_token_step_has_controller_scopes(proof_token) {
+    return {ok: false, reason: "continuation App token lacks controller lease scopes"}
+  }
+  const expression = "$"
+  if preflight?.env?.GH_TOKEN != expression + "{{ steps.app-token.outputs.token }}"
+    || preflight?.env?.GITHUB_TOKEN != expression + "{{ steps.app-token.outputs.token }}" {
+    return {ok: false, reason: "startup preflight is not wired to the scoped App token"}
+  }
+  if continuation?.env?.GH_TOKEN != expression + "{{ steps.proof-token.outputs.token }}"
+    || continuation?.env?.GITHUB_TOKEN != expression + "{{ steps.proof-token.outputs.token }}" {
+    return {ok: false, reason: "continuation is not wired to the scoped App token"}
+  }
+  if !contains(preflight?.run ?? "", "preflight_harn_update_continuation.harn") {
+    return {ok: false, reason: "startup continuation authorization preflight is missing"}
+  }
+  if preflight_index < 0 || materialize_index < 0 || preflight_index >= materialize_index {
+    return {ok: false, reason: "continuation authorization preflight does not precede fleet work"}
+  }
+  return {ok: true, reason: "controller_token_and_preflight_ready"}
+}
