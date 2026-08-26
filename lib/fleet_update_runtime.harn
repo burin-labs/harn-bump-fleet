@@ -1,0 +1,157 @@
+import { poll_until } from "std/poll"
+import { strip_v } from "std/semver"
+import { harn_pin_decision } from "./bump_decision"
+import { HarnPinProbe } from "./bump_pins"
+import { remote_pin, remote_pin_probe } from "./fleet_convergence"
+import { HarnUpdateSpec, harn_update_arm_decision } from "./fleet_manifest"
+import { github_enable_auto_merge } from "./github"
+import { load_pr_signature_metadata, unsigned_commits } from "./signed_bot_prs"
+
+pub type HarnUpdatePullRequest = {
+  number: int,
+  auto_merge_armed: bool,
+  head: {sha: string, ...rest},
+  ...rest,
+}
+
+pub type HarnUpdatePrerequisiteStatus = {
+  ready: bool,
+  total: int,
+  pending: list<string>,
+  detail: string,
+}
+
+pub fn update_remote_pin_probe(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  ref: string,
+) -> HarnPinProbe {
+  return remote_pin_probe(harness, update, ref)
+}
+
+pub fn update_remote_pin(harness: Harness, update: HarnUpdateSpec) -> string? {
+  return remote_pin(harness, update)
+}
+
+/** Arm only the exact observed, fully signed PR head allowed by the update contract. */
+pub fn ensure_update_auto_merge(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  pr: HarnUpdatePullRequest,
+) -> string {
+  if !update.auto_arm {
+    const withheld = harn_update_arm_decision(update, pr.head.sha, pr.auto_merge_armed)
+    return if withheld.action == "refuse" {
+      "failed: " + withheld.reason
+    } else {
+      withheld.reason
+    }
+  }
+  let signature_head: string? = nil
+  let unsigned_count = 0
+  if update.require_signed_head {
+    const metadata = try {
+      load_pr_signature_metadata(harness, update.repository, pr.number)
+    } catch (error) {
+      return "failed: signed head evidence unavailable: " + to_string(error)
+    }
+    signature_head = metadata.head_oid
+    unsigned_count = len(unsigned_commits(metadata))
+  }
+  const decision = harn_update_arm_decision(
+    update,
+    pr.head.sha,
+    pr.auto_merge_armed,
+    signature_head,
+    unsigned_count,
+  )
+  if decision.action == "refuse" {
+    return "failed: " + decision.reason
+  }
+  if decision.action != "arm" {
+    return decision.reason
+  }
+  const result = github_enable_auto_merge(harness, update.repository, pr.number, pr.head.sha)
+  return if is_err(result) {
+    "failed: " + to_string(unwrap_err(result))
+  } else {
+    unwrap(result).state
+  }
+}
+
+pub fn update_prerequisite_status(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+) -> HarnUpdatePrerequisiteStatus {
+  let pending = []
+  for required in update.prerequisites {
+    const required_spec: HarnUpdateSpec = {
+      repository: required.repository,
+      base_branch: required.base_branch,
+      workflow_path: "",
+      workflow_name: "",
+      branch: "",
+      pin: required.pin,
+      repair_enabled: false,
+      auto_arm: false,
+      require_signed_head: true,
+      prerequisites: [],
+      max_releases_behind: 0,
+    }
+    const pin = remote_pin(harness, required_spec)
+    const decision = if pin == nil {
+      nil
+    } else {
+      harn_pin_decision(pin, strip_v(target))
+    }
+    if decision == nil || !decision.ok || !decision.satisfies_target {
+      pending = pending
+        + [
+          required.repository + "="
+            + if pin == nil {
+              "unreadable"
+            } else {
+              pin
+            },
+        ]
+    }
+  }
+  return {
+    ready: len(pending) == 0,
+    total: len(update.prerequisites),
+    pending: pending,
+    detail: if len(pending) == 0 {
+      "all ${len(update.prerequisites)} prerequisite update(s) are on ${target}"
+    } else {
+      "${len(pending)}/${len(update.prerequisites)} prerequisite update(s) pending: "
+        + join(pending, ", ")
+    },
+  }
+}
+
+/** Wait boundedly for exact prerequisite pins before dispatching a dependent update. */
+pub fn wait_for_update_prerequisites(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+  timeout_ms: int,
+  interval_ms: int,
+) -> HarnUpdatePrerequisiteStatus {
+  if len(update.prerequisites) == 0 {
+    return update_prerequisite_status(harness, update, target)
+  }
+  const settled = poll_until(
+    harness.clock,
+    fn() {
+      const status = update_prerequisite_status(harness, update, target)
+      return if status.ready {
+        status
+      } else {
+        nil
+      }
+    },
+    {timeout_ms: timeout_ms, interval_ms: interval_ms},
+  )
+  return settled ?? update_prerequisite_status(harness, update, target)
+}
