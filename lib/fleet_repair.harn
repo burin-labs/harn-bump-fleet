@@ -3,7 +3,12 @@ import { agent_loop } from "std/agent/loop"
 import { agent_preset } from "std/agent/presets"
 import { workflow_run_repair } from "std/workflow/repair"
 import { FleetConvergenceRow, FleetConvergenceSnapshot } from "./fleet_convergence"
-import { FleetRepository, bump_validation_command } from "./fleet_manifest"
+import {
+  FleetManifest,
+  FleetRepository,
+  bump_validation_command,
+  resolve_harn_update_spec,
+} from "./fleet_manifest"
 import { github_enable_auto_merge, github_pr_upsert, github_worktree_commit } from "./github"
 import {
   HarnUpdateBudgetPolicy,
@@ -14,10 +19,12 @@ import {
   harn_update_usage,
 } from "./harn_update"
 import { install_binder, planner_defaults } from "./llm_defaults"
-import { await_published_head, load_pr_signature_metadata } from "./signed_bot_prs"
+import {
+  await_published_head,
+  load_pr_signature_metadata,
+  unsigned_commits,
+} from "./signed_bot_prs"
 import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
-
-const BUMP_BRANCH = "automation/bump-harn-runtime"
 
 // Change this when the repair prompt, tool surface, or receipt meaning changes.
 // A resumable agent session is evidence for one immutable repair contract, not
@@ -89,6 +96,9 @@ pub type FleetRepairCandidate = {
   validation_command: string,
   failing_checks: list<dict>,
   allowed_new_files: list<string>,
+  branch: string,
+  auto_arm: bool,
+  require_signed_head: bool,
 }
 
 pub type FleetRepairPlan = {
@@ -98,7 +108,15 @@ pub type FleetRepairPlan = {
   refused: list<{repo: string, reason: string}>,
 }
 
-pub type FleetRecoveryCandidate = {repo: string, head_sha: string, branch_pin: string}
+pub type FleetRecoveryCandidate = {
+  repo: string,
+  head_sha: string,
+  branch_pin: string,
+  branch: string,
+  base_branch: string,
+  auto_arm: bool,
+  require_signed_head: bool,
+}
 
 pub type FleetRepairAttempt = {
   attempt: int,
@@ -296,7 +314,21 @@ pub fn fleet_repair_plan(
   snapshot: FleetConvergenceSnapshot,
   repositories: list<FleetRepository>,
   policy: FleetRepairPolicy,
+  manifest: FleetManifest? = nil,
 ) -> FleetRepairPlan {
+  const update_manifest: FleetManifest = manifest
+    ?? {
+      schema_version: 1,
+      fleet: {default_root: "~/projects", default_branch: "main"},
+      policy: {
+        package_workflow:
+          "owner/repo/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        bump_workflow:
+          "owner/repo/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+      file_projections: [],
+      repositories: repositories,
+    }
   let candidates: list<FleetRepairCandidate> = []
   let recoveries: list<FleetRecoveryCandidate> = []
   let refused: list<{repo: string, reason: string}> = []
@@ -309,6 +341,11 @@ pub fn fleet_repair_plan(
       refused = refused + [repair_refusal(row, "repository_not_in_manifest")]
       continue
     }
+    const update = resolve_harn_update_spec(update_manifest, repo, snapshot.target)
+    if !update.repair_enabled {
+      refused = refused + [repair_refusal(row, "repair_disabled_by_update_contract")]
+      continue
+    }
     if row.reason == "target_branch_missing_pull_request" {
       if trim(row.head_sha ?? "") == "" || trim(row.branch_pin ?? "") == "" {
         refused = refused + [repair_refusal(row, "missing_target_branch_lease")]
@@ -316,7 +353,17 @@ pub fn fleet_repair_plan(
         refused = refused + [repair_refusal(row, "repository_budget_exhausted")]
       } else {
         recoveries = recoveries
-          + [{repo: row.repo, head_sha: row.head_sha ?? "", branch_pin: row.branch_pin ?? ""}]
+          + [
+            {
+              repo: row.repo,
+              head_sha: row.head_sha ?? "",
+              branch_pin: row.branch_pin ?? "",
+              branch: update.branch,
+              base_branch: update.base_branch,
+              auto_arm: update.auto_arm,
+              require_signed_head: update.require_signed_head,
+            },
+          ]
       }
       continue
     }
@@ -348,6 +395,9 @@ pub fn fleet_repair_plan(
           validation_command: validation_command,
           failing_checks: row.failing_checks ?? [],
           allowed_new_files: repo.bump_allowed_new_files ?? [],
+          branch: update.branch,
+          auto_arm: update.auto_arm,
+          require_signed_head: update.require_signed_head,
         },
       ]
   }
@@ -360,8 +410,8 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
     harness,
     {
       slug: candidate.repo,
-      head: BUMP_BRANCH,
-      base: "main",
+      head: candidate.branch,
+      base: candidate.base_branch,
       title: "Bump Harn runtime",
       body:
         "Automated Harn runtime bump. The fleet controller recovered the exact signed target branch after the producer's post-publication comparison returned a false no-op. Merges through the normal queue.",
@@ -380,6 +430,49 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
     }
   }
   const pr = unwrap(upsert)
+  if candidate.require_signed_head {
+    const metadata = try {
+      load_pr_signature_metadata(harness, candidate.repo, pr.number)
+    } catch (error) {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: "recovered_pull_request_signing_probe_failed:" + to_string(error),
+        pr_number: pr.number,
+        old_head_sha: candidate.head_sha,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+    if lowercase(metadata.head_oid) != lowercase(candidate.head_sha)
+      || len(unsigned_commits(metadata))
+        > 0 {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: "recovered_pull_request_head_is_not_exact_and_signed",
+        pr_number: pr.number,
+        old_head_sha: candidate.head_sha,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+  }
+  if !candidate.auto_arm {
+    return {
+      repo: candidate.repo,
+      status: "repaired",
+      reason: "target_branch_presented_auto_merge_withheld",
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      new_head_sha: candidate.head_sha,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
   const armed = github_enable_auto_merge(
     harness,
     candidate.repo,
@@ -426,7 +519,11 @@ fn run_git(process: HarnessProcess, repo_dir: string, args: list<string>) {
 }
 
 fn prepare_checkout(process: HarnessProcess, candidate: FleetRepairCandidate) -> string? {
-  const fetched = run_git(process, candidate.directory, ["fetch", "--quiet", "origin", BUMP_BRANCH])
+  const fetched = run_git(
+    process,
+    candidate.directory,
+    ["fetch", "--quiet", "origin", candidate.branch],
+  )
   if !fetched.success {
     return "fetch_failed: " + command_detail(fetched)
   }
@@ -796,7 +893,7 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
     harness,
     {
       slug: candidate.repo,
-      branch: BUMP_BRANCH,
+      branch: candidate.branch,
       headline: "Repair Harn runtime bump validation",
       repo_dir: candidate.directory,
       source: "index",
@@ -818,6 +915,12 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
   )
   if !settled.settled {
     throw "repair published but pull request head did not settle: " + settled.detail
+  }
+  if candidate.require_signed_head && len(unsigned_commits(settled.pr)) > 0 {
+    throw "repair published but exact pull request history is not fully signed"
+  }
+  if !candidate.auto_arm {
+    return new_head
   }
   const armed = github_enable_auto_merge(
     harness,

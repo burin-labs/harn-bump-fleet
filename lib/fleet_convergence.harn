@@ -1,7 +1,12 @@
 import { strip_v } from "std/semver"
 import { harn_pin_decision } from "./bump_decision"
-import { cargo_harn_pin_probe, formula_harn_pin_probe, harn_version_pin_probe } from "./bump_pins"
-import { FleetRepository } from "./fleet_manifest"
+import { HarnPinProbe, harn_pin_text_probe } from "./bump_pins"
+import {
+  FleetManifest,
+  FleetRepository,
+  HarnUpdateSpec,
+  resolve_harn_update_spec,
+} from "./fleet_manifest"
 import {
   github_branch_head,
   github_commit_reachable_from_branch,
@@ -12,16 +17,14 @@ import {
 import { HarnUpdateProofFacts, HarnUpdatePullRequestProof, harn_update_proof } from "./harn_update"
 import { operator_pr_patrol } from "./operator_pr_patrol"
 
-const BUMP_BRANCH = "automation/bump-harn-runtime"
-
 /**
  * Candidate merged PRs are selected by destination and state, not by the
  * fleet's preferred source branch. Another trusted workflow may land the same
  * exact target first; the proof below still requires its immutable head pin,
  * green checks, merge commit, and reachability from main.
  */
-pub fn merged_update_pull_request_query() -> dict {
-  return {base: "main", state: "closed", limit: 20}
+pub fn merged_update_pull_request_query(base_branch: string = "main") -> dict {
+  return {base: base_branch, state: "closed", limit: 20}
 }
 
 pub type FleetConvergenceRow = {
@@ -45,7 +48,39 @@ pub type FleetConvergenceSnapshot = {
   target: string,
   complete: bool,
   terminal: bool,
+  total_count: int,
+  pending_count: int,
+  failing_count: int,
   repositories: list<FleetConvergenceRow>,
+}
+
+pub type HarnRefFileReader = fn(string, string) -> string?
+
+/** Read one ref through the resolved pin contract; tests and GitHub use this same seam. */
+pub fn pin_probe_at_ref(
+  spec: HarnUpdateSpec,
+  ref: string,
+  read_file: HarnRefFileReader,
+) -> HarnPinProbe {
+  if spec.pin.kind != "auto" {
+    const declared = read_file(spec.pin.path ?? "", ref)
+    if declared == nil || trim(declared) == "" {
+      return {
+        pin: nil,
+        evidence: "declared ${spec.pin.kind} pin '${spec.pin.path ?? ""}' is missing at ${ref}",
+      }
+    }
+    return harn_pin_text_probe(declared, spec.pin)
+  }
+  const version = read_file(".harn-version", ref)
+  if version != nil && trim(version) != "" {
+    return harn_pin_text_probe(version, {kind: "version_file", path: ".harn-version"})
+  }
+  const cargo = read_file("Cargo.toml", ref)
+  if cargo != nil && trim(cargo) != "" {
+    return harn_pin_text_probe(cargo, {kind: "cargo", path: "Cargo.toml"})
+  }
+  return {pin: nil, evidence: "no .harn-version or Cargo.toml pin surface found at ${ref}"}
 }
 
 /**
@@ -53,38 +88,31 @@ pub type FleetConvergenceSnapshot = {
  * probe location exists. `.harn-version` is authoritative where it exists; the
  * Cargo pin is the fallback for consumers that link the runtime in-process.
  */
-pub fn remote_pin(
+pub fn remote_pin_probe(
   harness: Harness,
-  slug: string,
-  ref: string = "main",
-  pin_path: string? = nil,
-) -> string? {
-  // A declared path wins outright. It exists for consumers whose pin is not a
-  // `.harn-version` file at all, so falling through to the default probes
-  // would silently answer nil and read as an unreachable repository.
-  if pin_path != nil && trim(to_string(pin_path)) != "" {
-    const declared = github_file_text_at_ref(harness, slug, to_string(pin_path), ref)
-    if declared == nil || trim(declared) == "" {
-      return nil
-    }
-    if ends_with(to_string(pin_path), ".rb") {
-      return formula_harn_pin_probe(declared).pin
-    }
-    return harn_version_pin_probe(declared).pin
-  }
-  const version = github_file_text_at_ref(harness, slug, ".harn-version", ref)
-  if version != nil && trim(version) != "" {
-    return harn_version_pin_probe(version).pin
-  }
-  const cargo = github_file_text_at_ref(harness, slug, "Cargo.toml", ref)
-  if cargo != nil && trim(cargo) != "" {
-    return cargo_harn_pin_probe(cargo).pin
-  }
-  return nil
+  spec: HarnUpdateSpec,
+  ref: string? = nil,
+) -> HarnPinProbe {
+  const at_ref = ref ?? spec.base_branch
+  return pin_probe_at_ref(
+    spec,
+    at_ref,
+    { path, requested_ref ->
+      return github_file_text_at_ref(harness, spec.repository, path, requested_ref)
+    },
+  )
 }
 
-fn merged_update_proof(harness: Harness, slug: string, target: string, main_pin: string?) {
-  const listed = github_pr_list(harness, slug, merged_update_pull_request_query())
+pub fn remote_pin(harness: Harness, spec: HarnUpdateSpec, ref: string? = nil) -> string? {
+  return remote_pin_probe(harness, spec, ref).pin
+}
+
+fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, main_pin: string?) {
+  const listed = github_pr_list(
+    harness,
+    spec.repository,
+    merged_update_pull_request_query(spec.base_branch),
+  )
   if is_err(listed) {
     return {ok: false, reason: "merged_update_pull_request_probe_failed"}
   }
@@ -92,7 +120,7 @@ fn merged_update_proof(harness: Harness, slug: string, target: string, main_pin:
     if !(pr?.merged ?? false) || trim(pr?.merge_commit_oid ?? "") == "" {
       continue
     }
-    const head_pin = remote_pin(harness, slug, pr?.head?.sha ?? "")
+    const head_pin = remote_pin(harness, spec, pr?.head?.sha ?? "")
     if head_pin == nil {
       continue
     }
@@ -100,21 +128,21 @@ fn merged_update_proof(harness: Harness, slug: string, target: string, main_pin:
     if !head_decision.ok || !head_decision.satisfies_target {
       continue
     }
-    const checks = github_pr_checks(harness, slug, pr.number)
+    const checks = github_pr_checks(harness, spec.repository, pr.number)
     if is_err(checks) {
       return {ok: false, reason: "merged_update_checks_probe_failed"}
     }
     const observed_checks = unwrap(checks)
     const reachability = github_commit_reachable_from_branch(
       harness,
-      slug,
+      spec.repository,
       pr.merge_commit_oid ?? "",
-      "main",
+      spec.base_branch,
     )
     if is_err(reachability) {
       return {ok: false, reason: "merged_update_reachability_probe_failed"}
     }
-    const default_head_result = github_branch_head(harness, slug, "main")
+    const default_head_result = github_branch_head(harness, spec.repository, spec.base_branch)
     const default_head_sha = if is_err(default_head_result) {
       ""
     } else {
@@ -141,7 +169,7 @@ fn merged_update_proof(harness: Harness, slug: string, target: string, main_pin:
       merge_reachable_from_default_branch: reachable,
     }
     const facts: HarnUpdateProofFacts = {
-      repository: slug,
+      repository: spec.repository,
       target: target,
       default_branch_pin: main_pin ?? "",
       default_branch_head_sha: default_head_sha,
@@ -155,13 +183,15 @@ fn merged_update_proof(harness: Harness, slug: string, target: string, main_pin:
 /** Observe each consumer through connector-owned, typed GitHub surfaces. */
 pub fn fleet_convergence_snapshot(
   harness: Harness,
+  manifest: FleetManifest,
   repositories: list<FleetRepository>,
   target: string,
 ) -> FleetConvergenceSnapshot {
   const wanted = strip_v(target)
   let rows = []
   for repo in repositories {
-    const pin = remote_pin(harness, repo.slug)
+    const spec = resolve_harn_update_spec(manifest, repo, target)
+    const pin = remote_pin(harness, spec)
     const main_decision = if pin == nil {
       nil
     } else {
@@ -181,7 +211,7 @@ pub fn fleet_convergence_snapshot(
       continue
     }
     if main_decision?.satisfies_target ?? false {
-      const proof = merged_update_proof(harness, repo.slug, target, pin)
+      const proof = merged_update_proof(harness, spec, target, pin)
       rows = rows
         + [
           {
@@ -210,7 +240,7 @@ pub fn fleet_convergence_snapshot(
     const listed = github_pr_list(
       harness,
       repo.slug,
-      {head: BUMP_BRANCH, base: "main", state: "open", limit: 1},
+      {head: spec.branch, base: spec.base_branch, state: "open", limit: 1},
     )
     if is_err(listed) {
       rows = rows
@@ -231,7 +261,7 @@ pub fn fleet_convergence_snapshot(
       // an eventually-consistent branch comparison as equal. Preserve that
       // signed branch as a recoverable exact-head lease instead of collapsing
       // it into the same state as a workflow that never produced a bump.
-      const branch = github_branch_head(harness, repo.slug, BUMP_BRANCH)
+      const branch = github_branch_head(harness, repo.slug, spec.branch)
       const branch_head = if is_err(branch) {
         nil
       } else {
@@ -240,7 +270,7 @@ pub fn fleet_convergence_snapshot(
       const branch_pin = if branch_head == nil {
         nil
       } else {
-        remote_pin(harness, repo.slug, branch_head?.oid ?? BUMP_BRANCH)
+        remote_pin(harness, spec, branch_head?.oid ?? spec.branch)
       }
       const branch_decision = if branch_pin == nil {
         nil
@@ -269,7 +299,7 @@ pub fn fleet_convergence_snapshot(
       continue
     }
     const pr = prs[0]
-    const pr_pin = remote_pin(harness, repo.slug, pr?.head?.ref ?? "")
+    const pr_pin = remote_pin(harness, spec, pr?.head?.sha ?? "")
     const pr_decision = if pr_pin == nil {
       nil
     } else {
@@ -325,6 +355,9 @@ pub fn fleet_convergence_snapshot(
     target: target,
     complete: len(failures) == 0 && len(waiting) == 0,
     terminal: len(failures) > 0,
+    total_count: len(rows),
+    pending_count: len(waiting),
+    failing_count: len(failures),
     repositories: rows,
   }
 }

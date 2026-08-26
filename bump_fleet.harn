@@ -42,7 +42,7 @@ import {
   bump_workflow_dispatch_probe,
   fleet_pre_dispatch_phase,
 } from "lib/bump_fleet_pre_dispatch"
-import { cargo_harn_pin_probe, harn_version_pin_probe, local_harn_pin } from "lib/bump_pins"
+import { local_harn_pin } from "lib/bump_pins"
 import {
   bump_summary_format_ok,
   bump_summary_problem_outcome,
@@ -60,15 +60,21 @@ import {
 import { checkout_cleanup } from "lib/checkout_cleanup"
 import { fleet_summary_context } from "lib/context_projection"
 import {
+  HarnUpdateSpec,
   read_fleet_manifest,
   resolve_fleet_root,
+  resolve_harn_update_spec,
   scoped_harn_bump_repositories,
 } from "lib/fleet_manifest"
+import {
+  ensure_update_auto_merge,
+  update_remote_pin,
+  update_remote_pin_probe,
+  wait_for_update_prerequisites,
+} from "lib/fleet_update_runtime"
 import { remote_url_to_slug } from "lib/git"
 import {
   github_actions_run,
-  github_enable_auto_merge,
-  github_file_text_at_ref,
   github_latest_release_tag,
   github_pr_close,
   github_pr_comment,
@@ -104,8 +110,6 @@ import {
 import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
 import { timing_artifacts } from "lib/timing_report"
 
-const BUMP_BRANCH = "automation/bump-harn-runtime"
-
 const HARN_REPO = "burin-labs/harn"
 
 const POLL_INTERVAL_MS = 15000
@@ -129,8 +133,6 @@ const RELEASE_READINESS_MAX_MS = 45 * 60 * 1000
 fn bump_fleet_planner(env: HarnessEnv) -> PlannerDefaults {
   return planner_defaults(env, "HARN_BUMP_FLEET")
 }
-
-type PinProbe = {pin: string?, evidence: string}
 
 type BumpOutcomeBase = FleetOutcomeReceipt
 
@@ -264,14 +266,20 @@ fn bump_chat_only(harness: Harness, parsed: FleetOptions) {
 
 // -------------------------------------------------------------------------------------------------
 
-fn discover_repos(harness: Harness, configured_root: string? = nil, only: string? = nil) {
+fn discover_repos(
+  harness: Harness,
+  target: string,
+  configured_root: string? = nil,
+  only: string? = nil,
+) {
   const home = harness.env.get_or("HOME", "")
   const manifest = read_fleet_manifest(harness.fs)
   const projects = resolve_fleet_root(configured_root ?? manifest.fleet.default_root, home)
   let out = []
   for declared in scoped_harn_bump_repositories(manifest, only) {
+    const update = resolve_harn_update_spec(manifest, declared, target)
     const dir = path_join(projects, declared.directory)
-    const workflow = path_join(dir, ".github/workflows/bump-harn.yml")
+    const workflow = path_join(dir, update.workflow_path)
     if !harness.fs.exists(path_join(dir, ".git")) {
       throw "fleet repository ${declared.slug} is not checked out at ${dir}"
     }
@@ -303,7 +311,7 @@ fn discover_repos(harness: Harness, configured_root: string? = nil, only: string
     } else {
       "${dir}/${raw_common}"
     }
-    out = out + [{dir: dir, slug: declared.slug, common_dir: common}]
+    out = out + [{dir: dir, slug: declared.slug, common_dir: common, update: update}]
   }
   return out
 }
@@ -383,42 +391,6 @@ fn timed_bump_outcome(clock: HarnessClock, name: string, attrs: dict, callback: 
   } catch (e) {
     end_timing(clock, handle, {status: "error", outcome: "exception", error: to_string(e)})
     throw e
-  }
-}
-
-/**
- * Probe the version pinned on origin/main by reading the canonical connector surface.
- * Tries .harn-version first (most repos), falls back to exact
- * Harn Cargo pins (harn-cloud). Returns `{pin, evidence}` where `pin` is the
- * bare "X.Y.Z" string with any leading "v" already stripped, or nil.
- */
-fn read_remote_pin_probe_at_ref(harness: Harness, slug: string, ref: string) -> PinProbe {
-  const hv = github_file_text_at_ref(harness, slug, ".harn-version", ref)
-  if hv != nil && trim(hv) != "" {
-    return harn_version_pin_probe(hv)
-  }
-  const cargo = github_file_text_at_ref(harness, slug, "Cargo.toml", ref)
-  if cargo != nil && trim(cargo) != "" {
-    return cargo_harn_pin_probe(cargo)
-  }
-  return {pin: nil, evidence: "no .harn-version or Cargo.toml pin surface found at ${ref}"}
-}
-
-fn read_remote_pin_at_ref(harness: Harness, slug: string, ref: string) -> string? {
-  return read_remote_pin_probe_at_ref(harness, slug, ref).pin
-}
-
-fn read_remote_pin(harness: Harness, slug: string) -> string? {
-  return read_remote_pin_at_ref(harness, slug, "main")
-}
-
-/** Idempotently arm auto-merge under the PR head observed by the preceding read. */
-fn ensure_auto_merge(harness: Harness, slug: string, pr: BumpPullRequest) -> string {
-  const result = github_enable_auto_merge(harness, slug, pr.number, pr.head.sha)
-  return if is_err(result) {
-    "failed: " + to_string(unwrap_err(result))
-  } else {
-    unwrap(result).state
   }
 }
 
@@ -654,7 +626,7 @@ fn already_current_outcome(
 fn targeted_pr_outcome(
   harness: Harness,
   base: BumpOutcomeBase,
-  slug: string,
+  repo: FleetRepo,
   target: string,
   pr: BumpPullRequest,
   view_gate: RunSessionViewMarkdownGate,
@@ -662,7 +634,7 @@ fn targeted_pr_outcome(
 ) -> FleetOutcomeReceipt {
   const annotated = annotate_bump_pr_with_view_metadata(
     harness,
-    slug,
+    repo.slug,
     pr.number,
     target,
     view_gate,
@@ -680,11 +652,11 @@ fn targeted_pr_outcome(
       },
     )
   }
-  const am = if pr.auto_merge_armed {
-    "already_enabled"
-  } else {
-    ensure_auto_merge(harness, slug, pr)
-  }
+  const am = ensure_update_auto_merge(
+    harness,
+    repo.update,
+    {number: pr.number, auto_merge_armed: pr.auto_merge_armed, head: {sha: pr.head.sha}},
+  )
   const final_status = if starts_with(am, "failed") {
     "pr_open_for_target_auto_merge_failed"
   } else {
@@ -713,11 +685,11 @@ fn predispatch_resolution(
   view_gate: RunSessionViewMarkdownGate,
   public_surface_impact: PublicSurfaceImpactReport,
 ) {
-  const existing_pr = find_existing_pr(harness, repo.slug)
+  const existing_pr = find_existing_pr(harness, repo.update)
   const existing_probe = if existing_pr == nil {
     nil
   } else {
-    pr_target_probe(harness, repo.slug, existing_pr, target)
+    pr_target_probe(harness, repo.update, existing_pr, target)
   }
   const remote_decision = if remote_pin == nil {
     nil
@@ -810,7 +782,7 @@ fn predispatch_resolution(
       outcome: targeted_pr_outcome(
         harness,
         base,
-        repo.slug,
+        repo,
         target,
         existing_pr,
         view_gate,
@@ -847,7 +819,12 @@ fn dispatch_bump_workflow(
   base: BumpOutcomeBase,
   target: string,
 ) {
-  const dispatch = github_workflow_dispatch(harness, repo.slug, "bump-harn.yml", {version: target})
+  const dispatch = github_workflow_dispatch(
+    harness,
+    repo.slug,
+    repo.update.workflow_name,
+    {version: target},
+  )
   if is_err(dispatch) {
     return finish_outcome(
       base,
@@ -877,13 +854,13 @@ fn dispatch_bump_workflow(
 
 fn classify_post_dispatch(
   harness: Harness,
-  slug: string,
+  repo: FleetRepo,
   target: string,
   target_no_v: string,
   run_outcome: FleetOutcomeReceipt,
   stale_note: string,
 ) {
-  const post = wait_for_post_dispatch_state(harness, slug, target)
+  const post = wait_for_post_dispatch_state(harness, repo.update, target)
   const pr = post.pr
   const post_remote = post.remote_pin
   const outcome = if pr == nil {
@@ -927,7 +904,7 @@ fn classify_post_dispatch(
 
 fn with_auto_merge(
   harness: Harness,
-  slug: string,
+  repo: FleetRepo,
   classified: BumpClassification,
   target: string,
   view_gate: RunSessionViewMarkdownGate,
@@ -940,7 +917,7 @@ fn with_auto_merge(
   }
   const annotated = annotate_bump_pr_with_view_metadata(
     harness,
-    slug,
+    repo.slug,
     pr.number,
     target,
     view_gate,
@@ -954,11 +931,11 @@ fn with_auto_merge(
       auto_merge: nil,
     }
   }
-  const am = if pr.auto_merge_armed {
-    "already_enabled"
-  } else {
-    ensure_auto_merge(harness, slug, pr)
-  }
+  const am = ensure_update_auto_merge(
+    harness,
+    repo.update,
+    {number: pr.number, auto_merge_armed: pr.auto_merge_armed, head: {sha: pr.head.sha}},
+  )
   const detail = if starts_with(am, "failed") {
     "${with_pr.detail}; auto-merge: ${am}"
   } else {
@@ -986,8 +963,8 @@ fn bump_one(
         {repo: repo.slug},
         { ->
           return {
-            remote_pin: read_remote_pin(harness, repo.slug),
-            local_pin: local_harn_pin(harness.fs, repo.dir),
+            remote_pin: update_remote_pin(harness, repo.update),
+            local_pin: local_harn_pin(harness.fs, repo.dir, repo.update.pin),
           }
         },
       ).result
@@ -996,11 +973,11 @@ fn bump_one(
       const base = make_outcome(repo, local_pin, remote_pin)
       const target_no_v = strip_v(target)
       if dry_run {
-        const existing_pr = find_existing_pr(harness, repo.slug)
+        const existing_pr = find_existing_pr(harness, repo.update)
         const existing_probe = if existing_pr == nil {
           nil
         } else {
-          pr_target_probe(harness, repo.slug, existing_pr, target)
+          pr_target_probe(harness, repo.update, existing_pr, target)
         }
         return dry_run_predispatch_outcome(
           base,
@@ -1031,6 +1008,19 @@ fn bump_one(
       if pre.done {
         return pre.outcome
       }
+      const prerequisites = wait_for_update_prerequisites(
+        harness,
+        repo.update,
+        target,
+        MAX_POLL_MS,
+        POLL_INTERVAL_MS,
+      )
+      if !prerequisites.ready {
+        return finish_outcome(
+          base,
+          {status: "prerequisite_updates_pending", detail: prerequisites.detail},
+        )
+      }
       const run_outcome = timed_bump_phase(
         harness.clock,
         "bump.repo.dispatch_workflow",
@@ -1044,7 +1034,7 @@ fn bump_one(
         { ->
           return classify_post_dispatch(
             harness,
-            repo.slug,
+            repo,
             target,
             target_no_v,
             run_outcome,
@@ -1059,7 +1049,7 @@ fn bump_one(
         { ->
           return with_auto_merge(
             harness,
-            repo.slug,
+            repo,
             classified,
             target,
             view_gate,
@@ -1073,12 +1063,12 @@ fn bump_one(
 
 fn pr_target_probe(
   harness: Harness,
-  slug: string,
+  update: HarnUpdateSpec,
   pr: BumpPullRequest,
   target: string,
 ) -> BumpDecisionProbe {
   const target_no_v = strip_v(target)
-  const probe = read_remote_pin_probe_at_ref(harness, slug, pr.head.ref)
+  const probe = update_remote_pin_probe(harness, update, pr.head.sha)
   const pin = probe.pin
   if pin == nil {
     return {matches: false, pin: nil, evidence: "PR head pin is unknown: ${probe.evidence}"}
@@ -1117,14 +1107,14 @@ fn poll_exact_workflow_run(harness: Harness, slug: string, run_id: int) {
   return unwrap(final)
 }
 
-fn find_existing_pr(harness: Harness, slug: string) -> BumpPullRequest? {
+fn find_existing_pr(harness: Harness, update: HarnUpdateSpec) -> BumpPullRequest? {
   const prs = github_pr_list(
     harness,
-    slug,
-    {head: BUMP_BRANCH, base: "main", state: "open", limit: 1},
+    update.repository,
+    {head: update.branch, base: update.base_branch, state: "open", limit: 1},
   )
   if is_err(prs) {
-    throw "GitHub PR lookup failed for ${slug}: " + to_string(unwrap_err(prs))
+    throw "GitHub PR lookup failed for ${update.repository}: " + to_string(unwrap_err(prs))
   }
   const found = unwrap(prs)
   if len(found) == 0 {
@@ -1135,16 +1125,16 @@ fn find_existing_pr(harness: Harness, slug: string) -> BumpPullRequest? {
 
 fn probe_post_dispatch_state(
   harness: Harness,
-  slug: string,
+  update: HarnUpdateSpec,
   target: string,
   target_no_v: string,
 ) -> PostDispatchSnapshot {
-  const pr = find_existing_pr(harness, slug)
-  const remote = read_remote_pin(harness, slug)
+  const pr = find_existing_pr(harness, update)
+  const remote = update_remote_pin(harness, update)
   const probe = if pr == nil {
     nil
   } else {
-    pr_target_probe(harness, slug, pr, target)
+    pr_target_probe(harness, update, pr, target)
   }
   const settled = (pr != nil && probe.matches)
     || (pr == nil && remote != nil && remote == target_no_v)
@@ -1153,11 +1143,11 @@ fn probe_post_dispatch_state(
 
 fn settled_post_dispatch_state(
   harness: Harness,
-  slug: string,
+  update: HarnUpdateSpec,
   target: string,
   target_no_v: string,
 ) -> PostDispatchSnapshot? {
-  const snap = probe_post_dispatch_state(harness, slug, target, target_no_v)
+  const snap = probe_post_dispatch_state(harness, update, target, target_no_v)
   if snap.settled {
     return snap
   }
@@ -1166,19 +1156,19 @@ fn settled_post_dispatch_state(
 
 fn wait_for_post_dispatch_state(
   harness: Harness,
-  slug: string,
+  update: HarnUpdateSpec,
   target: string,
 ) -> PostDispatchSnapshot {
   const target_no_v = strip_v(target)
   const hit = poll_until(
     harness.clock,
-    fn() { return settled_post_dispatch_state(harness, slug, target, target_no_v) },
+    fn() { return settled_post_dispatch_state(harness, update, target, target_no_v) },
     {timeout_ms: POST_RUN_SETTLE_MS, interval_ms: POST_RUN_SETTLE_POLL_MS},
   )
   if hit != nil {
     return hit
   }
-  return probe_post_dispatch_state(harness, slug, target, target_no_v)
+  return probe_post_dispatch_state(harness, update, target, target_no_v)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1334,7 +1324,7 @@ fn restore_local_checkout_to_main(
 }
 
 fn error_outcome_for_repo(fs: HarnessFs, repo: FleetRepo, message: string) -> FleetOutcomeReceipt {
-  return base_outcome_fields(repo, local_harn_pin(fs, repo.dir), nil)
+  return base_outcome_fields(repo, local_harn_pin(fs, repo.dir, repo.update.pin), nil)
     + {status: "error", detail: message}
 }
 
@@ -1378,11 +1368,11 @@ pipeline main(harness: Harness) {
         )
         return cost_budget_audit_line(limit)
       },
-      discover_repos: fn() { return timed(
+      discover_repos: fn(target) { return timed(
         harness.clock,
         "bump.discovery",
         {},
-        { -> return discover_repos(harness, parsed.fleet_root, parsed.only) },
+        { -> return discover_repos(harness, target, parsed.fleet_root, parsed.only) },
       ).result },
       wait_for_readiness: fn(target) { return timed(
         harness.clock,
