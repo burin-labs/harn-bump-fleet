@@ -9,7 +9,7 @@ defaults for a new update.
 
 ## Read the result
 
-Download the `harn-update-receipts` artifact. Start with the startup receipt:
+Download the `harn-update-receipts-<run-id>-<run-attempt>` artifact. Start with the startup receipt:
 it proves preparation was durable before any provider or subprocess work. Then
 read the proof JSON receipt.
 Every repository must have state `proven`, with a pull-request number, checked
