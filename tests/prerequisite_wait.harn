@@ -2,6 +2,7 @@ import { PrerequisitePrDecision, load_prerequisite_pr } from "../lib/prerequisit
 import {
   PrerequisiteWaitAdapter,
   prerequisite_wait_not_required,
+  wait_prerequisite,
   wait_prerequisite_with_adapter,
 } from "../lib/prerequisite_wait"
 import { GithubClientOptions } from "harn-github-connector/default"
@@ -12,18 +13,33 @@ const NUMBER = 42
 
 const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+const MOVED_HEAD = "dddddddddddddddddddddddddddddddddddddddd"
+
 const API = "https://github.test"
 
 fn decision(fields: any = {}) -> PrerequisitePrDecision {
   return {
     ok: false,
-    status: "not_merged",
+    status: "pending",
     repo: REPO,
     number: NUMBER,
+    head_oid: HEAD,
     expected_head_oid: HEAD,
+    head_verification: "exact",
+    checks_observed: true,
+    checks_head_oid: HEAD,
+    check_state: "pending",
+    check_count: 1,
+    pending_check_count: 1,
+    failing_check_count: 0,
+    failing_check_names: [],
     detail: "pull request is open, not merged",
   }
     + fields
+}
+
+fn pending() -> PrerequisitePrDecision {
+  return decision({status: "pending"})
 }
 
 fn transient_503() -> PrerequisitePrDecision {
@@ -47,6 +63,8 @@ fn satisfied() -> PrerequisitePrDecision {
       github_state: "merged",
       merged_at: "2026-08-21T00:00:00Z",
       merge_commit_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      check_state: "green",
+      pending_check_count: 0,
       detail: "pull request is merged",
     },
   )
@@ -74,6 +92,64 @@ pipeline test_transient_503_then_success_preserves_retry_receipt(task: any) {
   assert_eq(receipt.retry_count, 1)
   assert_eq(receipt.last_status, "satisfied")
   assert_eq(receipt.elapsed_ms, 1000)
+}
+
+pipeline test_open_pending_then_success_is_the_only_pr_state_retry(task: any) {
+  let now_ms = 0
+  let attempts = 0
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return now_ms },
+    observe: fn() {
+      attempts = attempts + 1
+      return if attempts == 1 {
+        pending()
+      } else {
+        satisfied()
+      }
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 10000, 1000, adapter)
+  assert_eq(receipt.status, "satisfied")
+  assert_eq(receipt.attempts, 2)
+  assert_eq(receipt.retry_count, 0)
+  assert_eq(receipt.pending_check_count, 0)
+}
+
+pipeline test_terminal_pr_states_do_not_wait(task: any) {
+  for terminal in [
+    decision({status: "terminal_failure", detail: "checks failed"}),
+    decision({status: "missing_check_evidence", checks_observed: false}),
+    decision({status: "pending", checks_observed: false, checks_head_oid: ""}),
+    decision({status: "unexpected_head"}),
+  ] {
+    let waits = 0
+    const adapter: PrerequisiteWaitAdapter = {
+      now_ms: fn() { return 0 },
+      observe: fn() { return terminal },
+      wait: fn(_delay_ms) { waits = waits + 1 },
+    }
+    const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 10800000, 20000, adapter)
+    assert_eq(receipt.status, "terminal_error")
+    assert_eq(receipt.attempts, 1)
+    assert_eq(receipt.elapsed_ms, 0)
+    assert_eq(waits, 0)
+  }
+}
+
+pipeline test_adapter_cannot_report_success_without_exact_merge_evidence(task: any) {
+  let waits = 0
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return 0 },
+    observe: fn() { return satisfied()
+      + {merged_at: "", merge_commit_oid: ""} },
+    wait: fn(_delay_ms) { waits = waits + 1 },
+  }
+  const receipt = wait_prerequisite_with_adapter(REPO, NUMBER, HEAD, 10800000, 20000, adapter)
+  assert_eq(receipt.status, "terminal_error")
+  assert_eq(receipt.ok, false)
+  assert_eq(receipt.attempts, 1)
+  assert_eq(waits, 0)
 }
 
 pipeline test_persistent_503_exhausts_the_single_wall_clock_budget(task: any) {
@@ -152,6 +228,132 @@ fn pull_api_body() -> dict {
     base: {ref: "main", sha: "cccccccccccccccccccccccccccccccccccccccc"},
     head: {ref: "automation/projection", sha: HEAD},
   }
+}
+
+fn open_pull_api_body(fields: dict = {}) -> dict {
+  return pull_api_body()
+    + {
+      state: "open",
+      merged: false,
+      merged_at: nil,
+      merge_commit_sha: nil,
+      mergeable: true,
+      mergeable_state: "clean",
+      auto_merge: {merge_method: "squash"},
+    }
+    + fields
+}
+
+fn mock_pull_view(testing: HarnessTesting, body: dict) {
+  testing.http_mock(
+    "GET",
+    API + "/repos/octo-org/octo-repo/pulls/42",
+    {status: 200, body: json_stringify(body)},
+  )
+  testing.http_mock(
+    "GET",
+    API + "/repos/octo-org/octo-repo/branches/main/protection",
+    {status: 403, body: json_stringify({message: "Resource not accessible by integration"})},
+  )
+  testing.http_mock(
+    "POST",
+    API + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                number: NUMBER,
+                autoMergeRequest: {mergeMethod: "SQUASH"},
+                mergeQueueEntry: nil,
+              },
+            },
+          },
+        },
+      ),
+    },
+  )
+}
+
+fn mock_checks(testing: HarnessTesting, head: string, checks: list<dict>) {
+  testing.http_mock(
+    "GET",
+    API + "/repos/octo-org/octo-repo/commits/" + head + "/check-runs",
+    {status: 200, body: json_stringify({total_count: len(checks), check_runs: checks})},
+  )
+}
+
+pipeline test_production_wait_adapter_exits_hosted_deadline_on_terminal_red(
+  harness: Harness,
+  task: any,
+) {
+  harness.testing.http_mock_clear()
+  mock_pull_view(harness.testing, open_pull_api_body())
+  mock_checks(
+    harness.testing,
+    HEAD,
+    [
+      {
+        id: 7,
+        name: "GitHub Actions hygiene",
+        status: "completed",
+        conclusion: "failure",
+        head_sha: HEAD,
+      },
+    ],
+  )
+  const receipt = wait_prerequisite(
+    harness,
+    REPO,
+    NUMBER,
+    HEAD,
+    {head_ref: "automation/projection", base_ref: "main", files: []},
+    10800000,
+    20000,
+    connector_options(1),
+  )
+  assert_eq(receipt.status, "terminal_error")
+  assert_eq(receipt.attempts, 1)
+  assert_eq(receipt.pending_check_count, 0)
+  assert_eq(receipt.failing_check_names, ["GitHub Actions hygiene"])
+  assert(receipt.elapsed_ms < 1000)
+}
+
+pipeline test_production_reader_reports_exact_open_pending_shape(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_pull_view(harness.testing, open_pull_api_body())
+  mock_checks(
+    harness.testing,
+    HEAD,
+    [
+      {id: 8, name: "CI / test", status: "in_progress", conclusion: nil, head_sha: HEAD},
+      {id: 9, name: "CI / lint", status: "completed", conclusion: "success", head_sha: HEAD},
+    ],
+  )
+  const observed = load_prerequisite_pr(harness, REPO, NUMBER, HEAD, nil, connector_options(1))
+  assert_eq(observed.status, "pending")
+  assert_eq(observed.checks_head_oid, HEAD)
+  assert_eq(observed.check_count, 2)
+  assert_eq(observed.pending_check_count, 1)
+  assert_eq(observed.failing_check_count, 0)
+}
+
+pipeline test_production_reader_rejects_moved_head_before_check_read(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_pull_view(
+    harness.testing,
+    open_pull_api_body({head: {ref: "automation/projection", sha: MOVED_HEAD}}),
+  )
+  const observed = load_prerequisite_pr(harness, REPO, NUMBER, HEAD, nil, connector_options(1))
+  assert_eq(observed.status, "unexpected_head")
+  assert_eq(observed.head_oid, MOVED_HEAD)
+  const check_reads = harness.testing.http_mock_calls().filter(
+    { call -> contains(call.url, "/check-runs") },
+  )
+    .to_list()
+  assert_eq(len(check_reads), 0)
 }
 
 pipeline test_connector_safe_read_retries_503_before_classification(harness: Harness, task: any) {
