@@ -4,16 +4,19 @@ import {
   github_file_text_at_ref_result,
   github_is_rate_limited_read_error,
   github_is_transient_read_error,
+  github_pr_checks,
   github_pr_commits,
   github_pr_files,
   github_pr_view,
 } from "./github"
-import { GithubClientOptions } from "harn-github-connector/default"
+import { GithubClientOptions, GithubPullRequestChecks } from "harn-github-connector/default"
 
 pub type PrerequisitePrStatus = "satisfied" \
+  | "pending" \
+  | "terminal_failure" \
+  | "missing_check_evidence" \
   | "missing_pull_request" \
   | "unexpected_head" \
-  | "not_merged" \
   | "missing_merge_evidence" \
   | "github_error"
 
@@ -35,7 +38,23 @@ pub type PrerequisitePrDecision = {
   github_error_category?: string,
   github_http_status?: int?,
   github_retryable?: bool,
+  checks_observed: bool,
+  checks_head_oid: string,
+  check_state: string,
+  check_count: int,
+  pending_check_count: int,
+  failing_check_count: int,
+  failing_check_names: list<string>,
   detail: string,
+}
+
+pub type PrerequisiteCheckEvidence = {
+  head_oid: string,
+  state: string,
+  check_count: int,
+  pending_count: int,
+  failing_count: int,
+  failing_names: list<string>,
 }
 
 pub type PrerequisitePr = {
@@ -49,6 +68,11 @@ pub type PrerequisitePr = {
   mergeable_state?: string,
   merge_state_status?: string,
   mergeStateStatus?: string,
+  mergeable?: bool?,
+  auto_merge_armed?: bool,
+  in_merge_queue?: bool?,
+  queue_membership?: {queued?: bool, auto_merge_armed?: bool, ...rest},
+  draft?: bool,
   merged?: bool,
   merged_at?: string,
   mergedAt?: string,
@@ -100,6 +124,13 @@ fn github_error_decision(
     github_http_status: error.http_status,
     github_retryable: github_is_transient_read_error(error)
       || github_is_rate_limited_read_error(error),
+    checks_observed: false,
+    checks_head_oid: "",
+    check_state: "unknown",
+    check_count: 0,
+    pending_check_count: 0,
+    failing_check_count: 0,
+    failing_check_names: [],
     detail: prefix + ": " + to_string(error),
   }
   return decision
@@ -149,6 +180,7 @@ fn decision(
   detail: string,
   expected_head_oid: string = "",
   head_verification: "exact" | "projection_equivalent" | "unexpected" = "exact",
+  checks: PrerequisiteCheckEvidence? = nil,
 ) -> PrerequisitePrDecision {
   return {
     ok: ok,
@@ -164,7 +196,32 @@ fn decision(
     merged_at: text_or_empty(pr?.merged_at ?? pr?.mergedAt),
     merge_commit_oid: pr_merge_commit_oid(pr),
     head_verification: head_verification,
+    checks_observed: checks != nil,
+    checks_head_oid: checks?.head_oid ?? "",
+    check_state: checks?.state ?? "unknown",
+    check_count: checks?.check_count ?? 0,
+    pending_check_count: checks?.pending_count ?? 0,
+    failing_check_count: checks?.failing_count ?? 0,
+    failing_check_names: checks?.failing_names ?? [],
     detail: detail,
+  }
+}
+
+fn prerequisite_check_evidence(checks: GithubPullRequestChecks) -> PrerequisiteCheckEvidence {
+  const failing = checks.checks.filter(
+    { check ->
+      return lowercase(check.status) == "completed"
+        && !["success", "neutral", "skipped"].contains(lowercase(check.conclusion))
+    },
+  )
+    .to_list()
+  return {
+    head_oid: checks.head_sha,
+    state: lowercase(checks.rollup.state),
+    check_count: checks.rollup.total,
+    pending_count: checks.rollup.pending,
+    failing_count: checks.rollup.failed,
+    failing_names: failing.map({ check -> check.name }).to_list().sort(),
   }
 }
 
@@ -223,6 +280,118 @@ pub fn verify_projection_equivalent_head(
   }
 }
 
+fn classify_open_pr(
+  repo: string,
+  number: int,
+  pr: PrerequisitePr,
+  head_oid: string,
+  expected: string,
+  head_verification: "exact" | "projection_equivalent",
+  checks: PrerequisiteCheckEvidence?,
+) -> PrerequisitePrDecision {
+  if pr_state(pr) != "open" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request is ${pr_state(pr)} without merge evidence",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if pr?.draft ?? false {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request is a draft and cannot enter the merge queue",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  const merge_state = lowercase(pr_merge_state(pr))
+  if !(pr?.mergeable ?? true)
+    || ["dirty", "conflict", "conflicting"].contains(merge_state) {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request has terminal merge state ${merge_state}",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if checks == nil || checks.head_oid != head_oid {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "missing_check_evidence",
+      "open pull request is missing check evidence for exact head ${head_oid}",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if checks.failing_count > 0 || checks.state == "failing" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "exact-head checks failed: " + json_stringify(checks.failing_names),
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  const queued = (pr?.in_merge_queue ?? false) || (pr?.queue_membership?.queued ?? false)
+  const armed = (pr?.auto_merge_armed ?? false)
+    || (pr?.queue_membership?.auto_merge_armed ?? false)
+  if checks.state == "pending" || checks.pending_count > 0 || queued || armed {
+    const progress = if checks.state == "pending" || checks.pending_count > 0 {
+      "checks are running"
+    } else if queued {
+      "pull request is queued"
+    } else {
+      "auto-merge is armed"
+    }
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "pending",
+      "${progress}; ${checks.pending_count} checks pending",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  return decision(
+    repo,
+    number,
+    pr,
+    false,
+    "terminal_failure",
+    "pull request is green but neither queued nor armed for merge",
+    expected,
+    head_verification,
+    checks,
+  )
+}
+
 /**
  * Classify a release prerequisite PR from the connector's normalized PR view.
  *
@@ -236,6 +405,7 @@ pub fn classify_prerequisite_pr(
   pr: PrerequisitePr?,
   expected_head_oid: string = "",
   equivalent_head: bool = false,
+  checks: PrerequisiteCheckEvidence? = nil,
 ) -> PrerequisitePrDecision {
   if pr == nil {
     return decision(
@@ -271,16 +441,21 @@ pub fn classify_prerequisite_pr(
       "unexpected",
     )
   }
+  const accepted_head_verification: "exact" | "projection_equivalent" = if head_verification
+    == "projection_equivalent" {
+    "projection_equivalent"
+  } else {
+    "exact"
+  }
   if !pr_is_merged(pr) {
-    return decision(
+    return classify_open_pr(
       repo,
       number,
       pr,
-      false,
-      "not_merged",
-      "pull request is ${pr_state(pr)}, not merged",
+      head_oid,
       expected,
-      head_verification,
+      accepted_head_verification,
+      checks,
     )
   }
   const merged_at = text_or_empty(pr?.merged_at ?? pr?.mergedAt)
@@ -306,6 +481,7 @@ pub fn classify_prerequisite_pr(
     "pull request is merged at ${merged_at} with merge commit ${merge_commit} and ${head_verification} head evidence",
     expected,
     head_verification,
+    checks,
   )
 }
 
@@ -438,5 +614,36 @@ pub fn load_prerequisite_pr(
     }
     equivalent_head = true
   }
-  return classify_prerequisite_pr(repo, number, observed, expected_head_oid, equivalent_head)
+  if pr_is_merged(observed) {
+    return classify_prerequisite_pr(repo, number, observed, expected_head_oid, equivalent_head)
+  }
+  const lifecycle = classify_prerequisite_pr(
+    repo,
+    number,
+    observed,
+    expected_head_oid,
+    equivalent_head,
+  )
+  if lifecycle.status != "missing_check_evidence" {
+    return lifecycle
+  }
+  const checks = github_pr_checks(harness, repo, number, pr_head_oid(observed), options)
+  if is_err(checks) {
+    return github_error_decision(
+      repo,
+      number,
+      expected_head_oid,
+      "GitHub exact-head check read failed",
+      unwrap_err(checks),
+    )
+  }
+  const check_evidence = prerequisite_check_evidence(unwrap(checks))
+  return classify_prerequisite_pr(
+    repo,
+    number,
+    observed,
+    expected_head_oid,
+    equivalent_head,
+    check_evidence,
+  )
 }
