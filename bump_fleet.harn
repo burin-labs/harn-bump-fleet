@@ -25,6 +25,7 @@ import { poll_until } from "std/poll"
 import { strip_v } from "std/semver"
 import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
 import { workflow_run_repair } from "std/workflow/repair"
+import { live_bump_adapter_admission } from "lib/bump_adapter_admission"
 import {
   BumpDecisionPr,
   BumpDecisionProbe,
@@ -51,6 +52,7 @@ import {
   bump_summary_span_status,
   bump_summary_was_dispatched,
 } from "lib/bump_summary"
+import { dispatch_bump_workflow } from "lib/bump_workflow_dispatch"
 import {
   chat_cfg_from_run_dir,
   chat_enabled,
@@ -59,6 +61,13 @@ import {
 } from "lib/chat_runs"
 import { checkout_cleanup } from "lib/checkout_cleanup"
 import { fleet_summary_context } from "lib/context_projection"
+import {
+  FleetDispatchLineage,
+  fleet_dispatch_continuation_receipt,
+  fleet_dispatch_continuation_write,
+  fleet_dispatch_lineage,
+  fleet_dispatch_scope,
+} from "lib/fleet_dispatch_continuation"
 import {
   HarnUpdateSpec,
   read_fleet_manifest,
@@ -74,13 +83,11 @@ import {
 } from "lib/fleet_update_runtime"
 import { remote_url_to_slug } from "lib/git"
 import {
-  github_actions_run,
   github_latest_release_tag,
   github_pr_close,
   github_pr_comment,
   github_pr_list,
   github_release_at_tag,
-  github_workflow_dispatch,
 } from "lib/github"
 import {
   PlannerDefaults,
@@ -813,45 +820,6 @@ fn predispatch_resolution(
   return {done: false, outcome: nil, stale_note: ""}
 }
 
-fn dispatch_bump_workflow(
-  harness: Harness,
-  repo: FleetRepo,
-  base: BumpOutcomeBase,
-  target: string,
-) {
-  const dispatch = github_workflow_dispatch(
-    harness,
-    repo.slug,
-    repo.update.workflow_name,
-    {version: target},
-  )
-  if is_err(dispatch) {
-    return finish_outcome(
-      base,
-      {status: "dispatch_failed", detail: to_string(unwrap_err(dispatch))},
-    )
-  }
-  const accepted = unwrap(dispatch)
-  const polled = poll_exact_workflow_run(harness, repo.slug, accepted.run_id)
-  return if polled.status != "completed" {
-    {
-      ...base,
-      run_id: accepted.run_id,
-      run_url: accepted.url,
-      status: "run_in_progress",
-      detail: "workflow still ${polled.status} after ${MAX_POLL_MS / 1000}s",
-    }
-  } else {
-    {
-      ...base,
-      run_id: accepted.run_id,
-      run_url: accepted.url,
-      status: "run_${polled.conclusion}",
-      detail: "workflow concluded ${polled.conclusion}",
-    }
-  }
-}
-
 fn classify_post_dispatch(
   harness: Harness,
   repo: FleetRepo,
@@ -951,6 +919,8 @@ fn bump_one(
   dry_run: bool,
   view_gate: RunSessionViewMarkdownGate,
   public_surface_impact: PublicSurfaceImpactReport,
+  continuation_receipt: string,
+  continuation_lineage: FleetDispatchLineage?,
 ) -> FleetOutcomeReceipt {
   return timed_bump_outcome(
     harness.clock,
@@ -1021,12 +991,32 @@ fn bump_one(
           {status: "prerequisite_updates_pending", detail: prerequisites.detail},
         )
       }
+      const admission = live_bump_adapter_admission(harness, repo.update)
+      if !admission.ok {
+        return finish_outcome(base, {status: admission.status, detail: admission.detail})
+      }
       const run_outcome = timed_bump_phase(
         harness.clock,
         "bump.repo.dispatch_workflow",
         {repo: repo.slug},
-        { -> return dispatch_bump_workflow(harness, repo, base, target) },
+        { ->
+          return dispatch_bump_workflow(
+            harness,
+            {
+              repo: repo,
+              base: base,
+              target: target,
+              continuation_receipt: continuation_receipt,
+              continuation_lineage: continuation_lineage,
+              poll_timeout_ms: MAX_POLL_MS,
+              poll_interval_ms: POLL_INTERVAL_MS,
+            },
+          )
+        },
       )
+      if run_outcome.status == "run_in_progress" && trim(continuation_receipt) != "" {
+        return run_outcome
+      }
       const classified = timed(
         harness.clock,
         "bump.repo.post_dispatch_verification",
@@ -1078,33 +1068,6 @@ fn pr_target_probe(
     pin: pin,
     evidence: "PR head pin is ${pin}; target is ${target_no_v}; ${probe.evidence}",
   }
-}
-
-fn poll_exact_workflow_run(harness: Harness, slug: string, run_id: int) {
-  const completed = poll_until(
-    harness.clock,
-    fn() {
-      const run = github_actions_run(harness, slug, run_id)
-      if is_err(run) {
-        throw to_string(unwrap_err(run))
-      }
-      const observed = unwrap(run)
-      return if observed.status == "completed" {
-        observed
-      } else {
-        nil
-      }
-    },
-    {timeout_ms: MAX_POLL_MS, interval_ms: POLL_INTERVAL_MS},
-  )
-  if completed != nil {
-    return completed
-  }
-  const final = github_actions_run(harness, slug, run_id)
-  if is_err(final) {
-    throw to_string(unwrap_err(final))
-  }
-  return unwrap(final)
 }
 
 fn find_existing_pr(harness: Harness, update: HarnUpdateSpec) -> BumpPullRequest? {
@@ -1411,6 +1374,18 @@ pipeline main(harness: Harness) {
     return pre.exit_code
   }
   const context = pre.context
+  const continuation_lineage = if trim(parsed.continuation_receipt) == "" {
+    nil
+  } else {
+    fleet_dispatch_lineage(
+      context.target,
+      parsed.chain_id,
+      fleet_dispatch_scope(parsed.only),
+      parsed.update_round,
+      parsed.controller_run_id,
+      parsed.controller_run_attempt,
+    )
+  }
   const execution = fleet_execution_phase(
     harness.stdio,
     context,
@@ -1425,6 +1400,8 @@ pipeline main(harness: Harness) {
         dry_run,
         view_gate,
         impact,
+        parsed.continuation_receipt,
+        continuation_lineage,
       ) },
       error_outcome: fn(repo, message) { return error_outcome_for_repo(harness.fs, repo, message) },
       timed_dispatch: fn(attrs, callback) { return timed(
@@ -1441,6 +1418,17 @@ pipeline main(harness: Harness) {
       ).result },
     },
   )
+  if continuation_lineage != nil {
+    fleet_dispatch_continuation_write(
+      {fs: harness.fs, random: harness.random},
+      parsed.continuation_receipt,
+      fleet_dispatch_continuation_receipt(
+        unwrap(continuation_lineage),
+        context.repos,
+        execution.outcomes,
+      ),
+    )
+  }
   const finalized = fleet_finalization_phase(
     harness.stdio,
     context,

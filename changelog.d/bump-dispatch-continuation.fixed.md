@@ -1,0 +1,1 @@
+Runtime bumps now reject stale repository adapters before dispatch and preserve accepted workflow runs across exact controller rounds, reruns, and repository scope until their update pull requests appear.
