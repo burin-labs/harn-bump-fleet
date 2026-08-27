@@ -1,6 +1,7 @@
 import { strip_v } from "std/semver"
 import { harn_pin_decision } from "./bump_decision"
 import { HarnPinProbe, harn_pin_text_probe } from "./bump_pins"
+import { FleetDispatchContinuationReceipt } from "./fleet_dispatch_continuation"
 import {
   FleetManifest,
   FleetRepository,
@@ -8,6 +9,7 @@ import {
   resolve_harn_update_spec,
 } from "./fleet_manifest"
 import {
+  github_actions_run,
   github_branch_head,
   github_commit_reachable_from_branch,
   github_file_text_at_ref,
@@ -42,6 +44,181 @@ pub type FleetConvergenceRow = {
   failing_checks?: list<dict>,
   merge_commit_sha?: string,
   update_proof?: dict,
+  workflow_run_id?: int,
+  workflow_run_url?: string,
+}
+
+pub type FleetDispatchRunObservation = {
+  repository: string,
+  run_id: int,
+  run_url: string,
+  contract_matches: bool,
+  probe_ok: bool,
+  status: string,
+  conclusion: string,
+  detail: string,
+}
+
+fn convergence_snapshot_from_rows(
+  target: string,
+  rows: list<FleetConvergenceRow>,
+) -> FleetConvergenceSnapshot {
+  const failures = rows.filter({ row -> row.state == "failed" }).to_list()
+  const waiting = rows.filter({ row -> row.state == "waiting" }).to_list()
+  return {
+    target: target,
+    complete: len(failures) == 0 && len(waiting) == 0,
+    terminal: len(failures) > 0,
+    total_count: len(rows),
+    pending_count: len(waiting),
+    failing_count: len(failures),
+    repositories: rows,
+  }
+}
+
+/** Observe ordinary convergence, then preserve accepted-run liveness for missing PR lineage. */
+pub fn fleet_convergence_snapshot_with_continuation(
+  harness: Harness,
+  manifest: FleetManifest,
+  repositories: list<FleetRepository>,
+  target: string,
+  receipt: FleetDispatchContinuationReceipt?,
+) -> FleetConvergenceSnapshot {
+  const snapshot = fleet_convergence_snapshot(harness, manifest, repositories, target)
+  return continue_fleet_convergence(
+    snapshot,
+    dispatch_run_observations(harness, manifest, target, receipt, snapshot),
+  )
+}
+
+/** Reclassify only a missing exact branch/PR through its accepted workflow run. */
+pub fn continue_fleet_convergence(
+  snapshot: FleetConvergenceSnapshot,
+  observations: list<FleetDispatchRunObservation>,
+) -> FleetConvergenceSnapshot {
+  const rows = snapshot.repositories.map(
+    { row ->
+      if row.reason != "missing_bump_pull_request"
+        && row.reason != "target_branch_missing_pull_request" {
+        return row
+      }
+      const observed = observations.find({ value -> value.repository == row.repo })
+      if observed == nil {
+        return row
+      }
+      const lineage = {workflow_run_id: observed.run_id, workflow_run_url: observed.run_url}
+      if !observed.contract_matches {
+        return row
+          + lineage
+          + {state: "failed", reason: "accepted_bump_run_contract_mismatch: " + observed.detail}
+      }
+      if !observed.probe_ok {
+        return row
+          + lineage
+          + {state: "failed", reason: "accepted_bump_run_probe_failed: " + observed.detail}
+      }
+      if observed.status != "completed" {
+        return row
+          + lineage
+          + {state: "waiting", reason: "accepted_bump_run_in_progress: " + observed.status}
+      }
+      if observed.conclusion == "success" {
+        return row
+          + lineage
+          + {state: "waiting", reason: "accepted_bump_run_completed_awaiting_exact_pr"}
+      }
+      return row
+        + lineage
+        + {state: "failed", reason: "accepted_bump_run_${observed.conclusion}: " + observed.detail}
+    },
+  )
+    .to_list()
+  return convergence_snapshot_from_rows(snapshot.target, rows)
+}
+
+fn dispatch_run_observations(
+  harness: Harness,
+  manifest: FleetManifest,
+  target: string,
+  receipt: FleetDispatchContinuationReceipt?,
+  snapshot: FleetConvergenceSnapshot,
+) -> list<FleetDispatchRunObservation> {
+  if receipt == nil || receipt.target != target {
+    return []
+  }
+  const missing = snapshot.repositories.filter(
+    { row ->
+      row.reason == "missing_bump_pull_request"
+        || row.reason == "target_branch_missing_pull_request"
+    },
+  )
+    .map({ row -> row.repo })
+    .to_list()
+  let observations: list<FleetDispatchRunObservation> = []
+  for dispatch in receipt.dispatches {
+    if !missing.contains(dispatch.repository) {
+      continue
+    }
+    const repo = manifest.repositories.find({ value -> value.slug == dispatch.repository })
+    const spec = if repo == nil {
+      nil
+    } else {
+      resolve_harn_update_spec(manifest, repo, target)
+    }
+    const matches = spec != nil
+      && dispatch.target == target
+      && dispatch.workflow == spec.workflow_name
+      && dispatch.base_branch == spec.base_branch
+      && dispatch.branch == spec.branch
+    if !matches {
+      observations = observations
+        + [
+          {
+            repository: dispatch.repository,
+            run_id: dispatch.run_id,
+            run_url: dispatch.run_url,
+            contract_matches: false,
+            probe_ok: true,
+            status: "contract_mismatch",
+            conclusion: "",
+            detail: "receipt lineage disagrees with the current manifest",
+          },
+        ]
+      continue
+    }
+    const run = github_actions_run(harness, dispatch.repository, dispatch.run_id)
+    if is_err(run) {
+      observations = observations
+        + [
+          {
+            repository: dispatch.repository,
+            run_id: dispatch.run_id,
+            run_url: dispatch.run_url,
+            contract_matches: true,
+            probe_ok: false,
+            status: "unknown",
+            conclusion: "",
+            detail: to_string(unwrap_err(run)),
+          },
+        ]
+      continue
+    }
+    const observed = unwrap(run)
+    observations = observations
+      + [
+        {
+          repository: dispatch.repository,
+          run_id: dispatch.run_id,
+          run_url: dispatch.run_url,
+          contract_matches: true,
+          probe_ok: true,
+          status: observed.status,
+          conclusion: observed.conclusion ?? "",
+          detail: "exact accepted workflow run concluded ${observed.conclusion ?? "unknown"}",
+        },
+      ]
+  }
+  return observations
 }
 
 pub type FleetConvergenceSnapshot = {
@@ -351,15 +528,5 @@ pub fn fleet_convergence_snapshot(
         },
       ]
   }
-  const failures = rows.filter({ row -> row.state == "failed" }).to_list()
-  const waiting = rows.filter({ row -> row.state == "waiting" }).to_list()
-  return {
-    target: target,
-    complete: len(failures) == 0 && len(waiting) == 0,
-    terminal: len(failures) > 0,
-    total_count: len(rows),
-    pending_count: len(waiting),
-    failing_count: len(failures),
-    repositories: rows,
-  }
+  return convergence_snapshot_from_rows(target, rows)
 }
