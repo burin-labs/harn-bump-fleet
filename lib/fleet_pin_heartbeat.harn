@@ -1,0 +1,195 @@
+/**
+ * Pure recency verdict for the pin-staleness alarm.
+ *
+ * The alarm workflow is the durable page for a bump pipeline that stops
+ * landing. This module answers the question that workflow cannot ask about
+ * itself: has it actually produced a successful run inside the allowed age?
+ * Silence — no run, only old runs, or only unsuccessful ones — is the
+ * pre-#975 failure one layer up.
+ */
+/** The workflow file whose silence this heartbeat watches. */
+pub const PIN_STALENESS_WORKFLOW = "fleet-pin-staleness.yml"
+
+/** One issue, upserted by marker, so a dead alarm does not become a daily flood. */
+pub const HEARTBEAT_LABEL = "harn-pin-staleness-heartbeat"
+
+pub const HEARTBEAT_ISSUE_MARKER = "<!-- harn-bump-fleet:pin-staleness-heartbeat -->"
+
+pub type HeartbeatState = "fresh" | "silent"
+
+/** The fields the recency verdict actually reads. Extra workflow-run keys stay out. */
+pub type HeartbeatRun = {
+  id: int,
+  status: string,
+  conclusion: string?,
+  created_at: string?,
+  updated_at: string?,
+  url: string,
+}
+
+pub type HeartbeatVerdict = {
+  state: HeartbeatState,
+  silent: bool,
+  newest_success_id: int?,
+  newest_success_at: string?,
+  newest_success_url: string?,
+  detail: string,
+}
+
+/**
+ * A run counts as a pulse only when GitHub recorded it completed successfully.
+ *
+ * A red pin-staleness run is not a pulse. That is how lost `issues: write` and
+ * a broken `harn install --locked` become visible here instead of looking like
+ * a watchdog that is still barking.
+ */
+pub fn is_successful_pin_staleness_run(run: HeartbeatRun) -> bool {
+  return lowercase(trim(run.status)) == "completed"
+    && lowercase(trim(run.conclusion ?? "")) == "success"
+}
+
+/** Prefer the start time; fall back to the last update when GitHub omitted it. */
+pub fn heartbeat_run_observed_at(run: HeartbeatRun) -> string? {
+  const created = trim(run.created_at ?? "")
+  if created != "" {
+    return created
+  }
+  const updated = trim(run.updated_at ?? "")
+  if updated != "" {
+    return updated
+  }
+  return nil
+}
+
+fn unix_seconds(iso: string) -> int? {
+  return try {
+    to_int(date_parse(trim(iso)))
+  } catch (_e) {
+    nil
+  }
+}
+
+/**
+ * Age of `then_iso` in seconds, or nil when either timestamp is unreadable.
+ *
+ * An unreadable stamp is not "recent enough". Treating parse failure as zero
+ * age would make a corrupt row look like a live heartbeat.
+ */
+pub fn heartbeat_age_seconds(then_iso: string, now_iso: string) -> int? {
+  const then_s = unix_seconds(then_iso)
+  const now_s = unix_seconds(now_iso)
+  if then_s == nil || now_s == nil {
+    return nil
+  }
+  return now_s - then_s
+}
+
+/** The newest successful run, ignoring rows whose clock we cannot read. */
+pub fn newest_successful_heartbeat_run(runs: list<HeartbeatRun>) -> HeartbeatRun? {
+  let best: HeartbeatRun? = nil
+  let best_at = ""
+  for run in runs {
+    if !is_successful_pin_staleness_run(run) {
+      continue
+    }
+    const observed = heartbeat_run_observed_at(run)
+    if observed == nil || unix_seconds(to_string(observed)) == nil {
+      continue
+    }
+    if best == nil || to_string(observed) > best_at {
+      best = run
+      best_at = to_string(observed)
+    }
+  }
+  return best
+}
+
+/**
+ * Decide whether the pin-staleness alarm has produced a successful run
+ * recently enough to count as alive.
+ *
+ * `max_age_days` is a hard ceiling, inclusive. A success exactly N days old
+ * still counts; one second older is silence.
+ */
+pub fn pin_staleness_heartbeat_verdict(
+  runs: list<HeartbeatRun>,
+  now_iso: string,
+  max_age_days: int,
+) -> HeartbeatVerdict {
+  const newest = newest_successful_heartbeat_run(runs)
+  if newest == nil {
+    return {
+      state: "silent",
+      silent: true,
+      newest_success_id: nil,
+      newest_success_at: nil,
+      newest_success_url: nil,
+      detail: "no successful ${PIN_STALENESS_WORKFLOW} run is visible",
+    }
+  }
+  const observed = to_string(heartbeat_run_observed_at(newest))
+  const age = heartbeat_age_seconds(observed, now_iso)
+  if age == nil {
+    return {
+      state: "silent",
+      silent: true,
+      newest_success_id: newest.id,
+      newest_success_at: observed,
+      newest_success_url: newest.url,
+      detail: "successful run #${to_string(newest.id)} has an unreadable timestamp",
+    }
+  }
+  const budget = max_age_days * 86400
+  if age > budget {
+    return {
+      state: "silent",
+      silent: true,
+      newest_success_id: newest.id,
+      newest_success_at: observed,
+      newest_success_url: newest.url,
+      detail: "last successful ${PIN_STALENESS_WORKFLOW} run #${to_string(newest.id)} was "
+        + "${observed}, older than ${to_string(max_age_days)} day(s)",
+    }
+  }
+  return {
+    state: "fresh",
+    silent: false,
+    newest_success_id: newest.id,
+    newest_success_at: observed,
+    newest_success_url: newest.url,
+    detail: "successful ${PIN_STALENESS_WORKFLOW} run #${to_string(newest.id)} at ${observed}",
+  }
+}
+
+pub fn heartbeat_issue_title() -> string {
+  return "Fleet pin-staleness alarm has gone silent"
+}
+
+pub fn heartbeat_issue_body(
+  verdict: HeartbeatVerdict,
+  max_age_days: int,
+  run_url: string?,
+) -> string {
+  const last = if verdict.newest_success_url == nil {
+    "No successful run is visible."
+  } else {
+    "Last successful run: ${to_string(verdict.newest_success_url)} at "
+      + "${to_string(verdict.newest_success_at)}."
+  }
+  const trailer = if run_url == nil {
+    ""
+  } else {
+    "\n\nDetected by ${to_string(run_url)}."
+  }
+  return HEARTBEAT_ISSUE_MARKER
+    + "\n\n`.github/workflows/${PIN_STALENESS_WORKFLOW}` has not completed successfully "
+    + "within ${to_string(max_age_days)} day(s)."
+    + "\n\n${verdict.detail}"
+    + "\n\n${last}"
+    + "\n\nSilence here is the pre-alarm failure: a disabled cron, a token that lost "
+    + "`issues: write`, or a broken `harn install --locked` all look like a healthy "
+    + "fleet if nobody asks whether the alarm itself still ran."
+    + "\n\nThis issue is opened, refreshed, and closed by the pin-staleness heartbeat, "
+    + "which lives in a different workflow so the alarm cannot mark itself alive."
+    + trailer
+}
