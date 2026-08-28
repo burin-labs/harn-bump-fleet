@@ -3,10 +3,13 @@ import {
   ReleaseLaneRequest,
   claim_release_lane,
   finish_release_lane,
+  finish_release_lane_durable,
   parse_release_lane_headline,
   release_lane_blocking_reason,
   release_lane_claim_state,
+  release_lane_cleanup_warning,
   release_lane_headline,
+  release_lane_reclaimable_at,
   release_lane_ref,
   release_lane_report,
 } from "../lib/release_lane_lock"
@@ -435,6 +438,180 @@ pipeline test_a_reclaim_that_cannot_free_the_ref_reports_the_abandoned_lane(
   const claim = claim_release_lane(harness, lane_request())
   assert_eq(claim.state, "abandoned")
   assert(contains(to_string(release_lane_report(claim)), "abandon_release_attempts.harn"))
+}
+
+const HOSTED_RUN_ID = 32995361606
+
+fn hosted_holder() -> ReleaseLaneHolder {
+  return {
+    run_id: "019fc846",
+    host: "hosted-runner",
+    mode: "prepare",
+    started_at: "2026-08-04T16:00:00Z",
+    workflow_run_id: HOSTED_RUN_ID,
+    workflow_run_attempt: 1,
+  }
+}
+
+fn mock_lane_held_by_hosted(testing: HarnessTesting, claimant: ReleaseLaneHolder) {
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/ref/" + LANE_REF,
+    200,
+    {ref: "refs/" + LANE_REF, object: {sha: THEIRS, type: "commit"}},
+  )
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/commits/" + THEIRS,
+    200,
+    {sha: THEIRS, message: release_lane_headline("0.10.53", claimant)},
+  )
+}
+
+fn mock_hosted_workflow_run(testing: HarnessTesting, status: string, conclusion: string? = nil) {
+  json(
+    testing,
+    "GET",
+    API + "/repos/burin-labs/harn-bump-fleet/actions/runs/" + to_string(HOSTED_RUN_ID),
+    200,
+    {
+      id: HOSTED_RUN_ID,
+      workflow_id: 71,
+      path: ".github/workflows/hosted-release.yml",
+      run_number: 88,
+      run_attempt: 1,
+      name: "Hosted harn release",
+      display_title: "Hosted harn release",
+      event: "workflow_dispatch",
+      status: status,
+      conclusion: conclusion,
+      head_branch: "main",
+      head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      html_url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/"
+        + to_string(HOSTED_RUN_ID),
+      created_at: "2026-08-04T16:00:00Z",
+      run_started_at: "2026-08-04T16:00:10Z",
+      updated_at: "2026-08-04T17:08:54Z",
+    },
+  )
+}
+
+pipeline test_durable_finish_retries_unreadable_cleanup_then_releases(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    API + "/repos/burin-labs/harn/git/ref/" + LANE_REF,
+    {
+      responses: [
+        {status: 500, body: json_stringify({message: "Server Error"})},
+        {
+          status: 200,
+          body: json_stringify({ref: "refs/" + LANE_REF, object: {sha: MINE, type: "commit"}}),
+        },
+      ],
+    },
+  )
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const finished = finish_release_lane_durable(
+    harness,
+    "burin-labs/harn",
+    acquired_lane(),
+    api_options(),
+    {max_attempts: 3, base_delay_ms: 0, cap_delay_ms: 0},
+  )
+  assert_eq(finished.released, true)
+  assert_eq(finished.reason, "released")
+  assert_eq(deletes(harness.testing), 1)
+  const gets = harness.testing.http_mock_calls().filter({ call -> call.method == "GET" }).to_list()
+  assert_eq(len(gets), 2, "the first unreadable finish must be retried")
+}
+
+pipeline test_durable_finish_does_not_retry_a_replacement_holder(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  json(
+    harness.testing,
+    "GET",
+    API + "/repos/burin-labs/harn/git/ref/" + LANE_REF,
+    200,
+    {ref: "refs/" + LANE_REF, object: {sha: THEIRS, type: "commit"}},
+  )
+  const finished = finish_release_lane_durable(
+    harness,
+    "burin-labs/harn",
+    acquired_lane(),
+    api_options(),
+    {max_attempts: 4, base_delay_ms: 0, cap_delay_ms: 0},
+  )
+  assert_eq(finished.released, false)
+  assert_eq(finished.reason, "held_by_another")
+  assert_eq(deletes(harness.testing), 0)
+  assert_eq(len(harness.testing.http_mock_calls()), 1)
+}
+
+pipeline test_a_completed_hosted_holder_is_reclaimed_from_another_host(
+  harness: Harness,
+  task: any,
+) {
+  harness.testing.http_mock_clear()
+  mock_lane_held_by_hosted(harness.testing, hosted_holder())
+  mock_hosted_workflow_run(harness.testing, "completed", "success")
+  mock_mint_and_create(harness.testing, [taken(), created()])
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "acquired")
+  assert_eq(claim.reclaimed, true)
+  assert_eq(deletes(harness.testing), 1)
+  assert(contains(claim.message, "terminated hosted run 019fc846"))
+}
+
+pipeline test_an_in_progress_hosted_holder_is_never_deleted(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_lane_held_by_hosted(harness.testing, hosted_holder())
+  mock_hosted_workflow_run(harness.testing, "in_progress")
+  mock_mint_and_create(harness.testing, [taken()])
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "held")
+  assert_eq(claim.reclaimed ?? false, false)
+  assert_eq(deletes(harness.testing), 0, "a live hosted holder must keep the lane")
+}
+
+pipeline test_an_unreadable_hosted_run_does_not_reclaim(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_lane_held_by_hosted(harness.testing, hosted_holder())
+  json(
+    harness.testing,
+    "GET",
+    API + "/repos/burin-labs/harn-bump-fleet/actions/runs/" + to_string(HOSTED_RUN_ID),
+    500,
+    {message: "Server Error"},
+  )
+  mock_mint_and_create(harness.testing, [taken()])
+  json(harness.testing, "DELETE", API + "/repos/burin-labs/harn/git/refs/" + LANE_REF, 204, {})
+  const claim = claim_release_lane(harness, lane_request())
+  assert_eq(claim.state, "held")
+  assert_eq(deletes(harness.testing), 0, "fail closed when the hosted run cannot be read")
+}
+
+pipeline test_cleanup_warning_names_recovery_and_the_reclaimable_instant(task: any) {
+  assert_eq(release_lane_reclaimable_at("2026-08-04T16:00:00Z"), "2026-08-04T19:00:00Z")
+  const warning = release_lane_cleanup_warning(
+    {
+      attempted: true,
+      released: false,
+      reason: "unreadable",
+      version: "0.10.53",
+      ref: "refs/release-lane/v0.10.53",
+      oid: MINE,
+    },
+    "2026-08-04T16:00:00Z",
+  )
+  assert(contains(warning, "abandon_release_attempts.harn"))
+  assert(contains(warning, "--version 0.10.53 --apply --yes-live-release"))
+  assert(contains(warning, "reclaimable at 2026-08-04T19:00:00Z"))
+  assert_eq(contains(warning, "exact-OID crash recovery remains available"), false)
 }
 
 pipeline test_only_a_live_owned_prepare_or_ship_claims_a_lane(harness: Harness, task: any) {

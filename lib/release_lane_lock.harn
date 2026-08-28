@@ -1,4 +1,9 @@
-import { github_claim_ref, github_connector_options, github_release_ref } from "./github"
+import {
+  github_actions_run,
+  github_claim_ref,
+  github_connector_options,
+  github_release_ref,
+} from "./github"
 import {
   GithubClientOptions,
   GithubRefClaim,
@@ -87,6 +92,8 @@ pub type ReleaseLaneFinish = {
   oid: string,
 }
 
+pub type ReleaseLaneFinishPolicy = {max_attempts?: int, base_delay_ms?: int, cap_delay_ms?: int}
+
 /**
  * How long a lane may be held before the claim reports it as stale.
  *
@@ -95,6 +102,13 @@ pub type ReleaseLaneFinish = {
  * runner. Three hours is past anything a live release explains.
  */
 const STALE_AFTER_MINUTES = 180
+
+/**
+ * Hosted prepare/ship claims bind `GITHUB_RUN_ID` from this repository's
+ * hosted-release workflow. A later claimant on another hostname can prove
+ * that holder is gone only by reading that exact run.
+ */
+const HOSTED_RELEASE_LANE_WORKFLOW_REPO = "burin-labs/harn-bump-fleet"
 
 /**
  * Not `refs/heads/`. A lock under `refs/heads/` is a branch: it shows up in
@@ -273,16 +287,16 @@ pub fn release_lane_claim_state(
  * advisory that goes quiet when GitHub is unreachable reads exactly like an
  * uncontended lane, which is the one thing it must not do.
  *
- * An `abandoned` lane is taken back rather than reported. Normal terminal paths
- * release their exact claim through `finish_release_lane`; this reclaim remains
- * the crash-recovery path for process kills, machine loss, or any cleanup that
- * could not reach GitHub. `abandoned` already means the holder is this host,
- * and the caller holds this host's release lease, so that prior run is provably
- * gone. The exact-OID delete still refuses if the lane changed hands.
+ * An `abandoned` lane is taken back rather than reported. A hosted holder
+ * whose exact workflow run has completed is the same fact on another
+ * hostname: that runner is gone, and waiting out `STALE_AFTER_MINUTES` only
+ * papers over a leaked terminal cleanup. The exact-OID delete still refuses
+ * if the lane changed hands.
  */
 pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> ReleaseLaneClaim {
   const first = claim_release_lane_once(harness, request)
-  if first.state != "abandoned" {
+  const hosted_gone = first.state == "held" && hosted_workflow_run_is_gone(harness, first, request)
+  if first.state != "abandoned" && !hosted_gone {
     return first
   }
   const freed = release_release_lane(
@@ -301,6 +315,12 @@ pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> Rele
   if second.state != "acquired" {
     return second
   }
+  const prior = first.holder?.run_id ?? "(unnamed)"
+  const source = if hosted_gone {
+    "terminated hosted run ${prior}"
+  } else {
+    "this host's abandoned run ${prior}"
+  }
   return {
     state: "acquired",
     version: second.version,
@@ -308,8 +328,7 @@ pub fn claim_release_lane(harness: Harness, request: ReleaseLaneRequest) -> Rele
     oid: second.oid,
     holder: nil,
     held_for_minutes: 0,
-    message: "reclaimed the release lane for v${second.version} from this host's"
-      + " abandoned run ${first.holder?.run_id ?? "(unnamed)"}",
+    message: "reclaimed the release lane for v${second.version} from ${source}",
     reclaimed: true,
   }
 }
@@ -409,6 +428,155 @@ pub fn finish_release_lane(
     ref: claim.ref,
     oid: claim.oid,
   }
+}
+
+/**
+ * Terminal cleanup with bounded retry of transient `unreadable` outcomes.
+ *
+ * A successful release that fails one GitHub read at the defer is how a
+ * version gets wedged for the full staleness window. Repeating the exact-OID
+ * finish is cheap and cannot delete a replacement holder.
+ */
+pub fn finish_release_lane_durable(
+  harness: Harness,
+  slug: string,
+  claim: ReleaseLaneClaim?,
+  options: GithubClientOptions = github_connector_options(),
+  policy: ReleaseLaneFinishPolicy = {},
+) -> ReleaseLaneFinish {
+  const max_attempts = max(1, policy.max_attempts ?? 4)
+  const base_delay_ms = max(0, policy.base_delay_ms ?? 500)
+  const cap_delay_ms = max(base_delay_ms, policy.cap_delay_ms ?? 4000)
+  let attempt = 0
+  let last = finish_release_lane(harness, slug, claim, options)
+  while last.reason == "unreadable" && attempt + 1 < max_attempts {
+    attempt = attempt + 1
+    let delay_ms = base_delay_ms
+    for _ in range(0, attempt - 1) {
+      delay_ms = min(delay_ms * 2, cap_delay_ms)
+    }
+    if delay_ms > 0 {
+      harness.clock.sleep_ms(delay_ms)
+    }
+    last = finish_release_lane(harness, slug, claim, options)
+  }
+  return last
+}
+
+fn days_in_month(year: int, month: int) -> int {
+  if month == 2 {
+    const leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    return if leap {
+      29
+    } else {
+      28
+    }
+  }
+  if month == 4 || month == 6 || month == 9 || month == 11 {
+    return 30
+  }
+  return 31
+}
+
+fn two_digits(value: int) -> string {
+  return if value < 10 {
+    "0" + to_string(value)
+  } else {
+    to_string(value)
+  }
+}
+
+/** Add whole minutes to a UTC `YYYY-MM-DDTHH:MM:SSZ` instant, or nil. */
+pub fn release_lane_reclaimable_at(started_at: string) -> string? {
+  const captured = regex_captures(
+    "^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z$",
+    trim(started_at),
+  )
+  if len(captured) != 1 {
+    return nil
+  }
+  const groups = captured[0].groups
+  let year = to_int(groups[0]) ?? 0
+  let month = to_int(groups[1]) ?? 0
+  let day = to_int(groups[2]) ?? 0
+  let hour = to_int(groups[3]) ?? 0
+  let minute = to_int(groups[4]) ?? 0
+  const second = groups[5]
+  if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 {
+    return nil
+  }
+  minute = minute + STALE_AFTER_MINUTES
+  hour = hour + minute / 60
+  minute = minute % 60
+  day = day + hour / 24
+  hour = hour % 24
+  while day > days_in_month(year, month) {
+    day = day - days_in_month(year, month)
+    month = month + 1
+    if month > 12 {
+      month = 1
+      year = year + 1
+    }
+  }
+  return "${to_string(year)}-${two_digits(month)}-${two_digits(day)}T${two_digits(hour)}:${two_digits(minute)}:${second}Z"
+}
+
+/**
+ * Operator text when terminal cleanup could not free an owned lane.
+ *
+ * Names the abandon command and the exact staleness instant so a leaked lock
+ * is not mistaken for a live cross-host release.
+ */
+pub fn release_lane_cleanup_warning(result: ReleaseLaneFinish, started_at: string = "") -> string {
+  let warning = "   ⚠ release lane cleanup did not finish (${result.reason}): ${result.ref}"
+  if trim(result.version) != "" {
+    warning = warning
+      + "; recover with: harn run --no-sandbox abandon_release_attempts.harn -- --version "
+      + trim(result.version)
+      + " --apply --yes-live-release"
+  }
+  const when = release_lane_reclaimable_at(started_at)
+  if when != nil {
+    return warning
+      + "; if a foreign host still holds it, the lane becomes reclaimable at ${when}"
+  }
+  return warning
+    + "; a later claimant reclaims a completed hosted holder immediately; otherwise wait "
+    + to_string(STALE_AFTER_MINUTES)
+    + "m after the holder started"
+}
+
+fn hosted_release_holder_is_terminated(status: string) -> bool {
+  return lowercase(trim(status)) == "completed"
+}
+
+fn hosted_workflow_run_is_gone(
+  harness: Harness,
+  claim: ReleaseLaneClaim,
+  request: ReleaseLaneRequest,
+) -> bool {
+  const run_id = claim.holder?.workflow_run_id ?? 0
+  const attempt = claim.holder?.workflow_run_attempt ?? 0
+  if run_id <= 0 || attempt <= 0 {
+    return false
+  }
+  const fetched = github_actions_run(
+    harness,
+    HOSTED_RELEASE_LANE_WORKFLOW_REPO,
+    run_id,
+    request.options ?? github_connector_options(),
+  )
+  if is_err(fetched) {
+    return false
+  }
+  const run = unwrap(fetched)
+  if run.id != run_id {
+    return false
+  }
+  if (run.run_attempt ?? 0) != attempt && lowercase(trim(run.status)) != "completed" {
+    return false
+  }
+  return hosted_release_holder_is_terminated(run.status)
 }
 
 /**
