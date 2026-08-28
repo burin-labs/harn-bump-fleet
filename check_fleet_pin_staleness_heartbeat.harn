@@ -1,0 +1,207 @@
+#!/usr/bin/env harn
+//
+// The watchdog for the pin-staleness alarm.
+//
+// `.github/workflows/fleet-pin-staleness.yml` is the durable page for a bump
+// pipeline that stops landing. It is itself a scheduled workflow, so a dead
+// cron, a token that lost `issues: write`, or a broken `harn install` returns
+// the fleet to the pre-#975 silence and nothing says so. This check lives in a
+// different workflow and asks only whether that alarm has had a successful
+// run inside the allowed age.
+import { ParserSpec } from "std/cli/argparse"
+import { GithubClientOptions, GithubWorkflowRun } from "harn-github-connector/default"
+import { cli_options } from "lib/cli_options"
+import {
+  HEARTBEAT_ISSUE_MARKER,
+  HEARTBEAT_LABEL,
+  HeartbeatRun,
+  HeartbeatVerdict,
+  PIN_STALENESS_WORKFLOW,
+  heartbeat_issue_body,
+  heartbeat_issue_title,
+  pin_staleness_heartbeat_verdict,
+} from "lib/fleet_pin_heartbeat"
+import {
+  github_connector_options,
+  github_issue_create,
+  github_issue_update,
+  github_open_issues_with_label,
+  github_workflow_runs,
+} from "lib/github"
+
+const DEFAULT_REPO = "burin-labs/harn-bump-fleet"
+
+/** What the heartbeat did about its own tracking issue, and whether that succeeded. */
+pub type HeartbeatReconciliation = {ok: bool, action: string, detail: string}
+
+pub type PinStalenessHeartbeatOptions = {
+  repo: string,
+  workflow: string,
+  max_age_days: string,
+  dry_run: bool,
+  run_url?: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-fleet-pin-staleness-heartbeat",
+  args: [
+    {kind: "flag", name: "repo", long: "--repo", default: DEFAULT_REPO},
+    {kind: "flag", name: "workflow", long: "--workflow", default: PIN_STALENESS_WORKFLOW},
+    {kind: "flag", name: "max_age_days", long: "--max-age-days", default: "2"},
+    {kind: "switch", name: "dry_run", long: "--dry-run"},
+    {kind: "flag", name: "run_url", long: "--run-url"},
+  ],
+}
+
+pub fn parse_pin_staleness_heartbeat_args(args: list<string>) -> PinStalenessHeartbeatOptions {
+  return cli_options<PinStalenessHeartbeatOptions>(
+    ARG_SPEC,
+    args,
+    schema_of(PinStalenessHeartbeatOptions),
+  )
+}
+
+/**
+ * The age ceiling as a number, refusing anything that is not a positive one.
+ *
+ * A zero or garbage threshold would make every history read as silence or as
+ * fresh for incidental reasons. Either way the heartbeat would be disarmed.
+ */
+pub fn resolve_max_age_days(raw: string) -> int {
+  const parsed = to_int(trim(raw))
+  if parsed == nil || parsed < 1 {
+    throw "--max-age-days must be a positive integer, got '${raw}'"
+  }
+  return parsed
+}
+
+fn heartbeat_run_from(run: GithubWorkflowRun) -> HeartbeatRun {
+  return {
+    id: run.id,
+    status: run.status,
+    conclusion: run.conclusion,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+    url: run.url,
+  }
+}
+
+/**
+ * Reconcile the single heartbeat issue with what this check just observed.
+ *
+ * A failure to file or close is reported rather than swallowed: a heartbeat
+ * that cannot raise itself is the original defect wearing a new hat.
+ */
+pub fn reconcile_heartbeat(
+  harness: Harness,
+  verdict: HeartbeatVerdict,
+  options: PinStalenessHeartbeatOptions,
+  max_age_days: int,
+  client: GithubClientOptions = github_connector_options(),
+) -> HeartbeatReconciliation {
+  const listed = github_open_issues_with_label(harness, options.repo, HEARTBEAT_LABEL, client)
+  if is_err(listed) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(listed))}
+  }
+  const existing = unwrap(listed).filter({ issue -> contains(issue.body, HEARTBEAT_ISSUE_MARKER) })
+    .to_list()
+  const open_issue = if len(existing) == 0 {
+    nil
+  } else {
+    existing[0]
+  }
+  if !verdict.silent {
+    if open_issue == nil {
+      return {ok: true, action: "none", detail: "no heartbeat alarm open"}
+    }
+    if options.dry_run {
+      return {ok: true, action: "would_close", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    const closed = github_issue_update(
+      harness,
+      options.repo,
+      open_issue.number,
+      {state: "closed", state_reason: "completed"},
+      client,
+    )
+    if is_err(closed) {
+      return {ok: false, action: "close_failed", detail: to_string(unwrap_err(closed))}
+    }
+    return {ok: true, action: "closed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  const body = heartbeat_issue_body(verdict, max_age_days, options.run_url)
+  if open_issue != nil {
+    if options.dry_run {
+      return {ok: true, action: "would_refresh", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    const refreshed = github_issue_update(
+      harness,
+      options.repo,
+      open_issue.number,
+      {title: heartbeat_issue_title(), body: body},
+      client,
+    )
+    if is_err(refreshed) {
+      return {ok: false, action: "refresh_failed", detail: to_string(unwrap_err(refreshed))}
+    }
+    return {ok: true, action: "refreshed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_open", detail: verdict.detail}
+  }
+  const created = github_issue_create(
+    harness,
+    options.repo,
+    heartbeat_issue_title(),
+    body,
+    [HEARTBEAT_LABEL],
+    client,
+  )
+  if is_err(created) {
+    return {ok: false, action: "open_failed", detail: to_string(unwrap_err(created))}
+  }
+  return {ok: true, action: "opened", detail: verdict.detail}
+}
+
+pipeline main(harness: Harness) {
+  const options = parse_pin_staleness_heartbeat_args(argv)
+  const max_age_days = resolve_max_age_days(options.max_age_days)
+  const listed = github_workflow_runs(
+    harness,
+    options.repo,
+    options.workflow,
+    {status: "success"},
+    20,
+  )
+  if is_err(listed) {
+    harness.stdio.eprintln(
+      "error: could not list ${options.workflow} runs: ${to_string(unwrap_err(listed))}",
+    )
+    return 1
+  }
+  const runs = unwrap(listed).runs.map({ run -> heartbeat_run_from(run) }).to_list()
+  const verdict = pin_staleness_heartbeat_verdict(runs, harness.clock.date_iso(), max_age_days)
+  const reconciled = reconcile_heartbeat(harness, verdict, options, max_age_days)
+  const snapshot = {
+    schema_version: "harn_bump_fleet.pin_staleness_heartbeat.v1",
+    repo: options.repo,
+    workflow: options.workflow,
+    max_age_days: max_age_days,
+    state: verdict.state,
+    silent: verdict.silent,
+    newest_success_id: verdict.newest_success_id,
+    newest_success_at: verdict.newest_success_at,
+    newest_success_url: verdict.newest_success_url,
+    detail: verdict.detail,
+    alarm: {action: reconciled.action, ok: reconciled.ok, detail: reconciled.detail},
+  }
+  harness.stdio.println(json_stringify_pretty(snapshot))
+  if verdict.silent {
+    harness.stdio.eprintln("SILENT ${options.workflow}: ${verdict.detail}")
+  }
+  return if !reconciled.ok || verdict.silent {
+    1
+  } else {
+    0
+  }
+}
