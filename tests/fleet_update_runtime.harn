@@ -1,7 +1,11 @@
+import { HarnUpdateSpec } from "../lib/fleet_manifest"
 import {
   HarnUpdatePrerequisiteStatus,
+  HarnUpdatePullRequest,
+  ensure_update_auto_merge,
   resolve_update_prerequisites,
 } from "../lib/fleet_update_runtime"
+import { GithubClientOptions } from "harn-github-connector/default"
 
 fn prerequisite_status(ready: bool) -> HarnUpdatePrerequisiteStatus {
   return {
@@ -51,4 +55,144 @@ pipeline test_inline_dispatch_can_wait_for_a_prerequisite_to_become_ready(
   assert_eq(probes, 2)
   assert_eq(observed.ready, true)
   assert_eq(observed.pending, [])
+}
+
+const API = "https://github.test"
+
+fn api_options() -> GithubClientOptions {
+  return {api_base_url: API, installation_token: "fleet-auto-merge-test-token"}
+}
+
+fn update_spec(auto_arm: bool) -> HarnUpdateSpec {
+  return {
+    repository: "burin-labs/burin-code",
+    base_branch: "main",
+    workflow_path: ".github/workflows/bump-harn.yml",
+    workflow_name: "bump-harn.yml",
+    branch: "automation/bump-harn-runtime",
+    pin: {kind: "auto"},
+    repair_enabled: true,
+    auto_arm: auto_arm,
+    require_signed_head: false,
+    prerequisites: [],
+    max_releases_behind: 1,
+    adapter: {
+      workflow_reference:
+        "owner/harn/.github/workflows/bump-harn.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      orchestration_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      refresh_command: "",
+      validation_command: "",
+      node_version: "",
+      publish_failure_for_repair: false,
+      apply_behavior_preserving_fixes: false,
+      enable_auto_merge: auto_arm,
+    },
+  }
+}
+
+fn pr(armed: bool = false) -> HarnUpdatePullRequest {
+  return {number: 6780, auto_merge_armed: armed, head: {sha: "e5184c69"}}
+}
+
+fn graphql_calls(testing: HarnessTesting) -> int {
+  return len(testing.http_mock_calls().filter({ call -> contains(call.url, "/graphql") }).to_list())
+}
+
+fn mock_enable(testing: HarnessTesting) {
+  testing.http_mock(
+    "GET",
+    API + "/repos/burin-labs/burin-code/pulls/6780",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          number: 6780,
+          node_id: "PR_node_6780",
+          html_url: "https://github.com/burin-labs/burin-code/pull/6780",
+          head: {sha: "e5184c69"},
+          auto_merge: nil,
+        },
+      ),
+      headers: {"x-ratelimit-remaining": "20"},
+    },
+  )
+  testing.http_mock(
+    "POST",
+    API + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            enablePullRequestAutoMerge: {
+              actor: {login: "release-bot"},
+              pullRequest: {
+                number: 6780,
+                url: "https://github.com/burin-labs/burin-code/pull/6780",
+                mergeStateStatus: "CLEAN",
+                autoMergeRequest: {enabledAt: "2026-08-21T08:07:52Z", mergeMethod: "SQUASH"},
+              },
+            },
+          },
+        },
+      ),
+      headers: {"x-ratelimit-remaining": "19"},
+    },
+  )
+}
+
+/**
+ * A manifest hold must stop before the GitHub mutation. The v0.10.109 Burin
+ * bump was armed because `bump_one` called `ensure_update_auto_merge` without
+ * consulting `auto_arm`; the connector is the thing that must stay dark.
+ */
+pipeline test_manifest_hold_does_not_call_the_auto_merge_connector(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_enable(harness.testing)
+  const held = ensure_update_auto_merge(harness, update_spec(false), pr(), api_options())
+  assert_eq(held, "held_by_manifest")
+  assert_eq(graphql_calls(harness.testing), 0)
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_armed_hold_is_a_failed_receipt_not_a_silent_arm(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_enable(harness.testing)
+  const refused = ensure_update_auto_merge(harness, update_spec(false), pr(true), api_options())
+  assert_eq(refused, "failed: auto-merge is armed against the resolved update contract")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_auto_arm_repository_calls_the_auto_merge_connector(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_enable(harness.testing)
+  const armed = ensure_update_auto_merge(harness, update_spec(true), pr(), api_options())
+  assert_eq(armed, "enabled")
+  assert_eq(graphql_calls(harness.testing), 1)
+}
+
+pipeline test_already_enabled_and_api_failure_are_not_holds(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  const already = ensure_update_auto_merge(harness, update_spec(true), pr(true), api_options())
+  assert_eq(already, "already_enabled")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+  harness.testing.http_mock(
+    "GET",
+    API + "/repos/burin-labs/burin-code/pulls/6780",
+    {status: 404, body: json_stringify({message: "Not Found"})},
+  )
+  const failed = ensure_update_auto_merge(harness, update_spec(true), pr(), api_options())
+  assert(starts_with(failed, "failed:"))
+  assert_eq(contains(failed, "held_by_manifest"), false)
+}
+
+pipeline test_both_bump_controller_paths_honor_ensure_update_auto_merge(
+  harness: Harness,
+  task: any,
+) {
+  const source = harness.fs.read_text(path_join(dirname(harness.fs.cwd()), "bump_fleet.harn"))
+  assert(contains(source, "fn with_auto_merge("))
+  assert(contains(source, "fn targeted_pr_outcome("))
+  assert_eq(len(split(source, "ensure_update_auto_merge(")) - 1, 2)
+  assert_eq(contains(source, "github_enable_auto_merge("), false)
 }
