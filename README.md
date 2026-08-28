@@ -143,8 +143,10 @@ left the whole fleet unable to bump. `--no-auto-merge` proposes without arming.
 
 A repository that refuses arming — auto-merge switched off, or a gate the
 fleet's App cannot satisfy — is reported as `auto_merge.state = "refused"` and
-left for a human. It does not fail the run, because an unarmed proposal is
-still a correct repair.
+fails the run. A standing proposal older than three days is `overdue` and
+fails the same way. A sweep that cannot list open proposals does too. Silence
+here is the defect: a fleet that quietly stopped converging reads exactly like
+a fleet with nothing to converge.
 
 The scheduled `Converge Fleet Projections` workflow is the only place `--apply`
 runs by default; the harness itself reports and exits unless asked to write.

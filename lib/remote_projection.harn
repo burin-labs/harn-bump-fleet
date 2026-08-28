@@ -9,6 +9,7 @@ import {
   github_pr_close,
   github_pr_list,
   github_pr_upsert,
+  github_pr_view,
 } from "./github"
 import { GithubClientOptions } from "harn-github-connector/default"
 
@@ -20,6 +21,20 @@ import { GithubClientOptions } from "harn-github-connector/default"
  * one branch forever makes its pull request conflict as main advances.
  */
 pub const REMOTE_PROJECTION_BRANCH_PREFIX: string = "automation/fleet-projections"
+
+/**
+ * How many whole days a standing projection proposal may sit before the run
+ * turns red.
+ *
+ * The scheduled loop re-arms every night. A proposal that is still open after
+ * three of those runs is no longer waiting on checks: it is stuck on a red
+ * gate, a conflict, or a protection the App cannot satisfy. Silence through
+ * that window is the defect — a fleet that quietly stopped converging reads
+ * exactly like a fleet with nothing to converge.
+ */
+pub const DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS: int = 3
+
+const SECONDS_PER_DAY: int = 86400
 
 const PROJECTION_HEADLINE = "chore: restore fleet-owned projections"
 
@@ -41,7 +56,9 @@ pub fn remote_projection_branch(targets: list<FleetProjectionTarget>) -> string 
  * already correct, `drift` is a difference this run did not repair, `applied`
  * wrote, `error` could not tell. `pending` is the state only a remote sync can
  * be in — the repair is already proposed and waiting on review, which is
- * neither drift the run should re-report nor work it should redo.
+ * neither drift the run should re-report nor work it should redo. `overdue` is
+ * the time axis that `pending` itself does not have: a standing proposal
+ * younger than the age budget is still waiting, and one past it has failed.
  */
 pub type RemoteConvergenceResult = {
   slug: string,
@@ -52,6 +69,9 @@ pub type RemoteConvergenceResult = {
   pull_request?: int,
   url?: string,
   error?: string,
+  created_at?: string,
+  age_days?: int,
+  overdue?: bool,
   auto_merge?: AutoMergeOutcome,
   sweep?: ProposalSweep,
 }
@@ -60,9 +80,11 @@ pub type RemoteConvergenceResult = {
  * One superseded proposal, and what this run did about it.
  *
  * `would_close` is what `--check` reports, so a dry run names every proposal it
- * would retire without retiring one. `refused` is GitHub declining, recorded
- * rather than raised for the same reason a refused arming is: housekeeping that
- * fails must not turn a successful repair into a failed run.
+ * would retire without retiring one. `refused` is GitHub declining one close.
+ * It is recorded rather than raised so one repository declining housekeeping
+ * cannot abort the other twenty-five. The sweep's own listing failure is
+ * different: that is `ProposalSweep.error`, and it does fail the run, because
+ * not being able to look is silence.
  */
 pub type SweptProposal = {
   pull_request: int,
@@ -87,15 +109,124 @@ pub type ProposalSweep = {superseded: list<SweptProposal>, error?: string}
  *
  * `held` is the operator's brake rather than a failure. `refused` is GitHub
  * declining — a repository with auto-merge switched off, a queue that owns the
- * strategy, a gate the App may not satisfy — and it is reported rather than
- * raised, because an unarmed proposal is the behavior this loop had all along.
- * Silence would be the real defect: a fleet that quietly stopped converging
- * reads exactly like a fleet with nothing to converge.
+ * strategy, a gate the App may not satisfy. It fails the run. An unarmed
+ * proposal that stays green forever is the silence this loop exists to end.
  */
 pub type AutoMergeOutcome = {
   state: "armed" | "already_armed" | "held" | "refused",
   method?: string,
   error?: string,
+}
+
+/** Unix seconds, or nil when the stamp is empty or unreadable. */
+fn unix_seconds(iso: string) -> int? {
+  const stamp = trim(iso)
+  if stamp == "" {
+    return nil
+  }
+  return try {
+    to_int(date_parse(stamp))
+  } catch (_e) {
+    nil
+  }
+}
+
+/**
+ * Whole days from `created_at` to `now`, or nil when either stamp is unreadable.
+ *
+ * An unreadable timestamp reports no age rather than a wrong one. Inventing a
+ * day count from a missing GitHub field would escalate a young proposal or
+ * hide an old one, and both of those are worse than leaving `age_days` unset.
+ */
+pub fn pull_request_age_days(created_at: string, now: string) -> int? {
+  const created = unix_seconds(created_at)
+  const observed = unix_seconds(now)
+  if created == nil || observed == nil || (observed ?? 0) < (created ?? 0) {
+    return nil
+  }
+  return ((observed ?? 0) - (created ?? 0)) / SECONDS_PER_DAY
+}
+
+/** Whether the proposal is at least `age_budget_days` old. */
+pub fn pull_request_older_than(created_at: string, now: string, age_budget_days: int) -> bool {
+  const age = pull_request_age_days(created_at, now)
+  return age != nil && (age ?? 0) >= age_budget_days
+}
+
+/**
+ * Measure a standing proposal against the age budget.
+ *
+ * Only `pending` with an open pull request has a clock. A human-closed branch
+ * stays `pending` without a number; measuring that would invent age for a
+ * decision the cron is forbidden to reopen. Applied, clean, drift, and error
+ * outcomes keep the fields unset.
+ */
+pub fn with_projection_pr_age(
+  result: RemoteConvergenceResult,
+  now: string,
+  age_budget_days: int = DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS,
+) -> RemoteConvergenceResult {
+  if age_budget_days < 0 {
+    throw "projection PR age budget must not be negative"
+  }
+  const created_at = trim(result.created_at ?? "")
+  if result.status != "pending" || result.pull_request == nil || created_at == "" {
+    return result
+  }
+  const age = pull_request_age_days(created_at, now)
+  if age == nil {
+    return result
+  }
+  return result + {age_days: age, overdue: (age ?? 0) >= age_budget_days}
+}
+
+/** Read `created_at` from the typed pull-request view, or empty if it cannot. */
+fn observe_pull_created_at(
+  harness: Harness,
+  slug: string,
+  number: int,
+  options: GithubClientOptions,
+) -> string {
+  if number <= 0 {
+    return ""
+  }
+  const viewed = github_pr_view(harness, slug, number, options)
+  if is_err(viewed) {
+    return ""
+  }
+  return trim(to_string(unwrap(viewed)?.created_at ?? ""))
+}
+
+/**
+ * Attach the standing proposal's age, reading `created_at` when the result
+ * does not already carry it.
+ *
+ * `github.pr.list` returns a summary without timestamps. The view is the
+ * typed owner of `created_at`, so a pending proposal that omitted the field
+ * is observed once rather than treated as ageless forever.
+ */
+fn observe_projection_pr_age(
+  harness: Harness,
+  result: RemoteConvergenceResult,
+  options: GithubClientOptions,
+  now: string,
+  age_budget_days: int,
+) -> RemoteConvergenceResult {
+  const observed_now = if trim(now) == "" {
+    harness.clock.date_iso()
+  } else {
+    now
+  }
+  let created_at = trim(result.created_at ?? "")
+  if created_at == "" && result.status == "pending" && result.pull_request != nil {
+    created_at = observe_pull_created_at(harness, result.slug, result.pull_request ?? 0, options)
+  }
+  const aged = if created_at == "" {
+    result
+  } else {
+    result + {created_at: created_at}
+  }
+  return with_projection_pr_age(aged, observed_now, age_budget_days)
 }
 
 /**
@@ -134,9 +265,14 @@ pub fn projection_status_line(result: RemoteConvergenceResult) -> string {
   } else {
     ""
   }
+  const aging = if result.overdue ?? false {
+    " [overdue: ${to_string(result.age_days ?? 0)}d]"
+  } else {
+    ""
+  }
   // Retiring somebody else's pull request is a write worth naming on the line
   // it happened on, not only in the receipt a reader may never open.
-  return "${result.status} ${result.slug}: ${join(result.drifted, ", ")}${arming}${swept_summary(result)}"
+  return "${result.status} ${result.slug}: ${join(result.drifted, ", ")}${arming}${aging}${swept_summary(result)}"
 }
 
 /** Print the per-repository status on stderr. The JSON receipt owns stdout. */
@@ -573,6 +709,8 @@ pub fn converge_remote_repository(
   apply: bool,
   arm: bool = false,
   options: GithubClientOptions = github_connector_options(),
+  now: string = "",
+  age_budget_days: int = DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS,
 ) -> RemoteConvergenceResult {
   const attempt = try {
     converge_repository(harness, slug, default_branch, targets, apply, arm, options)
@@ -580,10 +718,22 @@ pub fn converge_remote_repository(
   if is_err(attempt) {
     return {slug: slug, status: "error", drifted: [], error: to_string(unwrap_err(attempt))}
   }
-  return unwrap(attempt)
+  return observe_projection_pr_age(harness, unwrap(attempt), options, now, age_budget_days)
 }
 
-/** Whether an outcome leaves the fleet out of conformance once the run ends. */
+/**
+ * Whether an outcome leaves the fleet out of conformance once the run ends.
+ *
+ * `drift` and `error` are the local-sync failures. `refused` arming and a
+ * sweep that could not list are the remote-sync failures that used to hide in
+ * the receipt. `overdue` is a standing proposal that outlived its age budget.
+ * A young `pending` proposal, a held arm, and a single close GitHub declined
+ * do not fail the run.
+ */
 pub fn remote_convergence_failed(result: RemoteConvergenceResult) -> bool {
-  return result.status == "drift" || result.status == "error"
+  return result.status == "drift"
+    || result.status == "error"
+    || (result.auto_merge?.state ?? "") == "refused"
+    || (result.sweep?.error ?? "") != ""
+    || (result.overdue ?? false)
 }
