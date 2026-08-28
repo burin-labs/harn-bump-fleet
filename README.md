@@ -309,7 +309,7 @@ Knobs (all `env_str`-style, all optional):
 | `CEREBRAS_API_KEY` | (none) | Auto-enables binder |
 | `HARN_EXT_BINDER` | `auto` | `0` to force off, `1` to force on |
 | `HARN_BINDER_PROVIDER` / `_MODEL` | `cerebras` / `gpt-oss-120b` | Override binder route |
-| `HARN_EXT_BINDER_TIMEOUT_MS` | `100` | Binder hop wall-clock budget |
+| `HARN_EXT_BINDER_TIMEOUT_MS` | `5000` | Binder hop wall-clock budget |
 | `HARN_EXT_BINDER_MAX_TOKENS` | `1024` | Per [#1814 finding 3](https://github.com/burin-labs/harn/pull/1814) |
 | `HARN_PLANNER_PROVIDER` / `_MODEL` | (auto) | Shared planner override |
 | `HARN_RELEASE_PROVIDER` / `_MODEL` etc. | (auto) | Per-harness override (highest priority) |
