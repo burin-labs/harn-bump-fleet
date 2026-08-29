@@ -70,6 +70,9 @@ scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 # Check fleet-owned runtime-bump adapters without writing them.
 scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
 
+# Check the typed first-party connector secret registry against harn.toml.
+scripts/with_env.sh harn run --no-sandbox sync_connector_secrets.harn -- --check
+
 # Report every remote fleet-owned file or package pin that drifts from fleet.toml.
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 
@@ -114,6 +117,14 @@ therefore fails closed instead of silently treating internal consistency as
 freshness. Custom package validation and runtime-bump refresh/validation
 commands remain named fields in the manifest; they do not create
 repository-local workflow templates or duplicate runtime bootstrap.
+
+The same manifest owns each first-party connector's required secret ids and
+trust direction. `policy.connector_secret_schema` selects one generated
+`[providers.setup].required_secrets` shape for all connector repositories.
+Keep it on `legacy` while the released Harn runtime accepts string entries;
+after a compatible release, one change to `direction-v1` projects the closed
+`{ id, direction }` records everywhere. `sync_connector_secrets.harn` is
+dry-run-first and changes no other manifest field.
 
 `converge_fleet_projections.harn` is the repair for what that check reports. It
 renders the same byte-exact projections, compares them against the same remote
