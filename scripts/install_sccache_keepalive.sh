@@ -12,6 +12,7 @@ set -euo pipefail
 self_dir="$(cd "$(dirname "$0")" && pwd)"
 label="com.burincode.sccache-keepalive"
 script="$self_dir/sccache_keepalive.sh"
+wrapper_installer="$self_dir/install_sccache_rustc_wrapper.sh"
 template="$self_dir/$label.plist.template"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 domain="gui/$(id -u)"
@@ -30,6 +31,8 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 [ -f "$template" ] || { echo "missing template: $template" >&2; exit 1; }
+[ -x "$wrapper_installer" ] || { echo "missing wrapper installer: $wrapper_installer" >&2; exit 1; }
+"$wrapper_installer"
 chmod +x "$script"
 mkdir -p "$HOME/Library/LaunchAgents"
 sed "s#__SCRIPT__#$script#g" "$template" > "$plist"
