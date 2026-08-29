@@ -86,6 +86,54 @@ announce_release_boundary() {
   fi
 }
 
+# Refuse a mutating release before it can enter either execution substrate when
+# the canonical base does not name the next development release. The release
+# controller performs the same validation later, but reaching it after source
+# preparation turns a one-second configuration error into an expensive failed
+# cut. `origin/main` is the contract because that is the tree a release may
+# fast-forward to and certify.
+preflight_development_workspace() {
+  if [ "$live_release" -ne 1 ] || { [ "$mode" != "prepare" ] && [ "$mode" != "ship-pr" ]; }; then
+    return 0
+  fi
+
+  if [ "$mock_run" -eq 0 ]; then
+    if ! git -C "$target_repo" fetch --quiet origin \
+      refs/heads/main:refs/remotes/origin/main; then
+      printf 'error: release preflight could not refresh origin/main in %s; nothing was dispatched\n' \
+        "$target_repo" >&2
+      return 2
+    fi
+  fi
+
+  local manifest
+  if ! manifest="$(git -C "$target_repo" show origin/main:Cargo.toml 2>/dev/null)"; then
+    printf 'error: release preflight could not read origin/main:Cargo.toml in %s; nothing was dispatched\n' \
+      "$target_repo" >&2
+    return 2
+  fi
+  local version
+  version="$(printf '%s\n' "$manifest" | awk '
+    /^\[workspace\.package\][[:space:]]*$/ { in_workspace_package = 1; next }
+    /^\[/ { in_workspace_package = 0 }
+    in_workspace_package && /^[[:space:]]*version[[:space:]]*=/ {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", line)
+      sub(/"[[:space:]]*(#.*)?$/, "", line)
+      print line
+      exit
+    }
+  ')"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
+    printf "error: release requires origin/main's exact X.Y.Z-dev workspace version; observed '%s'; nothing was dispatched\n" \
+      "${version:-<missing>}" >&2
+    return 2
+  fi
+  printf 'release-preflight workspace_version=%s ref=origin/main status=ready\n' "$version" >&2
+}
+
+preflight_development_workspace
+
 if { [ "$mode" = "audit" ] \
     && [ "$mock_run" -eq 0 ] \
     && [ "$local_audit" -eq 0 ]; } \
