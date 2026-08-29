@@ -9,7 +9,12 @@ import {
   bump_validation_command,
   resolve_harn_update_spec,
 } from "./fleet_manifest"
-import { github_enable_auto_merge, github_pr_upsert, github_worktree_commit } from "./github"
+import {
+  github_enable_auto_merge,
+  github_pr_upsert,
+  github_pr_view,
+  github_worktree_commit,
+} from "./github"
 import {
   HarnUpdateBudgetPolicy,
   HarnUpdateRuntimeProvenance,
@@ -130,6 +135,27 @@ pub type FleetRepairAttempt = {
   usage: HarnUpdateUsage,
 }
 
+pub type FleetRepairValidationEvidence = {
+  attempt: int,
+  command: string,
+  ok: bool,
+  diagnostic: string,
+}
+
+pub type FleetRepairSourceMutationEvidence = {
+  before_head_sha: string,
+  after_head_sha: string,
+  commit_created: bool,
+  pushed_head_observed: bool,
+}
+
+pub type FleetRepairControlPlaneEvidence = {
+  pull_request_present_before: bool,
+  pull_request_present_after: bool,
+  auto_merge_before: bool,
+  auto_merge_after: bool,
+}
+
 pub type FleetRepairResult = {
   repo: string,
   status: "repaired" | "refused" | "failed" | "no_change",
@@ -137,19 +163,15 @@ pub type FleetRepairResult = {
   pr_number?: int,
   old_head_sha?: string,
   new_head_sha?: string,
+  validation_evidence?: list<FleetRepairValidationEvidence>,
+  source_mutation?: FleetRepairSourceMutationEvidence,
+  control_plane_mutation?: FleetRepairControlPlaneEvidence,
   attempts: list<FleetRepairAttempt>,
   known_cost_usd: float,
   cost_status: "exact" | "lower_bound" | "unknown",
 }
 
 pub type FleetRepairTerminalOutcome = "mutated" | "already_repaired" | "declined" | "failed"
-
-pub type FleetRepairValidationEvidence = {
-  attempt: int,
-  command: string,
-  ok: bool,
-  diagnostic: string,
-}
 
 pub type FleetRepairMutationEvidence = {
   head_changed: bool,
@@ -455,6 +477,12 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
     }
   }
   const pr = unwrap(upsert)
+  const presented = {
+    pull_request_present_before: !pr.created,
+    pull_request_present_after: true,
+    auto_merge_before: pr.auto_merge_armed,
+    auto_merge_after: pr.auto_merge_armed,
+  }
   if candidate.require_signed_head {
     const metadata = try {
       load_pr_signature_metadata(harness, candidate.repo, pr.number)
@@ -493,6 +521,7 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
       pr_number: pr.number,
       old_head_sha: candidate.head_sha,
       new_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -512,6 +541,37 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
       reason: "recovered_pull_request_auto_merge_failed:" + to_string(unwrap_err(armed)),
       pr_number: pr.number,
       old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const observed = github_pr_view(harness, candidate.repo, pr.number)
+  if is_err(observed) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_readback_failed:"
+        + to_string(unwrap_err(observed)),
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const after = unwrap(observed)
+  if lowercase(after.head.sha) != lowercase(candidate.head_sha) || !after.auto_merge_armed {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_readback_did_not_match",
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented
+        + {auto_merge_after: after.auto_merge_armed},
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -524,6 +584,8 @@ fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) ->
     pr_number: pr.number,
     old_head_sha: candidate.head_sha,
     new_head_sha: candidate.head_sha,
+    control_plane_mutation: presented
+      + {auto_merge_after: after.auto_merge_armed},
     attempts: [],
     known_cost_usd: 0.0,
     cost_status: "exact",
@@ -901,7 +963,10 @@ pub fn fleet_repair_new_file_allowed(path: string, allowed: list<string>) -> boo
   return allowed.contains(path)
 }
 
-fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
+fn publish_candidate(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+) -> FleetRepairSourceMutationEvidence {
   // Tracked changes and manifest-authorized new files cross one exact-head
   // publisher. Build output and invented paths remain outside its authority.
   const staged = run_git(harness.process, candidate.directory, ["add", "-u"])
@@ -929,9 +994,10 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
   if is_err(published) {
     throw "repair publication failed: " + to_string(unwrap_err(published))
   }
-  const new_head = trim(to_string(unwrap(published)?.commit_oid ?? ""))
-  if new_head == "" {
-    throw "repair publication returned no commit oid"
+  const publication = unwrap(published)
+  const new_head = trim(publication.commit_oid)
+  if !publication.committed || new_head == "" {
+    throw "repair publication returned no created commit"
   }
   const settled = await_published_head(
     harness.clock,
@@ -944,8 +1010,18 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
   if candidate.require_signed_head && len(unsigned_commits(settled.pr)) > 0 {
     throw "repair published but exact pull request history is not fully signed"
   }
+  const evidence: FleetRepairSourceMutationEvidence = {
+    before_head_sha: candidate.head_sha,
+    after_head_sha: new_head,
+    commit_created: publication.committed
+      && lowercase(candidate.head_sha)
+        != lowercase(new_head),
+    pushed_head_observed: settled.settled
+      && lowercase(settled.pr?.head_oid ?? "")
+        == lowercase(new_head),
+  }
   if !candidate.auto_arm {
-    return new_head
+    return evidence
   }
   const armed = github_enable_auto_merge(
     harness,
@@ -957,7 +1033,7 @@ fn publish_candidate(harness: Harness, candidate: FleetRepairCandidate) {
   if is_err(armed) {
     throw "repair published but auto-merge re-arm failed: " + to_string(unwrap_err(armed))
   }
-  return new_head
+  return evidence
 }
 
 /** Repair one exact downstream bump PR under a bounded validate/repair loop. */
@@ -981,6 +1057,33 @@ pub fn repair_fleet_candidate(
     }
   }
   return repair_fleet_candidate_in_checkout(harness, candidate, target, policy)
+}
+
+fn deterministic_validation_evidence(
+  candidate: FleetRepairCandidate,
+  initial: dict,
+  formatted_paths: list<string>,
+  formatted: dict,
+) -> list<FleetRepairValidationEvidence> {
+  const initial_evidence = {
+    attempt: 0,
+    command: candidate.validation_command,
+    ok: initial.ok,
+    diagnostic: initial.output,
+  }
+  return if len(formatted_paths) == 0 {
+    [initial_evidence]
+  } else {
+    [
+      initial_evidence,
+      {
+        attempt: 1,
+        command: candidate.validation_command,
+        ok: formatted.ok,
+        diagnostic: formatted.output,
+      },
+    ]
+  }
 }
 
 /**
@@ -1012,6 +1115,12 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: "leased_checkout_already_valid",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validation_evidence(
+        candidate,
+        initial_validation,
+        [],
+        initial_validation,
+      ),
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -1035,8 +1144,14 @@ pub fn repair_fleet_candidate_in_checkout(
       }
     }
   }
+  const deterministic_validations = deterministic_validation_evidence(
+    candidate,
+    initial_validation,
+    formatted_paths,
+    formatted_validation,
+  )
   if formatted_validation.ok && len(formatted_paths) > 0 {
-    const new_head = try {
+    const publication = try {
       publish_candidate(harness, candidate)
     } catch (error) {
       return {
@@ -1045,6 +1160,7 @@ pub fn repair_fleet_candidate_in_checkout(
         reason: to_string(error),
         pr_number: candidate.pr_number,
         old_head_sha: candidate.head_sha,
+        validation_evidence: deterministic_validations,
         attempts: [],
         known_cost_usd: 0.0,
         cost_status: "exact",
@@ -1056,7 +1172,9 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: "canonical_format_validated_published_and_auto_merge_armed",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
-      new_head_sha: new_head,
+      new_head_sha: publication.after_head_sha,
+      validation_evidence: deterministic_validations,
+      source_mutation: publication,
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -1070,6 +1188,7 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: pre_agent_refusal ?? "agent_repair_required",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
       attempts: [],
       known_cost_usd: 0.0,
       cost_status: "exact",
@@ -1175,6 +1294,7 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: "validation_attempts_exhausted",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
       attempts: attempts,
       ...accounting,
     }
@@ -1187,11 +1307,12 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: "red_checkout_received_no_repair_delta",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
       attempts: attempts,
       ...accounting,
     }
   }
-  const new_head = try {
+  const publication = try {
     publish_candidate(harness, candidate)
   } catch (error) {
     return {
@@ -1200,6 +1321,7 @@ pub fn repair_fleet_candidate_in_checkout(
       reason: to_string(error),
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
       attempts: attempts,
       ...accounting,
     }
@@ -1210,7 +1332,9 @@ pub fn repair_fleet_candidate_in_checkout(
     reason: "validated_published_and_auto_merge_armed",
     pr_number: candidate.pr_number,
     old_head_sha: candidate.head_sha,
-    new_head_sha: new_head,
+    new_head_sha: publication.after_head_sha,
+    validation_evidence: deterministic_validations,
+    source_mutation: publication,
     attempts: attempts,
     ...accounting,
   }
@@ -1236,14 +1360,50 @@ fn fleet_repair_validation_command(plan: FleetRepairPlan, repo: string) -> strin
   return plan.candidates.find({ row -> row.repo == repo })?.validation_command ?? ""
 }
 
-/** Reduce controller-internal states to the four durable operator outcomes. */
+fn fleet_repair_observed_source_change(result: FleetRepairResult) -> bool {
+  const evidence = result.source_mutation
+  return evidence != nil && trim(evidence.before_head_sha) != ""
+    && trim(evidence.after_head_sha)
+      != ""
+    && lowercase(evidence.before_head_sha)
+      != lowercase(evidence.after_head_sha)
+    && evidence.commit_created
+    && evidence.pushed_head_observed
+}
+
+fn fleet_repair_observed_control_plane_change(result: FleetRepairResult) -> bool {
+  const evidence = result.control_plane_mutation
+  return evidence != nil
+    && (evidence.pull_request_present_before
+      != evidence.pull_request_present_after
+      || evidence.auto_merge_before
+        != evidence.auto_merge_after)
+}
+
+fn fleet_repair_observed_valid_noop(result: FleetRepairResult) -> bool {
+  const evidence = result.validation_evidence ?? []
+  if len(evidence) == 0 {
+    return false
+  }
+  const last = evidence[len(evidence) - 1]
+  return trim(last?.command ?? "") != "" && (last?.ok ?? false)
+}
+
+/** Reduce controller-internal states to the four evidence-backed operator outcomes. */
 pub fn fleet_repair_terminal_outcome(result: FleetRepairResult) -> FleetRepairTerminalOutcome {
-  if result.status == "repaired" && trim(result.new_head_sha ?? "") != "" {
+  if result.status == "repaired"
+    && (fleet_repair_observed_source_change(result)
+      || fleet_repair_observed_control_plane_change(result)) {
     return "mutated"
   }
   if result.status == "no_change" && result.reason == "leased_checkout_already_valid"
     && trim(result.old_head_sha ?? "")
-      != "" {
+      != ""
+    && lowercase(trim(result.new_head_sha ?? result.old_head_sha ?? ""))
+      == lowercase(trim(result.old_head_sha ?? ""))
+    && !fleet_repair_observed_source_change(result)
+    && !fleet_repair_observed_control_plane_change(result)
+    && fleet_repair_observed_valid_noop(result) {
     return "already_repaired"
   }
   if result.status == "refused" {
@@ -1257,11 +1417,14 @@ fn fleet_repair_terminal_result(
   result: FleetRepairResult,
 ) -> FleetRepairTerminalResult {
   const terminal_outcome = fleet_repair_terminal_outcome(result)
-  const before_head_sha = result.old_head_sha
+  const before_head_sha = result.source_mutation?.before_head_sha
+    ?? result.old_head_sha
     ?? fleet_repair_before_head(plan, result.repo)
-  const after_head_sha = result.new_head_sha ?? before_head_sha
+  const after_head_sha = result.source_mutation?.after_head_sha
+    ?? result.new_head_sha
+    ?? before_head_sha
   const validation_command = fleet_repair_validation_command(plan, result.repo)
-  let attempted_validations: list<FleetRepairValidationEvidence> = []
+  let attempted_validations: list<FleetRepairValidationEvidence> = result.validation_evidence ?? []
   for attempt in result.attempts {
     attempted_validations = attempted_validations
       + [
@@ -1273,16 +1436,8 @@ fn fleet_repair_terminal_result(
         },
       ]
   }
-  if len(attempted_validations) == 0 && validation_command != ""
-    && (result.reason == "leased_checkout_already_valid"
-      || result.reason == "canonical_format_validated_published_and_auto_merge_armed") {
-    attempted_validations = [
-      {attempt: 0, command: validation_command, ok: true, diagnostic: result.reason},
-    ]
-  }
-  const head_changed = before_head_sha != "" && after_head_sha != ""
-    && lowercase(before_head_sha)
-      != lowercase(after_head_sha)
+  const source = result.source_mutation
+  const control = result.control_plane_mutation
   return result
     + {
       terminal_outcome: terminal_outcome,
@@ -1290,10 +1445,18 @@ fn fleet_repair_terminal_result(
       after_head_sha: after_head_sha,
       attempted_validations: attempted_validations,
       mutation: {
-        head_changed: head_changed,
-        commit_created: terminal_outcome == "mutated" && head_changed,
-        pushed_head_observed: terminal_outcome == "mutated" && head_changed,
-        control_plane_changed: terminal_outcome == "mutated" && !head_changed,
+        head_changed: source != nil && trim(source.before_head_sha) != ""
+          && trim(source.after_head_sha)
+            != ""
+          && lowercase(source.before_head_sha)
+            != lowercase(source.after_head_sha),
+        commit_created: source?.commit_created ?? false,
+        pushed_head_observed: source?.pushed_head_observed ?? false,
+        control_plane_changed: control != nil
+          && (control.pull_request_present_before
+            != control.pull_request_present_after
+            || control.auto_merge_before
+              != control.auto_merge_after),
       },
     }
 }
