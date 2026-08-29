@@ -36,6 +36,10 @@ The entry points are:
   other jobs are its own.
 - `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
   every repository that delegates bump workflow ownership in `fleet.toml`.
+- `sync_connector_secrets.harn`: checks or applies the manifest-owned
+  `[providers.setup].required_secrets` projection for every first-party
+  connector. `policy.connector_secret_schema` keeps the output compatible with
+  the released Harn manifest schema until the fleet can move as one.
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
@@ -107,6 +111,7 @@ scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_connector_secrets.harn -- --check
 scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
 ```
 
