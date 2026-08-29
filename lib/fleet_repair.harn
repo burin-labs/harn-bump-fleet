@@ -29,7 +29,7 @@ import { release_compaction_policy, tool_repair_projection_policy } from "./tran
 // Change this when the repair prompt, tool surface, or receipt meaning changes.
 // A resumable agent session is evidence for one immutable repair contract, not
 // a cache that may outlive the checkout or the policy that created it.
-pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v9"
+pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v10"
 
 // The repair controller itself needs GitHub and one model provider. Keep this
 // host-seeded allowlist exact: Harn's in-process clients must fail closed before
@@ -142,17 +142,42 @@ pub type FleetRepairResult = {
   cost_status: "exact" | "lower_bound" | "unknown",
 }
 
+pub type FleetRepairTerminalOutcome = "mutated" | "already_repaired" | "declined" | "failed"
+
+pub type FleetRepairValidationEvidence = {
+  attempt: int,
+  command: string,
+  ok: bool,
+  diagnostic: string,
+}
+
+pub type FleetRepairMutationEvidence = {
+  head_changed: bool,
+  commit_created: bool,
+  pushed_head_observed: bool,
+  control_plane_changed: bool,
+}
+
+pub type FleetRepairTerminalResult = FleetRepairResult \
+  & {
+  terminal_outcome: FleetRepairTerminalOutcome,
+  before_head_sha: string,
+  after_head_sha: string,
+  attempted_validations: list<FleetRepairValidationEvidence>,
+  mutation: FleetRepairMutationEvidence,
+}
+
 pub type FleetRepairReceipt = {
-  schema_version: "harn_bump_fleet.harn_update_repair.v3",
+  schema_version: "harn_bump_fleet.harn_update_repair.v4",
   target: string,
   ok: bool,
   policy: FleetRepairPolicy,
   runtime_provenance: HarnUpdateRuntimeProvenance,
   authority: FleetRepairAuthorityAudit,
-  results: list<FleetRepairResult>,
+  results: list<FleetRepairTerminalResult>,
   known_cost_usd: float,
   cost_status: "exact" | "lower_bound" | "unknown",
-  stopped_reason?: string,
+  stopped_reason: string?,
 }
 
 /** Authority requested, granted, observed, and withheld for one repair receipt. */
@@ -1158,8 +1183,8 @@ pub fn repair_fleet_candidate_in_checkout(
   if len(paths) == 0 {
     return {
       repo: candidate.repo,
-      status: "no_change",
-      reason: "validator_passed_without_repair_delta",
+      status: "failed",
+      reason: "red_checkout_received_no_repair_delta",
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
       attempts: attempts,
@@ -1189,6 +1214,150 @@ pub fn repair_fleet_candidate_in_checkout(
     attempts: attempts,
     ...accounting,
   }
+}
+
+fn fleet_repair_selected_repositories(plan: FleetRepairPlan) -> list<string> {
+  return (plan.refused.map({ row -> row.repo }).to_list()
+    + plan.recoveries.map({ row -> row.repo }).to_list()
+    + plan.candidates.map({ row -> row.repo }).to_list())
+    .unique()
+}
+
+fn fleet_repair_before_head(plan: FleetRepairPlan, repo: string) -> string {
+  const recovery = plan.recoveries.find({ row -> row.repo == repo })
+  if recovery != nil {
+    return recovery.head_sha
+  }
+  const candidate = plan.candidates.find({ row -> row.repo == repo })
+  return candidate?.head_sha ?? ""
+}
+
+fn fleet_repair_validation_command(plan: FleetRepairPlan, repo: string) -> string {
+  return plan.candidates.find({ row -> row.repo == repo })?.validation_command ?? ""
+}
+
+/** Reduce controller-internal states to the four durable operator outcomes. */
+pub fn fleet_repair_terminal_outcome(result: FleetRepairResult) -> FleetRepairTerminalOutcome {
+  if result.status == "repaired" && trim(result.new_head_sha ?? "") != "" {
+    return "mutated"
+  }
+  if result.status == "no_change" && result.reason == "leased_checkout_already_valid"
+    && trim(result.old_head_sha ?? "")
+      != "" {
+    return "already_repaired"
+  }
+  if result.status == "refused" {
+    return "declined"
+  }
+  return "failed"
+}
+
+fn fleet_repair_terminal_result(
+  plan: FleetRepairPlan,
+  result: FleetRepairResult,
+) -> FleetRepairTerminalResult {
+  const terminal_outcome = fleet_repair_terminal_outcome(result)
+  const before_head_sha = result.old_head_sha
+    ?? fleet_repair_before_head(plan, result.repo)
+  const after_head_sha = result.new_head_sha ?? before_head_sha
+  const validation_command = fleet_repair_validation_command(plan, result.repo)
+  let attempted_validations: list<FleetRepairValidationEvidence> = []
+  for attempt in result.attempts {
+    attempted_validations = attempted_validations
+      + [
+        {
+          attempt: attempt.attempt,
+          command: validation_command,
+          ok: attempt.validation_ok,
+          diagnostic: attempt.validation_output,
+        },
+      ]
+  }
+  if len(attempted_validations) == 0 && validation_command != ""
+    && (result.reason == "leased_checkout_already_valid"
+      || result.reason == "canonical_format_validated_published_and_auto_merge_armed") {
+    attempted_validations = [
+      {attempt: 0, command: validation_command, ok: true, diagnostic: result.reason},
+    ]
+  }
+  const head_changed = before_head_sha != "" && after_head_sha != ""
+    && lowercase(before_head_sha)
+      != lowercase(after_head_sha)
+  return result
+    + {
+      terminal_outcome: terminal_outcome,
+      before_head_sha: before_head_sha,
+      after_head_sha: after_head_sha,
+      attempted_validations: attempted_validations,
+      mutation: {
+        head_changed: head_changed,
+        commit_created: terminal_outcome == "mutated" && head_changed,
+        pushed_head_observed: terminal_outcome == "mutated" && head_changed,
+        control_plane_changed: terminal_outcome == "mutated" && !head_changed,
+      },
+    }
+}
+
+/**
+ * Finalize one receipt without allowing a missing or ambiguous repository
+ * result to disappear into an aggregate success boolean.
+ */
+pub fn fleet_repair_receipt(
+  plan: FleetRepairPlan,
+  raw_results: list<FleetRepairResult>,
+  policy: FleetRepairPolicy,
+  stopped_reason: string? = nil,
+) -> FleetRepairReceipt {
+  let results: list<FleetRepairTerminalResult> = []
+  for repo in fleet_repair_selected_repositories(plan) {
+    const observed = raw_results.find({ result -> result.repo == repo })
+      ?? {
+        repo: repo,
+        status: "failed",
+        reason: "missing_terminal_outcome",
+        old_head_sha: fleet_repair_before_head(plan, repo),
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    results = results + [fleet_repair_terminal_result(plan, observed)]
+  }
+  const failed = results.filter(
+    { result ->
+      result.terminal_outcome != "mutated" && result.terminal_outcome != "already_repaired"
+    },
+  )
+    .to_list()
+  const cost_status: "exact" | "lower_bound" | "unknown" = if raw_results.any(
+    { result -> result.cost_status == "unknown" },
+  ) {
+    "unknown"
+  } else if raw_results.any(
+    { result -> result.cost_status == "lower_bound" },
+  ) {
+    "lower_bound"
+  } else {
+    "exact"
+  }
+  let known_cost_usd = 0.0
+  for result in raw_results {
+    known_cost_usd = known_cost_usd + result.known_cost_usd
+  }
+  const schema_version: "harn_bump_fleet.harn_update_repair.v4" =
+    "harn_bump_fleet.harn_update_repair.v4"
+  const receipt: FleetRepairReceipt = {
+    schema_version: schema_version,
+    target: plan.target,
+    ok: len(failed) == 0,
+    policy: policy,
+    runtime_provenance: policy.runtime_provenance,
+    authority: fleet_repair_authority_audit(plan, raw_results, policy),
+    results: results,
+    known_cost_usd: known_cost_usd,
+    cost_status: cost_status,
+    stopped_reason: stopped_reason,
+  }
+  return receipt
 }
 
 /** Execute one bounded plan and preserve every refusal in the typed receipt. */
@@ -1312,26 +1481,5 @@ pub fn repair_fleet_plan(
       stopped_reason = "run_cost_not_exact"
     }
   }
-  const failed = results.filter(
-    { result -> result.status != "repaired" && result.status != "no_change" },
-  )
-    .to_list()
-  return {
-    schema_version: "harn_bump_fleet.harn_update_repair.v3",
-    target: plan.target,
-    ok: len(failed) == 0,
-    policy: policy,
-    runtime_provenance: policy.runtime_provenance,
-    authority: fleet_repair_authority_audit(plan, results, policy),
-    results: results,
-    known_cost_usd: results.map({ result -> result.known_cost_usd }).to_list().sum(),
-    cost_status: if results.any({ result -> result.cost_status == "unknown" }) {
-      "unknown"
-    } else if results.any({ result -> result.cost_status == "lower_bound" }) {
-      "lower_bound"
-    } else {
-      "exact"
-    },
-    stopped_reason: stopped_reason,
-  }
+  return fleet_repair_receipt(plan, results, policy, stopped_reason)
 }
