@@ -1,0 +1,261 @@
+import { ReleaseChainRepairDecision, release_chain_repair_decision } from "./release_chain_repair"
+import {
+  ReleaseChainCause,
+  ReleaseChainControlReceipt,
+  ReleaseChainEvidenceRead,
+  ReleaseChainReceipt,
+  ReleaseChainStage,
+  ReleaseChainStageReceipt,
+  ReleaseChainUnprovenSubject,
+  release_chain_receipt_hash,
+} from "./release_chain_state"
+
+pub type ReleaseChainObservedSubject = {
+  evidence: ReleaseChainEvidenceRead,
+  proven: bool,
+  cause?: ReleaseChainCause,
+  retryable: bool,
+  detail: string,
+}
+
+pub type ReleaseChainObservation = {
+  schema_version: "harn.release-chain.observation.v1",
+  stage: ReleaseChainStage,
+  predicate: string,
+  subjects: list<ReleaseChainObservedSubject>,
+  observed_at: string,
+}
+
+pub type ReleaseChainTransitionAction = "record_stage" \
+  | "plan_repair" \
+  | "wait" \
+  | "stop" \
+  | "restart_revision" \
+  | "escalate" \
+  | "complete"
+
+pub type ReleaseChainTransition = {
+  schema_version: "harn.release-chain.transition.v1",
+  action: ReleaseChainTransitionAction,
+  reason: string,
+  control_cursor: int,
+  stage_receipt?: ReleaseChainStageReceipt,
+  repairs: list<ReleaseChainRepairDecision>,
+}
+
+fn transition(
+  action: ReleaseChainTransitionAction,
+  reason: string,
+  cursor: int,
+) -> ReleaseChainTransition {
+  return {
+    schema_version: "harn.release-chain.transition.v1",
+    action: action,
+    reason: reason,
+    control_cursor: cursor,
+    repairs: [],
+  }
+}
+
+fn stage_attempt(receipt: ReleaseChainReceipt, stage: ReleaseChainStage) -> int {
+  return len(receipt.stages.filter({ row -> row.stage == stage }).to_list()) + 1
+}
+
+fn control_transition(
+  receipt: ReleaseChainReceipt,
+  controls: list<ReleaseChainControlReceipt>,
+) -> ReleaseChainTransition? {
+  let expected = receipt.control_cursor + 1
+  for control in controls {
+    if control.chain_id != receipt.chain_id {
+      return transition(
+        "escalate",
+        "control event targets a different chain",
+        receipt.control_cursor,
+      )
+    }
+    if control.sequence != expected {
+      return transition("escalate", "control cursor has a gap", receipt.control_cursor)
+    }
+    if control.revision != receipt.revision {
+      return transition(
+        "escalate",
+        "control event targets a different chain revision",
+        control.sequence,
+      )
+    }
+    if control.kind == "stop" {
+      return transition("stop", control.reason, control.sequence)
+    }
+    if control.identity_bearing {
+      return transition(
+        "restart_revision",
+        "identity-bearing steer of ${control.field} requires a new chain revision",
+        control.sequence,
+      )
+    }
+    expected = expected + 1
+  }
+  return nil
+}
+
+pub fn release_chain_stage_receipt_from_observation(
+  receipt: ReleaseChainReceipt,
+  observation: ReleaseChainObservation,
+) -> ReleaseChainStageReceipt {
+  if observation.stage != receipt.current_stage {
+    throw "release chain observation targets ${observation.stage}, expected ${receipt.current_stage}"
+  }
+  if trim(observation.predicate) == "" {
+    throw "release chain observation predicate must be non-empty"
+  }
+  let proven_count = 0
+  let unproven: list<ReleaseChainUnprovenSubject> = []
+  for subject in observation.subjects {
+    if subject.proven {
+      if subject.evidence.status != "observed" {
+        throw "release chain proven subject must carry observed evidence"
+      }
+      proven_count = proven_count + 1
+    } else {
+      if subject.cause == nil {
+        throw "release chain unproven subject must carry a typed cause"
+      }
+      if trim(subject.detail) == "" {
+        throw "release chain unproven subject must carry diagnostic detail"
+      }
+      unproven = unproven
+        + [
+          {
+            subject: subject.evidence.subject,
+            cause: subject.cause,
+            retryable: subject.retryable,
+            detail: subject.detail,
+          },
+        ]
+    }
+  }
+  const subject_count = len(observation.subjects)
+  const unproven_count = len(unproven)
+  const status = if subject_count > 0 && unproven_count == 0 && proven_count == subject_count {
+    "proven"
+  } else {
+    "failed"
+  }
+  let cause: ReleaseChainCause = "unknown"
+  if unproven_count > 0 {
+    const first = unproven.find({ _row -> true })
+    if first == nil {
+      throw "release chain lost its first unproven subject"
+    }
+    cause = first.cause
+  }
+  let result: ReleaseChainStageReceipt = {
+    stage: observation.stage,
+    attempt: stage_attempt(receipt, observation.stage),
+    status: status,
+    predicate: observation.predicate,
+    subject_count: subject_count,
+    proven_count: proven_count,
+    unproven_count: unproven_count,
+    evidence: observation.subjects.map({ row -> row.evidence }).to_list(),
+    unproven: unproven,
+    input_receipt_hash: release_chain_receipt_hash(receipt),
+    started_at: observation.observed_at,
+    finished_at: observation.observed_at,
+  }
+  if status == "failed" {
+    result = result + {cause: cause}
+  }
+  return result
+}
+
+/** Pure reducer. It consumes observations and controls but executes no effects. */
+pub fn release_chain_reduce(
+  receipt: ReleaseChainReceipt,
+  observation: ReleaseChainObservation?,
+  controls: list<ReleaseChainControlReceipt> = [],
+) -> ReleaseChainTransition {
+  if receipt.status == "complete" {
+    return transition("complete", "release chain is already complete", receipt.control_cursor)
+  }
+  if receipt.status == "stopped" {
+    return transition("stop", "release chain is already stopped", receipt.control_cursor)
+  }
+  if receipt.status == "escalated" {
+    return transition("escalate", "release chain is already escalated", receipt.control_cursor)
+  }
+  const controlled = control_transition(receipt, controls)
+  if controlled != nil {
+    return controlled
+  }
+  let cursor = receipt.control_cursor
+  if len(controls) > 0 {
+    const last = controls.find(
+      { control -> control.sequence == receipt.control_cursor + len(controls) },
+    )
+    if last == nil {
+      throw "release chain controls lost their terminal cursor"
+    }
+    cursor = last.sequence
+  }
+  if observation == nil {
+    return transition(
+      "wait",
+      "observe ${receipt.current_stage} through its current semantic owner before any effect",
+      cursor,
+    )
+  }
+  const stage = release_chain_stage_receipt_from_observation(receipt, observation)
+  if stage.status == "proven" {
+    return transition("record_stage", "stage predicate is proven from a non-empty scope", cursor)
+      + {stage_receipt: stage}
+  }
+  if len(stage.unproven) == 0 {
+    return transition(
+      "escalate",
+      "stage predicate had an empty subject scope; absence is not proof",
+      cursor,
+    )
+      + {stage_receipt: stage}
+  }
+  const repairs = stage.unproven.map(
+    { subject ->
+      release_chain_repair_decision(
+        receipt.chain_id,
+        receipt.revision,
+        stage.stage,
+        subject.cause,
+        subject.subject,
+        stage.attempt,
+        receipt.target.tag,
+      )
+    },
+  )
+    .to_list()
+  const has_escalation = repairs.any({ repair -> repair.action == "escalate" })
+  const has_effect = repairs.any({ repair -> repair.action == "plan_effect" })
+  const action: ReleaseChainTransitionAction = if has_escalation {
+    "escalate"
+  } else if has_effect {
+    "plan_repair"
+  } else if repairs.any(
+    { repair -> repair.action == "wait" },
+  ) {
+    "wait"
+  } else {
+    "escalate"
+  }
+  return transition(
+    action,
+    if has_escalation {
+      "one or more typed causes require operator escalation"
+    } else if has_effect {
+      "bounded repairs are planned for every named unproven subject"
+    } else {
+      "current owners must be observed before repair can proceed"
+    },
+    cursor,
+  )
+    + {stage_receipt: stage, repairs: repairs}
+}

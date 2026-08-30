@@ -1,0 +1,447 @@
+import { read_json_typed_result } from "std/fs"
+import {
+  ReleaseChainExactValueRead,
+  release_chain_observe_converge,
+  release_chain_observe_pre_tag,
+  release_chain_observe_prove,
+  release_chain_observed_value,
+} from "../lib/release_chain_observe"
+import { release_chain_repair_decision } from "../lib/release_chain_repair"
+import {
+  ReleaseChainReceipt,
+  ReleaseChainStage,
+  release_chain_append_stage,
+  release_chain_control_write,
+  release_chain_new,
+  release_chain_pending_controls,
+  release_chain_receipt_hash,
+  release_chain_receipt_write,
+  release_chain_replay,
+  release_chain_validate_stage,
+} from "../lib/release_chain_state"
+import { ReleaseChainObservation, release_chain_reduce } from "../lib/release_chain_transition"
+
+const SHA = "1111111111111111111111111111111111111111"
+
+const OTHER_SHA = "2222222222222222222222222222222222222222"
+
+const NOW = "2026-08-29T22:21:00Z"
+
+type V010122ReplayFixture = {
+  schema_version: "harn.release-chain-replay-fixture.v1",
+  version: string,
+  tag: string,
+  source_sha: string,
+  tag_cut_at: string,
+  fragment_names: list<string>,
+  publication_missing_assets: list<string>,
+  pin_changed_at: string,
+  proof_deadline_at: string,
+  proof_started_at: string,
+  proof_run_id: int,
+}
+
+fn fresh_chain() -> ReleaseChainReceipt {
+  return release_chain_new(
+    "v0.10.122-main",
+    {
+      version: "0.10.122",
+      tag: "v0.10.122",
+      source_repo: "burin-labs/harn",
+      base_ref: "main",
+      initial_pin_sha: SHA,
+    },
+    NOW,
+  )
+}
+
+fn exact_read(
+  subject: string,
+  expected: string,
+  observed: string,
+  readable: bool = true,
+) -> ReleaseChainExactValueRead {
+  return {
+    subject: subject,
+    kind: "fixture_read",
+    expected: expected,
+    observed: observed,
+    source: "v0.10.122 replay fixture",
+    ref: "main",
+    identity: SHA,
+    readable: readable,
+    observed_at: NOW,
+  }
+}
+
+fn exact_observation(
+  stage: ReleaseChainStage,
+  subject: string = "known subject",
+) -> ReleaseChainObservation {
+  return {
+    schema_version: "harn.release-chain.observation.v1",
+    stage: stage,
+    predicate: "known non-null read equals its expected value",
+    subjects: [release_chain_observed_value(exact_read(subject, "yes", "yes"), "unknown", false)],
+    observed_at: NOW,
+  }
+}
+
+fn advance_to(target: ReleaseChainStage) -> ReleaseChainReceipt {
+  let receipt = fresh_chain()
+  while receipt.current_stage != target {
+    const decision = release_chain_reduce(receipt, exact_observation(receipt.current_stage), [])
+    if decision.stage_receipt == nil {
+      throw "fixture advance did not produce a stage receipt"
+    }
+    receipt = release_chain_append_stage(receipt, decision.stage_receipt, NOW)
+  }
+  return receipt
+}
+
+pipeline test_empty_scope_is_failed_and_known_non_null_read_passes(task: any) {
+  const receipt = fresh_chain()
+  const empty: ReleaseChainObservation = {
+    schema_version: "harn.release-chain.observation.v1",
+    stage: "preflight",
+    predicate: "at least one source predicate is read",
+    subjects: [],
+    observed_at: NOW,
+  }
+  const failed = release_chain_reduce(receipt, empty, [])
+  const passed = release_chain_reduce(receipt, exact_observation("preflight"), [])
+  assert_eq(failed.action, "escalate")
+  assert_eq(failed.stage_receipt?.subject_count, 0)
+  assert_eq(failed.stage_receipt?.status, "failed")
+  assert_eq(passed.action, "record_stage")
+  assert_eq(passed.stage_receipt?.subject_count, 1)
+  assert_eq(passed.stage_receipt?.status, "proven")
+}
+
+pipeline test_counts_and_named_failures_cannot_disagree(task: any) {
+  let rejected = false
+  try {
+    release_chain_validate_stage(
+      {
+        stage: "preflight",
+        attempt: 1,
+        status: "failed",
+        predicate: "one read",
+        subject_count: 1,
+        proven_count: 0,
+        unproven_count: 1,
+        evidence: [],
+        unproven: [],
+        cause: "unknown",
+        input_receipt_hash: "",
+        started_at: NOW,
+        finished_at: NOW,
+      },
+    )
+  } catch (_error) {
+    rejected = true
+  }
+  assert_eq(rejected, true)
+}
+
+pipeline test_receipt_log_is_append_only_and_replays_prior_hashes(harness: Harness, task: any) {
+  const root = path_join(
+    harness.fs.workspace_temp_dir(),
+    "release-chain-log-" + harness.random.uuid_v7(),
+  )
+  const initial = fresh_chain()
+  const io = {fs: harness.fs, random: harness.random}
+  release_chain_receipt_write(io, root, initial)
+  const decision = release_chain_reduce(initial, exact_observation("preflight"), [])
+  if decision.stage_receipt == nil {
+    throw "fixture did not produce a preflight receipt"
+  }
+  const next = release_chain_append_stage(initial, decision.stage_receipt, NOW)
+  release_chain_receipt_write(io, root, next)
+  const replayed = release_chain_replay(harness.fs, root, initial.chain_id)
+  assert_eq(replayed.map({ row -> row.revision }).to_list(), [0, 1])
+  assert_eq(next.stages[0]?.input_receipt_hash, release_chain_receipt_hash(initial))
+  let overwrite_rejected = false
+  try {
+    release_chain_receipt_write(io, root, next)
+  } catch (_error) {
+    overwrite_rejected = true
+  }
+  assert_eq(overwrite_rejected, true)
+}
+
+pipeline test_stop_cursor_survives_replay_and_blocks_every_future_effect(
+  harness: Harness,
+  task: any,
+) {
+  const root = path_join(
+    harness.fs.workspace_temp_dir(),
+    "release-chain-stop-" + harness.random.uuid_v7(),
+  )
+  const receipt = advance_to("pre_tag_checkpoint")
+  release_chain_control_write(
+    {fs: harness.fs, random: harness.random},
+    root,
+    {
+      schema_version: "harn.release-chain.control.v1",
+      chain_id: receipt.chain_id,
+      revision: receipt.revision,
+      sequence: 1,
+      kind: "stop",
+      actor: "release operator",
+      reason: "stand down before the immutable tag",
+      field: "",
+      value: "",
+      identity_bearing: false,
+      created_at: NOW,
+    },
+  )
+  const controls = release_chain_pending_controls(harness.fs, root, receipt)
+  const stopped = release_chain_reduce(receipt, exact_observation("pre_tag_checkpoint"), controls)
+  assert_eq(stopped.action, "stop")
+  assert_eq(stopped.control_cursor, 1)
+  assert_eq(stopped.stage_receipt, nil)
+  assert_eq(stopped.repairs, [])
+}
+
+pipeline test_identity_steer_requires_new_revision(task: any) {
+  const receipt = fresh_chain()
+  const decision = release_chain_reduce(
+    receipt,
+    nil,
+    [
+      {
+        schema_version: "harn.release-chain.control.v1",
+        chain_id: receipt.chain_id,
+        revision: receipt.revision,
+        sequence: 1,
+        kind: "steer",
+        actor: "release operator",
+        reason: "select a different source",
+        field: "target.initial_pin_sha",
+        value: OTHER_SHA,
+        identity_bearing: true,
+        created_at: NOW,
+      },
+    ],
+  )
+  assert_eq(decision.action, "restart_revision")
+}
+
+pipeline test_v010122_fragment_checkpoint_refuses_then_folded_tree_passes(task: any) {
+  const receipt = advance_to("pre_tag_checkpoint")
+  const base = {
+    publish_tree: {tag: "v0.10.122", tag_tree: SHA, publish_tree: SHA, main_tree: SHA},
+    release_contract_green: true,
+    changelog_folded: true,
+    observed_at: NOW,
+  }
+  const red = release_chain_reduce(
+    receipt,
+    release_chain_observe_pre_tag(base + {fragment_names: ["changelog.d/7370.changed.md"]}),
+    [],
+  )
+  const green = release_chain_reduce(
+    receipt,
+    release_chain_observe_pre_tag(base + {fragment_names: []}),
+    [],
+  )
+  assert_eq(red.action, "plan_repair")
+  assert_eq(red.stage_receipt?.cause, "unfolded_fragments")
+  assert_eq(red.repairs[0]?.effect?.kind, "open_fragment_fold_pr")
+  assert_eq(green.action, "record_stage")
+  assert_eq(green.stage_receipt?.subject_count, 4)
+  assert_eq(green.stage_receipt?.unproven_count, 0)
+}
+
+pipeline test_v010122_replay_fixture_is_closed_and_loads_through_typed_boundary(
+  harness: Harness,
+  task: any,
+) {
+  const loaded = read_json_typed_result<V010122ReplayFixture>(
+    harness.fs,
+    path_join(harness.fs.source_dir(), "fixtures/release-chain/v0.10.122.json"),
+    schema_of(V010122ReplayFixture),
+  )
+  assert(is_ok(loaded))
+  const fixture = unwrap(loaded)
+  assert_eq(fixture.tag, "v" + fixture.version)
+  assert_eq(fixture.fragment_names, ["changelog.d/7370.changed.md"])
+  assert_eq(fixture.proof_started_at, "2026-08-30T03:42:24Z")
+  assert_eq(fixture.proof_run_id, 33290873211)
+  assert(fixture.proof_deadline_at > fixture.pin_changed_at)
+}
+
+pipeline test_green_scheduler_cannot_hide_missing_publication_asset(task: any) {
+  const receipt = advance_to("prove")
+  const observed = release_chain_observe_prove(
+    {
+      tag: "v0.10.122",
+      tag_present: true,
+      tag_signature_verified: true,
+      release_found: true,
+      release_draft: false,
+      release_prerelease: false,
+      expected_prerelease: false,
+      required_assets: ["harn-aarch64-apple-darwin.tar.gz"],
+      missing_assets: ["harn-aarch64-apple-darwin.tar.gz"],
+      packages_published: true,
+    },
+    NOW,
+  )
+  const decision = release_chain_reduce(receipt, observed, [])
+  if decision.stage_receipt == nil {
+    throw "publication replay did not produce a stage receipt"
+  }
+  assert_eq(decision.stage_receipt.cause, "assets_missing")
+  assert_eq(
+    decision.stage_receipt.unproven.map({ row -> row.subject }).to_list(),
+    ["harn-aarch64-apple-darwin.tar.gz"],
+  )
+  assert_eq(decision.action, "plan_repair")
+  assert_eq(decision.repairs[0]?.effect?.kind, "recover_binary_assets")
+}
+
+pipeline test_convergence_empty_stale_and_current_scopes_stay_distinct(task: any) {
+  const receipt = advance_to("converge")
+  const empty = release_chain_reduce(
+    receipt,
+    release_chain_observe_converge("0.10.122", [], NOW),
+    [],
+  )
+  const stale = release_chain_reduce(
+    receipt,
+    release_chain_observe_converge(
+      "0.10.122",
+      [
+        {
+          repo: "burin-labs/consumer",
+          state: "waiting",
+          reason: "pin stale",
+          default_branch_pin: "0.10.121",
+        },
+      ],
+      NOW,
+    ),
+    [],
+  )
+  const current = release_chain_reduce(
+    receipt,
+    release_chain_observe_converge(
+      "0.10.122",
+      [
+        {
+          repo: "burin-labs/consumer",
+          state: "proven",
+          reason: "pin current",
+          default_branch_pin: "0.10.122",
+        },
+      ],
+      NOW,
+    ),
+    [],
+  )
+  assert_eq(empty.stage_receipt?.subject_count, 1)
+  assert_eq(empty.stage_receipt?.cause, "consumer_pin_unreadable")
+  assert_eq(stale.stage_receipt?.cause, "consumer_pin_stale")
+  assert_eq(stale.repairs[0]?.effect?.kind, "dispatch_consumer_repin")
+  assert_eq(current.stage_receipt?.status, "proven")
+}
+
+pipeline test_missing_convergence_proof_becomes_red_at_bounded_deadline(task: any) {
+  const receipt = advance_to("converge")
+  const late = release_chain_observe_converge(
+    "0.10.122",
+    [
+      {
+        repo: "burin-labs/consumer",
+        state: "proven",
+        reason: "pin current",
+        default_branch_pin: "0.10.122",
+      },
+    ],
+    "2026-08-30T03:42:00Z",
+    {
+      pin_changed_at: "2026-08-30T03:03:00Z",
+      deadline_at: "2026-08-30T03:33:00Z",
+      observed_at: "2026-08-30T03:42:00Z",
+      proof_started_at: "2026-08-30T03:42:24Z",
+      proof_run_id: 33290873211,
+    },
+  )
+  const decision = release_chain_reduce(receipt, late, [])
+  assert_eq(decision.stage_receipt?.subject_count, 2)
+  assert_eq(decision.stage_receipt?.cause, "convergence_proof_missing")
+  assert_eq(decision.repairs[0]?.effect?.kind, "dispatch_convergence_proof")
+  const timely = release_chain_reduce(
+    receipt,
+    release_chain_observe_converge(
+      "0.10.122",
+      [
+        {
+          repo: "burin-labs/consumer",
+          state: "proven",
+          reason: "pin current",
+          default_branch_pin: "0.10.122",
+        },
+      ],
+      "2026-08-30T03:20:00Z",
+      {
+        pin_changed_at: "2026-08-30T03:03:00Z",
+        deadline_at: "2026-08-30T03:33:00Z",
+        observed_at: "2026-08-30T03:20:00Z",
+        proof_started_at: "2026-08-30T03:04:00Z",
+        proof_run_id: 99,
+      },
+    ),
+    [],
+  )
+  assert_eq(timely.action, "record_stage")
+  assert_eq(timely.stage_receipt?.status, "proven")
+}
+
+pipeline test_closed_repair_policy_has_no_default_retry(task: any) {
+  const known = release_chain_repair_decision(
+    "chain",
+    1,
+    "pre_tag_checkpoint",
+    "unfolded_fragments",
+    "fragment",
+    1,
+    "v0.10.122",
+  )
+  const unknown = release_chain_repair_decision(
+    "chain",
+    1,
+    "preflight",
+    "unknown",
+    "source",
+    1,
+    "v0.10.122",
+  )
+  assert_eq(known.action, "plan_effect")
+  assert_eq(unknown.action, "escalate")
+  assert_eq(unknown.effect, nil)
+}
+
+pipeline test_resume_observes_recovered_effect_before_planning_duplicate(task: any) {
+  const receipt = advance_to("converge")
+  const recovered = release_chain_reduce(
+    receipt,
+    release_chain_observe_converge(
+      "0.10.122",
+      [
+        {
+          repo: "burin-labs/consumer",
+          state: "proven",
+          reason: "read-back current",
+          default_branch_pin: "0.10.122",
+        },
+      ],
+      NOW,
+    ),
+    [],
+  )
+  assert_eq(recovered.action, "record_stage")
+  assert_eq(recovered.repairs, [])
+}
