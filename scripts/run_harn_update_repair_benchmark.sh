@@ -25,7 +25,6 @@ benchmark_head=$(git -C "$benchmark_dir" rev-parse HEAD)
 
 cd "$repo_root"
 "$repo_root/scripts/with_env.sh" "$repo_root/.harn/bin/harn" run \
-  --no-sandbox \
   --write-root "$benchmark_dir" \
   benchmark_harn_update_repair.harn -- \
   --repository-dir "$benchmark_dir" \
