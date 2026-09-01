@@ -11,6 +11,15 @@ case "$route" in
 esac
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+toolchain_version=$(rustup run 1.95.0 rustc --version)
+case "$toolchain_version" in
+  "rustc 1.95.0 "*) ;;
+  *)
+    echo "benchmark requires Rust 1.95.0; observed: $toolchain_version" >&2
+    exit 1
+    ;;
+esac
+
 benchmark_dir=$(mktemp -d /private/tmp/harn-update-repair-benchmark.XXXXXX)
 cleanup() {
   rm -rf -- "$benchmark_dir"

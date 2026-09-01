@@ -11,8 +11,10 @@ that exact directory as a writable process root, and removes it at exit. The
 harness requires the exact clean commit. Its synthetic repository name is not
 owned by the GitHub App, so the canonical publisher refuses after local
 validation. This proves the agent and validator path without creating a pull
-request. The fixture carries its own Rust 1.95 toolchain pin, so the host's
-ambient compiler cannot change the benchmark.
+request. The fixture carries its own Rust 1.95 toolchain pin and the validator
+invokes that toolchain explicitly, so a package-manager compiler earlier on
+`PATH` cannot change the benchmark. The runner verifies that exact compiler
+before creating the fixture or spending model tokens.
 
 Run one route with the ordinary credential loader:
 
