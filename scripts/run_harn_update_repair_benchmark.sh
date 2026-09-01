@@ -19,6 +19,14 @@ case "$toolchain_version" in
     exit 1
     ;;
 esac
+clippy_version=$(rustup run 1.95.0 cargo-clippy -V)
+case "$clippy_version" in
+  "clippy 0.1.95 "*) ;;
+  *)
+    echo "benchmark requires Clippy 0.1.95; observed: $clippy_version" >&2
+    exit 1
+    ;;
+esac
 
 benchmark_dir=$(mktemp -d /private/tmp/harn-update-repair-benchmark.XXXXXX)
 cleanup() {
