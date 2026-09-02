@@ -1,0 +1,471 @@
+import { github_pr_checks, github_pr_view } from "./github"
+import { operator_pr_patrol_classify } from "./operator_pr_patrol"
+
+/**
+ * Admission: the decision to merge one green pull request at an exact head.
+ *
+ * This is the repo-owned replacement for a shell script that lived in fleet
+ * control's session scratchpad. Every guard below exists because GitHub's API
+ * reported something that read as success when it was not one, so each guard
+ * names the misread it prevents rather than the state it checks.
+ *
+ * The decision is pure. Reading GitHub and merging are separate functions, so
+ * a test can falsify the decision without a network and can prove that a
+ * dry run issues no merge.
+ */
+pub type AdmissionDecision = "admit" | "hold" | "measured_nothing" | "head_mismatch"
+
+/** How the merge is issued once the decision is `admit`. */
+pub type AdmissionMethod = "none" | "squash_head_match" | "rest_exact_head"
+
+pub type AdmissionCheck = {name: string, pending: bool, bad: bool, state: string}
+
+pub type AdmissionChecksSummary = {
+  total: int,
+  pending: int,
+  bad_names: list<string>,
+  pending_names: list<string>,
+  rows: list<AdmissionCheck>,
+}
+
+pub type AdmissionVerdict = {
+  repo: string,
+  pr_number: int?,
+  head_sha: string,
+  requested_head: string,
+  decision: AdmissionDecision,
+  reason: string,
+  method: AdmissionMethod,
+  required_check: string,
+  required_check_state: string,
+  total_checks: int,
+  pending_checks: int,
+  bad_checks: list<string>,
+  mergeable_state: string,
+  draft: bool,
+  auto_merge_armed: bool,
+  detail: string,
+}
+
+pub type AdmissionReceipt = {
+  verdict: AdmissionVerdict,
+  dry_run: bool,
+  merged: bool,
+  attempted_method: AdmissionMethod,
+  detail: string,
+}
+
+/** A merge attempt's observable outcome, independent of how it was issued. */
+pub type AdmissionMergeOutcome = {merged: bool, detail: string, policy_prohibited: bool}
+
+const REQUIRED_CHECK_DEFAULT = "CI status"
+
+/**
+ * Conclusions GitHub reports for a check that finished badly.
+ *
+ * `SKIPPED` and `NEUTRAL` are deliberately absent: a fleet pull request
+ * routinely carries thirty or more intentional skips, and counting one as bad
+ * would hold every admission forever.
+ */
+const BAD_CONCLUSIONS = ["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"]
+
+/** Commit-status states that mean the same thing as a failing check run. */
+const BAD_STATES = ["FAILURE", "ERROR"]
+
+fn upper(value: any) -> string {
+  return uppercase(trim(to_string(value ?? "")))
+}
+
+/** True only for a full, lowercase-normalized 40-character Git object id. */
+pub fn is_exact_head(oid: any) -> bool {
+  return regex_match("^[0-9a-fA-F]{40}$", trim(to_string(oid ?? ""))) != nil
+}
+
+/**
+ * Reduce a check rollup to one row per check name, keeping the last one.
+ *
+ * A respawned workflow run does not replace its predecessor's row. GitHub
+ * returns both, so the same check name appears twice: a stale FAILURE beside a
+ * fresh SUCCESS. Reading every row treats a rerun repository as permanently
+ * red; reading only the last row per name is what the rollup actually means.
+ * A bypass label respawns runs the same way, so this is not a rare shape.
+ */
+pub fn latest_check_per_name(rows: list?) -> list {
+  let order = []
+  let latest = {}
+  for row in rows ?? [] {
+    const name = to_string(row?.name ?? "")
+    if !latest.has(name) {
+      order = order + [name]
+    }
+    latest[name] = row
+  }
+  let reduced = []
+  for name in order {
+    reduced = reduced + [latest[name]]
+  }
+  return reduced
+}
+
+/** Classify one rollup row into the two bits an admission cares about. */
+pub fn admission_check_row(row: any) -> AdmissionCheck {
+  const typename = to_string(row?.__typename ?? row?.typename ?? "")
+  const status = upper(row?.status)
+  const conclusion = upper(row?.conclusion)
+  const state = upper(row?.state)
+  const is_check_run = typename == "CheckRun" || (status != "" && state == "")
+  const pending = (is_check_run && status != "" && status != "COMPLETED") || state == "PENDING"
+  const bad = BAD_CONCLUSIONS.contains(conclusion) || BAD_STATES.contains(state)
+  return {
+    name: to_string(row?.name ?? ""),
+    pending: pending,
+    bad: bad,
+    state: if conclusion != "" {
+      conclusion
+    } else if state != "" {
+      state
+    } else if status != "" {
+      status
+    } else {
+      "MISSING"
+    },
+  }
+}
+
+/** Summarize a rollup after latest-per-name reduction. */
+pub fn admission_checks_summary(rows: list?) -> AdmissionChecksSummary {
+  const reduced = latest_check_per_name(rows)
+  let classified = []
+  let bad_names = []
+  let pending_names = []
+  for row in reduced {
+    const check = admission_check_row(row)
+    classified = classified + [check]
+    if check.bad {
+      bad_names = bad_names + [check.name]
+    }
+    if check.pending {
+      pending_names = pending_names + [check.name]
+    }
+  }
+  return {
+    total: len(classified),
+    pending: len(pending_names),
+    bad_names: bad_names.sort(),
+    pending_names: pending_names.sort(),
+    rows: classified,
+  }
+}
+
+/**
+ * The required check's own state, looked up by exact name.
+ *
+ * `gh pr checks --required` lists only checks that reported. A required check
+ * that never started is simply absent from that output, so a pull request
+ * missing its aggregate gate reads as "all required checks passed". Looking the
+ * name up directly turns that absence into `MISSING`, which holds.
+ */
+pub fn required_check_state(rows: list?, required: string) -> string {
+  const summary = admission_checks_summary(rows)
+  for row in summary.rows {
+    if row.name == required {
+      return row.state
+    }
+  }
+  return "MISSING"
+}
+
+fn hold(base: AdmissionVerdict, reason: string, detail: string) -> AdmissionVerdict {
+  return base + {decision: "hold", reason: reason, method: "none", detail: detail}
+}
+
+/**
+ * Decide whether one observed pull request may be admitted.
+ *
+ * `requested_head` is the head the caller observed green. Passing it empty
+ * accepts whatever head the read returned, which is only safe for a dry run.
+ */
+pub fn admit_green_decide(
+  repo: string,
+  pr: any,
+  rollup: list?,
+  required: string = REQUIRED_CHECK_DEFAULT,
+  requested_head: string = "",
+) -> AdmissionVerdict {
+  const patrol = operator_pr_patrol_classify(
+    repo,
+    pr,
+    {state: "unknown", failing_checks: [], pending_checks: []},
+  )
+  const summary = admission_checks_summary(rollup)
+  const head = trim(to_string(pr?.head?.sha ?? pr?.head_oid ?? ""))
+  const mergeable = upper(pr?.mergeable_state ?? pr?.mergeable ?? "UNKNOWN")
+  const draft = pr?.draft ?? false
+  const req_state = required_check_state(rollup, required)
+  const base: AdmissionVerdict = {
+    repo: repo,
+    pr_number: patrol.pr_number,
+    head_sha: head,
+    requested_head: trim(requested_head),
+    decision: "hold",
+    reason: "unclassified",
+    method: "none",
+    required_check: required,
+    required_check_state: req_state,
+    total_checks: summary.total,
+    pending_checks: summary.pending,
+    bad_checks: summary.bad_names,
+    mergeable_state: mergeable,
+    draft: draft,
+    auto_merge_armed: patrol.auto_merge_armed,
+    detail: "",
+  }
+  // Absence first. A rollup with no rows, or a pull request with no head, is a
+  // failed read wearing the shape of a clean result: zero pending and zero bad
+  // are exactly what a green pull request reports. Nothing downstream can tell
+  // the two apart, so a measured nothing must never reach the merge branch.
+  if summary.total == 0 || !is_exact_head(head) {
+    return base
+      + {
+        decision: "measured_nothing",
+        reason: "measured_nothing",
+        method: "none",
+        detail:
+          "read returned ${summary.total} checks and head '${head}'; this is an unread pull request, not a green one",
+      }
+  }
+  // The merge is pinned to the head that was observed green. A push landing
+  // between the read and the merge would otherwise be admitted on evidence
+  // gathered about a different commit.
+  if base.requested_head != "" && lowercase(base.requested_head) != lowercase(head) {
+    return base
+      + {
+        decision: "head_mismatch",
+        reason: "head_moved",
+        method: "none",
+        detail: "requested ${base.requested_head} but the pull request head is ${head}",
+      }
+  }
+  if req_state != "SUCCESS" {
+    return hold(base, "required_check_not_success", "required check '${required}' is ${req_state}")
+  }
+  if draft {
+    return hold(base, "draft_pull_request", "pull request is a draft")
+  }
+  if len(summary.bad_names) > 0 {
+    return hold(base, "checks_failing", "failing checks: " + join(summary.bad_names, ", "))
+  }
+  if summary.pending > 0 {
+    return hold(
+      base,
+      "checks_pending",
+      "${summary.pending} pending: " + join(summary.pending_names, ", "),
+    )
+  }
+  if mergeable == "MERGEABLE" || mergeable == "CLEAN" {
+    return base
+      + {
+        decision: "admit",
+        reason: "green_at_exact_head",
+        method: "squash_head_match",
+        detail: "${summary.total} checks, 0 pending, 0 bad, mergeable at ${head}",
+      }
+  }
+  // GitHub computes mergeability asynchronously and serves a cached UNKNOWN for
+  // many minutes on a pull request that is genuinely mergeable. The REST merge
+  // re-evaluates server-side and refuses if it is not, so attempting it with
+  // the exact head is safe: GitHub, not this tool, makes the final call.
+  if mergeable == "UNKNOWN" {
+    return base
+      + {
+        decision: "admit",
+        reason: "green_at_exact_head_mergeability_unknown",
+        method: "rest_exact_head",
+        detail:
+          "${summary.total} checks, 0 pending, 0 bad; GitHub mergeability still UNKNOWN, REST re-evaluates at ${head}",
+      }
+  }
+  return hold(base, "mergeable_state", "mergeable state is ${mergeable}")
+}
+
+/** Read one pull request and its rollup, then decide. */
+pub fn admit_green_observe(
+  harness: Harness,
+  repo: string,
+  pr_ref: int | string,
+  required: string = REQUIRED_CHECK_DEFAULT,
+  requested_head: string = "",
+) -> AdmissionVerdict {
+  const pr = github_pr_view(harness, repo, pr_ref)
+  if is_err(pr) {
+    return admit_green_decide(repo, nil, [], required, requested_head)
+      + {reason: "pull_request_probe_failed", detail: to_string(unwrap_err(pr)?.message ?? "")}
+  }
+  const observed = unwrap(pr)
+  const checks = github_pr_checks(harness, repo, pr_ref)
+  if is_err(checks) {
+    return admit_green_decide(repo, observed, [], required, requested_head)
+      + {reason: "checks_probe_failed", detail: to_string(unwrap_err(checks)?.message ?? "")}
+  }
+  return admit_green_decide(repo, observed, unwrap(checks)?.checks ?? [], required, requested_head)
+}
+
+/** Issue the squash merge pinned to the exact head, through the `gh` adapter. */
+pub fn admission_merge_via_gh(
+  process: HarnessProcess,
+  repo: string,
+  pr_number: int,
+  head: string,
+) -> AdmissionMergeOutcome {
+  const result = process.run(
+    {
+      program: "gh",
+      args: [
+        "pr",
+        "merge",
+        to_string(pr_number),
+        "-R",
+        repo,
+        "--squash",
+        "--match-head-commit",
+        head,
+      ],
+    },
+  )
+  const detail = trim(result.stderr + result.stdout)
+  return {
+    merged: result.success,
+    detail: detail,
+    policy_prohibited: contains(lowercase(detail), "base branch policy prohibits"),
+  }
+}
+
+/** Issue the same squash merge through the REST endpoint, pinned to the head. */
+pub fn admission_merge_via_rest(
+  process: HarnessProcess,
+  repo: string,
+  pr_number: int,
+  head: string,
+) -> AdmissionMergeOutcome {
+  const result = process.run(
+    {
+      program: "gh",
+      args: [
+        "api",
+        "-X",
+        "PUT",
+        "repos/${repo}/pulls/${pr_number}/merge",
+        "-f",
+        "merge_method=squash",
+        "-f",
+        "sha=${head}",
+      ],
+    },
+  )
+  const detail = trim(result.stdout + result.stderr)
+  return {
+    merged: result.success && contains(detail, "\"merged\":true"),
+    detail: detail,
+    policy_prohibited: false,
+  }
+}
+
+/**
+ * Apply a verdict.
+ *
+ * `merge` and `rest_merge` are parameters so a test can prove that a dry run
+ * calls neither, and that a `hold` calls neither, without reaching GitHub.
+ */
+pub fn admit_green_apply(
+  verdict: AdmissionVerdict,
+  dry_run: bool,
+  merge: fn(int, string) -> AdmissionMergeOutcome,
+  rest_merge: fn(int, string) -> AdmissionMergeOutcome,
+) -> AdmissionReceipt {
+  if verdict.decision != "admit" {
+    return {
+      verdict: verdict,
+      dry_run: dry_run,
+      merged: false,
+      attempted_method: "none",
+      detail: verdict.detail,
+    }
+  }
+  if dry_run {
+    return {
+      verdict: verdict,
+      dry_run: true,
+      merged: false,
+      attempted_method: "none",
+      detail: "dry run: would merge via ${verdict.method} at ${verdict.head_sha}",
+    }
+  }
+  const number = verdict.pr_number ?? 0
+  if number <= 0 || !is_exact_head(verdict.head_sha) {
+    return {
+      verdict: verdict,
+      dry_run: false,
+      merged: false,
+      attempted_method: "none",
+      detail: "refusing to merge without a pull request number and an exact head",
+    }
+  }
+  if verdict.method == "rest_exact_head" {
+    const rest = rest_merge(number, verdict.head_sha)
+    return {
+      verdict: verdict,
+      dry_run: false,
+      merged: rest.merged,
+      attempted_method: "rest_exact_head",
+      detail: rest.detail,
+    }
+  }
+  const first = merge(number, verdict.head_sha)
+  if first.merged {
+    return {
+      verdict: verdict,
+      dry_run: false,
+      merged: true,
+      attempted_method: "squash_head_match",
+      detail: first.detail,
+    }
+  }
+  // `gh pr merge` refuses outright on a repository whose branch protection it
+  // cannot express, saying the base branch policy prohibits the merge. The REST
+  // endpoint accepts the same operation. Only that exact refusal falls through;
+  // any other failure is a real refusal and stands.
+  if !first.policy_prohibited {
+    return {
+      verdict: verdict,
+      dry_run: false,
+      merged: false,
+      attempted_method: "squash_head_match",
+      detail: first.detail,
+    }
+  }
+  const rest = rest_merge(number, verdict.head_sha)
+  return {
+    verdict: verdict,
+    dry_run: false,
+    merged: rest.merged,
+    attempted_method: "rest_exact_head",
+    detail: "gh refused (base branch policy prohibits); REST: " + rest.detail,
+  }
+}
+
+/** One line per pull request, in the shape a board admission line expects. */
+pub fn admission_receipt_line(receipt: AdmissionReceipt) -> string {
+  const v = receipt.verdict
+  const outcome = if receipt.merged {
+    "MERGED via ${receipt.attempted_method}"
+  } else if receipt.dry_run && v.decision == "admit" {
+    "DRY-RUN would-admit via ${v.method}"
+  } else if v.decision == "admit" {
+    "MERGE-FAILED"
+  } else {
+    uppercase(v.decision)
+  }
+  return "${v.repo}#${v.pr_number} ${outcome} head=${v.head_sha} required[${v.required_check}]=${v.required_check_state} checks=${v.total_checks} pending=${v.pending_checks} bad=["
+    + join(v.bad_checks, ",")
+    + "] ${v.reason}: ${v.detail}"
+}
