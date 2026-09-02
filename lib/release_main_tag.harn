@@ -9,9 +9,36 @@ import {
   release_watch_receipt_write,
 } from "./release_watch_state"
 
-pub type ReleaseMainTagAction = "wait" | "rearm" | "tag" | "reuse" | "abort"
+pub type ReleaseMainTagAction = "wait" | "rearm" | "tag" | "reuse" | "abort" | "certification_drift"
 
-pub type ReleaseMainTagDecision = {action: ReleaseMainTagAction, reason: string, merge_sha: string}
+pub type ReleaseMainTagDecision = {
+  action: ReleaseMainTagAction,
+  reason: string,
+  merge_sha: string,
+  drifted_paths: list<string>,
+}
+
+/**
+ * What the certified candidate and the merged main commit each point at.
+ *
+ * The public tag is minted on the release pull request's merge commit into
+ * main, not on the frozen source the release certified. When main moves between
+ * certification and that merge, the tag names a tree nobody certified, and
+ * publication reads the tag tree, so the uncertified commits ship inside the
+ * version. Observed on v0.10.126: the candidate froze at e125cffb, two pull
+ * requests landed on main before the release merged, and the tag's tree
+ * diverged from the candidate's across 68 files.
+ *
+ * `drifted_paths` exists so the refusal can name what moved instead of asking
+ * an operator to go and diff two commits.
+ */
+pub type ReleaseCertificationTrees = {
+  candidate_commit: string,
+  candidate_tree: string,
+  merged_commit: string,
+  merged_tree: string,
+  drifted_paths: list<string>,
+}
 
 pub type ReleaseMainTagPullRequest = {
   number: int,
@@ -28,6 +55,12 @@ pub type ReleaseMainTagPullRequest = {
 pub type ReleaseMainTagAdapter = {
   pull_request: fn(int) -> ReleaseMainTagPullRequest?,
   remote_tag_target: fn(int) -> string,
+  /**
+   * Resolve the certified candidate's tree and the merged main commit's tree.
+   * Required, not optional: an absent prober would let the drift gate pass by
+   * not running.
+   */
+  certification_trees: fn(string) -> ReleaseCertificationTrees?,
   rearm: fn(ReleaseMainTagPullRequest) -> bool,
   merged_main_ancestor: fn(string) -> bool,
   push_tag: fn(string) -> list<dict>,
@@ -47,8 +80,38 @@ fn main_tag_decision(
   action: ReleaseMainTagAction,
   reason: string,
   merge_sha: string = "",
+  drifted_paths: list<string> = [],
 ) -> ReleaseMainTagDecision {
-  return {action: action, reason: reason, merge_sha: merge_sha}
+  return {action: action, reason: reason, merge_sha: merge_sha, drifted_paths: drifted_paths}
+}
+
+fn tree_oid(value: string?) -> string {
+  return lowercase(trim(to_string(value ?? "")))
+}
+
+/**
+ * Report whether the merged main commit carries the tree the release certified.
+ *
+ * Both tree OIDs must be present. An unresolved tree is not agreement: two
+ * empty strings compare equal, which is exactly how a probe that answered
+ * nothing would read as a clean release.
+ */
+pub fn release_certification_trees_agree(trees: ReleaseCertificationTrees) -> bool {
+  const candidate = tree_oid(trees.candidate_tree)
+  const merged = tree_oid(trees.merged_tree)
+  return candidate != "" && merged != "" && candidate == merged
+}
+
+fn drift_reason(trees: ReleaseCertificationTrees) -> string {
+  const named = if len(trees.drifted_paths) == 0 {
+    "no paths reported"
+  } else {
+    trees.drifted_paths.join(", ")
+  }
+  return "main moved since certification; re-dispatch at ${tree_oid(trees.merged_commit)}"
+    + ". The release certified ${tree_oid(trees.candidate_commit)} (tree ${tree_oid(trees.candidate_tree)})"
+    + " but the merged main commit carries tree ${tree_oid(trees.merged_tree)}."
+    + " Drifted paths: ${named}"
 }
 
 fn exact_commit(value: string?) {
@@ -64,6 +127,7 @@ pub fn release_main_tag_decision(
   receipt: ReleaseWatchReceipt,
   pull_request: ReleaseMainTagPullRequest?,
   remote_tag_target_sha: string,
+  certification_trees: fn(string) -> ReleaseCertificationTrees?,
 ) -> ReleaseMainTagDecision {
   const remote_target = lowercase(trim(remote_tag_target_sha))
   if remote_target != "" && !exact_commit(remote_target) {
@@ -117,6 +181,26 @@ pub fn release_main_tag_decision(
       merge_sha,
     )
   }
+  // The tag is about to name a main commit, not the frozen source. Prove that
+  // commit still carries the tree this release certified before minting an
+  // immutable public tag over it. The probe is a parameter rather than a later
+  // step so no caller can reach a "tag" verdict without having run it.
+  const trees = certification_trees(merge_sha)
+  if trees == nil {
+    return main_tag_decision(
+      "abort",
+      "could not prove the merged main commit ${merge_sha} carries the certified tree; refusing to mint ${receipt.tag} without that proof",
+      merge_sha,
+    )
+  }
+  if !release_certification_trees_agree(trees) {
+    return main_tag_decision(
+      "certification_drift",
+      drift_reason(trees),
+      merge_sha,
+      trees.drifted_paths,
+    )
+  }
   if remote_target == "" {
     return main_tag_decision("tag", "release PR merged; mint the tag on its main commit", merge_sha)
   }
@@ -167,6 +251,50 @@ fn default_release_main_tag_adapter(
       }
       return true
     },
+    certification_trees: fn(merge_sha) {
+      const candidate = lowercase(trim(receipt.publication.head_oid))
+      const merged = lowercase(trim(merge_sha))
+      if candidate == "" || merged == "" {
+        return nil
+      }
+      const fetched = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["fetch", "origin", "--quiet", "main"],
+      )
+      if !fetched.success {
+        return nil
+      }
+      const candidate_tree = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["rev-parse", "--verify", "${candidate}^{tree}"],
+      )
+      const merged_tree = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["rev-parse", "--verify", "${merged}^{tree}"],
+      )
+      if !candidate_tree.success || !merged_tree.success {
+        return nil
+      }
+      const diffed = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["diff", "--name-only", candidate, merged],
+      )
+      if !diffed.success {
+        return nil
+      }
+      const paths = split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
+      return {
+        candidate_commit: candidate,
+        candidate_tree: trim(candidate_tree.stdout),
+        merged_commit: merged,
+        merged_tree: trim(merged_tree.stdout),
+        drifted_paths: paths,
+      }
+    },
     merged_main_ancestor: fn(merge_sha) {
       const fetched = run_git(
         {env: harness.env, process: harness.process},
@@ -212,8 +340,9 @@ pub fn run_release_main_tag(
       receipt,
       pull_request,
       adapter.remote_tag_target(poll),
+      adapter.certification_trees,
     )
-    if decision.action == "abort" {
+    if decision.action == "abort" || decision.action == "certification_drift" {
       return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
     }
     if decision.action == "rearm" {
@@ -286,6 +415,15 @@ pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMai
       head: {ref: receipt.publication.remote_ref, sha: receipt.publication.head_oid},
     } },
     remote_tag_target: fn(_poll) { return "" },
+    // The mock release never advances main, so the certified tree and the
+    // merged tree are the same tree.
+    certification_trees: fn(sha) { return {
+      candidate_commit: receipt.publication.head_oid,
+      candidate_tree: "cccccccccccccccccccccccccccccccccccccccc",
+      merged_commit: sha,
+      merged_tree: "cccccccccccccccccccccccccccccccccccccccc",
+      drifted_paths: [],
+    } },
     rearm: fn(_pr) { return true },
     merged_main_ancestor: fn(sha) { return sha == merge_sha },
     push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
