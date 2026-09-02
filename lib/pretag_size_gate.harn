@@ -54,6 +54,7 @@ pub type PreTagSizeGateStartedEvent = {
   expected_source_sha: string,
   target_job: string,
   required_source_step: string,
+  required_fuse_step: string,
   required_size_step: string,
   benchmark_only: bool,
   runner_profile: string,
@@ -76,13 +77,117 @@ pub type PreTagSizeGateDispatchResult = PreTagSizeGateDispatch \
 
 pub type PreTagRunViewResult = PreTagRunView | Result<PreTagRunView, PreTagSizeGateError>
 
+pub type PreTagExistingRunResult = PreTagBinaryGateRun \
+  | nil \
+  | Result<PreTagBinaryGateRun?, PreTagSizeGateError>
+
 pub type PreTagSizeGateAdapter = {
   dispatch: fn(PreTagBinaryGateConfig) -> PreTagSizeGateDispatchResult,
   view_run: fn(int) -> PreTagRunViewResult,
   wait: fn(int) -> nil,
+  // Optional. When present, it answers "has this exact source already been
+  // measured?" before anything is dispatched. A lookup that cannot answer must
+  // return Ok(nil) or an Err, never a fabricated absence: reading "no prior
+  // run" out of a failed lookup would turn every provider hiccup into a
+  // repeated forty-minute build, which is the cost this exists to avoid.
+  find_existing?: fn(PreTagBinaryGateConfig) -> PreTagExistingRunResult,
 }
 
 pub type PreTagSizeGateStartedHandler = fn(PreTagSizeGateStartedEvent) -> nil
+
+pub type PreTagSizeReuseAction = "reuse" | "dispatch" | "refuse"
+
+pub type PreTagSizeReuseDecision = {
+  action: PreTagSizeReuseAction,
+  reason: string,
+  run_id: int,
+  run_url: string,
+}
+
+/**
+ * Decide what to do about a run that already measured this exact source.
+ *
+ * The gate dispatches a ~40-minute Linux build. Twice on the v0.10.126 cut it
+ * dispatched that build for a commit an earlier attempt had already measured,
+ * and the second dispatch re-derived the same arithmetic from the same bytes
+ * and refused again. Both halves of that are addressed here, and they are the
+ * same question asked once:
+ *
+ * - A terminal-green run for this source under this exact policy is proof. Take
+ *   it and skip the build.
+ * - A terminal-failed run for this source under this exact policy is also
+ *   proof, of the other verdict. Re-dispatching cannot change it, so refuse
+ *   with the reason instead of spending the build to be told again.
+ * - An in-flight run is neither yet; adopt it and wait rather than starting a
+ *   second one beside it.
+ * - Anything measured under a DIFFERENT policy SHA says nothing about this
+ *   release. The policy binding is the point of the gate, so that is a
+ *   dispatch, not a reuse.
+ * - A cancelled, stale, or startup-failed run never judged the code at all.
+ */
+pub fn pre_tag_size_reuse_decision(
+  config: PreTagBinaryGateConfig,
+  existing: PreTagBinaryGateRun?,
+) -> PreTagSizeReuseDecision {
+  if existing == nil {
+    return {
+      action: "dispatch",
+      reason: "no prior run measured ${config.expected_source_sha}",
+      run_id: 0,
+      run_url: "",
+    }
+  }
+  const run_id = existing.id
+  const run_url = existing.url
+  if existing.event != config.event || existing.head_branch != config.policy_ref
+    || lowercase(existing.head_sha)
+      != lowercase(config.expected_policy_sha) {
+    return {
+      action: "dispatch",
+      reason:
+        "run ${run_id} measured ${config.expected_source_sha} under a different policy identity (${existing.event} on ${existing.head_branch} at ${existing.head_sha}); this release requires ${config.event} on ${config.policy_ref} at ${config.expected_policy_sha}",
+      run_id: run_id,
+      run_url: run_url,
+    }
+  }
+  if existing.status != "completed" {
+    return {
+      action: "reuse",
+      reason:
+        "run ${run_id} is already ${existing.status} for ${config.expected_source_sha} under this exact policy; adopting it instead of starting a second build",
+      run_id: run_id,
+      run_url: run_url,
+    }
+  }
+  const conclusion = lowercase(trim(existing.conclusion ?? ""))
+  if conclusion == "success" {
+    return {
+      action: "reuse",
+      reason:
+        "run ${run_id} already measured ${config.expected_source_sha} under this exact policy and succeeded",
+      run_id: run_id,
+      run_url: run_url,
+    }
+  }
+  // A run that never judged the code says nothing about it. Everything else
+  // did judge it, and judged it the same way the next build would.
+  if ["cancelled", "stale", "startup_failure"].contains(conclusion) {
+    return {
+      action: "dispatch",
+      reason:
+        "run ${run_id} for ${config.expected_source_sha} concluded ${conclusion} without judging the source",
+      run_id: run_id,
+      run_url: run_url,
+    }
+  }
+  return {
+    action: "refuse",
+    reason:
+      "run ${run_id} already measured ${config.expected_source_sha} under policy ${config.policy_ref} at ${config.expected_policy_sha} and concluded ${conclusion}. That verdict is deterministic in the source and the policy, both of which are unchanged, so a second build would spend roughly forty minutes reproducing it. Fix the cause or move the policy; do not retry. ${run_url}",
+    run_id: run_id,
+    run_url: run_url,
+  }
+}
 
 fn gate_result(
   success: bool,
@@ -181,6 +286,7 @@ fn pre_tag_size_gate_started_event(config: PreTagBinaryGateConfig, dispatched: a
     expected_source_sha: config.expected_source_sha,
     target_job: config.target_job,
     required_source_step: config.required_source_step,
+    required_fuse_step: config.required_fuse_step,
     required_size_step: config.required_size_step,
     benchmark_only: config.benchmark_only,
     runner_profile: config.runner_profile,
@@ -200,6 +306,63 @@ fn pre_tag_size_gate_started_event(config: PreTagBinaryGateConfig, dispatched: a
 }
 
 /**
+ * Acquire the run this gate will judge: an existing one when the source was
+ * already measured under this exact policy, a refusal when that measurement
+ * already failed, and otherwise a fresh dispatch.
+ */
+fn acquire_pre_tag_size_run(
+  config: PreTagBinaryGateConfig,
+  adapter: PreTagSizeGateAdapter,
+) -> Result<PreTagSizeGateDispatch, PreTagSizeGateResult> {
+  if adapter.find_existing != nil {
+    const looked_up = adapter.find_existing(config)
+    if is_err(looked_up) {
+      return Err(
+        gate_result(
+          false,
+          "dispatch",
+          "could not determine whether ${config.expected_source_sha} was already measured: "
+            + to_string(unwrap_err(looked_up)),
+        ),
+      )
+    }
+    const existing = if is_ok(looked_up) {
+      unwrap(looked_up)
+    } else {
+      looked_up
+    }
+    const decision = pre_tag_size_reuse_decision(config, existing)
+    if decision.action == "refuse" {
+      return Err(gate_result(false, "dispatch", decision.reason, decision.run_id, decision.run_url))
+    }
+    if decision.action == "reuse" && existing != nil {
+      return Ok(
+        {
+          accepted: true,
+          run_id: existing.id,
+          url: existing.url,
+          event: existing.event,
+          head_branch: existing.head_branch,
+          head_sha: existing.head_sha,
+          reused: true,
+        },
+      )
+    }
+  }
+  const dispatched = adapter.dispatch(config)
+  if is_err(dispatched) {
+    return Err(gate_result(false, "dispatch", to_string(unwrap_err(dispatched))))
+  }
+  return Ok(
+    if is_ok(dispatched) {
+      unwrap(dispatched)
+    } else {
+      dispatched
+    },
+  )
+}
+
+/**
  * Execute the pre-tag gate against the exact workflow run identity returned by
  * dispatch. The adapter returns connector-owned typed records; no run-list
  * correlation, JSON parsing, or wall-clock discovery window is involved.
@@ -209,10 +372,11 @@ pub fn run_pre_tag_size_gate(
   adapter: PreTagSizeGateAdapter,
   on_started: PreTagSizeGateStartedHandler? = nil,
 ) -> PreTagSizeGateResult {
-  const dispatched = adapter.dispatch(config)
-  if is_err(dispatched) {
-    return gate_result(false, "dispatch", to_string(unwrap_err(dispatched)))
+  const acquired = acquire_pre_tag_size_run(config, adapter)
+  if is_err(acquired) {
+    return unwrap_err(acquired)
   }
+  const dispatched = unwrap(acquired)
   if on_started != nil {
     on_started(pre_tag_size_gate_started_event(config, dispatched))
   }
@@ -331,6 +495,7 @@ pub fn mock_pre_tag_size_gate_adapter(config: PreTagBinaryGateConfig) -> PreTagS
           conclusion: "success",
           steps: [
             {name: config.required_source_step, status: "completed", conclusion: "success"},
+            {name: config.required_fuse_step, status: "completed", conclusion: "success"},
             {name: config.required_size_step, status: "completed", conclusion: "success"},
           ],
         },
