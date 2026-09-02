@@ -271,6 +271,12 @@ carries a worked example.
 The same words are the `area/*` labels in `.github/labels.yml`, so a title and a
 label agree.
 
+Use `Closes #N` only when the pull request lands every enumerated sub-ask in
+that issue. A partial resolution uses `Partial: #N items: 1, 3` or `Refs #N`;
+adding an item suffix after `Closes #N` does not stop GitHub from closing the
+whole issue. Use `Single-ask: #N` only when the issue has no enumerated
+sub-asks and the pull request resolves it completely.
+
 <!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->
 
 ## Ecosystem working agreement
