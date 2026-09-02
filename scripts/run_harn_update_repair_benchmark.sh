@@ -28,7 +28,12 @@ case "$clippy_version" in
     ;;
 esac
 
-benchmark_dir=$(mktemp -d /private/tmp/harn-update-repair-benchmark.XXXXXX)
+benchmark_parent=${TMPDIR:-/tmp}
+if [[ ! -d "$benchmark_parent" ]]; then
+  echo "benchmark temporary directory does not exist: $benchmark_parent" >&2
+  exit 1
+fi
+benchmark_dir=$(mktemp -d "${benchmark_parent%/}/harn-update-repair-benchmark.XXXXXX")
 cleanup() {
   rm -rf -- "$benchmark_dir"
 }
@@ -37,8 +42,18 @@ trap cleanup EXIT
 cp -R "$repo_root/testdata/harn_update_repair/." "$benchmark_dir"
 git -C "$benchmark_dir" init -q
 git -C "$benchmark_dir" add .
-git -C "$benchmark_dir" commit -q -m fixture
+git -C "$benchmark_dir" \
+  -c user.name="Harn Repair Benchmark" \
+  -c user.email="harn-repair-benchmark@invalid.example" \
+  commit -q -m fixture
 benchmark_head=$(git -C "$benchmark_dir" rev-parse HEAD)
+
+if rustup run 1.95.0 cargo-clippy \
+  --manifest-path "$benchmark_dir/Cargo.toml" \
+  --locked --all-targets -- -D warnings >/dev/null 2>&1; then
+  echo "fixture unexpectedly passes before repair" >&2
+  exit 1
+fi
 
 cd "$repo_root"
 "$repo_root/scripts/with_env.sh" "$repo_root/.harn/bin/harn" run \
