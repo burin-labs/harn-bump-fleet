@@ -1,4 +1,4 @@
-import { run_pre_tag_size_gate } from "../lib/pretag_size_gate"
+import { pre_tag_size_reuse_decision, run_pre_tag_size_gate } from "../lib/pretag_size_gate"
 import { pre_tag_binary_size_gate_config } from "../lib/release_execution"
 import { PreTagBinaryGateConfig } from "../lib/workflow_runs"
 
@@ -43,6 +43,14 @@ fn run_view(
             },
             {
               number: 8,
+              name: "Check the distribution fuse",
+              status: "completed",
+              conclusion: step_conclusion,
+              started_at: "2026-07-13T10:08:30Z",
+              completed_at: "2026-07-13T10:08:35Z",
+            },
+            {
+              number: 9,
               name: "Evaluate the binary-size growth signal",
               status: "completed",
               conclusion: step_conclusion,
@@ -103,6 +111,7 @@ pipeline test_pre_tag_size_gate_green_from_virtual_snapshots(task: any) {
   assert_eq(started_events[0].target_job, "Build x86_64-unknown-linux-gnu")
   assert_eq(started_events[0].required_source_step, "Verify benchmark source revision")
   assert_eq(started_events[0].required_size_step, "Evaluate the binary-size growth signal")
+  assert_eq(started_events[0].required_fuse_step, "Check the distribution fuse")
   assert_eq(started_events[0].transient_view_retry_max_attempts, 3)
   assert_eq(started_events[0].transient_view_retry_base_ms, 1000)
   assert_eq(started_events[0].transient_view_retry_cap_ms, 5000)
@@ -129,6 +138,7 @@ pipeline test_pre_tag_size_gate_times_out_on_virtual_active_snapshots(task: any)
     expected_source_sha: base.expected_source_sha,
     target_job: base.target_job,
     required_source_step: base.required_source_step,
+    required_fuse_step: base.required_fuse_step,
     required_size_step: base.required_size_step,
     benchmark_only: base.benchmark_only,
     runner_profile: base.runner_profile,
@@ -376,6 +386,7 @@ pipeline test_pre_tag_size_gate_bounds_persistent_rate_limit_by_completion_timeo
     expected_source_sha: base.expected_source_sha,
     target_job: base.target_job,
     required_source_step: base.required_source_step,
+    required_fuse_step: base.required_fuse_step,
     required_size_step: base.required_size_step,
     benchmark_only: base.benchmark_only,
     runner_profile: base.runner_profile,
@@ -413,4 +424,146 @@ pipeline test_pre_tag_size_gate_bounds_persistent_rate_limit_by_completion_timeo
   assert_eq(result.view_attempts, 2)
   assert_eq(result.transient_view_retries, 2)
   assert_eq(result.completion_timeout_ms, 20)
+}
+
+/** Fixtures and coverage for reusing a measured run instead of rebuilding it. */
+fn existing_run(status: string, conclusion: string, head_sha: string = SHA) {
+  return {
+    id: 77,
+    event: "workflow_dispatch",
+    head_branch: "main",
+    head_sha: head_sha,
+    status: status,
+    conclusion: conclusion,
+    url: "https://github.test/run/77",
+  }
+}
+
+/**
+ * The gate must not rebuild a commit it already measured.
+ *
+ * The v0.10.126 cut dispatched the same ~40-minute Linux build twice for the
+ * same source under the same policy. The second one could not have reached a
+ * different verdict: the inputs were byte-identical.
+ */
+pipeline test_a_measured_source_is_reused_not_rebuilt(task: any) {
+  const config = pre_tag_binary_size_gate_config("main", SHA, "release/v1.2.3", SHA)
+  const green = pre_tag_size_reuse_decision(config, existing_run("completed", "success"))
+  assert_eq(green.action, "reuse")
+  assert_eq(green.run_id, 77)
+  assert(contains(green.reason, "already measured"))
+  // An in-flight run is adopted rather than raced with a second build.
+  const active = pre_tag_size_reuse_decision(config, existing_run("in_progress", ""))
+  assert_eq(active.action, "reuse")
+  assert(contains(active.reason, "instead of starting a second build"))
+  // Nothing measured it: dispatch, and say that is why.
+  const absent = pre_tag_size_reuse_decision(config, nil)
+  assert_eq(absent.action, "dispatch")
+  assert_eq(absent.run_id, 0)
+  assert(contains(absent.reason, "no prior run measured"))
+}
+
+/**
+ * A deterministic failure must fail fast, not re-run.
+ *
+ * Retrying a size verdict spends forty minutes reproducing arithmetic over
+ * unchanged bytes. The refusal has to carry the run so an operator can read the
+ * verdict rather than re-derive it.
+ */
+pipeline test_a_deterministic_failure_refuses_instead_of_retrying(task: any) {
+  const config = pre_tag_binary_size_gate_config("main", SHA, "release/v1.2.3", SHA)
+  const failed = pre_tag_size_reuse_decision(config, existing_run("completed", "failure"))
+  assert_eq(failed.action, "refuse")
+  assert_eq(failed.run_id, 77)
+  assert(contains(failed.reason, "do not retry"))
+  assert(contains(failed.reason, "https://github.test/run/77"))
+  const timed_out = pre_tag_size_reuse_decision(config, existing_run("completed", "timed_out"))
+  assert_eq(timed_out.action, "refuse")
+}
+
+/**
+ * A run that never judged the code says nothing about it, and a run judged
+ * under a different policy says nothing about THIS release. Both dispatch.
+ * The policy binding is the reason this gate exists, so reuse must never
+ * quietly cross it.
+ */
+pipeline test_inconclusive_and_foreign_policy_runs_are_not_proof(task: any) {
+  const config = pre_tag_binary_size_gate_config("main", SHA, "release/v1.2.3", SHA)
+  for conclusion in ["cancelled", "stale", "startup_failure"] {
+    const decision = pre_tag_size_reuse_decision(config, existing_run("completed", conclusion))
+    assert_eq(decision.action, "dispatch")
+    assert(contains(decision.reason, "without judging the source"))
+  }
+  const other_policy = pre_tag_size_reuse_decision(
+    config,
+    existing_run("completed", "success", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+  )
+  assert_eq(other_policy.action, "dispatch")
+  assert(contains(other_policy.reason, "different policy identity"))
+}
+
+/**
+ * A lookup that could not answer must not read as "nothing was measured".
+ * Reading absence out of a failed lookup turns every provider hiccup into a
+ * repeated forty-minute build, which is the cost this exists to avoid.
+ */
+pipeline test_a_failed_lookup_is_not_an_absent_run(task: any) {
+  let dispatches = 0
+  const result = run_pre_tag_size_gate(
+    pre_tag_binary_size_gate_config("main", SHA, "release/v1.2.3", SHA),
+    virtual_adapter(run_view("success"))
+      + {
+        find_existing: fn(_config) { return Err(
+          {code: "run_list_failed", message: "provider unavailable"},
+        ) },
+        dispatch: fn(_config) {
+          dispatches = dispatches + 1
+          return {
+            accepted: true,
+            run_id: 11,
+            url: "https://github.test/run/11",
+            event: "workflow_dispatch",
+            head_branch: "main",
+            head_sha: SHA,
+          }
+        },
+      },
+  )
+  assert_eq(result.success, false)
+  assert_eq(dispatches, 0)
+  assert(contains(result.message, "could not determine whether"))
+}
+
+/** End to end: a reusable green run passes the gate without any dispatch. */
+pipeline test_the_gate_passes_on_a_reused_run_without_dispatching(task: any) {
+  let dispatches = 0
+  let started_events = []
+  const terminal = run_view("success")
+  const result = run_pre_tag_size_gate(
+    pre_tag_binary_size_gate_config("main", SHA, "release/v1.2.3", SHA),
+    {
+      find_existing: fn(_config) { return {
+        id: 11,
+        event: "workflow_dispatch",
+        head_branch: "main",
+        head_sha: SHA,
+        status: "completed",
+        conclusion: "success",
+        url: "https://github.test/run/11",
+      } },
+      dispatch: fn(_config) {
+        dispatches = dispatches + 1
+        return Err({code: "should_not_dispatch", message: "the gate rebuilt a measured commit"})
+      },
+      view_run: fn(_run_id) { return {run: terminal, jobs: terminal.jobs ?? []} },
+      wait: fn(_interval_ms) {
+      },
+    },
+    { event -> started_events = started_events + [event] },
+  )
+  assert_eq(result.success, true)
+  assert_eq(dispatches, 0)
+  assert_eq(result.run_id, 11)
+  assert_eq(len(started_events), 1)
+  assert_eq(started_events[0].reused, true)
 }
