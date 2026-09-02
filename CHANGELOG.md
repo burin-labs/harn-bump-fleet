@@ -94,10 +94,10 @@
   have passed. This prevents duplicate local hooks from hanging a live release;
   GitHub CI, merge queue, and tag-triggered publish/build workflows remain the
   authoritative gates.
-- **Optional remote audit offload (tornadough), fail-open.** `--offload-audit`
+- **Optional remote audit offload, fail-open.** `--offload-audit`
   (or `HARN_RELEASE_OFFLOAD_AUDIT=1`) runs the ~548s `release_gate.sh audit` —
   the long pole that duplicates merge-queue CI — on a remote builder
-  (`--offload-host`, default tornadough) and passes the existing
+  selected with `--offload-host` and passes the existing
   `release_ship.sh --skip-audit` to the local prepare only when the remote run
   is definitively green. Every other outcome (host unreachable, ssh/transport
   failure, setup failure, or a red remote audit) falls back to the full local

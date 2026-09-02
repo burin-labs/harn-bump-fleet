@@ -121,9 +121,10 @@ verifies other byte-exact file projections, and verifies that each canonical
 reusable-workflow pin still publishes the same bytes as the owner's current
 default branch. A fleet whose consumers all agree on a stale canonical pin
 therefore fails closed instead of silently treating internal consistency as
-freshness. Custom package validation and runtime-bump refresh/validation
-commands remain named fields in the manifest; they do not create
-repository-local workflow templates or duplicate runtime bootstrap.
+freshness. Public repositories may retain custom package validation and
+runtime-bump commands as named fields. Private consumers instead own those
+details in `.harn/fleet-projections.toml`, so the public manifest carries no
+private path or command inventory.
 
 The same manifest owns each first-party connector's required secret ids and
 trust direction. `policy.connector_secret_schema` selects one generated

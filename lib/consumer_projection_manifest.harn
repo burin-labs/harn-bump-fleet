@@ -1,0 +1,269 @@
+import {
+  FleetFileProjection,
+  FleetManifest,
+  FleetRepository,
+  HarnPinSpec,
+  validate_repository_path,
+  validate_repository_slug,
+} from "./fleet_manifest"
+import { github_branch_head, github_connector_options, github_file_text_at_ref } from "./github"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+pub const CONSUMER_PROJECTION_MANIFEST_PATH: string = ".harn/fleet-projections.toml"
+
+/** One source-owned file whose destination is selected by the consumer. */
+pub type ConsumerFileProjection = {source_slug: string, source_path: string, target_path: string}
+
+/** Private runtime-update details interpreted only after the consumer publishes them. */
+pub type ConsumerBumpContract = {
+  refresh_command: string,
+  validate_command: string,
+  refresh_notes?: string,
+  node_version?: string,
+  allowed_new_files?: list<string>,
+}
+
+/** The fixed-path operational contract stored by one consuming repository. */
+pub type ConsumerProjectionManifest = {
+  schema_version: 1,
+  harn_pin: HarnPinSpec,
+  bump: ConsumerBumpContract,
+  file_projections: list<ConsumerFileProjection>,
+}
+
+pub type ParsedConsumerContract = {
+  repository: FleetRepository,
+  projections: list<FleetFileProjection>,
+}
+
+/** All consumer manifests resolved into the fleet's existing projection shape. */
+pub type ConsumerProjectionResolution = {
+  repositories: list<FleetRepository>,
+  projections: list<FleetFileProjection>,
+  errors: list<string>,
+  contract_refs: dict<string, string>,
+}
+
+/** Repositories that delegate destination discovery to their own manifest. */
+pub fn consumer_projection_repositories(manifest: FleetManifest) -> list<FleetRepository> {
+  return manifest.repositories.filter({ repo -> repo.consumer_owned_contract ?? false }).to_list()
+}
+
+/** Parse and validate one consumer-owned contract without trusting its target slug. */
+pub fn parse_consumer_contract_manifest(
+  fleet: FleetManifest,
+  consumer: FleetRepository,
+  text: string,
+) -> ParsedConsumerContract {
+  const raw = toml_parse(text)
+  if type_of(raw) != "dict"
+    || raw.keys().sort()
+      != ["bump", "file_projections", "harn_pin", "schema_version"] {
+    throw "consumer contract must contain only schema_version, harn_pin, bump, and file_projections"
+  }
+  if type_of(raw.get("harn_pin")) != "dict"
+    || !(raw.get("harn_pin") ?? {}).keys().all({ key -> ["kind", "path"].contains(key) }) {
+    throw "consumer harn_pin contains an unknown field"
+  }
+  if type_of(raw.get("bump")) != "dict"
+    || !(raw.get("bump") ?? {}).keys().all(
+      { key ->
+        [
+          "allowed_new_files",
+          "node_version",
+          "refresh_command",
+          "refresh_notes",
+          "validate_command",
+        ]
+          .contains(key)
+      },
+    ) {
+    throw "consumer bump contract contains an unknown field"
+  }
+  for projection in raw.get("file_projections") ?? [] {
+    if type_of(projection) != "dict"
+      || projection.keys().sort()
+        != ["source_path", "source_slug", "target_path"] {
+      throw "consumer file projection contains an unknown or missing field"
+    }
+  }
+  const decoded = schema_expect(raw, ConsumerProjectionManifest)
+  if decoded.harn_pin.kind == "auto" || trim(decoded.harn_pin.path ?? "") == "" {
+    throw "consumer harn_pin must name one explicit pin kind and path"
+  }
+  validate_repository_path(decoded.harn_pin.path ?? "")
+  if trim(decoded.bump.refresh_command) == "" || trim(decoded.bump.validate_command) == "" {
+    throw "consumer bump contract must name non-empty refresh and validation commands"
+  }
+  if decoded.bump.node_version != nil
+    && len(regex_captures("^[0-9]+$", trim(decoded.bump.node_version ?? "")))
+      == 0 {
+    throw "consumer bump node_version must be a major version"
+  }
+  for path in decoded.bump.allowed_new_files ?? [] {
+    validate_repository_path(path)
+  }
+  let declared = {}
+  for repo in fleet.repositories {
+    declared[repo.slug] = true
+  }
+  let targets = {}
+  let projections = []
+  for projection in decoded.file_projections {
+    validate_repository_slug(projection.source_slug)
+    validate_repository_path(projection.source_path)
+    validate_repository_path(projection.target_path)
+    if !(declared[projection.source_slug] ?? false) {
+      throw "consumer projection source '${projection.source_slug}' is not declared in fleet.toml"
+    }
+    if targets[projection.target_path] ?? false {
+      throw "consumer projection manifest repeats target '${projection.target_path}'"
+    }
+    if projection.source_slug == consumer.slug && projection.source_path == projection.target_path {
+      throw "consumer projection source and target must differ"
+    }
+    targets[projection.target_path] = true
+    projections = projections
+      + [
+        {
+          source_slug: projection.source_slug,
+          source_path: projection.source_path,
+          target_slug: consumer.slug,
+          target_path: projection.target_path,
+        },
+      ]
+  }
+  return {
+    repository: consumer
+      + {
+        harn_pin_kind: decoded.harn_pin.kind,
+        harn_pin_path: decoded.harn_pin.path,
+        bump_refresh_command: trim(decoded.bump.refresh_command),
+        bump_refresh_notes: decoded.bump.refresh_notes,
+        bump_validate_command: trim(decoded.bump.validate_command),
+        bump_node_version: decoded.bump.node_version,
+        bump_allowed_new_files: decoded.bump.allowed_new_files ?? [],
+      },
+    projections: projections,
+  }
+}
+
+/** Resolve every declared consumer manifest, reporting absence and invalid data explicitly. */
+pub fn resolve_consumer_projection_manifests(
+  fleet: FleetManifest,
+  texts: dict<string, string>,
+  consumers: list<FleetRepository> = consumer_projection_repositories(fleet),
+) -> ConsumerProjectionResolution {
+  let projections = []
+  let repositories = []
+  let errors = []
+  let targets = {}
+  for consumer in consumers {
+    const text = texts[consumer.slug]
+    if text == nil {
+      errors = errors
+        + ["${consumer.slug}:${CONSUMER_PROJECTION_MANIFEST_PATH}: manifest is missing"]
+      continue
+    }
+    try {
+      const resolved = parse_consumer_contract_manifest(fleet, consumer, to_string(text))
+      for projection in resolved.projections {
+        const key = projection.target_slug + ":" + projection.target_path
+        if targets[key] ?? false {
+          throw "duplicate fleet file projection target '${key}'"
+        }
+        targets[key] = true
+      }
+      projections = projections + resolved.projections
+      repositories = repositories + [resolved.repository]
+    } catch (error) {
+      errors = errors
+        + ["${consumer.slug}:${CONSUMER_PROJECTION_MANIFEST_PATH}: ${to_string(error)}"]
+    }
+  }
+  return {repositories: repositories, projections: projections, errors: errors, contract_refs: {}}
+}
+
+/** Read and resolve consumer manifests from one exact remote branch. */
+pub fn read_remote_consumer_projection_manifests(
+  harness: Harness,
+  fleet: FleetManifest,
+  branch: string,
+  consumers: list<FleetRepository> = consumer_projection_repositories(fleet),
+  options: GithubClientOptions = github_connector_options(),
+) -> ConsumerProjectionResolution {
+  let texts: dict<string, string> = {}
+  let contract_refs: dict<string, string> = {}
+  for consumer in consumers {
+    const head = github_branch_head(harness, consumer.slug, branch, options)
+    if is_err(head) {
+      throw "consumer contract branch lookup failed for ${consumer.slug}@${branch}: "
+        + to_string(unwrap_err(head))
+    }
+    const contract_ref = lowercase(trim(unwrap(head).oid))
+    if len(regex_captures("^[0-9a-f]{40}$", contract_ref)) == 0 {
+      throw "consumer contract branch lookup returned an invalid commit for ${consumer.slug}@${branch}"
+    }
+    const text = github_file_text_at_ref(
+      harness,
+      consumer.slug,
+      CONSUMER_PROJECTION_MANIFEST_PATH,
+      contract_ref,
+      options,
+    )
+    if text != nil {
+      texts[consumer.slug] = text ?? ""
+    }
+    contract_refs[consumer.slug] = contract_ref
+  }
+  return resolve_consumer_projection_manifests(fleet, texts, consumers)
+    + {contract_refs: contract_refs}
+}
+
+/** Overlay private runtime rows in memory without changing the public manifest file. */
+pub fn manifest_with_consumer_contracts(
+  fleet: FleetManifest,
+  resolved: ConsumerProjectionResolution,
+) -> FleetManifest {
+  if len(resolved.errors) > 0 {
+    throw "consumer contract resolution failed: " + resolved.errors.join("; ")
+  }
+  return fleet
+    + {
+      repositories: fleet.repositories.map(
+        { repo ->
+          const hydrated = resolved.repositories.find({ value -> value.slug == repo.slug })
+          return hydrated ?? repo
+        },
+      )
+        .to_list(),
+    }
+}
+
+/** Replace selected consumer rows with their private remote runtime contracts. */
+pub fn hydrate_remote_consumer_repositories(
+  harness: Harness,
+  fleet: FleetManifest,
+  repositories: list<FleetRepository>,
+  branch: string,
+) -> list<FleetRepository> {
+  const consumers = repositories.filter({ repo -> repo.consumer_owned_contract ?? false }).to_list()
+  if len(consumers) == 0 {
+    return repositories
+  }
+  const resolved = read_remote_consumer_projection_manifests(harness, fleet, branch, consumers)
+  const hydrated_manifest = manifest_with_consumer_contracts(fleet, resolved)
+  return repositories.map(
+    { repo ->
+      if !(repo.consumer_owned_contract ?? false) {
+        return repo
+      }
+      const hydrated = hydrated_manifest.repositories.find({ value -> value.slug == repo.slug })
+      if hydrated == nil {
+        throw "consumer contract resolution returned no repository for '${repo.slug}'"
+      }
+      return hydrated
+    },
+  )
+    .to_list()
+}
