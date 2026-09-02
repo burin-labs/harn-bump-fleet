@@ -41,6 +41,13 @@ runs. The wrapper verifies the repo-pinned runtime before Harn parses the
 program and loads the configured provider environment. Mock release runs can
 stay sandboxed.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It
+covers the pinned runtime setup, the two checks to run, the changelog fragment,
+and the `[Area] Sentence case description` title convention. `AGENTS.md` names
+which module owns which release stage.
+
 ## Usage
 
 ```sh

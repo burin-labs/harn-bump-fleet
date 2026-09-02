@@ -241,6 +241,36 @@ Before opening a PR, rebase on the latest `origin/main` and run the checks
 above. Review your own diff for stale comments and duplicated abstractions.
 Then push a branch, and enable auto-merge when CI is green.
 
+## Pull requests
+
+Title every pull request `[Area] Sentence case description`. Capitalize the
+first word of the description and proper nouns only, and leave the trailing
+period off.
+
+`Area` is one of these, chosen from this repository's directory map:
+
+| Area | Covers |
+| --- | --- |
+| `Release` | `release_*.harn`, `release_harn.harn`, the watchers, and publication proof |
+| `Fleet` | `fleet.toml` membership and policy, dispatch, and repair |
+| `Bump` | Runtime bump orchestration, `.harn-version` pins, and bump adapters |
+| `Projections` | Fleet-owned file projections, drift checks, and convergence |
+| `CI` | This repository's own workflows and required checks |
+| `Scripts` | Launchers and wrappers under `scripts/` |
+| `Docs` | `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and `docs/` |
+| `Tests` | `tests/` and `tests-risky/` coverage |
+
+Pick the area that owns the behavior you changed, not the file you touched most.
+A change to `lib/release_ship_pr.harn` is `[Release]` even though it lives under
+`lib/`. If two areas fit, the pull request is probably two pull requests.
+
+Keep the description to 3-5 sentences: what changed, why, the one risk, and how
+you verified it. Do not list test commands. `.github/pull_request_template.md`
+carries a worked example.
+
+The same words are the `area/*` labels in `.github/labels.yml`, so a title and a
+label agree.
+
 <!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->
 
 ## Ecosystem working agreement
