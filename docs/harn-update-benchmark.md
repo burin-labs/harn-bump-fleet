@@ -22,6 +22,12 @@ Run one route with the ordinary credential loader:
 scripts/run_harn_update_repair_benchmark.sh value
 ```
 
+The value route defaults to the same production-ready Cerebras GPT-OSS-120B
+cell used by the hosted fleet. A strong-route trial must name an accessible
+provider and model through `HARN_UPDATE_STRONG_PROVIDER` and
+`HARN_UPDATE_STRONG_MODEL`; the runner refuses to relabel the shared planner
+default as a strong route.
+
 Store every JSON result outside the source checkout. Compare the validated
 result, route, model, tokens, exact or lower-bound cost, elapsed time, and
 changed paths. Run the strong route only after a documented value-route miss;

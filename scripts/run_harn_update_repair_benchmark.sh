@@ -3,9 +3,22 @@ set -euo pipefail
 
 route=${1:-value}
 case "$route" in
-  auto|value|strong) ;;
+  value)
+    route_provider=${HARN_UPDATE_VALUE_PROVIDER:-cerebras}
+    route_model=${HARN_UPDATE_VALUE_MODEL:-gpt-oss-120b}
+    route_prefix=HARN_UPDATE_VALUE
+    ;;
+  strong)
+    if [[ -z "${HARN_UPDATE_STRONG_PROVIDER:-}" || -z "${HARN_UPDATE_STRONG_MODEL:-}" ]]; then
+      echo "strong benchmark route requires HARN_UPDATE_STRONG_PROVIDER and HARN_UPDATE_STRONG_MODEL" >&2
+      exit 2
+    fi
+    route_provider=$HARN_UPDATE_STRONG_PROVIDER
+    route_model=$HARN_UPDATE_STRONG_MODEL
+    route_prefix=HARN_UPDATE_STRONG
+    ;;
   *)
-    echo "usage: $0 [auto|value|strong]" >&2
+    echo "usage: $0 [value|strong]" >&2
     exit 2
     ;;
 esac
@@ -56,7 +69,10 @@ if rustup run 1.95.0 cargo-clippy \
 fi
 
 cd "$repo_root"
-"$repo_root/scripts/with_env.sh" "$repo_root/.harn/bin/harn" run \
+"$repo_root/scripts/with_env.sh" env \
+  "${route_prefix}_PROVIDER=$route_provider" \
+  "${route_prefix}_MODEL=$route_model" \
+  "$repo_root/.harn/bin/harn" run \
   --write-root "$benchmark_dir" \
   benchmark_harn_update_repair.harn -- \
   --repository-dir "$benchmark_dir" \
