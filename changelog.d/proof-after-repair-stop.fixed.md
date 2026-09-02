@@ -1,0 +1,1 @@
+- Keep deterministic fleet proof and bounded successor scheduling live when uncertain repair spend stops further paid agent calls.

@@ -1,0 +1,388 @@
+#!/usr/bin/env harn
+//
+// refresh_release_binary_size_baseline.harn — record what the release that just
+// shipped actually weighs.
+//
+// harn's `.github/release-binary-size-policy.json` holds the bytes a release was
+// accepted at. Nothing moved it automatically, so it stayed at 0.10.118 while
+// releases shipped past it, and the growth those releases accumulated was
+// carried instead by an `accepted_growth` allowance whose own reason said
+// "remove after the released baseline refresh". The refresh never ran, the
+// allowance ran out, and the v0.10.126 cut spent two full Linux builds being
+// refused by the difference.
+//
+// The refresh is arithmetic over the release's own build, not a judgement, so
+// it belongs in the tail.
+//
+// It runs off the publication proof and nothing else. Fleet convergence is
+// skipped whenever an earlier tail phase fails, and a baseline that only
+// refreshes after a flawless release is a baseline that goes stale exactly
+// when the release process is having a bad week.
+//
+// Usage:
+//   harn run refresh_release_binary_size_baseline.harn -- --tag vX.Y.Z --repo PATH [--apply]
+import { ParserSpec } from "std/cli/argparse"
+import { strip_v } from "std/semver"
+import { cli_options } from "lib/cli_options"
+import {
+  github_branch_commit,
+  github_branch_head,
+  github_claim_ref,
+  github_connector_options,
+  github_enable_auto_merge,
+  github_file_text_at_ref_result,
+  github_pr_upsert,
+  github_workflow_runs,
+} from "lib/github"
+import { pre_tag_binary_size_report_artifact } from "lib/release_execution"
+import { run_git } from "lib/release_runtime"
+import {
+  BinarySizePolicy,
+  baseline_refresh_pull_request_body,
+  refresh_binary_size_baseline,
+} from "lib/release_size_baseline"
+import { read_release_size_report, release_size_report_rejection } from "lib/release_size_report"
+
+type Options = {
+  tag: string,
+  repo: string,
+  slug: string,
+  apply: bool,
+  json: bool,
+  no_auto_merge: bool,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "refresh-release-binary-size-baseline",
+  args: [
+    {kind: "flag", name: "tag", long: "--tag", default: ""},
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "flag", name: "slug", long: "--slug", default: "burin-labs/harn"},
+    {kind: "switch", name: "apply", long: "--apply"},
+    {kind: "switch", name: "json", long: "--json"},
+    {kind: "switch", name: "no_auto_merge", long: "--no-auto-merge"},
+  ],
+}
+
+const POLICY_PATH = ".github/release-binary-size-policy.json"
+
+const SIZE_TARGET = "x86_64-unknown-linux-gnu"
+
+const RELEASE_WORKFLOW = "build-release-binaries.yml"
+
+const DEFAULT_BRANCH = "main"
+
+const BRANCH = "automation/release-binary-size-baseline"
+
+const HEADLINE = "Refresh the release binary-size baseline"
+
+/** Downloading one run artifact, behind a seam a test can stand in for. */
+pub type SizeReportAdapter = {download: fn(int, string, string) -> {success: bool, message: string}}
+
+fn production_adapter(process: HarnessProcess, cwd: string) -> SizeReportAdapter {
+  return {
+    download: fn(run_id, artifact, destination) {
+      const result = process.run(
+        {
+          program: "gh",
+          args: ["run", "download", to_string(run_id), "--name", artifact, "--dir", destination],
+          cwd: cwd,
+        },
+      )
+      const message = if trim(result.stderr) != "" {
+        trim(result.stderr)
+      } else {
+        trim(result.stdout)
+      }
+      return {success: result.success, message: message}
+    },
+  }
+}
+
+/**
+ * The tag-push run that built the release.
+ *
+ * A tag push sets `head_branch` to the tag, so the release's own build is
+ * identifiable without guessing from timestamps. Only a successful run is
+ * eligible: a failed one may still have uploaded a report, and reading bytes
+ * out of a build that did not finish would record a number for an artifact
+ * nobody shipped.
+ */
+fn released_build_run(harness: Harness, slug: string, tag: string) -> Result<dict, string> {
+  const listed = github_workflow_runs(
+    harness,
+    slug,
+    RELEASE_WORKFLOW,
+    {event: "push", branch: tag},
+    50,
+  )
+  if is_err(listed) {
+    return Err(
+      "could not list ${RELEASE_WORKFLOW} runs for ${tag}: " + to_string(unwrap_err(listed)),
+    )
+  }
+  let best = nil
+  for run in unwrap(listed).runs {
+    if run.status != "completed" || (run.conclusion ?? "") != "success" {
+      continue
+    }
+    if best == nil || run.id > best.id {
+      best = run
+    }
+  }
+  if best == nil {
+    return Err("no successful ${RELEASE_WORKFLOW} run is recorded for ${tag}")
+  }
+  return Ok(best)
+}
+
+fn released_commit(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  repo: string,
+  tag: string,
+) -> string {
+  const resolved = run_git(git, {repo: repo, mock: false}, ["rev-list", "-n", "1", tag])
+  return lowercase(trim(resolved.stdout ?? ""))
+}
+
+fn report_outcome(stdio: HarnessStdio, options: Options, record: dict) -> int {
+  if options.json {
+    stdio.println(json_stringify(record))
+  } else {
+    stdio.println(to_string(record.detail ?? ""))
+  }
+  return if record.ok ?? false {
+    0
+  } else {
+    1
+  }
+}
+
+pipeline main(harness: Harness) -> int {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const tag = trim(options.tag)
+  const repo = trim(options.repo)
+  if tag == "" || repo == "" {
+    harness.stdio.eprintln(
+      "usage: harn run refresh_release_binary_size_baseline.harn -- --tag vX.Y.Z --repo PATH [--apply]",
+    )
+    return 2
+  }
+  const slug = trim(options.slug)
+  const version = strip_v(tag)
+  const commit = released_commit({env: harness.env, process: harness.process}, repo, tag)
+  if commit == "" {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not resolve the commit ${tag} names in ${repo}"},
+    )
+  }
+  const run = released_build_run(harness, slug, tag)
+  if is_err(run) {
+    return report_outcome(harness.stdio, options, {ok: false, detail: unwrap_err(run)})
+  }
+  const build_run = unwrap(run)
+  // Named by the one owner of the workflow contract, not spelled again here.
+  const artifact = pre_tag_binary_size_report_artifact(commit)
+  const destination = harness.fs.mkdtemp_in_workspace("release-size-report")
+  const downloaded = production_adapter(harness.process, repo).download(
+    build_run.id,
+    artifact,
+    destination,
+  )
+  if !downloaded.success {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {
+        ok: false,
+        detail: "could not download ${artifact} from run ${build_run.id}: ${downloaded.message}",
+      },
+    )
+  }
+  const report_result = read_release_size_report(harness.fs, "${destination}/binary-size.json")
+  if !is_ok(report_result) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {
+        ok: false,
+        detail: "run ${build_run.id} published ${artifact} without a readable binary-size.json: "
+          + json_stringify(unwrap_err(report_result)),
+      },
+    )
+  }
+  const report = unwrap(report_result)
+  const rejection = release_size_report_rejection(report, SIZE_TARGET, commit)
+  if rejection != nil {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "refusing to refresh: ${rejection}"},
+    )
+  }
+  const current = github_file_text_at_ref_result(harness, slug, POLICY_PATH, DEFAULT_BRANCH)
+  if is_err(current) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not read ${POLICY_PATH}: " + to_string(unwrap_err(current))},
+    )
+  }
+  const current_text = unwrap(current)
+  if current_text == nil {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "${slug} has no ${POLICY_PATH} on ${DEFAULT_BRANCH}"},
+    )
+  }
+  const parsed = json_parse(current_text)
+  const policy: BinarySizePolicy = parsed
+  const refreshed = refresh_binary_size_baseline(
+    policy,
+    {
+      version: version,
+      source_sha: commit,
+      bytes: report.bytes,
+      observed_at: harness.clock.date_iso(),
+      target: SIZE_TARGET,
+      build_identity: report.build_identity,
+    },
+  )
+  if is_err(refreshed) {
+    return report_outcome(harness.stdio, options, {ok: false, detail: unwrap_err(refreshed)})
+  }
+  const result = unwrap(refreshed)
+  const summary = result.summary
+  const run_url = to_string(build_run.url ?? "")
+  const body = baseline_refresh_pull_request_body(summary, run_url)
+  if !result.changed {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {
+        ok: true,
+        changed: false,
+        detail:
+          "${POLICY_PATH} already records ${summary.bytes} bytes for ${version}; nothing to propose",
+        summary: summary,
+      },
+    )
+  }
+  if !options.apply {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {
+        ok: true,
+        changed: true,
+        applied: false,
+        detail:
+          "would refresh the baseline to ${summary.bytes} bytes from ${summary.previous_bytes} and drop ${summary.accepted_growth_dropped} acceptance(s); re-run with --apply",
+        summary: summary,
+      },
+    )
+  }
+  const connector = github_connector_options()
+  const head = github_branch_head(harness, slug, DEFAULT_BRANCH, connector)
+  if is_err(head) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not read ${DEFAULT_BRANCH}: " + to_string(unwrap_err(head))},
+    )
+  }
+  const base_oid = to_string(unwrap(head)?.oid ?? "")
+  const claim = github_claim_ref(harness, slug, "refs/heads/${BRANCH}", {oid: base_oid}, connector)
+  if is_err(claim) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not claim ${BRANCH}: " + to_string(unwrap_err(claim))},
+    )
+  }
+  const branch_oid = to_string(unwrap(claim)?.oid ?? "")
+  const commit_result = github_branch_commit(
+    harness,
+    {
+      slug: slug,
+      branch: BRANCH,
+      expected_head_oid: branch_oid,
+      headline: HEADLINE,
+      body: body,
+      files: [{path: POLICY_PATH, contents: result.text}],
+    },
+    connector,
+  )
+  if is_err(commit_result) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not commit the refresh: " + to_string(unwrap_err(commit_result))},
+    )
+  }
+  const head_oid = to_string(unwrap(commit_result)?.oid ?? "")
+  const pull = github_pr_upsert(
+    harness,
+    {
+      slug: slug,
+      head: BRANCH,
+      base: DEFAULT_BRANCH,
+      title: "${HEADLINE} at ${version}",
+      body: body,
+      expected_head_oid: head_oid,
+    },
+    connector,
+  )
+  if is_err(pull) {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {
+        ok: false,
+        detail: "could not open the refresh pull request: " + to_string(unwrap_err(pull)),
+      },
+    )
+  }
+  const pull_number = to_int(unwrap(pull)?.number) ?? 0
+  // Armed by default, leased to the exact commit this run published, so an
+  // appended commit fails closed rather than riding along. The pull request is
+  // fleet-authored over fleet-derived bytes and still has to pass every check
+  // harn requires; what arming removes is the person whose only remaining job
+  // was to agree with arithmetic. `--no-auto-merge` holds it.
+  const armed = if options.no_auto_merge {
+    {state: "held"}
+  } else {
+    const enabled = github_enable_auto_merge(
+      harness,
+      slug,
+      pull_number,
+      head_oid,
+      "squash",
+      connector,
+    )
+    if is_err(enabled) {
+      {state: "failed", detail: to_string(unwrap_err(enabled))}
+    } else {
+      {state: "armed"}
+    }
+  }
+  return report_outcome(
+    harness.stdio,
+    options,
+    {
+      ok: true,
+      changed: true,
+      applied: true,
+      pull_request: pull_number,
+      url: to_string(unwrap(pull)?.url ?? ""),
+      commit: head_oid,
+      auto_merge: armed,
+      detail:
+        "opened ${slug}#${pull_number} refreshing the baseline to ${summary.bytes} bytes for ${version}",
+      summary: summary,
+    },
+  )
+}

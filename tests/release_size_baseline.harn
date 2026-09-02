@@ -1,0 +1,237 @@
+// Tests for the release-tail baseline refresh: what it refuses to write, what
+// it writes, and that what it writes is the file harn already has.
+import { read_json_typed_result } from "std/fs"
+import {
+  BaselineRefreshInput,
+  BinarySizePolicy,
+  FUSE_MAX_HEADROOM_PERCENT,
+  FUSE_MIN_HEADROOM_PERCENT,
+  baseline_refresh_pull_request_body,
+  refresh_binary_size_baseline,
+  refreshed_fuse_bytes,
+  render_binary_size_policy,
+} from "../lib/release_size_baseline"
+import {
+  RELEASE_SIZE_REPORT_SCHEMA,
+  ReleaseSizeReport,
+  read_release_size_report,
+  release_size_report_rejection,
+} from "../lib/release_size_report"
+
+fn fixture(fs: HarnessFs, name: string) -> string {
+  return path_join(fs.source_dir(), "../testdata/release_size", name)
+}
+
+const TARGET = "x86_64-unknown-linux-gnu"
+
+const RELEASED_SHA = "19883f98d360a4b691fdbf3fd9559295c5ed65e1"
+
+fn load_policy(fs: HarnessFs) -> BinarySizePolicy {
+  const result = read_json_typed_result<BinarySizePolicy>(
+    fs,
+    fixture(fs, "policy-0.10.118.json"),
+    schema_of(BinarySizePolicy),
+  )
+  if !is_ok(result) {
+    throw "policy fixture must parse: " + json_stringify(result)
+  }
+  return unwrap(result)
+}
+
+fn load_report(fs: HarnessFs) -> ReleaseSizeReport {
+  const result = read_release_size_report(fs, fixture(fs, "report-0.10.126.json"))
+  if !is_ok(result) {
+    throw "report fixture must parse: " + json_stringify(result)
+  }
+  return unwrap(result)
+}
+
+fn input_from(report: ReleaseSizeReport, version: string) -> BaselineRefreshInput {
+  return {
+    version: version,
+    source_sha: report.source_sha,
+    bytes: report.bytes,
+    observed_at: "2026-09-02T04:11:07Z",
+    target: report.target,
+    build_identity: report.build_identity,
+  }
+}
+
+// --- the renderer must reproduce the file it is replacing --------------------
+/**
+ * The renderer writes the policy file by hand rather than round-tripping a
+ * generic serializer, so the one thing that must be proved is that it produces
+ * the same bytes harn already has. If this drifts, every refresh reformats the
+ * whole document and the diff stops being readable.
+ */
+@test
+pipeline test_the_renderer_reproduces_the_committed_policy_file(harness: Harness, task: unknown) {
+  const rendered = render_binary_size_policy(load_policy(harness.fs))
+  assert_eq(rendered, harness.fs.read_text(fixture(harness.fs, "policy-0.10.118.json")))
+}
+
+// --- falsifier (d) -----------------------------------------------------------
+/**
+ * Falsifier (d). The refresh must write the exact bytes the report carries and
+ * remove the allowance, or it has not done the job the v0.10.126 cut needed
+ * doing. Byte-exactness is the whole point: a baseline that is approximately
+ * the released size is a baseline that refuses or excuses the wrong builds.
+ */
+@test
+pipeline test_the_refresh_writes_the_reports_exact_bytes(harness: Harness, task: unknown) {
+  const policy = load_policy(harness.fs)
+  const report = load_report(harness.fs)
+  const before = policy.targets[0]
+  assert(before != nil)
+  assert_eq(before.accepted_growth.count, 1)
+  assert_eq(before.baseline.version, "0.10.118")
+  const refreshed = refresh_binary_size_baseline(policy, input_from(report, "0.10.126"))
+  assert(is_ok(refreshed), json_stringify(refreshed))
+  const result = unwrap(refreshed)
+  assert_eq(result.changed, true)
+  const summary = result.summary
+  assert_eq(summary.bytes, report.bytes)
+  assert_eq(summary.bytes, 250395033)
+  assert_eq(summary.source_sha, RELEASED_SHA)
+  assert_eq(summary.previous_bytes, 242554944)
+  assert_eq(summary.delta_bytes, 7840089)
+  assert_eq(summary.accepted_growth_dropped, 1)
+  // The written document says the same thing the summary does, and it parses
+  // back as the same closed contract harn validates it against.
+  const reparsed: BinarySizePolicy = json_parse(result.text)
+  const target = reparsed.targets[0]
+  assert(target != nil)
+  assert_eq(target.baseline.bytes, 250395033)
+  assert_eq(target.baseline.version, "0.10.126")
+  assert_eq(target.baseline.source_sha, RELEASED_SHA)
+  assert_eq(target.baseline.observed_at, "2026-09-02T04:11:07Z")
+  assert_eq(target.baseline.build_identity.rustc, "1.95.0")
+  assert_eq(target.accepted_growth, [])
+  assert_eq(target.growth.warn_bytes, 4194304)
+}
+
+/**
+ * The 0.10.126 bytes leave the committed fuse at 6.78% headroom, below the 10%
+ * floor harn's contract requires. A refresh that wrote the baseline and left
+ * the fuse alone would produce a file that fails harn's own validation, so the
+ * fuse moves with it.
+ */
+@test
+pipeline test_a_refresh_that_would_break_the_headroom_band_moves_the_fuse(
+  harness: Harness,
+  task: unknown,
+) {
+  const result = unwrap(
+    refresh_binary_size_baseline(
+      load_policy(harness.fs),
+      input_from(load_report(harness.fs), "0.10.126"),
+    ),
+  )
+  assert_eq(result.summary.fuse_moved, true)
+  assert(result.summary.fuse_bytes > result.summary.previous_fuse_bytes)
+  const headroom = result.summary.headroom_percent_hundredths
+  assert(headroom >= FUSE_MIN_HEADROOM_PERCENT * 100)
+  assert(headroom <= FUSE_MAX_HEADROOM_PERCENT * 100)
+  assert(baseline_refresh_pull_request_body(result.summary, "").contains("distribution fuse moved"))
+}
+
+/** A fuse still inside the band is left exactly where a person put it. */
+@test
+pipeline test_a_fuse_inside_the_band_is_not_moved(harness: Harness, task: unknown) {
+  // 242554944 with the committed 267386880 fuse is 10.24% headroom.
+  assert_eq(refreshed_fuse_bytes(267386880, 242554944), 267386880)
+  // A binary that shrank far enough leaves the fuse above the band, so it moves.
+  assert(refreshed_fuse_bytes(267386880, 200000000) < 267386880)
+  const result = unwrap(
+    refresh_binary_size_baseline(
+      load_policy(harness.fs),
+      input_from(load_report(harness.fs), "0.10.126") + {bytes: 243000000},
+    ),
+  )
+  assert_eq(result.summary.fuse_moved, false)
+  assert_eq(result.summary.fuse_bytes, 267386880)
+}
+
+// --- what the refresh refuses ------------------------------------------------
+/**
+ * A report is only usable as a baseline when it measured the commit that
+ * shipped, under a release profile, with the fuse intact. Each of these would
+ * otherwise record a number the baseline claims is something it is not.
+ */
+@test
+pipeline test_a_report_that_measured_something_else_is_refused(harness: Harness, task: unknown) {
+  const report = load_report(harness.fs)
+  assert_eq(release_size_report_rejection(report, TARGET, RELEASED_SHA), nil)
+  const other_commit = release_size_report_rejection(
+    report,
+    TARGET,
+    "0000000000000000000000000000000000000000",
+  )
+  assert(other_commit != nil)
+  assert(other_commit.contains("the released commit is"))
+  const other_target = release_size_report_rejection(report, "aarch64-apple-darwin", RELEASED_SHA)
+  assert(other_target != nil)
+  assert(other_target.contains("expected `aarch64-apple-darwin`"))
+  const breached = release_size_report_rejection(report + {fuse: "breached"}, TARGET, RELEASED_SHA)
+  assert(breached != nil)
+  assert(breached.contains("cannot set the accepted baseline"))
+  const wrong_schema = release_size_report_rejection(
+    report + {schema: "harn.release_binary_size_report.v0"},
+    TARGET,
+    RELEASED_SHA,
+  )
+  assert(wrong_schema != nil)
+  assert(wrong_schema.contains(RELEASE_SIZE_REPORT_SCHEMA))
+  const debug_build = release_size_report_rejection(
+    report + {build_identity: report.build_identity + {profile: "dev"}},
+    TARGET,
+    RELEASED_SHA,
+  )
+  assert(debug_build != nil)
+  assert(debug_build.contains("release-profile bytes"))
+}
+
+/**
+ * A growth warning must not block the refresh. The whole point is that the
+ * release with the growth is the release whose bytes become the new normal.
+ */
+@test
+pipeline test_a_growth_warning_does_not_block_the_refresh(harness: Harness, task: unknown) {
+  const report = load_report(harness.fs)
+  assert_eq(report.growth, "warn")
+  assert_eq(report.blocking, false)
+  assert_eq(release_size_report_rejection(report, TARGET, RELEASED_SHA), nil)
+}
+
+/** A target the policy does not carry is an error, not a silently added entry. */
+@test
+pipeline test_an_unknown_target_is_an_error(harness: Harness, task: unknown) {
+  const refreshed = refresh_binary_size_baseline(
+    load_policy(harness.fs),
+    input_from(load_report(harness.fs), "0.10.126") + {target: "aarch64-apple-darwin"},
+  )
+  assert(is_err(refreshed))
+  assert(to_string(unwrap_err(refreshed)).contains("no entry for target"))
+}
+
+/** The body states the numbers, so a reviewer does not have to recompute them. */
+@test
+pipeline test_the_pull_request_body_states_what_changed(harness: Harness, task: unknown) {
+  const result = unwrap(
+    refresh_binary_size_baseline(
+      load_policy(harness.fs),
+      input_from(load_report(harness.fs), "0.10.126"),
+    ),
+  )
+  const body = baseline_refresh_pull_request_body(
+    result.summary,
+    "https://github.com/burin-labs/harn/actions/runs/1",
+  )
+  assert(body.contains("0.10.118"))
+  assert(body.contains("0.10.126"))
+  assert(body.contains("250395033"))
+  assert(body.contains("242554944"))
+  assert(body.contains("7840089"))
+  assert(body.contains("Dropped 1 `accepted_growth` entry"))
+  assert(body.contains("https://github.com/burin-labs/harn/actions/runs/1"))
+}
