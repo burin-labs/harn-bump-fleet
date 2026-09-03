@@ -2,12 +2,16 @@ import {
   github_commit_check_runs,
   github_commit_pull_requests,
   github_disable_auto_merge,
+  github_pr_create,
+  github_pr_list,
   github_pr_merge,
   github_pr_mergeability,
   github_pr_view,
   github_repository_rulesets,
+  github_workflow_dispatch,
 } from "./github"
 import { decode_github_workflow } from "./github_workflow"
+import { latest_check_per_name, required_check_state } from "./pr_admission"
 import {
   ReleaseDriftCommit,
   ReleaseDriftEvidence,
@@ -16,6 +20,12 @@ import {
   release_required_contexts_from_rulesets,
 } from "./release_drift_evidence"
 import { execution_failed } from "./release_execution"
+import {
+  ReleaseMainDelta,
+  release_main_delta_decision,
+  release_main_delta_deferral_reason,
+  release_main_delta_unobserved,
+} from "./release_main_delta"
 import {
   ReleaseMergeGateState,
   release_certification_bearing_paths,
@@ -27,17 +37,25 @@ import { remote_tag_target_sha } from "./release_repin"
 import { release_git_remote_refs, run_git } from "./release_runtime"
 import { ensure_release_tag_pushed_at } from "./release_tag"
 import {
+  ReleaseUnfoldDecision,
+  release_unfold_body,
+  release_unfold_decision,
+  release_unfold_title,
+} from "./release_unfold"
+import {
   ReleaseCertificationDrift,
   ReleaseWatchReceipt,
   release_certification_drift_unobserved,
   release_watch_receipt_bind_main_commit,
   release_watch_receipt_record_certification_drift,
+  release_watch_receipt_record_main_delta,
   release_watch_receipt_write,
 } from "./release_watch_state"
 
 pub type ReleaseMainTagAction = "wait" \
   | "merge" \
-  | "certify_delta" \
+  | "certify_main" \
+  | "unfold" \
   | "defer" \
   | "tag" \
   | "reuse" \
@@ -100,15 +118,19 @@ pub type ReleaseMainTagAdapter = {
    * Required for the same reason the tree prober is: an absent observation
    * would release the merge by not looking.
    */
-  merge_gate: fn(ReleaseMainTagPullRequest, string, int) -> ReleaseMergeGateState?,
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
   /** Merge the release pull request under its exact observed head lease. */
   merge: fn(ReleaseMainTagPullRequest) -> bool,
   /**
-   * Run the lanes only a release runs against the tree that will ship, and
-   * report the main head they passed on. An empty string means the delta could
-   * not be run, which holds the merge rather than releasing it.
+   * Where the lanes only a release runs stand on the merged main commit.
+   * Required, not optional, for the same reason the tree prober is: a gate that
+   * can be reached by not looking is not a gate.
    */
-  certify_delta: fn(string) -> string,
+  main_delta: fn(string, int) -> ReleaseMainDelta,
+  /** Start those lanes on the merged main commit. False when they could not start. */
+  dispatch_main_delta: fn(string) -> bool,
+  /** Open the pull request that reverts a bump which merged but must not ship. */
+  unfold: fn(string) -> ReleaseUnfoldDecision,
   /** Take the merge back if an earlier run left auto-merge armed. */
   disarm: fn(ReleaseMainTagPullRequest, string) -> bool,
   merged_main_ancestor: fn(string) -> bool,
@@ -211,14 +233,12 @@ fn exact_commit(value: string?) {
  */
 fn release_open_pr_merge_decision(
   pull_request: ReleaseMainTagPullRequest,
-  merge_gate: fn(ReleaseMainTagPullRequest, string, int) -> ReleaseMergeGateState?,
-  delta_verified_at: string,
-  delta_iterations: int,
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
 ) -> ReleaseMainTagDecision {
   if pull_request?.in_merge_queue ?? false {
     return main_tag_decision("wait", "release pull request is inside the merge queue")
   }
-  const gate = merge_gate(pull_request, delta_verified_at, delta_iterations)
+  const gate = merge_gate(pull_request)
   if gate == nil {
     return main_tag_decision(
       "abort",
@@ -228,15 +248,6 @@ fn release_open_pr_merge_decision(
   const gated = release_merge_gate_decision(gate)
   if gated.action == "merge" {
     return main_tag_decision("merge", gated.reason, "", gated.bearing_paths, gate.observed_main)
-  }
-  if gated.action == "certify_delta" {
-    return main_tag_decision(
-      "certify_delta",
-      gated.reason,
-      "",
-      gated.bearing_paths,
-      gate.observed_main,
-    )
   }
   if gated.action == "defer" {
     return main_tag_decision("defer", gated.reason, "", gated.bearing_paths, gate.observed_main)
@@ -257,9 +268,9 @@ pub fn release_main_tag_decision(
   pull_request: ReleaseMainTagPullRequest?,
   remote_tag_target_sha: string,
   certification_trees: fn(string) -> ReleaseCertificationTrees?,
-  merge_gate: fn(ReleaseMainTagPullRequest, string, int) -> ReleaseMergeGateState?,
-  delta_verified_at: string = "",
-  delta_iterations: int = 0,
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
+  main_delta: fn(string, int) -> ReleaseMainDelta,
+  poll: int,
 ) -> ReleaseMainTagDecision {
   const remote_target = lowercase(trim(remote_tag_target_sha))
   if remote_target != "" && !exact_commit(remote_target) {
@@ -297,12 +308,7 @@ pub fn release_main_tag_decision(
         "release pull request is ${github_state}; only an open or merged PR can own the tag",
       )
     }
-    return release_open_pr_merge_decision(
-      pull_request,
-      merge_gate,
-      delta_verified_at,
-      delta_iterations,
-    )
+    return release_open_pr_merge_decision(pull_request, merge_gate)
   }
   const merge_sha = lowercase(trim(to_string(pull_request?.merge_commit_oid ?? "")))
   if !exact_commit(merge_sha) {
@@ -336,7 +342,28 @@ pub fn release_main_tag_decision(
     )
   }
   if remote_target == "" {
-    return main_tag_decision("tag", "release PR merged; mint the tag on its main commit", merge_sha)
+    // The last gate in front of the publication act. The merge let green drift
+    // in on main's own required checks; the lanes only a release runs have
+    // still not seen this tree, and the tag is what makes it permanent.
+    const delta = main_delta(merge_sha, poll)
+    const verdict = release_main_delta_decision(delta, merge_sha, trees.drifted_paths)
+    if verdict.action == "dispatch" {
+      return main_tag_decision("certify_main", verdict.reason, merge_sha, trees.drifted_paths)
+    }
+    if verdict.action == "wait" {
+      return main_tag_decision("wait", verdict.reason, merge_sha, trees.drifted_paths)
+    }
+    if verdict.action == "unfold" {
+      return main_tag_decision("unfold", verdict.reason, merge_sha, trees.drifted_paths)
+    }
+    if verdict.action == "abort" {
+      return main_tag_decision("abort", verdict.reason, merge_sha, trees.drifted_paths)
+    }
+    return main_tag_decision(
+      "tag",
+      "release PR merged; ${verdict.reason}; mint the tag on its main commit",
+      merge_sha,
+    )
   }
   if remote_target == merge_sha {
     return main_tag_decision("reuse", "release tag already names the merged main commit", merge_sha)
@@ -372,16 +399,6 @@ fn release_main_git_drifted_paths(
   }
   return split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
 }
-
-/**
- * How many times one release may re-run its release-only lanes before giving up.
- *
- * Main merges every twenty-one minutes at the median and those lanes take about
- * thirty-four, so a release that keeps chasing a moving branch would spend
- * hours doing it. Three attempts bound the spend and the terminal names what
- * stranded it.
- */
-const RELEASE_DELTA_MAX_ITERATIONS = 3
 
 /** Certification lanes whose triggers decide what only a release runs. */
 const RELEASE_CERTIFICATION_WORKFLOWS = [
@@ -493,6 +510,238 @@ fn release_main_drift_evidence(
   )
 }
 
+/** The workflow files whose lanes only a release runs, for dispatch. */
+fn release_main_delta_workflow_paths(fs: HarnessFs, cfg: dict) -> list<string> {
+  let entries = []
+  for path in RELEASE_CERTIFICATION_WORKFLOWS {
+    const source = try {
+      fs.read_text(path_join(to_string(cfg?.repo ?? ""), path))
+    }
+    if is_err(source) {
+      continue
+    }
+    const decoded = try {
+      decode_github_workflow(unwrap(source))
+    }
+    if is_err(decoded) {
+      continue
+    }
+    entries = entries + [{path: path, workflow: unwrap(decoded)}]
+  }
+  return release_only_check_set(entries).source_workflows
+}
+
+/**
+ * Where the release-only lanes stand on the merged main commit.
+ *
+ * Reads the commit's own check runs, because after the merge the tree in
+ * question is a real commit on the default branch and its runs attach to it
+ * directly. Rows reduce to the latest per name for the same reason they do in
+ * the drift evidence: a rerun leaves a stale failure beside a fresh success.
+ *
+ * Every failure to read reports `not_observed`, which refuses the tag. The one
+ * state this must never invent is a pass.
+ */
+fn release_main_delta_observation(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  merge_sha: string,
+) -> ReleaseMainDelta {
+  const lanes = release_main_release_only_checks(harness.fs, cfg)
+  if len(lanes) == 0 {
+    return release_main_delta_unobserved()
+  }
+  const runs = github_commit_check_runs(harness, receipt.slug, merge_sha)
+  if is_err(runs) {
+    return release_main_delta_unobserved()
+  }
+  const latest = latest_check_per_name(unwrap(runs))
+  let checks = []
+  let failing = ""
+  let pending = 0
+  for lane in lanes {
+    const state = required_check_state(latest, lane)
+    checks = checks + [{name: lane, state: state, run_url: ""}]
+    if state == "MISSING" {
+      pending = pending + 1
+    } else if uppercase(trim(state)) == "PENDING" || uppercase(trim(state)) == "IN_PROGRESS" {
+      pending = pending + 1
+    } else if uppercase(trim(state)) != "SUCCESS" && failing == "" {
+      failing = lane
+    }
+  }
+  const observed_at = harness.clock.date_iso()
+  if failing != "" {
+    return {
+      state: "failed",
+      commit: lowercase(trim(merge_sha)),
+      lanes: lanes,
+      checks: checks,
+      failing_check: failing,
+      observed_at: observed_at,
+    }
+  }
+  const state = if pending == len(lanes) {
+    "not_started"
+  } else if pending > 0 {
+    "running"
+  } else {
+    "passed"
+  }
+  return {
+    state: state,
+    commit: lowercase(trim(merge_sha)),
+    lanes: lanes,
+    checks: checks,
+    failing_check: "",
+    observed_at: observed_at,
+  }
+}
+
+/** Start the release-only lanes on the merged main commit. */
+fn release_main_delta_dispatch(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  merge_sha: string,
+) -> bool {
+  const paths = release_main_delta_workflow_paths(harness.fs, cfg)
+  if len(paths) == 0 {
+    return false
+  }
+  // `workflow_dispatch` takes a ref, not a bare commit, so the merged commit
+  // gets a branch of its own. Naming it for the sha makes a retry find the same
+  // ref rather than racing a second one, and leaves the evidence attached to
+  // the exact tree that was tested.
+  const ref = "release-certify/" + lowercase(trim(merge_sha))
+  const git = {env: harness.env, process: harness.process}
+  const pushed = run_git(
+    git,
+    cfg,
+    ["push", "--force-with-lease", "origin", "${lowercase(trim(merge_sha))}:refs/heads/${ref}"],
+  )
+  if !pushed.success {
+    return false
+  }
+  for path in paths {
+    const dispatched = github_workflow_dispatch(harness, receipt.slug, path, {}, ref)
+    if is_err(dispatched) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Open the pull request that reverts a bump which merged but must not ship.
+ *
+ * The revert is `git revert -m 1` of the release merge commit: one diff that
+ * restores the development version and every folded changelog fragment,
+ * because folding and bumping were the only things the release did.
+ */
+pub fn release_open_unfold_pull_request(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  merge_sha: string,
+) -> ReleaseUnfoldDecision {
+  const version = trim(receipt.tag).substring(1)
+  const development_version = version + "-dev"
+  const existing = github_pr_list(harness, receipt.slug, {state: "open"})
+  const open_number = if is_ok(existing) {
+    unfold_pull_number(unwrap(existing), release_unfold_title(version))
+  } else {
+    0
+  }
+  const decision = release_unfold_decision(
+    {
+      tag: receipt.tag,
+      version: version,
+      merge_commit: lowercase(trim(merge_sha)),
+      development_version: development_version,
+      tag_published: false,
+      open_pull_number: open_number,
+    },
+  )
+  if decision.action != "open" {
+    return decision
+  }
+  const git = {env: harness.env, process: harness.process}
+  const prepared = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
+  if !prepared.success {
+    return unfold_failed(decision, "could not fetch origin/main to build the revert")
+  }
+  const branched = run_git(
+    git,
+    cfg,
+    ["checkout", "-B", decision.branch, lowercase(trim(merge_sha))],
+  )
+  if !branched.success {
+    return unfold_failed(decision, "could not create ${decision.branch}")
+  }
+  const reverted = run_git(git, cfg, ["revert", "--no-edit", "-m", "1", lowercase(trim(merge_sha))])
+  if !reverted.success {
+    return unfold_failed(decision, "could not revert ${lowercase(trim(merge_sha))}")
+  }
+  const pushed = run_git(git, cfg, ["push", "--force-with-lease", "origin", decision.branch])
+  if !pushed.success {
+    return unfold_failed(decision, "could not push ${decision.branch}")
+  }
+  const delta = release_main_delta_observation(harness, cfg, receipt, merge_sha)
+  const created = github_pr_create(
+    harness,
+    {
+      slug: receipt.slug,
+      title: decision.title,
+      head: decision.branch,
+      base: "main",
+      body: release_unfold_body(
+        {
+          tag: receipt.tag,
+          version: version,
+          development_version: development_version,
+          merge_commit: lowercase(trim(merge_sha)),
+          failing_check: delta.failing_check,
+          drifted_commits: drifted_commit_names(receipt),
+        },
+      ),
+    },
+  )
+  if is_err(created) {
+    return unfold_failed(decision, "could not open the unfold pull request")
+  }
+  return decision
+}
+
+/** The already-open unfold for this version, or 0. */
+fn unfold_pull_number(pulls: list?, title: string) -> int {
+  for pull in pulls ?? [] {
+    if trim(to_string(pull?.title ?? "")) == title {
+      return to_int(pull?.number ?? 0)
+    }
+  }
+  return 0
+}
+
+fn unfold_failed(decision: ReleaseUnfoldDecision, because: string) -> ReleaseUnfoldDecision {
+  return decision
+    + {
+      action: "refuse",
+      reason: "${because}; the bump is still on main and must be reverted by hand",
+      terminal_reason: "unfold_could_not_be_opened",
+    }
+}
+
+/** The drifted commits this release merged onto, named for the revert body. */
+fn drifted_commit_names(receipt: ReleaseWatchReceipt) -> string {
+  const commits = receipt.certification_drift.commits
+  if len(commits) == 0 {
+    return "none recorded"
+  }
+  return commits.map({ commit -> commit.sha }).join(", ")
+}
+
 fn default_release_main_tag_adapter(
   harness: Harness,
   cfg: dict,
@@ -530,10 +779,23 @@ fn default_release_main_tag_adapter(
       }
       return unwrap(merged).merged
     },
-    // No live runner supplies the release-only lanes to this loop yet, so a
-    // drift they bear on holds the merge and says so, rather than merging a
-    // tree they never saw. Returning the head here is what would release it.
-    certify_delta: fn(_observed_main) { return "" },
+    // Where the lanes only a release runs stand on the merged main commit.
+    // Reads the commit's own check runs, reduced latest-per-name, because a
+    // rerun leaves a stale failure beside a fresh success.
+    main_delta: fn(merge_sha) { return release_main_delta_observation(
+      harness,
+      cfg,
+      receipt,
+      merge_sha,
+    ) },
+    dispatch_main_delta: fn(merge_sha) { return release_main_delta_dispatch(
+      harness,
+      cfg,
+      receipt,
+      merge_sha,
+    ) },
+    unfold:
+      fn(merge_sha) { return release_open_unfold_pull_request(harness, cfg, receipt, merge_sha) },
     disarm: fn(pull_request, observed_main) {
       const held = github_disable_auto_merge(
         harness,
@@ -580,7 +842,7 @@ fn default_release_main_tag_adapter(
     // Where main is right now, read from the remote rather than a local
     // mirror, plus what changed since the commit this release certified and
     // whether each of those commits passed the branch's own required checks.
-    merge_gate: fn(pull_request, delta_verified_at, delta_iterations) {
+    merge_gate: fn(pull_request) {
       const certified_base = lowercase(trim(receipt.pin_sha))
       const observed = release_git_remote_refs(harness.process, cfg, ["refs/heads/main"])
       if !observed.success {
@@ -606,9 +868,6 @@ fn default_release_main_tag_adapter(
         drifted_paths: [],
         evidence: nil,
         release_only_checks: [],
-        delta_verified_at: delta_verified_at,
-        delta_iterations: delta_iterations,
-        max_delta_iterations: RELEASE_DELTA_MAX_ITERATIONS,
       }
       if observed_main == certified_base || certified_base == "" {
         return stable
@@ -664,8 +923,6 @@ fn default_release_main_tag_adapter(
  */
 fn release_certification_drift_from_gate(
   gate: ReleaseMergeGateState?,
-  delta_verified_at: string,
-  delta_iterations: int,
 ) -> ReleaseCertificationDrift {
   if gate == nil {
     return release_certification_drift_unobserved()
@@ -680,8 +937,6 @@ fn release_certification_drift_from_gate(
       commits: [],
       drifted_paths: [],
       release_only_checks: gate.release_only_checks,
-      delta_verified_at: delta_verified_at,
-      delta_iterations: delta_iterations,
       observed_at: "",
     }
   }
@@ -707,8 +962,6 @@ fn release_certification_drift_from_gate(
       .to_list(),
     drifted_paths: gate.drifted_paths,
     release_only_checks: gate.release_only_checks,
-    delta_verified_at: delta_verified_at,
-    delta_iterations: delta_iterations,
     observed_at: evidence.observed_at,
   }
 }
@@ -724,12 +977,12 @@ pub fn run_release_main_tag(
 ) -> ReleaseMainTagResult {
   let receipt = original_receipt
   const adapter = injected_adapter ?? default_release_main_tag_adapter(harness, cfg, receipt)
-  // The head the release-only lanes last passed on, and how many times they
-  // have been run for this release. Held across polls because main can move
-  // again while they run, and the next poll has to judge the new drift knowing
-  // what the last delta actually proved.
-  let delta_verified_at = ""
-  let delta_iterations = 0
+  // What the last poll decided, so an exhausted loop reports the state main is
+  // actually in. A release whose bump merged and whose post-merge lanes were
+  // still running is not a release that "did not merge", and telling an
+  // operator that sends them to cut again against a branch that refuses it.
+  let last_action = ""
+  let last_merge_sha = ""
   let poll = 0
   while poll < options.max_polls {
     const pull_request = adapter.pull_request(poll)
@@ -739,8 +992,8 @@ pub fn run_release_main_tag(
       adapter.remote_tag_target(poll),
       adapter.certification_trees,
       adapter.merge_gate,
-      delta_verified_at,
-      delta_iterations,
+      adapter.main_delta,
+      poll,
     )
     if decision.action == "defer" {
       // Nothing merged, so main still carries the development version and a
@@ -754,20 +1007,36 @@ pub fn run_release_main_tag(
     if decision.action == "abort" || decision.action == "certification_drift" {
       return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
     }
-    if decision.action == "certify_delta" {
-      // The lanes only a release runs have not seen this tree. Run them, record
-      // the head they passed on, and let the next poll re-decide: main may have
-      // moved again while they ran, and that new drift gets the same rules.
-      delta_iterations = delta_iterations + 1
-      const verified = adapter.certify_delta(decision.observed_main)
-      if trim(verified) != "" {
-        delta_verified_at = lowercase(trim(verified))
+    if decision.action == "unfold" {
+      // The merged tree failed a lane only a release runs. No tag was minted,
+      // so the whole of what shipped is a revertible commit on main, and the
+      // recovery that a person wrote by hand the last time this happened is
+      // opened here instead.
+      const delta = adapter.main_delta(decision.merge_sha, poll)
+      const unfolded = adapter.unfold(decision.merge_sha)
+      receipt = release_watch_receipt_record_main_delta(receipt, delta, adapter.now(poll))
+      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
+      return {
+        status: 2,
+        reason: release_main_delta_deferral_reason(
+          receipt.tag,
+          delta,
+          drifted_commit_names(receipt),
+        )
+          + " ${unfolded.reason}.",
+        receipt: receipt,
+        steps: [],
+        polls: poll + 1,
       }
-      if trim(verified) == "" {
+    }
+    if decision.action == "certify_main" {
+      // Start the lanes and keep polling. The tag stays unminted until they
+      // report, and an unreadable report refuses rather than tags.
+      if !adapter.dispatch_main_delta(decision.merge_sha) {
         return {
           status: 2,
           reason:
-            "could not run the release-only lanes on ${decision.observed_main}: ${decision.reason}",
+            "could not start the release-only lanes on the merged main commit ${decision.merge_sha}",
           receipt: receipt,
           steps: [],
           polls: poll + 1,
@@ -776,10 +1045,10 @@ pub fn run_release_main_tag(
     } else if decision.action == "merge" {
       // Write the evidence before the irreversible act, so a merged release is
       // never one whose record says nobody looked.
-      const gate = adapter.merge_gate(pull_request, delta_verified_at, delta_iterations)
+      const gate = adapter.merge_gate(pull_request)
       receipt = release_watch_receipt_record_certification_drift(
         receipt,
-        release_certification_drift_from_gate(gate, delta_verified_at, delta_iterations),
+        release_certification_drift_from_gate(gate),
         adapter.now(poll),
       )
       release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
@@ -824,17 +1093,53 @@ pub fn run_release_main_tag(
       release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, bound)
       return {status: 0, reason: decision.reason, receipt: bound, steps: steps, polls: poll + 1}
     }
+    last_action = decision.action
+    last_merge_sha = decision.merge_sha
     poll = poll + 1
     if poll < options.max_polls && options.interval_ms > 0 {
       adapter.wait(options.interval_ms)
     }
   }
+  const exhausted = if last_action == "certify_main" || last_action == "wait" {
+    if trim(last_merge_sha) == "" {
+      "release PR did not merge within ${to_string(options.max_polls)} polls"
+    } else {
+      "the release PR merged at ${last_merge_sha}, but the lanes only a release runs had not"
+        + " reported within ${to_string(options.max_polls)} polls, so no tag was minted."
+        + " Main carries the bumped version and this is not a fresh-cut state:"
+        + " let those lanes finish and resume this receipt, or unfold the bump if they failed"
+    }
+  } else {
+    "release PR did not merge within ${to_string(options.max_polls)} polls"
+  }
+  return {status: 3, reason: exhausted, receipt: receipt, steps: [], polls: options.max_polls}
+}
+
+/**
+ * Open the unfold by hand, for a watch that died between the merge and the
+ * post-merge verdict.
+ *
+ * The release opens this itself when the lanes fail. This entry point exists
+ * because a process that is killed after the merge leaves main carrying a bump
+ * that no fresh cut will follow, and the recovery must not depend on the same
+ * process surviving to offer it.
+ */
+pub fn run_release_unfold(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  merge_sha: string,
+) -> {status: int, reason: string, steps: list<dict>} {
+  const decision = release_open_unfold_pull_request(harness, cfg, receipt, merge_sha)
+  const opened = decision.action == "open" || decision.action == "already_open"
   return {
-    status: 3,
-    reason: "release PR did not merge within ${options.max_polls} polls",
-    receipt: receipt,
-    steps: [],
-    polls: options.max_polls,
+    status: if opened {
+      0
+    } else {
+      2
+    },
+    reason: decision.reason,
+    steps: [{name: "open-release-unfold", success: opened, reason: decision.reason}],
   }
 }
 
@@ -863,7 +1168,7 @@ pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMai
     } },
     // The mock release never advances main, so the merge gate always sees the
     // certified base and a pull request GitHub would merge now.
-    merge_gate: fn(_pr, _delta_verified_at, _delta_iterations) { return {
+    merge_gate: fn(_pr) { return {
       certified_base: receipt.pin_sha,
       observed_main: receipt.pin_sha,
       mergeable_state: "clean",
@@ -871,12 +1176,27 @@ pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMai
       drifted_paths: [],
       evidence: nil,
       release_only_checks: [],
-      delta_verified_at: "",
-      delta_iterations: 0,
-      max_delta_iterations: 3,
     } },
     merge: fn(_pr) { return true },
-    certify_delta: fn(observed_main) { return observed_main },
+    main_delta: fn(mock_merge_sha, _poll) { return {
+      state: "skipped_tree_already_certified",
+      commit: mock_merge_sha,
+      lanes: [],
+      checks: [],
+      failing_check: "",
+      observed_at: "",
+    } },
+    dispatch_main_delta: fn(_merge_sha) { return true },
+    unfold: fn(_merge_sha) { return release_unfold_decision(
+      {
+        tag: receipt.tag,
+        version: "",
+        merge_commit: "",
+        development_version: "",
+        tag_published: false,
+        open_pull_number: 0,
+      },
+    ) },
     disarm: fn(_pr, _observed_main) { return true },
     merged_main_ancestor: fn(sha) { return sha == merge_sha },
     push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
