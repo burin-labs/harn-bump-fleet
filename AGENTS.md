@@ -15,11 +15,13 @@ The entry points are:
   same hosted workflow as a live release. `--local-audit` is diagnosis only.
   Live prepare/ship-pr requires `--yes-live-release`.
 - `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
-  written by `release_harn`. It holds the merge until `origin/main` is still the
-  certified base, arms it, waits for the exact PR to merge, signs and pushes the
-  merged-main tag, then monitors publication without repeating preparation.
-  `--tag-stranded-main <sha>` recovers a release whose bump merged without a
-  tag.
+  written by `release_harn`. It merges the release pull request itself under the
+  pull request's exact head lease once every commit that landed since
+  certification is proved green on main, runs the release-only lanes on the
+  merged commit, signs and pushes the merged-main tag, then monitors publication
+  without repeating preparation. `--tag-stranded-main <sha>` recovers a release
+  whose bump merged without a tag; `--unfold-merged-bump <sha>` opens the revert
+  for a bump that merged and must not be published.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
@@ -209,14 +211,24 @@ receipt. The watcher reads the branch's required contexts from its rulesets,
 resolves every commit that landed since certification against them, and merges
 under the pull request's exact head lease. A drifted commit carrying a red or
 unreported required check stops the release with nothing merged, so main keeps
-its development version and a fresh cut stays admissible. Drift that reaches
-paths only the release's own lanes cover has those lanes run once on the tree
-that will ship, bounded at three attempts. After that exact PR squash-merges,
-the watcher verifies
-the merge commit on `origin/main`, signs and pushes `vX.Y.Z` at that commit, and
-binds the receipt to it once. The tag gate that follows accepts a merged tree
-that differs from the certified one only where the recorded drift accounts for
-it, and refuses anything else. Publish/build workflows derive from the immutable
+its development version and a fresh cut stays admissible. Green drift merges
+whatever it touched: the lanes only a release runs take about thirty-four
+minutes against a branch that moves every nineteen, so gating the merge on them
+is the same freeze by a slower route.
+
+Those lanes run once on the merged main commit instead, before the tag, because
+the tag is the publication act and an unpublished bump is a revertible commit.
+The lane set is computed from workflow triggers rather than a maintained list: a
+workflow the branch already runs on push, pull request, or merge group proves
+nothing extra. A merged tree that is already the certified one skips them by a
+named verdict rather than by falling through. If a lane fails, the watcher opens
+the revert pull request itself, restoring the development version and the folded
+changelog fragments, and reports a deferral naming the drifted commits and the
+check that stopped it. After the exact PR squash-merges and those lanes pass,
+the watcher verifies the merge commit on `origin/main`, signs and pushes
+`vX.Y.Z` at that commit, and binds the receipt to it once. The tag gate accepts
+a merged tree that differs from the certified one only where the recorded drift
+accounts for it, and refuses anything else. Publish/build workflows derive from the immutable
 tag; no candidate archive is promoted as the release artifact.
 
 A release whose bump merged without a tag is recovered by
@@ -224,6 +236,13 @@ A release whose bump merged without a tag is recovered by
 cut the release preflight refuses. That mode tags the stranded merge commit
 only when its tree is the certified one, or differs from it only in paths
 certification does not depend on, and refuses otherwise.
+
+The opposite recovery is `unfold-merged-bump`, for a bump that merged and must
+not be published. It opens the revert that returns main to its development
+version and restores the folded changelog fragments, and refuses once the tag is
+public, because reverting a commit a tag names does not unpublish the tag. The
+release opens that revert itself when the post-merge lanes fail; the mode exists
+for a watch that died between the merge and the verdict.
 
 A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
 rebuilds that candidate on fresh base, the fresh base is part of the artifact.
