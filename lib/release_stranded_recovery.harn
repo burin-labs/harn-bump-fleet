@@ -1,0 +1,176 @@
+/**
+ * Recover a release whose version bump merged without a tag.
+ *
+ * This is the state no other entry point admits. The release launcher's
+ * preflight refuses a fresh cut because main is no longer an `X.Y.Z-dev`
+ * workspace, and resuming the original watch receipt re-enters the tree gate
+ * that stopped the run in the first place. v0.10.128 sat here: main carried the
+ * bumped version, no tag existed, and the only way out was a hand-written
+ * revert plus a human-held freeze over the next cut.
+ *
+ * Tagging main where it stands is legitimate exactly when main's tree is the
+ * certified one, or differs from it only in paths certification does not depend
+ * on. Anything else refuses and names the remediation, because a tag minted
+ * over uncertified code is the defect this whole gate exists to prevent.
+ */
+import { workspace_version_from_manifest } from "./release_analysis"
+import { execution_failed } from "./release_execution"
+import {
+  ReleaseStrandedRecoveryState,
+  release_stranded_recovery_decision,
+} from "./release_merge_gate"
+import { remote_tag_target_sha } from "./release_repin"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ensure_release_tag_pushed_at } from "./release_tag"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+
+pub type ReleaseStrandedRecoveryAdapter = {
+  /**
+   * Observe main, the tag, and both trees. Required, and nil-on-failure: a
+   * recovery that could not look must refuse rather than tag.
+   */
+  observe: fn() -> ReleaseStrandedRecoveryState?,
+  merged_main_ancestor: fn(string) -> bool,
+  push_tag: fn(string) -> list<dict>,
+  now: fn() -> string,
+}
+
+pub type ReleaseStrandedRecoveryResult = {
+  status: int,
+  action: string,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+  steps: list<dict>,
+}
+
+fn git_text(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  args: list<string>,
+) -> string? {
+  const result = run_git(git, cfg, args)
+  if !result.success {
+    return nil
+  }
+  return trim(result.stdout)
+}
+
+pub fn default_release_stranded_recovery_adapter(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  target_commit: string,
+) -> ReleaseStrandedRecoveryAdapter {
+  const git = {env: harness.env, process: harness.process}
+  return {
+    observe: fn() {
+      const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
+      if !fetched.success {
+        return nil
+      }
+      const target = lowercase(trim(target_commit))
+      const target_tree = git_text(git, cfg, ["rev-parse", "--verify", "${target}^{tree}"])
+      const candidate = lowercase(trim(receipt.publication.head_oid))
+      const certified_tree = git_text(git, cfg, ["rev-parse", "--verify", "${candidate}^{tree}"])
+      const manifest = git_text(git, cfg, ["show", "${target}:Cargo.toml"])
+      if target_tree == nil || certified_tree == nil || manifest == nil {
+        return nil
+      }
+      const observed_tags = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/tags/${receipt.tag}", "refs/tags/${receipt.tag}^{}"],
+      )
+      if !observed_tags.success {
+        return nil
+      }
+      const tag_target = remote_tag_target_sha(observed_tags.refs)
+      const drifted = git_text(git, cfg, ["diff", "--name-only", candidate, target])
+      if drifted == nil {
+        return nil
+      }
+      return {
+        tag: receipt.tag,
+        tag_exists: trim(tag_target) != "",
+        tag_target: tag_target,
+        target_commit: target,
+        target_version: workspace_version_from_manifest(manifest),
+        certified_tree: lowercase(certified_tree),
+        target_tree: lowercase(target_tree),
+        drifted_paths: split(drifted, "\n").filter({ path -> trim(path) != "" }).to_list(),
+      }
+    },
+    merged_main_ancestor: fn(commit) { return run_git(
+      git,
+      cfg,
+      ["merge-base", "--is-ancestor", commit, "origin/main"],
+    ).success },
+    push_tag: fn(commit) { return ensure_release_tag_pushed_at(
+      harness,
+      cfg,
+      receipt.tag.substring(1),
+      commit,
+      [],
+      "release-stranded-recovery-${receipt.tag}",
+    ) },
+    now: fn() { return harness.clock.date_iso() },
+  }
+}
+
+/** Tag a stranded release where it stands, or refuse and say what to do instead. */
+pub fn run_release_stranded_recovery(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  target_commit: string,
+  injected_adapter: ReleaseStrandedRecoveryAdapter? = nil,
+) -> ReleaseStrandedRecoveryResult {
+  const adapter = injected_adapter
+    ?? default_release_stranded_recovery_adapter(harness, cfg, receipt, target_commit)
+  const observed = adapter.observe()
+  if observed == nil {
+    return {
+      status: 2,
+      action: "refuse",
+      reason: "could not observe the release commit, the tag, and both trees;"
+        + " refusing to tag without that proof",
+      receipt: receipt,
+      steps: [],
+    }
+  }
+  const decision = release_stranded_recovery_decision(observed)
+  if decision.action == "refuse" {
+    return {status: 2, action: "refuse", reason: decision.reason, receipt: receipt, steps: []}
+  }
+  if !adapter.merged_main_ancestor(decision.merge_oid) {
+    return {
+      status: 2,
+      action: "refuse",
+      reason: "${decision.merge_oid} is not reachable from origin/main",
+      receipt: receipt,
+      steps: [],
+    }
+  }
+  const steps = if decision.action == "tag" {
+    adapter.push_tag(decision.merge_oid)
+  } else {
+    []
+  }
+  if execution_failed(steps) {
+    return {
+      status: 2,
+      action: decision.action,
+      reason: "stranded release tag push failed",
+      receipt: receipt,
+      steps: steps,
+    }
+  }
+  const bound = release_watch_receipt_bind_main_commit(receipt, decision.merge_oid, adapter.now())
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, bound)
+  return {status: 0, action: decision.action, reason: decision.reason, receipt: bound, steps: steps}
+}

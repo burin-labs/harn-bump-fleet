@@ -15,9 +15,11 @@ The entry points are:
   same hosted workflow as a live release. `--local-audit` is diagnosis only.
   Live prepare/ship-pr requires `--yes-live-release`.
 - `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
-  written by `release_harn`. It waits for the exact PR to merge, signs and
-  pushes the merged-main tag, then monitors publication without repeating
-  preparation.
+  written by `release_harn`. It holds the merge until `origin/main` is still the
+  certified base, arms it, waits for the exact PR to merge, signs and pushes the
+  merged-main tag, then monitors publication without repeating preparation.
+  `--tag-stranded-main <sha>` recovers a release whose bump merged without a
+  tag.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
@@ -200,10 +202,21 @@ join. A write-once `release-certify/<candidate-oid>` branch lets GitHub dispatch
 the exact commit while `main` keeps merging. Any missing, stale, moved, or red
 lane blocks the release PR. An explicit startup pin remains load-bearing for
 parent ancestry, base fast-forward suppression, and the pre-merge drift probe.
-After that exact PR squash-merges, the watcher verifies the merge commit on
-`origin/main`, signs and pushes `vX.Y.Z` at that commit, and binds the receipt
-to it once. Publish/build workflows derive from the immutable tag; no
-candidate archive is promoted as the release artifact.
+The release pull request opens unarmed. The merge is the release's own act:
+the watcher arms auto-merge only when `origin/main` is still the commit the
+release certified and GitHub reports the pull request would merge now. When
+main moved first, the watcher takes any armed merge back and ends the run with
+nothing merged, so main keeps its development version and a fresh cut at the
+new head is admissible. After that exact PR squash-merges, the watcher verifies
+the merge commit on `origin/main`, signs and pushes `vX.Y.Z` at that commit, and
+binds the receipt to it once. Publish/build workflows derive from the immutable
+tag; no candidate archive is promoted as the release artifact.
+
+A release whose bump merged without a tag is recovered by
+`recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
+cut the release preflight refuses. That mode tags the stranded merge commit
+only when its tree is the certified one, or differs from it only in paths
+certification does not depend on, and refuses otherwise.
 
 A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
 rebuilds that candidate on fresh base, the fresh base is part of the artifact.
