@@ -86,6 +86,14 @@ Do not put stage policy back in the entrypoint or add a second implementation
 behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line
 ceiling for every maintained handwritten source file.
 
+Every pull request this repository opens gets its title from
+`lib/pr_title_convention.harn`, never from a literal at the call site.
+`burin-labs/harn` runs a required title gate that refuses a subject without a
+leading `[Area]` from its own area list, and a bot pull request is not exempt.
+`check_pr_title_convention.harn` refuses a registered title that gate would
+reject, and refuses a pull-request call site the module does not name, so a new
+opener cannot ship an unowned title.
+
 ## Commands
 
 Use the pinned Harn version from `.harn-version`.
