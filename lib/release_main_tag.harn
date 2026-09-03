@@ -1,5 +1,15 @@
-import { github_enable_auto_merge, github_pr_view } from "./github"
+import {
+  github_disable_auto_merge,
+  github_enable_auto_merge,
+  github_pr_mergeability,
+  github_pr_view,
+} from "./github"
 import { execution_failed } from "./release_execution"
+import {
+  ReleaseMergeGateState,
+  release_merge_gate_decision,
+  release_stranded_recovery_advice,
+} from "./release_merge_gate"
 import { remote_tag_target_sha } from "./release_repin"
 import { release_git_remote_refs, run_git } from "./release_runtime"
 import { ensure_release_tag_pushed_at } from "./release_tag"
@@ -9,13 +19,21 @@ import {
   release_watch_receipt_write,
 } from "./release_watch_state"
 
-pub type ReleaseMainTagAction = "wait" | "rearm" | "tag" | "reuse" | "abort" | "certification_drift"
+pub type ReleaseMainTagAction = "wait" \
+  | "arm" \
+  | "reanchor" \
+  | "certification_stale" \
+  | "tag" \
+  | "reuse" \
+  | "abort" \
+  | "certification_drift"
 
 pub type ReleaseMainTagDecision = {
   action: ReleaseMainTagAction,
   reason: string,
   merge_sha: string,
   drifted_paths: list<string>,
+  observed_main: string,
 }
 
 /**
@@ -61,7 +79,15 @@ pub type ReleaseMainTagAdapter = {
    * not running.
    */
   certification_trees: fn(string) -> ReleaseCertificationTrees?,
-  rearm: fn(ReleaseMainTagPullRequest) -> bool,
+  /**
+   * Observe where main is now, and what changed since the certified base.
+   * Required for the same reason the tree prober is: an absent observation
+   * would release the merge by not looking.
+   */
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
+  arm: fn(ReleaseMainTagPullRequest) -> bool,
+  /** Take the merge back when main moved after the release armed it. */
+  disarm: fn(ReleaseMainTagPullRequest, string) -> bool,
   merged_main_ancestor: fn(string) -> bool,
   push_tag: fn(string) -> list<dict>,
   now: fn(int) -> string,
@@ -81,8 +107,15 @@ fn main_tag_decision(
   reason: string,
   merge_sha: string = "",
   drifted_paths: list<string> = [],
+  observed_main: string = "",
 ) -> ReleaseMainTagDecision {
-  return {action: action, reason: reason, merge_sha: merge_sha, drifted_paths: drifted_paths}
+  return {
+    action: action,
+    reason: reason,
+    merge_sha: merge_sha,
+    drifted_paths: drifted_paths,
+    observed_main: observed_main,
+  }
 }
 
 fn tree_oid(value: string?) -> string {
@@ -102,20 +135,71 @@ pub fn release_certification_trees_agree(trees: ReleaseCertificationTrees) -> bo
   return candidate != "" && merged != "" && candidate == merged
 }
 
-fn drift_reason(trees: ReleaseCertificationTrees) -> string {
+fn drift_reason(tag: string, trees: ReleaseCertificationTrees) -> string {
   const named = if len(trees.drifted_paths) == 0 {
     "no paths reported"
   } else {
     trees.drifted_paths.join(", ")
   }
-  return "main moved since certification; re-dispatch at ${tree_oid(trees.merged_commit)}"
-    + ". The release certified ${tree_oid(trees.candidate_commit)} (tree ${tree_oid(trees.candidate_tree)})"
-    + " but the merged main commit carries tree ${tree_oid(trees.merged_tree)}."
-    + " Drifted paths: ${named}"
+  return "main moved between certification and the merge, so ${tag} would name a tree nobody"
+    + " certified. The release certified ${tree_oid(trees.candidate_commit)}"
+    + " (tree ${tree_oid(trees.candidate_tree)}) but the merged main commit"
+    + " ${tree_oid(trees.merged_commit)} carries tree ${tree_oid(trees.merged_tree)}."
+    + " Drifted paths: ${named}. "
+    + release_stranded_recovery_advice(tag, trees.merged_commit)
 }
 
 fn exact_commit(value: string?) {
   return regex_match("^[0-9a-f]{40}$", lowercase(trim(to_string(value ?? "")))) != nil
+}
+
+/**
+ * Decide what to do with a release pull request that has not merged yet.
+ *
+ * The merge is the release's own act, not GitHub's. Arming auto-merge at
+ * pull-request open let GitHub squash whenever the checks finished, at a base
+ * nobody re-observed, which is how a certified candidate turned into an
+ * uncertified tag. Arming is held here until main is still the commit this
+ * release certified, and until GitHub reports it would merge now rather than
+ * later.
+ */
+fn release_open_pr_merge_decision(
+  pull_request: ReleaseMainTagPullRequest,
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
+) -> ReleaseMainTagDecision {
+  if pull_request?.in_merge_queue ?? false {
+    return main_tag_decision("wait", "release pull request is inside the merge queue")
+  }
+  const gate = merge_gate(pull_request)
+  if gate == nil {
+    return main_tag_decision(
+      "abort",
+      "could not observe origin/main against the certified base; refusing to release the merge without that proof",
+    )
+  }
+  const gated = release_merge_gate_decision(gate)
+  if gated.action == "arm" {
+    if pull_request?.auto_merge_armed ?? false {
+      return main_tag_decision("wait", "release pull request is armed at the certified base")
+    }
+    return main_tag_decision("arm", gated.reason)
+  }
+  if gated.action == "reanchor" {
+    return main_tag_decision("reanchor", gated.reason, "", gated.bearing_paths, gate.observed_main)
+  }
+  if gated.action == "recertify" {
+    return main_tag_decision(
+      "certification_stale",
+      gated.reason,
+      "",
+      gated.bearing_paths,
+      gate.observed_main,
+    )
+  }
+  if gated.action == "abort" {
+    return main_tag_decision("abort", gated.reason)
+  }
+  return main_tag_decision("wait", gated.reason)
 }
 
 /**
@@ -128,6 +212,7 @@ pub fn release_main_tag_decision(
   pull_request: ReleaseMainTagPullRequest?,
   remote_tag_target_sha: string,
   certification_trees: fn(string) -> ReleaseCertificationTrees?,
+  merge_gate: fn(ReleaseMainTagPullRequest) -> ReleaseMergeGateState?,
 ) -> ReleaseMainTagDecision {
   const remote_target = lowercase(trim(remote_tag_target_sha))
   if remote_target != "" && !exact_commit(remote_target) {
@@ -165,10 +250,7 @@ pub fn release_main_tag_decision(
         "release pull request is ${github_state}; only an open or merged PR can own the tag",
       )
     }
-    if (pull_request?.in_merge_queue ?? false) || (pull_request?.auto_merge_armed ?? false) {
-      return main_tag_decision("wait", "release pull request is awaiting its main merge")
-    }
-    return main_tag_decision("rearm", "release pull request lost merge-queue handoff")
+    return release_open_pr_merge_decision(pull_request, merge_gate)
   }
   const merge_sha = lowercase(trim(to_string(pull_request?.merge_commit_oid ?? "")))
   if !exact_commit(merge_sha) {
@@ -196,7 +278,7 @@ pub fn release_main_tag_decision(
   if !release_certification_trees_agree(trees) {
     return main_tag_decision(
       "certification_drift",
-      drift_reason(trees),
+      drift_reason(receipt.tag, trees),
       merge_sha,
       trees.drifted_paths,
     )
@@ -212,6 +294,31 @@ pub fn release_main_tag_decision(
     "release tag target ${remote_target} does not match merged main commit ${merge_sha}",
     merge_sha,
   )
+}
+
+/**
+ * Paths that changed on main since the certified base.
+ *
+ * An empty list means "nothing changed", which the gate only ever reads
+ * alongside two equal heads. A failed comparison returns an empty list too, so
+ * every caller must check the heads first and treat an unexplained difference
+ * as unproved rather than clean.
+ */
+fn release_main_git_drifted_paths(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  certified_base: string,
+  observed_main: string,
+) -> list<string> {
+  const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
+  if !fetched.success {
+    return []
+  }
+  const diffed = run_git(git, cfg, ["diff", "--name-only", certified_base, observed_main])
+  if !diffed.success {
+    return []
+  }
+  return split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
 }
 
 fn default_release_main_tag_adapter(
@@ -238,7 +345,7 @@ fn default_release_main_tag_adapter(
       }
       return remote_tag_target_sha(observed.refs)
     },
-    rearm: fn(pull_request) {
+    arm: fn(pull_request) {
       const armed = github_enable_auto_merge(
         harness,
         receipt.slug,
@@ -247,9 +354,63 @@ fn default_release_main_tag_adapter(
         "squash",
       )
       if is_err(armed) {
-        throw "could not re-arm release PR auto-merge: " + to_string(unwrap_err(armed))
+        throw "could not arm release PR auto-merge: " + to_string(unwrap_err(armed))
       }
       return true
+    },
+    disarm: fn(pull_request, observed_main) {
+      const held = github_disable_auto_merge(
+        harness,
+        {
+          slug: receipt.slug,
+          pull_number: pull_request.number,
+          expected_head_oid: pull_request.head.sha,
+          base_branch: "main",
+          expected_base_oid: observed_main,
+          restore_merge_method: "squash",
+        },
+      )
+      return is_ok(held)
+    },
+    // Where main is right now, read from the remote rather than a local
+    // mirror, plus what changed since the commit this release certified.
+    merge_gate: fn(pull_request) {
+      const certified_base = lowercase(trim(receipt.pin_sha))
+      const observed = release_git_remote_refs(harness.process, cfg, ["refs/heads/main"])
+      if !observed.success {
+        return nil
+      }
+      const heads = observed.refs.filter({ ref -> ref.ref == "refs/heads/main" }).to_list()
+      if len(heads) != 1 {
+        return nil
+      }
+      const observed_main = lowercase(trim(heads[0].oid))
+      const mergeability = github_pr_mergeability(harness, receipt.slug, pull_request.number)
+      const resolved = is_ok(mergeability) && (unwrap(mergeability).resolved ?? false)
+      const merge_state = if is_ok(mergeability) {
+        lowercase(trim(to_string(unwrap(mergeability).mergeable_state)))
+      } else {
+        "unknown"
+      }
+      const drifted = if observed_main == certified_base || certified_base == "" {
+        []
+      } else {
+        release_main_git_drifted_paths(
+          {env: harness.env, process: harness.process},
+          cfg,
+          certified_base,
+          observed_main,
+        )
+      }
+      return {
+        certified_base: certified_base,
+        observed_main: observed_main,
+        mergeable_state: merge_state,
+        mergeable_resolved: resolved,
+        drifted_paths: drifted,
+        reanchor_attempts: 0,
+        max_reanchor_attempts: 0,
+      }
     },
     certification_trees: fn(merge_sha) {
       const candidate = lowercase(trim(receipt.publication.head_oid))
@@ -341,12 +502,23 @@ pub fn run_release_main_tag(
       pull_request,
       adapter.remote_tag_target(poll),
       adapter.certification_trees,
+      adapter.merge_gate,
     )
+    if decision.action == "reanchor" || decision.action == "certification_stale" {
+      // Main moved while this release was certifying. Nothing merged, so main
+      // still carries the development version and a fresh cut is admissible.
+      // Take the merge back first: an armed pull request would otherwise squash
+      // the moment its checks finish.
+      if pull_request != nil && (pull_request?.auto_merge_armed ?? false) {
+        adapter.disarm(pull_request, decision.observed_main)
+      }
+      return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
+    }
     if decision.action == "abort" || decision.action == "certification_drift" {
       return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
     }
-    if decision.action == "rearm" {
-      if pull_request == nil || !adapter.rearm(pull_request) {
+    if decision.action == "arm" {
+      if pull_request == nil || !adapter.arm(pull_request) {
         return {
           status: 2,
           reason: "release PR auto-merge rearm failed",
@@ -424,7 +596,19 @@ pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMai
       merged_tree: "cccccccccccccccccccccccccccccccccccccccc",
       drifted_paths: [],
     } },
-    rearm: fn(_pr) { return true },
+    // The mock release never advances main, so the merge gate always sees the
+    // certified base and a pull request GitHub would merge now.
+    merge_gate: fn(_pr) { return {
+      certified_base: receipt.pin_sha,
+      observed_main: receipt.pin_sha,
+      mergeable_state: "clean",
+      mergeable_resolved: true,
+      drifted_paths: [],
+      reanchor_attempts: 0,
+      max_reanchor_attempts: 0,
+    } },
+    arm: fn(_pr) { return true },
+    disarm: fn(_pr, _observed_main) { return true },
     merged_main_ancestor: fn(sha) { return sha == merge_sha },
     push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
     now: fn(_poll) { return "2026-07-13T00:00:01Z" },
