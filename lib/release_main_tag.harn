@@ -1,4 +1,8 @@
-import { github_enable_auto_merge, github_pr_view } from "./github"
+import {
+  github_disable_auto_merge,
+  github_enable_auto_merge,
+  github_pr_view,
+} from "./github"
 import { execution_failed } from "./release_execution"
 import { remote_tag_target_sha } from "./release_repin"
 import { release_git_remote_refs, run_git } from "./release_runtime"
@@ -9,7 +13,13 @@ import {
   release_watch_receipt_write,
 } from "./release_watch_state"
 
-pub type ReleaseMainTagAction = "wait" | "rearm" | "tag" | "reuse" | "abort" | "certification_drift"
+pub type ReleaseMainTagAction = "wait" \
+  | "rearm" \
+  | "tag" \
+  | "reuse" \
+  | "abort" \
+  | "base_drift" \
+  | "certification_drift"
 
 pub type ReleaseMainTagDecision = {
   action: ReleaseMainTagAction,
@@ -40,6 +50,29 @@ pub type ReleaseCertificationTrees = {
   drifted_paths: list<string>,
 }
 
+/**
+ * Where the default branch stood when the release certified, and where it
+ * stands now, while the release pull request is still open.
+ *
+ * `ReleaseCertificationTrees` asks the same question one moment too late. It
+ * compares the certified candidate against the merge commit, so it can only
+ * answer once that merge commit exists, and by then the fold is on main with
+ * no tag and no executable escape (harn-bump-fleet#1090). This evidence is the
+ * same comparison taken while the cheap outcome is still available: re-dispatch
+ * costs a cut, where the post-merge refusal costs a hand-written revert of the
+ * default branch.
+ *
+ * `drifted_paths` rather than a commit comparison, because the default branch
+ * advancing is not by itself drift: a commit that lands and is reverted leaves
+ * the certified tree intact, and refusing there would refuse a release that is
+ * still exactly what it certified.
+ */
+pub type ReleaseBaseDrift = {
+  certified_base: string,
+  current_base: string,
+  drifted_paths: list<string>,
+}
+
 pub type ReleaseMainTagPullRequest = {
   number: int,
   merged: bool,
@@ -61,7 +94,20 @@ pub type ReleaseMainTagAdapter = {
    * not running.
    */
   certification_trees: fn(string) -> ReleaseCertificationTrees?,
+  /**
+   * Resolve how far the default branch has moved from the certified base while
+   * the release pull request is still open. Required for the same reason
+   * `certification_trees` is: a prober that can be left out is a gate that can
+   * pass by not running.
+   */
+  base_drift: fn(string) -> ReleaseBaseDrift?,
   rearm: fn(ReleaseMainTagPullRequest) -> bool,
+  /**
+   * Take the release pull request out of its merge handoff. A `base_drift`
+   * verdict is worth nothing if auto-merge lands the pull request anyway in the
+   * seconds after it is reached.
+   */
+  disarm: fn(ReleaseMainTagPullRequest) -> bool,
   merged_main_ancestor: fn(string) -> bool,
   push_tag: fn(string) -> list<dict>,
   now: fn(int) -> string,
@@ -102,6 +148,33 @@ pub fn release_certification_trees_agree(trees: ReleaseCertificationTrees) -> bo
   return candidate != "" && merged != "" && candidate == merged
 }
 
+/**
+ * Report whether the default branch still carries the tree the release
+ * certified its base against.
+ *
+ * Both commits must be present, for the reason
+ * `release_certification_trees_agree` states: two unresolved reads compare
+ * equal, and that is exactly how a probe that answered nothing reads as a
+ * branch that never moved.
+ */
+pub fn release_base_unchanged(drift: ReleaseBaseDrift) -> bool {
+  const certified = tree_oid(drift.certified_base)
+  const current = tree_oid(drift.current_base)
+  return certified != "" && current != "" && len(drift.drifted_paths) == 0
+}
+
+fn base_drift_reason(drift: ReleaseBaseDrift) -> string {
+  const named = if len(drift.drifted_paths) == 0 {
+    "no paths reported"
+  } else {
+    drift.drifted_paths.join(", ")
+  }
+  return "main moved since certification while the release PR was still open;"
+    + " re-dispatch at ${tree_oid(drift.current_base)}."
+    + " The release certified against base ${tree_oid(drift.certified_base)}."
+    + " Drifted paths: ${named}"
+}
+
 fn drift_reason(trees: ReleaseCertificationTrees) -> string {
   const named = if len(trees.drifted_paths) == 0 {
     "no paths reported"
@@ -128,6 +201,7 @@ pub fn release_main_tag_decision(
   pull_request: ReleaseMainTagPullRequest?,
   remote_tag_target_sha: string,
   certification_trees: fn(string) -> ReleaseCertificationTrees?,
+  base_drift: fn(string) -> ReleaseBaseDrift?,
 ) -> ReleaseMainTagDecision {
   const remote_target = lowercase(trim(remote_tag_target_sha))
   if remote_target != "" && !exact_commit(remote_target) {
@@ -164,6 +238,21 @@ pub fn release_main_tag_decision(
         "abort",
         "release pull request is ${github_state}; only an open or merged PR can own the tag",
       )
+    }
+    // The release PR is still open, so the cheap outcome is still available.
+    // Prove the default branch has not moved off the certified base BEFORE
+    // letting it merge: the same comparison after the merge costs a manual
+    // repair of main, because the fold gate then refuses a fresh cut and the
+    // recovery workflow re-enters this same refusal (harn-bump-fleet#1090).
+    const base = base_drift(receipt.pin_sha)
+    if base == nil {
+      return main_tag_decision(
+        "abort",
+        "could not prove the release base is still the certified head ${receipt.pin_sha}; refusing to let ${receipt.tag} merge without that proof",
+      )
+    }
+    if !release_base_unchanged(base) {
+      return main_tag_decision("base_drift", base_drift_reason(base), "", base.drifted_paths)
     }
     if (pull_request?.in_merge_queue ?? false) || (pull_request?.auto_merge_armed ?? false) {
       return main_tag_decision("wait", "release pull request is awaiting its main merge")
@@ -238,6 +327,31 @@ fn default_release_main_tag_adapter(
       }
       return remote_tag_target_sha(observed.refs)
     },
+    base_drift: fn(certified_base) {
+      const certified = lowercase(trim(to_string(certified_base ?? "")))
+      if !exact_commit(certified) {
+        return nil
+      }
+      const git = {env: harness.env, process: harness.process}
+      const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
+      if !fetched.success {
+        return nil
+      }
+      const head = run_git(git, cfg, ["rev-parse", "--verify", "origin/main"])
+      if !head.success {
+        return nil
+      }
+      const current = lowercase(trim(head.stdout))
+      // `git diff` between two commits the local clone may not both carry
+      // would report an empty diff on failure, which is the shape that reads
+      // as "the branch never moved". Refuse instead.
+      const diffed = run_git(git, cfg, ["diff", "--name-only", certified, current])
+      if !diffed.success {
+        return nil
+      }
+      const paths = split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
+      return {certified_base: certified, current_base: current, drifted_paths: paths}
+    },
     rearm: fn(pull_request) {
       const armed = github_enable_auto_merge(
         harness,
@@ -295,6 +409,25 @@ fn default_release_main_tag_adapter(
         drifted_paths: paths,
       }
     },
+    disarm: fn(pull_request) {
+      const git = {env: harness.env, process: harness.process}
+      const head = run_git(git, cfg, ["rev-parse", "--verify", "origin/main"])
+      if !head.success {
+        return false
+      }
+      const held = github_disable_auto_merge(
+        harness,
+        {
+          slug: receipt.slug,
+          pull_number: pull_request.number,
+          expected_head_oid: pull_request.head.sha,
+          base_branch: "main",
+          expected_base_oid: lowercase(trim(head.stdout)),
+          restore_merge_method: "squash",
+        },
+      )
+      return !is_err(held)
+    },
     merged_main_ancestor: fn(merge_sha) {
       const fetched = run_git(
         {env: harness.env, process: harness.process},
@@ -341,7 +474,26 @@ pub fn run_release_main_tag(
       pull_request,
       adapter.remote_tag_target(poll),
       adapter.certification_trees,
+      adapter.base_drift,
     )
+    if decision.action == "base_drift" {
+      // Refusing while the pull request stays armed refuses nothing: auto-merge
+      // lands it seconds later and the release is stranded exactly as it would
+      // have been. Take the handoff away first, then report.
+      const held = if pull_request == nil { false } else { adapter.disarm(pull_request) }
+      const detail = if held {
+        "auto-merge held"
+      } else {
+        "auto-merge could NOT be held; the release PR may still merge"
+      }
+      return {
+        status: 2,
+        reason: "${decision.reason} (${detail})",
+        receipt: receipt,
+        steps: [],
+        polls: poll + 1,
+      }
+    }
     if decision.action == "abort" || decision.action == "certification_drift" {
       return {status: 2, reason: decision.reason, receipt: receipt, steps: [], polls: poll + 1}
     }
@@ -424,7 +576,15 @@ pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMai
       merged_tree: "cccccccccccccccccccccccccccccccccccccccc",
       drifted_paths: [],
     } },
+    // The mock release never advances main either, so the certified base and
+    // the current base are the same commit.
+    base_drift: fn(certified_base) { return {
+      certified_base: certified_base,
+      current_base: certified_base,
+      drifted_paths: [],
+    } },
     rearm: fn(_pr) { return true },
+    disarm: fn(_pr) { return true },
     merged_main_ancestor: fn(sha) { return sha == merge_sha },
     push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
     now: fn(_poll) { return "2026-07-13T00:00:01Z" },
