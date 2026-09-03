@@ -12,3 +12,7 @@ the one `pr_title_area` the fleet's pull requests belong under, and the manifest
 refuses either one declared without the other. Projection convergence and bump
 recovery read that row, so `burin-labs/burin-code` now receives `[Harn] Bump
 Harn runtime` rather than a title its own gate would refuse.
+
+The typed repair contract moved to `lib/fleet_repair_contract.harn`, which keeps
+`lib/fleet_repair.harn` under the 1,500-line ceiling and lets a stage name the
+shapes it takes without pulling in the agent loop and the GitHub client with it.
