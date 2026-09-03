@@ -1,0 +1,324 @@
+import { github_connector_options, github_pr_list } from "./github"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+const PAGE_SIZE = 100
+
+const MAX_PAGES = 10
+
+const ISSUE_PREVIEW_LIMIT = 100
+
+pub const PRLESS_BRANCH_ISSUE_MARKER_PREFIX: string = "<!-- harn-bump-fleet:prless-branches:"
+
+pub const PRLESS_BRANCH_LABEL: string = "fleet/prless-branch-audit"
+
+pub type BranchAuditState = "clean" | "findings" | "measurement_failed"
+
+pub type RepositoryBranch = {name: string, head_oid: string, protected: bool}
+
+pub type RepositoryBranchAudit = {
+  slug: string,
+  default_branch: string,
+  state: BranchAuditState,
+  branch_count: int?,
+  open_pr_head_count: int?,
+  prless_branch_count: int?,
+  prless_branches: list<RepositoryBranch>,
+  error_code?: string,
+  detail: string,
+}
+
+pub type FleetBranchAuditReceipt = {
+  schema_version: string,
+  requested_repository_count: int,
+  scanned_repository_count: int,
+  failed_repository_count: int,
+  branch_count: int,
+  open_pr_head_count: int,
+  prless_branch_count: int,
+  repositories: list<RepositoryBranchAudit>,
+}
+
+type GithubBranchRow = {name: string, commit: {sha: string}, protected?: bool, ...rest}
+
+type GithubBranchRows = list<GithubBranchRow>
+
+fn slug_parts(slug: string) -> {owner: string, repo: string} {
+  const parts = split(slug, "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    throw "repository slug must be owner/name, got '${slug}'"
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+fn branch_page(
+  harness: Harness,
+  slug: string,
+  page: int,
+  client: GithubClientOptions,
+) -> list<RepositoryBranch> {
+  const parts = slug_parts(slug)
+  const response = api_call(
+    harness,
+    {
+      path:
+        "/repos/${parts.owner}/${parts.repo}/branches?page=${to_string(page)}&per_page=${to_string(PAGE_SIZE)}",
+      options: client,
+    },
+  )
+  if is_err(response) {
+    throw "branch_page_failed: " + to_string(unwrap_err(response))
+  }
+  const raw = unwrap(response)
+  if !schema_is(raw, GithubBranchRows) {
+    throw "branch_response_malformed: GitHub did not return a typed branch list"
+  }
+  let rows: list<RepositoryBranch> = []
+  for branch in raw {
+    const name = trim(branch.name)
+    const head_oid = lowercase(trim(branch.commit.sha))
+    if name == "" || len(regex_captures("^[0-9a-f]{40}$", head_oid)) == 0 {
+      throw "branch_response_malformed: branch name or commit SHA is invalid"
+    }
+    rows = rows + [{name: name, head_oid: head_oid, protected: branch.protected ?? false}]
+  }
+  return rows
+}
+
+fn all_branches(
+  harness: Harness,
+  slug: string,
+  client: GithubClientOptions,
+) -> list<RepositoryBranch> {
+  let branches: list<RepositoryBranch> = []
+  for page in range(1, MAX_PAGES + 1) {
+    const rows = branch_page(harness, slug, page, client)
+    branches = branches + rows
+    if len(rows) < PAGE_SIZE {
+      return branches
+    }
+  }
+  throw "branch_page_limit_exceeded: ${slug} returned ${to_string(PAGE_SIZE)} branches on all "
+    + "${to_string(MAX_PAGES)} bounded pages"
+}
+
+fn all_open_pr_head_names(
+  harness: Harness,
+  slug: string,
+  client: GithubClientOptions,
+) -> list<string> {
+  let names: list<string> = []
+  for page in range(1, MAX_PAGES + 1) {
+    const response = github_pr_list(
+      harness,
+      slug,
+      {state: "open", per_page: PAGE_SIZE, page: page},
+      client,
+    )
+    if is_err(response) {
+      throw "pull_request_page_failed: " + to_string(unwrap_err(response))
+    }
+    const rows = unwrap(response)
+    for pull in rows {
+      // A fork pull request does not own a branch in the surveyed repository.
+      if lowercase(trim(pull.head.repo)) == lowercase(trim(slug)) {
+        const name = trim(pull.head.ref)
+        if name == "" {
+          throw "pull_request_response_malformed: an open same-repository pull request omitted its head branch"
+        }
+        if !contains(names, name) {
+          names = names + [name]
+        }
+      }
+    }
+    if len(rows) < PAGE_SIZE {
+      return names
+    }
+  }
+  throw "pull_request_page_limit_exceeded: ${slug} returned ${to_string(PAGE_SIZE)} open pull "
+    + "requests on all ${to_string(MAX_PAGES)} bounded pages"
+}
+
+fn branch_snapshot_fingerprint(branches: list<RepositoryBranch>) -> list<string> {
+  return branches.map({ branch -> "${branch.name}@${branch.head_oid}" }).to_list().sort()
+}
+
+fn name_snapshot_fingerprint(names: list<string>) -> list<string> {
+  return names.map({ name -> name }).to_list().sort()
+}
+
+fn measurement_failure(
+  slug: string,
+  default_branch: string,
+  detail: string,
+) -> RepositoryBranchAudit {
+  const pieces = split(detail, ":")
+  return {
+    slug: slug,
+    default_branch: default_branch,
+    state: "measurement_failed",
+    branch_count: nil,
+    open_pr_head_count: nil,
+    prless_branch_count: nil,
+    prless_branches: [],
+    error_code: trim(pieces[0]),
+    detail: detail,
+  }
+}
+
+/**
+ * Survey one repository through a typed, non-vacuous interface.
+ *
+ * The default branch is the positive control. A visible GitHub repository
+ * cannot have a valid default branch that is absent from its branch listing,
+ * so an empty or partial response is a measurement failure rather than inbox
+ * zero.
+ */
+pub fn survey_repository_branches(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  client: GithubClientOptions = github_connector_options(),
+) -> RepositoryBranchAudit {
+  const observed = try {
+    const branches = all_branches(harness, slug, client)
+    if len(branches) == 0 {
+      throw "empty_branch_read: GitHub returned zero branches"
+    }
+    let names: list<string> = []
+    for branch in branches {
+      if contains(names, branch.name) {
+        throw "duplicate_branch_read: GitHub returned branch '${branch.name}' more than once"
+      }
+      names = names + [branch.name]
+    }
+    if !contains(names, default_branch) {
+      throw "default_branch_missing: '${default_branch}' was absent from the branch listing"
+    }
+    const open_heads = all_open_pr_head_names(harness, slug, client)
+    // REST pages are not a snapshot. Read both inventories twice and refuse a
+    // moving answer so a branch inserted between pages cannot hide another.
+    const confirmed_branches = all_branches(harness, slug, client)
+    const confirmed_open_heads = all_open_pr_head_names(harness, slug, client)
+    if branch_snapshot_fingerprint(branches) != branch_snapshot_fingerprint(confirmed_branches) {
+      throw "branch_snapshot_moved: branch names or commit identities changed during the audit"
+    }
+    if name_snapshot_fingerprint(open_heads) != name_snapshot_fingerprint(confirmed_open_heads) {
+      throw "pull_request_snapshot_moved: open same-repository pull-request heads changed during the audit"
+    }
+    const findings = confirmed_branches.filter(
+      { branch -> branch.name != default_branch && !contains(open_heads, branch.name) },
+    )
+      .to_list()
+    const state: BranchAuditState = if len(findings) == 0 {
+      "clean"
+    } else {
+      "findings"
+    }
+    const row: RepositoryBranchAudit = {
+      slug: slug,
+      default_branch: default_branch,
+      state: state,
+      branch_count: len(branches),
+      open_pr_head_count: len(open_heads),
+      prless_branch_count: len(findings),
+      prless_branches: findings,
+      error_code: nil,
+      detail: if len(findings) == 0 {
+        "every non-default branch is the head of an open pull request"
+      } else {
+        "${to_string(len(findings))} non-default branch(es) have no open pull request"
+      },
+    }
+    row
+  }
+  if is_err(observed) {
+    return measurement_failure(slug, default_branch, to_string(unwrap_err(observed)))
+  }
+  return unwrap(observed)
+}
+
+pub fn fleet_branch_audit_receipt(rows: list<RepositoryBranchAudit>) -> FleetBranchAuditReceipt {
+  let scanned = 0
+  let failed = 0
+  let branch_count = 0
+  let open_pr_head_count = 0
+  let prless_branch_count = 0
+  for row in rows {
+    if row.state == "measurement_failed" {
+      failed = failed + 1
+      continue
+    }
+    scanned = scanned + 1
+    branch_count = branch_count + (row.branch_count ?? 0)
+    open_pr_head_count = open_pr_head_count + (row.open_pr_head_count ?? 0)
+    prless_branch_count = prless_branch_count + (row.prless_branch_count ?? 0)
+  }
+  return {
+    schema_version: "harn_bump_fleet.prless_branch_audit.v1",
+    requested_repository_count: len(rows),
+    scanned_repository_count: scanned,
+    failed_repository_count: failed,
+    branch_count: branch_count,
+    open_pr_head_count: open_pr_head_count,
+    prless_branch_count: prless_branch_count,
+    repositories: rows,
+  }
+}
+
+pub fn prless_branch_issue_marker(slug: string) -> string {
+  return PRLESS_BRANCH_ISSUE_MARKER_PREFIX + slug + " -->"
+}
+
+pub fn prless_branch_issue_title(row: RepositoryBranchAudit) -> string {
+  return if row.state == "measurement_failed" {
+    "Fleet branch audit could not measure ${row.slug}"
+  } else {
+    "Branches without open pull requests in ${row.slug}"
+  }
+}
+
+fn finding_preview(rows: list<RepositoryBranch>) -> list<RepositoryBranch> {
+  let preview: list<RepositoryBranch> = []
+  for row in rows {
+    if len(preview) >= ISSUE_PREVIEW_LIMIT {
+      break
+    }
+    preview = preview + [row]
+  }
+  return preview
+}
+
+pub fn prless_branch_issue_body(row: RepositoryBranchAudit, run_url: string?) -> string {
+  const trailer = if run_url == nil {
+    ""
+  } else {
+    "\n\nDetected by ${to_string(run_url)}."
+  }
+  if row.state == "measurement_failed" {
+    return prless_branch_issue_marker(row.slug)
+      + "\n\nThe daily fleet branch audit could not establish a complete branch census."
+      + " It is refusing to report inbox zero.\n\nError: `${row.error_code ?? "unknown"}`\n\n"
+      + row.detail
+      + "\n\nThis issue refreshes until a complete read succeeds. The audit never deletes branches."
+      + trailer
+  }
+  const preview = finding_preview(row.prless_branches)
+  const omitted = len(row.prless_branches) - len(preview)
+  const omitted_text = if omitted == 0 {
+    ""
+  } else {
+    "\n\n${to_string(omitted)} additional branch(es) are present in the workflow receipt."
+  }
+  return prless_branch_issue_marker(row.slug)
+    + "\n\nThe daily fleet branch audit found **${to_string(row.prless_branch_count ?? 0)}** "
+    + "non-default branch(es) that are not the head of an open pull request."
+    + "\n\nThe audit measured ${to_string(row.branch_count ?? 0)} branch(es) and "
+    + "${to_string(row.open_pr_head_count ?? 0)} unique same-repository open pull-request head(s)."
+    + "\n\n```json\n"
+    + json_stringify_pretty(preview)
+    + "\n```"
+    + omitted_text
+    + "\n\nReview, finish, or archive the work deliberately. This audit never deletes branches."
+    + " It refreshes this issue while findings remain and closes it when none remain."
+    + trailer
+}

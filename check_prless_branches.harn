@@ -1,0 +1,277 @@
+#!/usr/bin/env harn
+//
+// Daily read-only branch inventory for the repositories owned by fleet.toml.
+// Findings and measurement failures are projected into one durable issue in
+// each affected repository. Branch deletion remains a deliberate human or
+// agent action outside this harness.
+import { ParserSpec } from "std/cli/argparse"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+import { cli_options } from "lib/cli_options"
+import { read_fleet_manifest } from "lib/fleet_manifest"
+import { github_connector_options, github_issue_create, github_issue_update } from "lib/github"
+import {
+  FleetBranchAuditReceipt,
+  PRLESS_BRANCH_ISSUE_MARKER_PREFIX,
+  PRLESS_BRANCH_LABEL,
+  RepositoryBranchAudit,
+  fleet_branch_audit_receipt,
+  prless_branch_issue_body,
+  prless_branch_issue_marker,
+  prless_branch_issue_title,
+  survey_repository_branches,
+} from "lib/prless_branch_audit"
+
+const ISSUE_PAGE_SIZE = 100
+
+const MAX_ISSUE_PAGES = 10
+
+pub type BranchAuditOptions = {only?: string, dry_run: bool, run_url?: string}
+
+pub type BranchAuditIssueReconciliation = {ok: bool, action: string, detail: string}
+
+type GithubIssueRow = {
+  number: int,
+  title?: string,
+  body?: string,
+  state: string,
+  pull_request?: dict,
+  ...rest,
+}
+
+type GithubIssueRows = list<GithubIssueRow>
+
+type GithubLabelRow = {name: string, color: string, ...rest}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-prless-branches",
+  args: [
+    {kind: "flag", name: "only", long: "--only"},
+    {kind: "switch", name: "dry_run", long: "--dry-run"},
+    {kind: "flag", name: "run_url", long: "--run-url"},
+  ],
+}
+
+pub fn parse_branch_audit_args(args: list<string>) -> BranchAuditOptions {
+  return cli_options<BranchAuditOptions>(ARG_SPEC, args, schema_of(BranchAuditOptions))
+}
+
+fn slug_parts(slug: string) -> {owner: string, repo: string} {
+  const parts = split(slug, "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    throw "repository slug must be owner/name, got '${slug}'"
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+fn audit_label_path(slug: string) -> string {
+  const parts = slug_parts(slug)
+  return "/repos/${parts.owner}/${parts.repo}/labels/fleet%2Fprless-branch-audit"
+}
+
+/**
+ * Establish the label used as the issue lookup key before relying on it.
+ * GitHub silently drops unknown labels during issue creation, which would
+ * otherwise make the next run miss the issue and open a duplicate.
+ */
+fn ensure_audit_label(harness: Harness, slug: string, dry_run: bool, client: GithubClientOptions) {
+  const observed = api_call(harness, {path: audit_label_path(slug), options: client})
+  if !is_err(observed) {
+    const label = unwrap(observed)
+    if !schema_is(label, GithubLabelRow) || label.name != PRLESS_BRANCH_LABEL {
+      throw "label_response_malformed: GitHub did not return the audit-owned label"
+    }
+    return
+  }
+  const failure = unwrap_err(observed)
+  if (failure?.http_status ?? 0) != 404 {
+    throw "label_probe_failed: " + to_string(failure)
+  }
+  if dry_run {
+    return
+  }
+  const parts = slug_parts(slug)
+  const created = api_call(
+    harness,
+    {
+      path: "/repos/${parts.owner}/${parts.repo}/labels",
+      method: "POST",
+      body: {
+        name: PRLESS_BRANCH_LABEL,
+        color: "B60205",
+        description: "Daily audit found remote branches with no open pull request",
+      },
+      options: client,
+    },
+  )
+  if is_err(created) {
+    throw "label_create_failed: " + to_string(unwrap_err(created))
+  }
+  const label = unwrap(created)
+  if !schema_is(label, GithubLabelRow) || label.name != PRLESS_BRANCH_LABEL {
+    throw "label_create_response_malformed: GitHub did not confirm the audit-owned label"
+  }
+}
+
+fn open_audit_issues(
+  harness: Harness,
+  slug: string,
+  client: GithubClientOptions,
+) -> list<GithubIssueRow> {
+  const parts = slug_parts(slug)
+  let matching: list<GithubIssueRow> = []
+  for page in range(1, MAX_ISSUE_PAGES + 1) {
+    const response = api_call(
+      harness,
+      {
+        path:
+          "/repos/${parts.owner}/${parts.repo}/issues?labels=${PRLESS_BRANCH_LABEL}&page=${to_string(page)}&per_page=${to_string(ISSUE_PAGE_SIZE)}&state=all",
+        options: client,
+      },
+    )
+    if is_err(response) {
+      throw "issue_page_failed: " + to_string(unwrap_err(response))
+    }
+    const raw = unwrap(response)
+    if !schema_is(raw, GithubIssueRows) {
+      throw "issue_response_malformed: GitHub did not return a typed issue list"
+    }
+    for issue in raw {
+      if issue.pull_request == nil
+        && starts_with(trim(issue.body ?? ""), PRLESS_BRANCH_ISSUE_MARKER_PREFIX) {
+        matching = matching + [issue]
+      }
+    }
+    if len(raw) < ISSUE_PAGE_SIZE {
+      return matching
+    }
+  }
+  throw "issue_page_limit_exceeded: ${slug} returned ${to_string(ISSUE_PAGE_SIZE)} issues "
+    + "on all ${to_string(MAX_ISSUE_PAGES)} bounded pages"
+}
+
+/** Reconcile the one marker-owned issue for a repository. */
+pub fn reconcile_branch_audit_issue(
+  harness: Harness,
+  row: RepositoryBranchAudit,
+  options: BranchAuditOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> BranchAuditIssueReconciliation {
+  const existing = try {
+    ensure_audit_label(harness, row.slug, options.dry_run, client)
+    open_audit_issues(harness, row.slug, client).filter(
+      { issue -> contains(issue.body ?? "", prless_branch_issue_marker(row.slug)) },
+    )
+      .to_list()
+  }
+  if is_err(existing) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(existing))}
+  }
+  const matches = unwrap(existing)
+  if len(matches) > 1 {
+    return {ok: false, action: "duplicate_issue", detail: "multiple issues carry the stable marker"}
+  }
+  const open_issue = if len(matches) == 0 {
+    nil
+  } else {
+    matches[0]
+  }
+  if row.state == "clean" {
+    if open_issue == nil {
+      return {ok: true, action: "none", detail: "no branch audit issue open"}
+    }
+    if options.dry_run {
+      return {ok: true, action: "would_close", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    if lowercase(open_issue.state) == "closed" {
+      return {ok: true, action: "none", detail: "branch audit issue already closed"}
+    }
+    const closed = github_issue_update(
+      harness,
+      row.slug,
+      open_issue.number,
+      {state: "closed", state_reason: "completed"},
+      client,
+    )
+    if is_err(closed) {
+      return {ok: false, action: "close_failed", detail: to_string(unwrap_err(closed))}
+    }
+    return {ok: true, action: "closed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  const body = prless_branch_issue_body(row, options.run_url)
+  if open_issue != nil {
+    if options.dry_run {
+      return {ok: true, action: "would_refresh", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    const refreshed = github_issue_update(
+      harness,
+      row.slug,
+      open_issue.number,
+      {title: prless_branch_issue_title(row), body: body, state: "open"},
+      client,
+    )
+    if is_err(refreshed) {
+      return {ok: false, action: "refresh_failed", detail: to_string(unwrap_err(refreshed))}
+    }
+    return {ok: true, action: "refreshed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_open", detail: row.detail}
+  }
+  const created = github_issue_create(
+    harness,
+    row.slug,
+    prless_branch_issue_title(row),
+    body,
+    [PRLESS_BRANCH_LABEL],
+    client,
+  )
+  if is_err(created) {
+    return {ok: false, action: "open_failed", detail: to_string(unwrap_err(created))}
+  }
+  return {ok: true, action: "opened", detail: row.detail}
+}
+
+pipeline main(harness: Harness) {
+  const options = parse_branch_audit_args(argv)
+  const manifest = read_fleet_manifest(harness.fs)
+  const repositories = manifest.repositories.filter(
+    { repo -> options.only == nil || repo.slug == options.only },
+  )
+    .to_list()
+  if len(repositories) == 0 {
+    harness.stdio.eprintln(
+      "error: branch audit matched zero repositories for '${options.only ?? "all"}'",
+    )
+    return 2
+  }
+  let rows: list<RepositoryBranchAudit> = []
+  let reconciliations = []
+  let reconciliation_failed = false
+  for repo in repositories {
+    const row = survey_repository_branches(harness, repo.slug, manifest.fleet.default_branch)
+    rows = rows + [row]
+    const reconciled = reconcile_branch_audit_issue(harness, row, options)
+    if !reconciled.ok {
+      reconciliation_failed = true
+    }
+    reconciliations = reconciliations
+      + [{repo: row.slug, action: reconciled.action, ok: reconciled.ok, detail: reconciled.detail}]
+  }
+  const receipt: FleetBranchAuditReceipt = fleet_branch_audit_receipt(rows)
+  harness.stdio.println(json_stringify_pretty(receipt + {issues: reconciliations}))
+  for row in rows {
+    if row.state == "measurement_failed" {
+      harness.stdio.eprintln("UNMEASURED ${row.slug}: ${row.detail}")
+    } else if row.state == "findings" {
+      harness.stdio.eprintln(
+        "PR-LESS ${row.slug}: ${to_string(row.prless_branch_count ?? 0)} branch(es)",
+      )
+    }
+  }
+  return if reconciliation_failed || receipt.failed_repository_count > 0
+    || receipt.prless_branch_count > 0 {
+    1
+  } else {
+    0
+  }
+}
