@@ -1,4 +1,9 @@
 import {
+  ReleaseDriftCommit,
+  release_drift_commit_evidence,
+  release_drift_evidence,
+} from "../lib/release_drift_evidence"
+import {
   ReleaseMergeGateState,
   ReleaseStrandedRecoveryState,
   release_certification_bearing_paths,
@@ -14,12 +19,43 @@ const CERTIFIED_TREE = "4444444444444444444444444444444444444444"
 
 const DRIFTED_TREE = "5555555555555555555555555555555555555555"
 
+// The two contexts burin-labs/harn requires on main, and the two lanes only a
+// release runs, both computed rather than chosen: the required set comes from
+// the branch's rulesets and the lane set from workflow triggers.
+const REQUIRED = ["CI status", "drift"]
+
+const RELEASE_ONLY = ["Workspace nextest (macos-latest)", "Workspace nextest (windows-latest)"]
+
 fn string_list(value: any) -> list<string> {
   let out: list<string> = []
   for item in value {
     out = out + [to_string(item)]
   }
   return out
+}
+
+fn run(name: string, conclusion: string) {
+  return {name: name, status: "COMPLETED", conclusion: conclusion, __typename: "CheckRun"}
+}
+
+fn green_commit(sha: string) -> ReleaseDriftCommit {
+  return release_drift_commit_evidence(
+    sha,
+    7885,
+    REQUIRED,
+    [run("CI status", "SUCCESS"), run("drift", "SUCCESS")],
+    [],
+  )
+}
+
+fn red_commit(sha: string) -> ReleaseDriftCommit {
+  return release_drift_commit_evidence(
+    sha,
+    7897,
+    REQUIRED,
+    [run("CI status", "FAILURE"), run("drift", "SUCCESS")],
+    [],
+  )
 }
 
 fn gate(overrides: dict = {}) -> ReleaseMergeGateState {
@@ -29,8 +65,11 @@ fn gate(overrides: dict = {}) -> ReleaseMergeGateState {
     mergeable_state: "clean",
     mergeable_resolved: true,
     drifted_paths: [],
-    reanchor_attempts: 0,
-    max_reanchor_attempts: 2,
+    evidence: nil,
+    release_only_checks: RELEASE_ONLY,
+    delta_verified_at: "",
+    delta_iterations: 0,
+    max_delta_iterations: 3,
   }
     + overrides
   return {
@@ -39,9 +78,201 @@ fn gate(overrides: dict = {}) -> ReleaseMergeGateState {
     mergeable_state: to_string(merged.mergeable_state),
     mergeable_resolved: merged.mergeable_resolved == true,
     drifted_paths: string_list(merged.drifted_paths),
-    reanchor_attempts: to_int(merged.reanchor_attempts),
-    max_reanchor_attempts: to_int(merged.max_reanchor_attempts),
+    evidence: merged.evidence,
+    release_only_checks: string_list(merged.release_only_checks),
+    delta_verified_at: to_string(merged.delta_verified_at),
+    delta_iterations: to_int(merged.delta_iterations),
+    max_delta_iterations: to_int(merged.max_delta_iterations),
   }
+}
+
+fn drifted(paths: list<string>, overrides: dict = {}) -> ReleaseMergeGateState {
+  return gate(
+    {
+      observed_main: MOVED,
+      drifted_paths: paths,
+      evidence: release_drift_evidence(
+        BASE,
+        MOVED,
+        REQUIRED,
+        [green_commit(MOVED)],
+        "2026-09-03T03:00:00Z",
+      ),
+    }
+      + overrides,
+  )
+}
+
+/** Main did not move and GitHub would merge now, so the merge is released. */
+pipeline test_merge_gate_merges_on_a_stable_base(task: any) {
+  assert_eq(release_merge_gate_decision(gate()).action, "merge")
+}
+
+/**
+ * A stable base is not enough. Merging while the checks are still running would
+ * land at a base nobody re-observed, which is the window this gate closes.
+ */
+pipeline test_merge_gate_holds_until_github_would_merge_now(task: any) {
+  const blocked = release_merge_gate_decision(gate({mergeable_state: "blocked"}))
+  const unresolved = release_merge_gate_decision(
+    gate({mergeable_state: "clean", mergeable_resolved: false}),
+  )
+  const conflicted = release_merge_gate_decision(gate({mergeable_state: "dirty"}))
+  assert_eq([blocked.action, unresolved.action], ["hold", "hold"])
+  assert_eq(conflicted.action, "abort")
+}
+
+/**
+ * The contract. Main moved, but every commit that landed passed the branch's own
+ * required checks, and nothing it changed is a path the release-only lanes bear
+ * on, so the release merges instead of waiting for a freeze.
+ */
+pipeline test_merge_gate_merges_green_paperwork_drift(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(["changelog.d/7885.fixed.md", "CHANGELOG.md"]),
+  )
+  assert_eq(decision.action, "merge")
+  assert(contains(decision.reason, "passed CI status, drift"))
+}
+
+/**
+ * The v0.10.128 shape under the new contract. Main moved by code, every drifted
+ * commit is green on main's own checks, but the release runs lanes no ordinary
+ * pull request does, so that delta runs on the shipping tree before the merge.
+ */
+pipeline test_merge_gate_runs_the_release_only_delta_for_code_drift(task: any) {
+  const decision = release_merge_gate_decision(drifted(["crates/harn-core/src/lib.rs"]))
+  assert_eq(
+    [decision.action, decision.bearing_paths],
+    ["certify_delta", ["crates/harn-core/src/lib.rs"]],
+  )
+  assert(contains(decision.reason, "Workspace nextest (windows-latest)"))
+}
+
+/** Once the delta has passed on this exact head, the merge is released. */
+pipeline test_merge_gate_merges_once_the_delta_passed_on_this_head(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(["crates/harn-core/src/lib.rs"], {delta_verified_at: MOVED}),
+  )
+  assert_eq(decision.action, "merge")
+  assert(contains(decision.reason, "already passed on ${MOVED}"))
+}
+
+/** A delta that passed on some earlier head proves nothing about this one. */
+pipeline test_merge_gate_ignores_a_delta_from_another_head(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(["crates/harn-core/src/lib.rs"], {delta_verified_at: BASE}),
+  )
+  assert_eq(decision.action, "certify_delta")
+}
+
+/**
+ * A drifted commit that did not pass the branch's own required checks stops the
+ * release. This is the v0.10.128 merge commit's real shape: `CI status=failure`.
+ */
+pipeline test_merge_gate_defers_a_drifted_commit_that_is_not_green(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {
+        evidence: release_drift_evidence(
+          BASE,
+          MOVED,
+          REQUIRED,
+          [green_commit(BASE), red_commit(MOVED)],
+          "2026-09-03T03:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq([decision.action, decision.terminal_reason], ["defer", "drifted_commit_not_green"])
+  assert(contains(decision.reason, "without passing CI status"))
+  assert(contains(decision.reason, "Nothing was merged and main is untouched"))
+}
+
+/** The loop is bounded, and exhausting it names the commits it gave up on. */
+pipeline test_merge_gate_bounds_the_delta_loop(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {delta_iterations: 3, max_delta_iterations: 3, delta_verified_at: BASE},
+    ),
+  )
+  assert_eq(
+    [decision.action, decision.terminal_reason],
+    ["defer", "release_delta_iterations_exhausted"],
+  )
+  assert(contains(decision.reason, MOVED))
+  assert(contains(decision.reason, "Workspace nextest (macos-latest)"))
+}
+
+/**
+ * Evidence that was never gathered is not clean drift, and evidence describing
+ * other heads is not evidence about these ones. Both are the shape where a
+ * missing observation would release the merge it was meant to guard.
+ */
+pipeline test_merge_gate_refuses_absent_or_stale_evidence(task: any) {
+  const absent = release_merge_gate_decision(
+    gate({observed_main: MOVED, drifted_paths: ["crates/harn-core/src/lib.rs"]}),
+  )
+  const stale = release_merge_gate_decision(
+    gate(
+      {
+        observed_main: MOVED,
+        drifted_paths: ["crates/harn-core/src/lib.rs"],
+        evidence: release_drift_evidence(
+          BASE,
+          BASE,
+          REQUIRED,
+          [green_commit(BASE)],
+          "2026-09-03T02:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq(
+    [absent.terminal_reason, stale.terminal_reason],
+    ["drift_evidence_not_observed", "drift_evidence_is_stale"],
+  )
+}
+
+/** An unreadable required set defers rather than merging on an unproved drift. */
+pipeline test_merge_gate_defers_when_the_required_set_is_unreadable(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {
+        evidence: release_drift_evidence(
+          BASE,
+          MOVED,
+          [],
+          [green_commit(MOVED)],
+          "2026-09-03T03:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq(
+    [decision.action, decision.terminal_reason],
+    ["defer", "required_contexts_not_observed"],
+  )
+}
+
+/**
+ * A probe that answered nothing must not read as a stable base. Two unresolved
+ * heads compare equal, which is exactly how a missing observation would release
+ * the merge.
+ */
+pipeline test_merge_gate_refuses_an_unobserved_base(task: any) {
+  const unobserved = release_merge_gate_decision(gate({certified_base: "", observed_main: ""}))
+  const partial = release_merge_gate_decision(gate({observed_main: ""}))
+  const malformed = release_merge_gate_decision(gate({observed_main: "not-a-sha"}))
+  assert_eq([unobserved.action, partial.action, malformed.action], ["abort", "abort", "abort"])
+}
+
+/** A moved head that reports no paths is an unproved probe, not a clean drift. */
+pipeline test_merge_gate_refuses_a_drift_with_no_reported_paths(task: any) {
+  assert_eq(release_merge_gate_decision(gate({observed_main: MOVED})).action, "abort")
 }
 
 fn stranded(overrides: dict = {}) -> ReleaseStrandedRecoveryState {
@@ -66,85 +297,6 @@ fn stranded(overrides: dict = {}) -> ReleaseStrandedRecoveryState {
     target_tree: to_string(merged.target_tree),
     drifted_paths: string_list(merged.drifted_paths),
   }
-}
-
-/**
- * Falsifier 1: main moved while the release was certifying, so the release PR
- * must not be released to merge. Tonight's cut merged here and stranded main at
- * 0.10.128 with no tag.
- */
-pipeline test_merge_gate_refuses_to_arm_when_main_moved(task: any) {
-  const decision = release_merge_gate_decision(
-    gate({observed_main: MOVED, drifted_paths: ["crates/harn-core/src/lib.rs"]}),
-  )
-  assert_ne(decision.action, "arm")
-  assert_eq(decision.action, "recertify")
-  assert_eq(decision.bearing_paths, ["crates/harn-core/src/lib.rs"])
-}
-
-/** Falsifier 2: main did not move and GitHub would merge now, so the merge is released. */
-pipeline test_merge_gate_arms_only_on_a_stable_base(task: any) {
-  assert_eq(release_merge_gate_decision(gate()).action, "arm")
-}
-
-/**
- * A stable base is not enough. Arming while checks are still running reopens the
- * whole window, because GitHub merges later, at a base nobody re-observed.
- */
-pipeline test_merge_gate_holds_until_github_would_merge_now(task: any) {
-  const blocked = release_merge_gate_decision(gate({mergeable_state: "blocked"}))
-  const unresolved = release_merge_gate_decision(
-    gate({mergeable_state: "clean", mergeable_resolved: false}),
-  )
-  const conflicted = release_merge_gate_decision(gate({mergeable_state: "dirty"}))
-  assert_eq([blocked.action, unresolved.action], ["hold", "hold"])
-  assert_eq(conflicted.action, "abort")
-}
-
-/** Falsifier 3: drift confined to changelog fragments takes the incremental path. */
-pipeline test_merge_gate_reanchors_a_changelog_only_drift(task: any) {
-  const decision = release_merge_gate_decision(
-    gate(
-      {
-        observed_main: MOVED,
-        drifted_paths: ["changelog.d/7885.fixed.md", "changelog.d/7891.added.md", "CHANGELOG.md"],
-      },
-    ),
-  )
-  assert_eq([decision.action, decision.bearing_paths], ["reanchor", []])
-}
-
-/** The incremental path is bounded, and exhausting it is a named terminal. */
-pipeline test_merge_gate_bounds_the_reanchor_loop(task: any) {
-  const decision = release_merge_gate_decision(
-    gate(
-      {
-        observed_main: MOVED,
-        drifted_paths: ["changelog.d/7885.fixed.md"],
-        reanchor_attempts: 2,
-        max_reanchor_attempts: 2,
-      },
-    ),
-  )
-  assert_eq(decision.action, "recertify")
-  assert_eq(decision.terminal_reason, "reanchor_attempts_exhausted")
-}
-
-/**
- * A probe that answered nothing must not read as a stable base. Two unresolved
- * heads compare equal, which is exactly how a missing observation would arm the
- * merge.
- */
-pipeline test_merge_gate_refuses_an_unobserved_base(task: any) {
-  const unobserved = release_merge_gate_decision(gate({certified_base: "", observed_main: ""}))
-  const partial = release_merge_gate_decision(gate({observed_main: ""}))
-  const malformed = release_merge_gate_decision(gate({observed_main: "not-a-sha"}))
-  assert_eq([unobserved.action, partial.action, malformed.action], ["abort", "abort", "abort"])
-}
-
-/** A moved head that reports no paths is an unproved probe, not a clean drift. */
-pipeline test_merge_gate_refuses_a_drift_with_no_reported_paths(task: any) {
-  assert_eq(release_merge_gate_decision(gate({observed_main: MOVED})).action, "abort")
 }
 
 /** The classifier fails closed: anything not named non-bearing is bearing. */

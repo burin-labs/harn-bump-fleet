@@ -202,14 +202,21 @@ join. A write-once `release-certify/<candidate-oid>` branch lets GitHub dispatch
 the exact commit while `main` keeps merging. Any missing, stale, moved, or red
 lane blocks the release PR. An explicit startup pin remains load-bearing for
 parent ancestry, base fast-forward suppression, and the pre-merge drift probe.
-The release pull request opens unarmed. The merge is the release's own act:
-the watcher arms auto-merge only when `origin/main` is still the commit the
-release certified and GitHub reports the pull request would merge now. When
-main moved first, the watcher takes any armed merge back and ends the run with
-nothing merged, so main keeps its development version and a fresh cut at the
-new head is admissible. After that exact PR squash-merges, the watcher verifies
+The release pull request opens unarmed, and the merge is the release's own act
+rather than GitHub's. The shipped tree is the certified tree plus commits that
+passed main's own required checks, verified at merge time and recorded in the
+receipt. The watcher reads the branch's required contexts from its rulesets,
+resolves every commit that landed since certification against them, and merges
+under the pull request's exact head lease. A drifted commit carrying a red or
+unreported required check stops the release with nothing merged, so main keeps
+its development version and a fresh cut stays admissible. Drift that reaches
+paths only the release's own lanes cover has those lanes run once on the tree
+that will ship, bounded at three attempts. After that exact PR squash-merges,
+the watcher verifies
 the merge commit on `origin/main`, signs and pushes `vX.Y.Z` at that commit, and
-binds the receipt to it once. Publish/build workflows derive from the immutable
+binds the receipt to it once. The tag gate that follows accepts a merged tree
+that differs from the certified one only where the recorded drift accounts for
+it, and refuses anything else. Publish/build workflows derive from the immutable
 tag; no candidate archive is promoted as the release artifact.
 
 A release whose bump merged without a tag is recovered by
