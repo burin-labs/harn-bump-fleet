@@ -1,21 +1,34 @@
 /**
  * When the release pull request is allowed to merge, and what to do about a
- * main branch that moved while the release was certifying.
+ * default branch that moved while the release was certifying.
  *
  * The release candidate is parented at the commit the release pinned, so a
- * squash onto main carries main's tree plus the release's own paperwork. The
- * merged tree is therefore the certified tree only while main still sits at
- * that pin. Nothing in the harness used to check that before the merge: the
- * ship phase armed GitHub's auto-merge at pull-request open, and GitHub merged
- * whenever the checks went green, which is up to a full certification later.
- * The tree gate that refuses the tag then reported the loss after the merge had
- * already happened, leaving main carrying a bumped version with no tag.
+ * squash onto main carries main's tree plus the release's own paperwork. Main
+ * moves at a median of one merge every twenty-one minutes and a two-hour
+ * certification sees a still branch on fewer than one cut in ten, so demanding
+ * that the merged tree equal the certified tree exactly is demanding a freeze,
+ * and a freeze held by a person is not a mechanism.
  *
- * This module owns the decision that has to happen first: the merge is only
- * released when the observed base is still the certified base. Everything here
- * is pure, so the same rules decide a live cut, a rehearsal, and a recovery.
+ * The contract is therefore not identity. The shipped tree is the certified
+ * tree plus commits that passed main's own required checks, verified at merge
+ * time and recorded in the receipt. Two things follow. Drift that carries a red
+ * or unreported required check stops the release. And drift that main's checks
+ * cannot speak for, because the release runs lanes no ordinary pull request
+ * does, has that release-only delta run once on the tree that will actually
+ * ship before the merge is released.
+ *
+ * Nothing in the harness used to check any of this before the merge: the ship
+ * phase armed GitHub's auto-merge at pull-request open, and GitHub merged
+ * whenever the checks went green, up to a full certification later. The tree
+ * gate that refuses the tag then reported the loss after the merge had already
+ * happened, leaving main carrying a bumped version with no tag.
+ *
+ * Everything here is pure, so the same rules decide a live cut, a rehearsal,
+ * and a recovery.
  */
-/** Paths whose exact bytes the release certification does not depend on. */
+import { ReleaseDriftEvidence } from "./release_drift_evidence"
+
+/** Paths no release-only lane depends on, so drift confined to them ships as is. */
 const NON_BEARING_PATH_PREFIXES = ["changelog.d/"]
 
 const NON_BEARING_PATHS = ["CHANGELOG.md"]
@@ -26,7 +39,7 @@ const MERGEABLE_NOW_STATES = ["clean", "unstable"]
 /** Pull-request states that no amount of waiting repairs. */
 const UNRECOVERABLE_MERGE_STATES = ["dirty"]
 
-pub type ReleaseMergeGateAction = "hold" | "arm" | "reanchor" | "recertify" | "abort"
+pub type ReleaseMergeGateAction = "hold" | "merge" | "certify_delta" | "defer" | "abort"
 
 pub type ReleaseMergeGateState = {
   certified_base: string,
@@ -34,8 +47,14 @@ pub type ReleaseMergeGateState = {
   mergeable_state: string,
   mergeable_resolved: bool,
   drifted_paths: list<string>,
-  reanchor_attempts: int,
-  max_reanchor_attempts: int,
+  /** Nil until the drift has been read. Absent evidence never means clean. */
+  evidence: ReleaseDriftEvidence?,
+  /** Names of the lanes only a release runs, computed from workflow triggers. */
+  release_only_checks: list<string>,
+  /** The exact main head the release-only delta last passed on. */
+  delta_verified_at: string,
+  delta_iterations: int,
+  max_delta_iterations: int,
 }
 
 pub type ReleaseMergeGateDecision = {
@@ -119,6 +138,14 @@ fn gate_decision(
   }
 }
 
+/**
+ * Decide the drift case: main moved while the release was certifying.
+ *
+ * Order matters and every step fails closed. The evidence must exist and must
+ * describe these exact two heads, or a stale read from an earlier poll would
+ * decide a merge it never saw. Every drifted commit must carry a green required
+ * check. Only then does the release-only delta question arise.
+ */
 fn drift_decision(state: ReleaseMergeGateState) -> ReleaseMergeGateDecision {
   const drifted = state.drifted_paths.filter({ path -> trim(path) != "" }).to_list()
   if len(drifted) == 0 {
@@ -129,41 +156,127 @@ fn drift_decision(state: ReleaseMergeGateState) -> ReleaseMergeGateDecision {
       "drift_paths_not_observed",
     )
   }
-  const bearing = release_certification_bearing_paths(drifted)
-  if len(bearing) > 0 {
+  const evidence = state.evidence
+  if evidence == nil {
     return gate_decision(
-      "recertify",
-      "main moved to ${oid(state.observed_main)} while v-next was certifying, and the change reaches"
-        + " paths this release certified. Nothing was merged and main is untouched."
-        + " Re-dispatch the hosted release at ${oid(state.observed_main)}."
-        + " Certification-bearing paths: ${named(bearing)}",
-      "certification_does_not_transfer",
+      "abort",
+      "main moved to ${oid(state.observed_main)} and the drift was never read;"
+        + " refusing to release the merge without that evidence",
+      "drift_evidence_not_observed",
+    )
+  }
+  if oid(evidence.certified_base) != oid(state.certified_base)
+    || oid(evidence.observed_main) != oid(state.observed_main) {
+    return gate_decision(
+      "abort",
+      "the drift evidence describes ${oid(evidence.certified_base)}..${oid(evidence.observed_main)},"
+        + " not the ${oid(state.certified_base)}..${oid(state.observed_main)} being decided",
+      "drift_evidence_is_stale",
+    )
+  }
+  if !evidence.green {
+    const terminal = if len(evidence.required_contexts) == 0 {
+      "required_contexts_not_observed"
+    } else {
+      "drifted_commit_not_green"
+    }
+    return gate_decision(
+      "defer",
+      "${evidence.reason}. Nothing was merged and main is untouched."
+        + " The release may not carry a commit the branch itself did not pass.",
+      terminal,
+    )
+  }
+  const bearing = release_certification_bearing_paths(drifted)
+  if len(state.release_only_checks) == 0 || len(bearing) == 0 {
+    return mergeability_decision(
+      state,
+      "main moved to ${oid(state.observed_main)}, every drifted commit passed"
+        + " ${evidence.required_contexts.join(", ")}, and nothing it changed is a path"
+        + " the release-only lanes bear on",
+    )
+  }
+  if oid(state.delta_verified_at) == oid(state.observed_main) {
+    return mergeability_decision(
+      state,
+      "the release-only lanes (${state.release_only_checks.join(", ")}) already passed on"
+        + " ${oid(state.observed_main)}, and every drifted commit passed"
+        + " ${evidence.required_contexts.join(", ")}",
       bearing,
     )
   }
-  if state.reanchor_attempts >= state.max_reanchor_attempts {
+  if state.delta_iterations >= state.max_delta_iterations {
     return gate_decision(
-      "recertify",
-      "main moved to ${oid(state.observed_main)} more times than this release may re-anchor"
-        + " (${to_string(state.max_reanchor_attempts)}). Nothing was merged and main is untouched."
+      "defer",
+      "main moved ${to_string(state.delta_iterations)} times while the release-only lanes"
+        + " (${state.release_only_checks.join(", ")}) were running, which is the whole budget."
+        + " Nothing was merged and main is untouched."
+        + " Drifted commits: ${commit_shas(evidence)}."
         + " Re-dispatch the hosted release at ${oid(state.observed_main)}",
-      "reanchor_attempts_exhausted",
+      "release_delta_iterations_exhausted",
+      bearing,
     )
   }
   return gate_decision(
-    "reanchor",
-    "main moved to ${oid(state.observed_main)}, and every changed path is release paperwork that"
-      + " certification does not depend on. Re-anchor the candidate there and keep the certification."
-      + " Changed paths: ${named(drifted)}",
+    "certify_delta",
+    "every drifted commit passed ${evidence.required_contexts.join(", ")}, but"
+      + " ${named(bearing)} is not covered by them. Run ${state.release_only_checks.join(", ")}"
+      + " on the tree that will ship, then merge",
+    "",
+    bearing,
   )
 }
 
+/** Every drifted commit named, so a refusal points at commits rather than a count. */
+fn commit_shas(evidence: ReleaseDriftEvidence) -> string {
+  return evidence.commits.map({ commit -> commit.sha }).join(", ")
+}
+
 /**
- * Decide whether the release pull request may be released to merge.
+ * Release the merge only when GitHub would take it now.
+ *
+ * Arming or merging while the checks are still running reopens the whole
+ * window, because the merge would then land at a base nobody re-observed.
+ */
+fn mergeability_decision(
+  state: ReleaseMergeGateState,
+  because: string,
+  bearing_paths: list<string> = [],
+) -> ReleaseMergeGateDecision {
+  const merge_state = lowercase(trim(state.mergeable_state))
+  if UNRECOVERABLE_MERGE_STATES.contains(merge_state) {
+    return gate_decision(
+      "abort",
+      "the release pull request is ${merge_state} and cannot merge as certified",
+      "release_pr_unmergeable",
+      bearing_paths,
+    )
+  }
+  if !state.mergeable_resolved {
+    return gate_decision(
+      "hold",
+      "GitHub has not resolved the release pull request's mergeability",
+      "",
+      bearing_paths,
+    )
+  }
+  if !MERGEABLE_NOW_STATES.contains(merge_state) {
+    return gate_decision(
+      "hold",
+      "GitHub reports the release pull request as ${merge_state}; it would not merge now",
+      "",
+      bearing_paths,
+    )
+  }
+  return gate_decision("merge", "${because}, and GitHub would merge now", "", bearing_paths)
+}
+
+/**
+ * Decide whether the release pull request may be merged.
  *
  * Both heads must be exact. An unobserved head is not agreement: two empty
  * strings compare equal, which is precisely how a probe that answered nothing
- * would arm the merge it was supposed to guard.
+ * would release the merge it was supposed to guard.
  */
 pub fn release_merge_gate_decision(state: ReleaseMergeGateState) -> ReleaseMergeGateDecision {
   if !exact_commit(state.certified_base) {
@@ -183,26 +296,9 @@ pub fn release_merge_gate_decision(state: ReleaseMergeGateState) -> ReleaseMerge
   if oid(state.observed_main) != oid(state.certified_base) {
     return drift_decision(state)
   }
-  const merge_state = lowercase(trim(state.mergeable_state))
-  if UNRECOVERABLE_MERGE_STATES.contains(merge_state) {
-    return gate_decision(
-      "abort",
-      "the release pull request is ${merge_state} and cannot merge as certified",
-      "release_pr_unmergeable",
-    )
-  }
-  if !state.mergeable_resolved {
-    return gate_decision("hold", "GitHub has not resolved the release pull request's mergeability")
-  }
-  if !MERGEABLE_NOW_STATES.contains(merge_state) {
-    return gate_decision(
-      "hold",
-      "GitHub reports the release pull request as ${merge_state}; it would not merge now",
-    )
-  }
-  return gate_decision(
-    "arm",
-    "main still sits at the certified base ${oid(state.certified_base)} and GitHub would merge now",
+  return mergeability_decision(
+    state,
+    "main still sits at the certified base ${oid(state.certified_base)}",
   )
 }
 

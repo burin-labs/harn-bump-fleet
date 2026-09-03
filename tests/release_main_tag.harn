@@ -1,3 +1,7 @@
+import {
+  release_drift_commit_evidence,
+  release_drift_evidence,
+} from "../lib/release_drift_evidence"
 import { release_main_tag_decision, run_release_main_tag } from "../lib/release_main_tag"
 import { release_publication } from "../lib/release_publication"
 import { release_watch_receipt, release_watch_receipt_read } from "../lib/release_watch_state"
@@ -21,30 +25,18 @@ fn agreeing_trees(merge_sha: string) {
 
 /** Main is still the certified base and GitHub would merge the release now. */
 fn stable_gate(base: string) {
-  return { _pr ->
+  return { _pr, _delta_verified_at, _delta_iterations ->
     return {
       certified_base: base,
       observed_main: base,
       mergeable_state: "clean",
       mergeable_resolved: true,
       drifted_paths: [],
-      reanchor_attempts: 0,
-      max_reanchor_attempts: 0,
-    }
-  }
-}
-
-/** Main moved to `head` since the certified base, changing `paths`. */
-fn moved_gate(base: string, head: string, paths: list<string>) {
-  return { _pr ->
-    return {
-      certified_base: base,
-      observed_main: head,
-      mergeable_state: "clean",
-      mergeable_resolved: true,
-      drifted_paths: paths,
-      reanchor_attempts: 0,
-      max_reanchor_attempts: 0,
+      evidence: nil,
+      release_only_checks: [],
+      delta_verified_at: "",
+      delta_iterations: 0,
+      max_delta_iterations: 3,
     }
   }
 }
@@ -78,7 +70,12 @@ fn pull_request(overrides: dict = {}) {
   }
 }
 
-pipeline test_release_tag_waits_until_exact_pr_merges(task: any) {
+/**
+ * An open pull request at the certified base is merged by the release itself,
+ * not left to GitHub. Arming at pull-request open is what let a merge land at a
+ * base nobody re-observed.
+ */
+pipeline test_release_tag_merges_the_exact_pr_at_its_certified_base(task: any) {
   const decision = release_main_tag_decision(
     receipt(),
     pull_request(),
@@ -86,10 +83,11 @@ pipeline test_release_tag_waits_until_exact_pr_merges(task: any) {
     agreeing_trees,
     stable_gate(PIN),
   )
-  assert_eq([decision.action, decision.merge_sha], ["wait", ""])
+  assert_eq([decision.action, decision.merge_sha], ["merge", ""])
 }
 
-pipeline test_release_tag_arms_an_unowned_open_pr(task: any) {
+/** An unarmed pull request is exactly the normal case now: the release merges it. */
+pipeline test_release_tag_merges_an_unarmed_open_pr(task: any) {
   const decision = release_main_tag_decision(
     receipt(),
     pull_request({auto_merge_armed: false}),
@@ -97,7 +95,7 @@ pipeline test_release_tag_arms_an_unowned_open_pr(task: any) {
     agreeing_trees,
     stable_gate(PIN),
   )
-  assert_eq(decision.action, "arm")
+  assert_eq(decision.action, "merge")
 }
 
 pipeline test_release_tag_mints_only_at_merged_main_commit(task: any) {
@@ -197,7 +195,8 @@ pipeline test_release_main_tag_path_arms_then_binds_merged_main(harness: Harness
       remote_tag_target: fn(_poll) { return "" },
       certification_trees: fn(sha) { return agreeing_trees(sha) },
       merge_gate: stable_gate(PIN),
-      arm: fn(_pr) { return true },
+      merge: fn(_pr) { return true },
+      certify_delta: fn(head) { return head },
       disarm: fn(_pr, _observed_main) { return true },
       merged_main_ancestor: fn(sha) { return sha == MERGED_MAIN },
       push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == MERGED_MAIN}] },
@@ -232,7 +231,8 @@ pipeline test_release_main_tag_path_rejects_non_main_merge(harness: Harness, tas
       remote_tag_target: fn(_poll) { return "" },
       certification_trees: fn(sha) { return agreeing_trees(sha) },
       merge_gate: stable_gate(PIN),
-      arm: fn(_pr) { return true },
+      merge: fn(_pr) { return true },
+      certify_delta: fn(head) { return head },
       disarm: fn(_pr, _observed_main) { return true },
       merged_main_ancestor: fn(_sha) { return false },
       push_tag: fn(_sha) { return [{name: "unexpected", success: true}] },
@@ -413,7 +413,8 @@ pipeline test_release_main_tag_path_refuses_a_drifted_merge(harness: Harness, ta
         drifted_paths: ["Cargo.lock"],
       } },
       merge_gate: stable_gate(PIN),
-      arm: fn(_pr) { return true },
+      merge: fn(_pr) { return true },
+      certify_delta: fn(head) { return head },
       disarm: fn(_pr, _observed_main) { return true },
       merged_main_ancestor: fn(_sha) { return true },
       push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
@@ -431,21 +432,173 @@ pipeline test_release_main_tag_path_refuses_a_drifted_merge(harness: Harness, ta
 
 const MOVED_MAIN = "6666666666666666666666666666666666666666"
 
+/** A path a callback writes to so the test can prove it ran. */
+fn marker(fs: HarnessFs, name: string) -> string {
+  const path = path_join(fs.workspace_temp_dir(), "marker-" + name + ".txt")
+  if fs.exists(path) {
+    fs.delete(path)
+  }
+  return path
+}
+
+/** What a callback recorded, or the empty string when it never ran. */
+fn marked(fs: HarnessFs, path: string) -> string {
+  if !fs.exists(path) {
+    return ""
+  }
+  return trim(fs.read_text(path))
+}
+
+fn check_run(name: string, conclusion: string) {
+  return {name: name, status: "COMPLETED", conclusion: conclusion, __typename: "CheckRun"}
+}
+
+fn drift_gate(paths: list<string>, conclusion: string, release_only: list<string>) {
+  return { _pr, delta_verified_at, delta_iterations ->
+    return {
+      certified_base: PIN,
+      observed_main: MOVED_MAIN,
+      mergeable_state: "clean",
+      mergeable_resolved: true,
+      drifted_paths: paths,
+      evidence: release_drift_evidence(
+        PIN,
+        MOVED_MAIN,
+        ["CI status"],
+        [
+          release_drift_commit_evidence(
+            MOVED_MAIN,
+            7885,
+            ["CI status"],
+            [check_run("CI status", conclusion)],
+            [],
+          ),
+        ],
+        "2026-09-03T03:00:00Z",
+      ),
+      release_only_checks: release_only,
+      delta_verified_at: delta_verified_at,
+      delta_iterations: delta_iterations,
+      max_delta_iterations: 3,
+    }
+  }
+}
+
 /**
- * The v0.10.128 shape, decided before the irreversible act. Main moved to a
- * commit that changes certified paths while the release was certifying, so the
- * release refuses to release its merge, takes the armed merge back, and leaves
- * main carrying the development version a fresh cut can still use.
+ * The contract, through the driver. Main moved by code, every drifted commit
+ * passed the branch's own required checks, and the lanes only a release runs
+ * pass on the shipping tree. The release then merges under its head lease and
+ * tags, instead of waiting for a person to freeze the branch.
+ *
+ * Every claim here is read from what the runner itself produced: a callback's
+ * writes do not survive back into this scope, but the receipt the runner wrote
+ * does, and it is the artifact an operator would check afterwards anyway.
  */
-pipeline test_release_main_tag_path_holds_the_merge_when_main_moved(harness: Harness, task: any) {
-  const path = path_join(harness.fs.workspace_temp_dir(), "release-held-merge.json")
-  // A previous run of this workspace may have left a receipt here, and these
-  // claims are about what this run wrote.
+pipeline test_release_main_tag_path_certifies_the_delta_then_merges(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-delta-merge.json")
   if harness.fs.exists(path) {
     harness.fs.delete(path)
   }
-  let armed = false
-  let disarmed = ""
+  const result = run_release_main_tag(
+    harness,
+    {mock: true, repo: "/mock/harn"},
+    receipt(),
+    path,
+    {max_polls: 4, interval_ms: 0},
+    {
+      pull_request: fn(poll) { return if poll < 2 {
+        pull_request({auto_merge_armed: false})
+      } else {
+        pull_request({merged: true, github_state: "merged", merge_commit_oid: MERGED_MAIN})
+      } },
+      remote_tag_target: fn(_poll) { return "" },
+      certification_trees: fn(sha) { return agreeing_trees(sha) },
+      merge_gate: drift_gate(
+        ["crates/harn-core/src/lib.rs"],
+        "SUCCESS",
+        ["Workspace nextest (windows-latest)"],
+      ),
+      merge: fn(_pr) { return true },
+      certify_delta: fn(head) { return head },
+      disarm: fn(_pr, _observed_main) { return true },
+      merged_main_ancestor: fn(_sha) { return true },
+      push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == MERGED_MAIN}] },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
+      wait: fn(_delay_ms) { return nil },
+    },
+  )
+  assert_eq(result.status, 0)
+  assert(result.steps.any({ step -> step.name == "push-release-tag" && step.success }))
+  const recorded = release_watch_receipt_read(harness.fs, path)?.certification_drift
+  assert_eq(recorded?.state, "recorded")
+  assert_eq(recorded?.observed_main, MOVED_MAIN)
+  assert_eq(recorded?.required_contexts, ["CI status"])
+  assert_eq(recorded?.drifted_paths, ["crates/harn-core/src/lib.rs"])
+  assert_eq(recorded?.commits?.map({ commit -> commit.green }), [true])
+  // The delta ran once, on the exact head that shipped.
+  assert_eq([recorded?.delta_iterations, recorded?.delta_verified_at], [1, MOVED_MAIN])
+}
+
+/**
+ * Green drift that changes nothing the release-only lanes bear on merges
+ * straight away, paying for no delta run at all. This is the case that lets a
+ * release land while main keeps moving, and it is the common one: an ordinary
+ * pull request adds a changelog fragment.
+ */
+pipeline test_release_main_tag_path_merges_green_paperwork_drift(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-paperwork-drift.json")
+  if harness.fs.exists(path) {
+    harness.fs.delete(path)
+  }
+  const result = run_release_main_tag(
+    harness,
+    {mock: true, repo: "/mock/harn"},
+    receipt(),
+    path,
+    {max_polls: 3, interval_ms: 0},
+    {
+      pull_request: fn(poll) { return if poll < 1 {
+        pull_request({auto_merge_armed: false})
+      } else {
+        pull_request({merged: true, github_state: "merged", merge_commit_oid: MERGED_MAIN})
+      } },
+      remote_tag_target: fn(_poll) { return "" },
+      certification_trees: fn(sha) { return agreeing_trees(sha) },
+      merge_gate: drift_gate(
+        ["changelog.d/7885.fixed.md"],
+        "SUCCESS",
+        ["Workspace nextest (windows-latest)"],
+      ),
+      merge: fn(_pr) { return true },
+      // Returning nothing would hold the merge, so a run that reaches its tag
+      // proves the delta was never asked for.
+      certify_delta: fn(_head) { return "" },
+      disarm: fn(_pr, _observed_main) { return true },
+      merged_main_ancestor: fn(_sha) { return true },
+      push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == MERGED_MAIN}] },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
+      wait: fn(_delay_ms) { return nil },
+    },
+  )
+  assert_eq(result.status, 0)
+  const recorded = release_watch_receipt_read(harness.fs, path)?.certification_drift
+  assert_eq(recorded?.state, "recorded")
+  assert_eq([recorded?.delta_iterations, recorded?.delta_verified_at], [0, ""])
+  assert_eq(recorded?.drifted_paths, ["changelog.d/7885.fixed.md"])
+}
+
+/**
+ * The v0.10.128 shape. A drifted commit that did not pass the branch's own
+ * required checks stops the release: nothing merges, main keeps its development
+ * version, and a fresh cut stays admissible.
+ */
+pipeline test_release_main_tag_path_defers_drift_that_is_not_green(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-red-drift.json")
+  if harness.fs.exists(path) {
+    harness.fs.delete(path)
+  }
+  const merged = marker(harness.fs, "red-merged")
+  const disarmed = marker(harness.fs, "red-disarmed")
   const result = run_release_main_tag(
     harness,
     {mock: true, repo: "/mock/harn"},
@@ -456,85 +609,47 @@ pipeline test_release_main_tag_path_holds_the_merge_when_main_moved(harness: Har
       pull_request: fn(_poll) { return pull_request({auto_merge_armed: true}) },
       remote_tag_target: fn(_poll) { return "" },
       certification_trees: fn(sha) { return agreeing_trees(sha) },
-      merge_gate: moved_gate(PIN, MOVED_MAIN, ["crates/harn-core/src/lib.rs"]),
-      arm: fn(_pr) {
-        armed = true
+      merge_gate: drift_gate(
+        ["crates/harn-core/src/lib.rs"],
+        "FAILURE",
+        ["Workspace nextest (windows-latest)"],
+      ),
+      merge: fn(_pr) {
+        harness.fs.write_text(merged, "merged")
         return true
       },
+      certify_delta: fn(head) { return head },
       disarm: fn(_pr, observed_main) {
-        disarmed = observed_main
+        harness.fs.write_text(disarmed, observed_main)
         return true
       },
       merged_main_ancestor: fn(_sha) { return true },
       push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
-      now: fn(_poll) { return "2026-09-03T01:00:00Z" },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
       wait: fn(_delay_ms) { return nil },
     },
   )
-  assert_eq([result.status, armed, disarmed], [2, false, MOVED_MAIN])
+  assert_eq(
+    [to_string(result.status), marked(harness.fs, merged), marked(harness.fs, disarmed)],
+    ["2", "", MOVED_MAIN],
+  )
+  assert(contains(result.reason, "without passing CI status"))
   assert(contains(result.reason, "Nothing was merged and main is untouched"))
-  assert(contains(result.reason, "Re-dispatch the hosted release at ${MOVED_MAIN}"))
-  assert(contains(result.reason, "crates/harn-core/src/lib.rs"))
   assert_eq(harness.fs.exists(path), false)
 }
 
 /**
- * A stable base is not on its own a licence to arm. GitHub merges an armed pull
- * request whenever its checks finish, which is the window this gate exists to
- * close, so arming waits until GitHub reports it would merge now.
+ * Green drift that changes nothing the release-only lanes bear on merges
+ * straight away, without paying for a delta run. This is the case that lets a
+ * release land while main keeps moving.
  */
-pipeline test_release_main_tag_path_holds_until_checks_are_green(harness: Harness, task: any) {
-  const path = path_join(harness.fs.workspace_temp_dir(), "release-pending-checks.json")
-  // A previous run of this workspace may have left a receipt here, and these
-  // claims are about what this run wrote.
+pipeline test_release_main_tag_path_merges_green_paperwork_drift(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-paperwork-drift.json")
   if harness.fs.exists(path) {
     harness.fs.delete(path)
   }
-  let armed = false
-  const result = run_release_main_tag(
-    harness,
-    {mock: true, repo: "/mock/harn"},
-    receipt(),
-    path,
-    {max_polls: 2, interval_ms: 0},
-    {
-      pull_request: fn(_poll) { return pull_request({auto_merge_armed: false}) },
-      remote_tag_target: fn(_poll) { return "" },
-      certification_trees: fn(sha) { return agreeing_trees(sha) },
-      merge_gate: { _pr ->
-        return {
-          certified_base: PIN,
-          observed_main: PIN,
-          mergeable_state: "blocked",
-          mergeable_resolved: true,
-          drifted_paths: [],
-          reanchor_attempts: 0,
-          max_reanchor_attempts: 0,
-        }
-      },
-      arm: fn(_pr) {
-        armed = true
-        return true
-      },
-      disarm: fn(_pr, _observed_main) { return true },
-      merged_main_ancestor: fn(_sha) { return true },
-      push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
-      now: fn(_poll) { return "2026-09-03T01:00:00Z" },
-      wait: fn(_delay_ms) { return nil },
-    },
-  )
-  assert_eq([result.status, result.polls, armed], [3, 2, false])
-}
-
-/** The negative control: a stable base and green checks do arm the merge. */
-pipeline test_release_main_tag_path_arms_on_a_stable_green_base(harness: Harness, task: any) {
-  const path = path_join(harness.fs.workspace_temp_dir(), "release-armed.json")
-  // A previous run of this workspace may have left a receipt here, and these
-  // claims are about what this run wrote.
-  if harness.fs.exists(path) {
-    harness.fs.delete(path)
-  }
-  let armed = false
+  const merged = marker(harness.fs, "paperwork-merged")
+  const delta_ran = marker(harness.fs, "paperwork-delta")
   const result = run_release_main_tag(
     harness,
     {mock: true, repo: "/mock/harn"},
@@ -545,30 +660,39 @@ pipeline test_release_main_tag_path_arms_on_a_stable_green_base(harness: Harness
       pull_request: fn(_poll) { return pull_request({auto_merge_armed: false}) },
       remote_tag_target: fn(_poll) { return "" },
       certification_trees: fn(sha) { return agreeing_trees(sha) },
-      merge_gate: stable_gate(PIN),
-      arm: fn(_pr) {
-        armed = true
+      merge_gate: drift_gate(
+        ["changelog.d/7885.fixed.md"],
+        "SUCCESS",
+        ["Workspace nextest (windows-latest)"],
+      ),
+      merge: fn(_pr) {
+        harness.fs.write_text(merged, "merged")
         return true
+      },
+      certify_delta: fn(head) {
+        harness.fs.write_text(delta_ran, head)
+        return head
       },
       disarm: fn(_pr, _observed_main) { return true },
       merged_main_ancestor: fn(_sha) { return true },
       push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
-      now: fn(_poll) { return "2026-09-03T01:00:00Z" },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
       wait: fn(_delay_ms) { return nil },
     },
   )
-  assert_eq([result.status, armed], [3, true])
+  assert_eq([marked(harness.fs, merged), marked(harness.fs, delta_ran)], ["merged", ""])
 }
 
-/** An unobservable main head refuses the merge instead of reading as stable. */
-pipeline test_release_main_tag_path_refuses_an_unobservable_main(harness: Harness, task: any) {
-  const path = path_join(harness.fs.workspace_temp_dir(), "release-unobserved-main.json")
-  // A previous run of this workspace may have left a receipt here, and these
-  // claims are about what this run wrote.
+/**
+ * A delta the runner could not run holds the merge. Reading an empty answer as
+ * a passing lane is the exact shape where absence reads as success.
+ */
+pipeline test_release_main_tag_path_holds_when_the_delta_cannot_run(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-delta-unavailable.json")
   if harness.fs.exists(path) {
     harness.fs.delete(path)
   }
-  let armed = false
+  const merged = marker(harness.fs, "unavailable-merged")
   const result = run_release_main_tag(
     harness,
     {mock: true, repo: "/mock/harn"},
@@ -579,18 +703,141 @@ pipeline test_release_main_tag_path_refuses_an_unobservable_main(harness: Harnes
       pull_request: fn(_poll) { return pull_request({auto_merge_armed: false}) },
       remote_tag_target: fn(_poll) { return "" },
       certification_trees: fn(sha) { return agreeing_trees(sha) },
-      merge_gate: { _pr -> return nil },
-      arm: fn(_pr) {
-        armed = true
+      merge_gate: drift_gate(
+        ["crates/harn-core/src/lib.rs"],
+        "SUCCESS",
+        ["Workspace nextest (windows-latest)"],
+      ),
+      merge: fn(_pr) {
+        harness.fs.write_text(merged, "merged")
         return true
       },
+      certify_delta: fn(_head) { return "" },
       disarm: fn(_pr, _observed_main) { return true },
       merged_main_ancestor: fn(_sha) { return true },
       push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
-      now: fn(_poll) { return "2026-09-03T01:00:00Z" },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
       wait: fn(_delay_ms) { return nil },
     },
   )
-  assert_eq([result.status, armed], [2, false])
+  assert_eq([to_string(result.status), marked(harness.fs, merged)], ["2", ""])
+  assert(contains(result.reason, "could not run the release-only lanes"))
+}
+
+/** An unobservable main head refuses the merge instead of reading as stable. */
+pipeline test_release_main_tag_path_refuses_an_unobservable_main(harness: Harness, task: any) {
+  const path = path_join(harness.fs.workspace_temp_dir(), "release-unobserved-main.json")
+  if harness.fs.exists(path) {
+    harness.fs.delete(path)
+  }
+  const merged = marker(harness.fs, "unobserved-merged")
+  const result = run_release_main_tag(
+    harness,
+    {mock: true, repo: "/mock/harn"},
+    receipt(),
+    path,
+    {max_polls: 2, interval_ms: 0},
+    {
+      pull_request: fn(_poll) { return pull_request({auto_merge_armed: false}) },
+      remote_tag_target: fn(_poll) { return "" },
+      certification_trees: fn(sha) { return agreeing_trees(sha) },
+      merge_gate: { _pr, _delta_verified_at, _delta_iterations -> return nil },
+      merge: fn(_pr) {
+        harness.fs.write_text(merged, "merged")
+        return true
+      },
+      certify_delta: fn(head) { return head },
+      disarm: fn(_pr, _observed_main) { return true },
+      merged_main_ancestor: fn(_sha) { return true },
+      push_tag: fn(_sha) { return [{name: "unexpected-tag-push", success: true}] },
+      now: fn(_poll) { return "2026-09-03T03:00:00Z" },
+      wait: fn(_delay_ms) { return nil },
+    },
+  )
+  assert_eq([to_string(result.status), marked(harness.fs, merged)], ["2", ""])
   assert(contains(result.reason, "could not observe origin/main"))
+}
+
+/**
+ * The tag gate, reworded for the contract. The merged tree is allowed to differ
+ * from the certified one exactly where the recorded drift accounts for it, and
+ * nowhere else. Identity is no longer the test, because main moves during every
+ * cut, but an unaccounted file still stops the tag.
+ */
+fn drifted_receipt(recorded_paths: list<string>) {
+  return receipt()
+    + {
+      certification_drift: {
+        state: "recorded",
+        certified_base: PIN,
+        observed_main: MOVED_MAIN,
+        required_contexts: ["CI status"],
+        commits: [
+          {
+            sha: MOVED_MAIN,
+            pull_number: 7885,
+            checks: [{name: "CI status", state: "SUCCESS", source: "main_commit"}],
+            green: true,
+            blocking_check: "",
+          },
+        ],
+        drifted_paths: recorded_paths,
+        release_only_checks: ["Workspace nextest (windows-latest)"],
+        delta_verified_at: MOVED_MAIN,
+        delta_iterations: 1,
+        observed_at: "2026-09-03T03:00:00Z",
+      },
+    }
+}
+
+fn drifted_trees(merge_sha: string, paths: list<string>) {
+  return {
+    candidate_commit: CANDIDATE,
+    candidate_tree: CERTIFIED_TREE,
+    merged_commit: merge_sha,
+    merged_tree: "7777777777777777777777777777777777777777",
+    drifted_paths: paths,
+  }
+}
+
+pipeline test_release_tag_accepts_a_tree_the_recorded_drift_accounts_for(task: any) {
+  const merged = pull_request({merged: true, github_state: "merged", merge_commit_oid: MERGED_MAIN})
+  const decision = release_main_tag_decision(
+    drifted_receipt(["crates/harn-core/src/lib.rs"]),
+    merged,
+    "",
+    fn(sha) { return drifted_trees(sha, ["crates/harn-core/src/lib.rs"]) },
+    stable_gate(PIN),
+  )
+  assert_eq([decision.action, decision.merge_sha], ["tag", MERGED_MAIN])
+}
+
+pipeline test_release_tag_refuses_a_file_the_record_never_named(task: any) {
+  const merged = pull_request({merged: true, github_state: "merged", merge_commit_oid: MERGED_MAIN})
+  const decision = release_main_tag_decision(
+    drifted_receipt(["crates/harn-core/src/lib.rs"]),
+    merged,
+    "",
+    fn(sha) { return drifted_trees(
+      sha,
+      ["crates/harn-core/src/lib.rs", "crates/harn-cli/src/main.rs"],
+    ) },
+    stable_gate(PIN),
+  )
+  assert_eq(decision.action, "certification_drift")
+  assert(contains(decision.reason, "crates/harn-cli/src/main.rs"))
+  assert(contains(decision.reason, "mode tag-stranded-main"))
+}
+
+/** A record that was never written accounts for nothing, so identity is required. */
+pipeline test_release_tag_requires_identity_without_a_record(task: any) {
+  const merged = pull_request({merged: true, github_state: "merged", merge_commit_oid: MERGED_MAIN})
+  const decision = release_main_tag_decision(
+    receipt(),
+    merged,
+    "",
+    fn(sha) { return drifted_trees(sha, ["crates/harn-core/src/lib.rs"]) },
+    stable_gate(PIN),
+  )
+  assert_eq(decision.action, "certification_drift")
 }

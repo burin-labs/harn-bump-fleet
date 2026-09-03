@@ -1,0 +1,197 @@
+/**
+ * What landed on the default branch while a release was certifying, and whether
+ * each of those commits passed the branch's own required checks.
+ *
+ * The release certifies one exact tree, and main moves at a median of one merge
+ * every twenty-one minutes, so a two-hour certification almost never sees a
+ * still branch. Demanding that the merged tree equal the certified tree exactly
+ * therefore means demanding a freeze. The contract instead is that the shipped
+ * tree is the certified tree plus commits that passed main's own required
+ * checks, and this module is what makes that claim checkable rather than
+ * assumed: every drifted commit is named, every required context is resolved to
+ * a conclusion, and the whole record goes in the release receipt.
+ *
+ * Three observed shapes drive the rules here, all measured on burin-labs/harn:
+ *
+ * - A required context can be absent from a main commit. `drift` appears on 2
+ *   of the 20 most recent main commits and on 20 of 20 pull-request heads, so
+ *   reading only the main commit would report a green branch as unproved.
+ *   Evidence therefore falls back to the commit's own pull request head.
+ * - A main commit carries stale failures beside fresh successes. Two of those
+ *   20 show a failed workspace test next to a passing aggregate, because a
+ *   rerun does not replace its predecessor's row. Rows reduce to the latest per
+ *   name before anything is judged.
+ * - A required context that never reported is absent, not passing. It resolves
+ *   to `MISSING`, which is not green.
+ */
+import { latest_check_per_name, required_check_state } from "./pr_admission"
+
+pub type ReleaseDriftCheckSource = "main_commit" | "pull_request_head" | "missing"
+
+pub type ReleaseDriftCheck = {name: string, state: string, source: ReleaseDriftCheckSource}
+
+pub type ReleaseDriftCommit = {
+  sha: string,
+  /** 0 when no pull request could be associated with the commit. */
+  pull_number: int,
+  checks: list<ReleaseDriftCheck>,
+  green: bool,
+  blocking_check: string,
+}
+
+pub type ReleaseDriftEvidence = {
+  certified_base: string,
+  observed_main: string,
+  required_contexts: list<string>,
+  commits: list<ReleaseDriftCommit>,
+  green: bool,
+  blocking_sha: string,
+  blocking_check: string,
+  reason: string,
+  observed_at: string,
+}
+
+fn oid(value: any) -> string {
+  return lowercase(trim(to_string(value ?? "")))
+}
+
+/**
+ * Resolve one required context against a commit, then against its pull request.
+ *
+ * `required_check_state` already reduces to the latest row per name and returns
+ * `MISSING` for a context that never reported, which is the difference between
+ * "this check passed" and "nobody ran this check".
+ */
+fn resolve_context(context: string, commit_rows: list?, head_rows: list?) -> ReleaseDriftCheck {
+  const on_commit = required_check_state(latest_check_per_name(commit_rows), context)
+  if on_commit != "MISSING" {
+    return {name: context, state: on_commit, source: "main_commit"}
+  }
+  const on_head = required_check_state(latest_check_per_name(head_rows), context)
+  if on_head != "MISSING" {
+    return {name: context, state: on_head, source: "pull_request_head"}
+  }
+  return {name: context, state: "MISSING", source: "missing"}
+}
+
+/** Resolve every required context for one drifted commit. */
+pub fn release_drift_commit_evidence(
+  sha: string,
+  pull_number: int,
+  required_contexts: list<string>,
+  commit_rows: list?,
+  head_rows: list?,
+) -> ReleaseDriftCommit {
+  let checks: list<ReleaseDriftCheck> = []
+  let blocking = ""
+  for context in required_contexts {
+    const resolved = resolve_context(context, commit_rows, head_rows)
+    checks = checks + [resolved]
+    if blocking == "" && uppercase(trim(resolved.state)) != "SUCCESS" {
+      blocking = resolved.name
+    }
+  }
+  return {
+    sha: oid(sha),
+    pull_number: pull_number,
+    checks: checks,
+    green: len(required_contexts) > 0 && blocking == "",
+    blocking_check: blocking,
+  }
+}
+
+/**
+ * Judge the whole drift.
+ *
+ * An empty required set is refused rather than treated as satisfied. A branch
+ * whose protection could not be read is indistinguishable from one with nothing
+ * to satisfy, and the second reading would let every drifted commit through on
+ * the strength of a failed API call.
+ */
+pub fn release_drift_evidence(
+  certified_base: string,
+  observed_main: string,
+  required_contexts: list<string>,
+  commits: list<ReleaseDriftCommit>,
+  observed_at: string,
+) -> ReleaseDriftEvidence {
+  const base = {
+    certified_base: oid(certified_base),
+    observed_main: oid(observed_main),
+    required_contexts: required_contexts,
+    commits: commits,
+    observed_at: observed_at,
+  }
+  if len(required_contexts) == 0 {
+    return base
+      + {
+        green: false,
+        blocking_sha: "",
+        blocking_check: "",
+        reason:
+          "the branch's required checks could not be read, so no drifted commit can be proved green",
+      }
+  }
+  if len(commits) == 0 {
+    return base
+      + {
+        green: false,
+        blocking_sha: "",
+        blocking_check: "",
+        reason:
+          "main moved but no drifted commit was reported; refusing to act on an unproved comparison",
+      }
+  }
+  for commit in commits {
+    if !commit.green {
+      const named = if commit.blocking_check == "" {
+        "an unresolved required check"
+      } else {
+        commit.blocking_check
+      }
+      return base
+        + {
+          green: false,
+          blocking_sha: commit.sha,
+          blocking_check: commit.blocking_check,
+          reason: "commit ${commit.sha} landed on main without passing ${named}",
+        }
+    }
+  }
+  return base
+    + {
+      green: true,
+      blocking_sha: "",
+      blocking_check: "",
+      reason:
+        "every one of the ${to_string(len(commits))} commits that landed since certification passed ${required_contexts.join(", ")}",
+    }
+}
+
+/**
+ * The contexts a branch requires, read from its rulesets.
+ *
+ * Classic branch protection answers 404 on this repository's default branch, so
+ * the rulesets endpoint is the authority. Only active rulesets count: a
+ * disabled one describes a rule nobody is enforcing.
+ */
+pub fn release_required_contexts_from_rulesets(rulesets: list?) -> list<string> {
+  let contexts: list<string> = []
+  for ruleset in rulesets ?? [] {
+    if lowercase(trim(to_string(ruleset?.enforcement ?? ""))) != "active" {
+      continue
+    }
+    for rule in ruleset?.rules ?? [] {
+      if to_string(rule?.type ?? "") != "required_status_checks" {
+        continue
+      }
+      for check in rule?.parameters?.required_status_checks ?? [] {
+        const context = trim(to_string(check?.context ?? ""))
+        if context != "" && !contexts.contains(context) {
+          contexts = contexts + [context]
+        }
+      }
+    }
+  }
+  return contexts.sort()
+}
