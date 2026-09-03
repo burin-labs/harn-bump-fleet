@@ -28,7 +28,17 @@ import { latest_check_per_name, required_check_state } from "./pr_admission"
 
 pub type ReleaseDriftCheckSource = "main_commit" | "pull_request_head" | "missing"
 
-pub type ReleaseDriftCheck = {name: string, state: string, source: ReleaseDriftCheckSource}
+pub type ReleaseDriftCheck = {
+  name: string,
+  state: string,
+  source: ReleaseDriftCheckSource,
+  /**
+   * True for a lane only a release runs. Such a lane is not required by the
+   * branch, so a commit can reach main before it reports. That makes an absent
+   * result "not yet" rather than "never", which waits instead of refusing.
+   */
+  release_only: bool,
+}
 
 pub type ReleaseDriftCommit = {
   sha: string,
@@ -37,6 +47,12 @@ pub type ReleaseDriftCommit = {
   checks: list<ReleaseDriftCheck>,
   green: bool,
   blocking_check: string,
+  /**
+   * A release-only lane on this commit that has not reported yet. Distinct
+   * from `blocking_check`: this one resolves itself by waiting, that one never
+   * does.
+   */
+  pending_check: string,
 }
 
 pub type ReleaseDriftEvidence = {
@@ -47,9 +63,16 @@ pub type ReleaseDriftEvidence = {
   green: bool,
   blocking_sha: string,
   blocking_check: string,
+  /** True when nothing has failed but a release-only lane has not finished. */
+  pending: bool,
+  pending_sha: string,
+  pending_check: string,
   reason: string,
   observed_at: string,
 }
+
+/** No lane is waiting, which every terminal verdict must say explicitly. */
+const NOT_PENDING = {pending: false, pending_sha: "", pending_check: ""}
 
 fn oid(value: any) -> string {
   return lowercase(trim(to_string(value ?? "")))
@@ -62,16 +85,51 @@ fn oid(value: any) -> string {
  * `MISSING` for a context that never reported, which is the difference between
  * "this check passed" and "nobody ran this check".
  */
-fn resolve_context(context: string, commit_rows: list?, head_rows: list?) -> ReleaseDriftCheck {
+fn resolve_context(
+  context: string,
+  commit_rows: list?,
+  head_rows: list?,
+  release_only: bool = false,
+) -> ReleaseDriftCheck {
   const on_commit = required_check_state(latest_check_per_name(commit_rows), context)
   if on_commit != "MISSING" {
-    return {name: context, state: on_commit, source: "main_commit"}
+    return {name: context, state: on_commit, source: "main_commit", release_only: release_only}
   }
   const on_head = required_check_state(latest_check_per_name(head_rows), context)
   if on_head != "MISSING" {
-    return {name: context, state: on_head, source: "pull_request_head"}
+    return {name: context, state: on_head, source: "pull_request_head", release_only: release_only}
   }
-  return {name: context, state: "MISSING", source: "missing"}
+  return {name: context, state: "MISSING", source: "missing", release_only: release_only}
+}
+
+/** A check state that is neither a pass nor a settled failure. */
+fn unfinished(state: string) -> bool {
+  const normalized = uppercase(trim(state))
+  return normalized == "MISSING"
+    || normalized == "PENDING"
+    || normalized == "QUEUED"
+    || normalized == "IN_PROGRESS"
+    || normalized == "WAITING"
+}
+
+/**
+ * The release-only lanes this commit owes an answer for.
+ *
+ * A lane only a release runs is required of a drifted commit exactly when that
+ * commit touched a path the lane bears on. Without this condition a
+ * documentation commit would owe a workspace test run that its own pull request
+ * never triggered, and the release would wait forever for a result nobody is
+ * going to produce.
+ */
+pub fn release_drift_lane_contexts(
+  release_only_checks: list<string>,
+  changed_paths: list<string>,
+  bearing_paths: list<string>,
+) -> list<string> {
+  if len(release_only_checks) == 0 || len(changed_paths) == 0 || len(bearing_paths) == 0 {
+    return []
+  }
+  return release_only_checks
 }
 
 /** Resolve every required context for one drifted commit. */
@@ -81,13 +139,37 @@ pub fn release_drift_commit_evidence(
   required_contexts: list<string>,
   commit_rows: list?,
   head_rows: list?,
+  lane_contexts: list<string> = [],
 ) -> ReleaseDriftCommit {
   let checks: list<ReleaseDriftCheck> = []
   let blocking = ""
+  let pending = ""
   for context in required_contexts {
     const resolved = resolve_context(context, commit_rows, head_rows)
     checks = checks + [resolved]
+    // A context the branch requires is settled by the time a commit is on
+    // main. An absent one is a commit that reached main without it, which no
+    // amount of waiting repairs.
     if blocking == "" && uppercase(trim(resolved.state)) != "SUCCESS" {
+      blocking = resolved.name
+    }
+  }
+  for lane in lane_contexts {
+    if required_contexts.contains(lane) {
+      continue
+    }
+    const resolved = resolve_context(lane, commit_rows, head_rows, true)
+    checks = checks + [resolved]
+    if uppercase(trim(resolved.state)) == "SUCCESS" {
+      continue
+    }
+    // A lane the branch does not require can still be running when the commit
+    // merges, so an unfinished one waits and a failed one refuses.
+    if unfinished(resolved.state) {
+      if pending == "" {
+        pending = resolved.name
+      }
+    } else if blocking == "" {
       blocking = resolved.name
     }
   }
@@ -95,8 +177,9 @@ pub fn release_drift_commit_evidence(
     sha: oid(sha),
     pull_number: pull_number,
     checks: checks,
-    green: len(required_contexts) > 0 && blocking == "",
+    green: len(required_contexts) > 0 && blocking == "" && pending == "",
     blocking_check: blocking,
+    pending_check: pending,
   }
 }
 
@@ -122,43 +205,66 @@ pub fn release_drift_evidence(
     commits: commits,
     observed_at: observed_at,
   }
+  const unproved = {green: false, blocking_sha: "", blocking_check: ""} + NOT_PENDING
   if len(required_contexts) == 0 {
     return base
+      + unproved
       + {
-        green: false,
-        blocking_sha: "",
-        blocking_check: "",
         reason:
           "the branch's required checks could not be read, so no drifted commit can be proved green",
       }
   }
   if len(commits) == 0 {
     return base
+      + unproved
       + {
-        green: false,
-        blocking_sha: "",
-        blocking_check: "",
         reason:
           "main moved but no drifted commit was reported; refusing to act on an unproved comparison",
       }
   }
+  // A settled failure outranks an unfinished lane. A commit that failed a check
+  // does not become admissible because another commit is still running one.
   for commit in commits {
-    if !commit.green {
-      const named = if commit.blocking_check == "" {
-        "an unresolved required check"
-      } else {
-        commit.blocking_check
-      }
+    if commit.blocking_check != "" {
       return base
+        + NOT_PENDING
         + {
           green: false,
           blocking_sha: commit.sha,
           blocking_check: commit.blocking_check,
-          reason: "commit ${commit.sha} landed on main without passing ${named}",
+          reason: "commit ${commit.sha} landed on main without passing ${commit.blocking_check}",
+        }
+    }
+  }
+  for commit in commits {
+    if commit.pending_check != "" {
+      return base
+        + {
+          green: false,
+          blocking_sha: "",
+          blocking_check: "",
+          pending: true,
+          pending_sha: commit.sha,
+          pending_check: commit.pending_check,
+          reason: "commit ${commit.sha} is still waiting on ${commit.pending_check}, which the branch"
+            + " does not require and which runs on its pull request",
+        }
+    }
+  }
+  for commit in commits {
+    if !commit.green {
+      return base
+        + NOT_PENDING
+        + {
+          green: false,
+          blocking_sha: commit.sha,
+          blocking_check: "",
+          reason: "commit ${commit.sha} landed on main without an unresolved required check",
         }
     }
   }
   return base
+    + NOT_PENDING
     + {
       green: true,
       blocking_sha: "",
