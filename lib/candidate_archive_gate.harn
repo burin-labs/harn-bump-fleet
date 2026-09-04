@@ -15,13 +15,24 @@ import {
 } from "./candidate_archive_receipt"
 import {
   github_actions_run,
+  github_actions_run_jobs,
   github_is_rate_limited_read_error,
   github_is_transient_read_error,
   github_workflow_dispatch,
 } from "./github"
-import { recorded_step, release_candidate_archive_gate_config } from "./release_execution"
+import {
+  pre_tag_binary_size_gate_step_contract,
+  pre_tag_binary_size_gate_workflow_path,
+  recorded_step,
+  release_candidate_archive_gate_config,
+} from "./release_execution"
 import { ReleasePublication } from "./release_publication"
 import { release_log_event, release_repo_slug, release_run_root, run_git } from "./release_runtime"
+import {
+  PreTagBinaryGateConfig,
+  PreTagBinaryGateJob,
+  pre_tag_binary_gate_verdict,
+} from "./workflow_runs"
 
 pub type CandidateArchiveGatePhase = "dispatch" | "inspect" | "complete"
 
@@ -72,9 +83,11 @@ pub type CandidateArchiveGateError = {code: string, message: string, ...rest}
 pub type CandidateArchiveGateDispatchResult = CandidateArchiveGateDispatch \
   | Result<CandidateArchiveGateDispatch, CandidateArchiveGateError>
 
+pub type CandidateArchiveGateView = {run: CandidateArchiveGateRun, jobs: list<PreTagBinaryGateJob>}
+
 pub type CandidateArchiveGateAdapter = {
   dispatch: fn(CandidateArchiveGateConfig) -> CandidateArchiveGateDispatchResult,
-  view_run: fn(int) -> Result<{run: CandidateArchiveGateRun}, CandidateArchiveGateError>,
+  view_run: fn(int) -> Result<CandidateArchiveGateView, CandidateArchiveGateError>,
   wait: fn(int) -> nil,
 }
 
@@ -135,36 +148,37 @@ pub fn candidate_archive_gate_event(
 fn candidate_archive_gate_verdict(
   config: CandidateArchiveGateConfig,
   run: CandidateArchiveGateRun,
+  jobs: list<PreTagBinaryGateJob>,
 ) -> {action: string, message: string} {
-  if run.event != config.event || run.head_branch != config.policy_ref {
+  const size_config: PreTagBinaryGateConfig = {
+    workflow: config.workflow,
+    event: config.event,
+    policy_ref: config.policy_ref,
+    expected_policy_sha: config.expected_policy_sha,
+    source_ref: config.source_ref,
+    expected_source_sha: config.expected_source_sha,
+    target_job: config.target_job,
+    required_source_step: config.required_source_step,
+    required_fuse_step: config.required_fuse_step,
+    required_size_step: config.required_size_step,
+    benchmark_only: false,
+    runner_profile: config.runner_profile,
+    targets: config.targets,
+    completion_timeout_ms: config.completion_timeout_ms,
+    completion_interval_ms: config.completion_interval_ms,
+    transient_view_retry_max_attempts: config.transient_view_retry_max_attempts,
+    transient_view_retry_base_ms: config.transient_view_retry_base_ms,
+    transient_view_retry_cap_ms: config.transient_view_retry_cap_ms,
+  }
+  const verdict = pre_tag_binary_gate_verdict(size_config, run, jobs)
+  if verdict.action == "pass" {
     return {
-      action: "fail",
+      action: "pass",
       message:
-        "run ${run.id} policy identity changed to ${run.event} on ${run.head_branch}; expected ${config.event} on ${config.policy_ref}",
+        "run ${run.id} built candidate archives and cleared the Linux size gate for ${config.source_ref} at ${config.expected_source_sha} under policy ${config.policy_ref}@${config.expected_policy_sha}",
     }
   }
-  if run.head_sha != lowercase(config.expected_policy_sha) {
-    return {
-      action: "fail",
-      message:
-        "observed run ${run.id} changed policy SHA to ${run.head_sha}; expected ${config.expected_policy_sha}",
-    }
-  }
-  if run.status != "completed" {
-    return {action: "wait", message: "run ${run.id} is ${run.status}"}
-  }
-  if run.conclusion != "success" {
-    return {
-      action: "fail",
-      message:
-        "run ${run.id} completed with conclusion ${run.conclusion}; refusing to certify candidate archives",
-    }
-  }
-  return {
-    action: "pass",
-    message:
-      "run ${run.id} built candidate archives for ${config.source_ref} at ${config.expected_source_sha} under policy ${config.policy_ref}@${config.expected_policy_sha}",
-  }
+  return verdict
 }
 
 fn view_exact_run_with_transient_retry(
@@ -213,6 +227,10 @@ fn candidate_archive_gate_started_event(config: CandidateArchiveGateConfig, disp
     expected_policy_sha: config.expected_policy_sha,
     source_ref: config.source_ref,
     expected_source_sha: config.expected_source_sha,
+    target_job: config.target_job,
+    required_source_step: config.required_source_step,
+    required_fuse_step: config.required_fuse_step,
+    required_size_step: config.required_size_step,
     candidate_only: config.candidate_only,
     runner_profile: config.runner_profile,
     targets: config.targets,
@@ -310,7 +328,7 @@ pub fn run_candidate_archive_gate(
         transient_view_retries,
       )
     }
-    const verdict = candidate_archive_gate_verdict(config, unwrap(viewed).run)
+    const verdict = candidate_archive_gate_verdict(config, unwrap(viewed).run, unwrap(viewed).jobs)
     if verdict.action == "pass" || verdict.action == "fail" {
       const recovery_suffix = if transient_view_retries > 0 {
         " after ${transient_view_retries} transient status-read retries"
@@ -401,6 +419,42 @@ pub fn run_release_candidate_archive_gate(
         publication.remote_ref,
         publication.head_oid,
       )
+      const shown = if cfg.mock {
+        {success: true, stdout: ""}
+      } else {
+        run_git(
+          {env: harness.env, process: harness.process},
+          cfg,
+          ["show", "${unwrap(policy_head)}:${pre_tag_binary_size_gate_workflow_path()}"],
+        )
+      }
+      const contract = pre_tag_binary_size_gate_step_contract(
+        cfg.mock,
+        shown.success,
+        shown.stdout ?? "",
+        config,
+      )
+      if !contract.ok {
+        return {
+          steps: steps
+            + [
+              recorded_step(
+                "candidate-archive-and-size-gate",
+                "require SHA-matched five-target archives and Linux size proof",
+                candidate_archive_gate_command_result(
+                  candidate_archive_gate_failure(
+                    if contract.unreadable {
+                      "could not read ${pre_tag_binary_size_gate_workflow_path()} at ${unwrap(policy_head)}; refusing to dispatch an unverified candidate gate"
+                    } else {
+                      "${pre_tag_binary_size_gate_workflow_path()} at ${unwrap(policy_head)} does not define required candidate gate step(s): ${join(contract.missing, ", ")}"
+                    },
+                  ),
+                ),
+              ),
+            ],
+          success: false,
+        }
+      }
       const adapter = if cfg.mock {
         mock_candidate_archive_gate_adapter(config)
       } else {
@@ -466,6 +520,10 @@ pub fn run_release_candidate_archive_gate(
               return run
             }
             const observed = unwrap(run)
+            const jobs = github_actions_run_jobs(harness, slug, action_run_id)
+            if is_err(jobs) {
+              return jobs
+            }
             return Ok(
               {
                 run: {
@@ -477,6 +535,26 @@ pub fn run_release_candidate_archive_gate(
                   conclusion: observed.conclusion,
                   url: observed.url,
                 },
+                jobs: unwrap(jobs).jobs.map(
+                  { job ->
+                    return {
+                      name: job.name,
+                      status: job.status,
+                      conclusion: job.conclusion ?? "",
+                      steps: job.steps.map(
+                        { step ->
+                          return {
+                            name: step.name,
+                            status: step.status,
+                            conclusion: step.conclusion ?? "",
+                          }
+                        },
+                      )
+                        .to_list(),
+                    }
+                  },
+                )
+                  .to_list(),
               },
             )
           },
@@ -522,8 +600,8 @@ pub fn run_release_candidate_archive_gate(
     steps: steps
       + [
         recorded_step(
-          "candidate-archive-gate",
-          "require SHA-matched five-target candidate archive workflow",
+          "candidate-archive-and-size-gate",
+          "require SHA-matched five-target archives and Linux size proof",
           candidate_archive_gate_command_result(result),
         ),
       ],
@@ -557,6 +635,18 @@ pub fn mock_candidate_archive_gate_adapter(
           conclusion: "success",
           url: "https://github.test/run/${run_id}",
         },
+        jobs: [
+          {
+            name: config.target_job,
+            status: "completed",
+            conclusion: "success",
+            steps: [
+              {name: config.required_source_step, status: "completed", conclusion: "success"},
+              {name: config.required_fuse_step, status: "completed", conclusion: "success"},
+              {name: config.required_size_step, status: "completed", conclusion: "success"},
+            ],
+          },
+        ],
       },
     ) },
     wait: fn(_interval_ms) {
