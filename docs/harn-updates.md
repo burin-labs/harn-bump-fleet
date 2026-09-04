@@ -36,7 +36,10 @@ authority ledger: requested, granted, controller-proven used, denied, and
 structurally unused scope, plus the Harn decider. It contains only secret
 reference names and consumer bindings, never secret material. Detailed tool
 calls remain in the signed agent transcript rather than being guessed from
-availability.
+availability. A validator is granted and used only when its launch returns
+through the prepared process boundary. A sandbox refusal is denied, an absent
+result stays unused, and contradictory launch evidence is recorded as
+malformed instead of being promoted to a grant.
 
 The model may change tracked files through exact-text edits. It may create a
 new file only when the repository manifest names that exact path; the creation
