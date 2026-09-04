@@ -14,6 +14,17 @@ segment_polls="${HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS:-60}"
 interval_seconds="${HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS:-30}"
 max_segment_seconds=2700
 
+# Keep the refreshed gh login under the runner's secret scratch root. The
+# confined release boundary already grants that root because it contains the
+# signing key and git credential store. Using gh's default ~/.config path here
+# made an otherwise valid token unreadable once the watcher installed process
+# confinement, so artifact recovery failed before it could read its receipt.
+if [[ -n "${RUNNER_TEMP:-}" ]]; then
+  export GH_CONFIG_DIR="${GH_CONFIG_DIR:-${RUNNER_TEMP}/gh-config}"
+  mkdir -p "$GH_CONFIG_DIR"
+  chmod 700 "$GH_CONFIG_DIR"
+fi
+
 if [[ ! "$segment_polls" =~ ^[1-9][0-9]*$ ]]; then
   echo "HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS must be a positive integer" >&2
   exit 2
