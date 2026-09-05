@@ -42,6 +42,7 @@ import {
   ReleaseUnfoldDecision,
   release_unfold_body,
   release_unfold_decision,
+  release_unfold_revert_args,
   release_unfold_title,
 } from "./release_unfold"
 import {
@@ -58,25 +59,14 @@ pub type ReleaseMainTagAction = "wait" \
   | "merge" \
   | "certify_main" \
   | "unfold" \
+  | "unfold_merge_race" \
   | "defer" \
   | "tag" \
   | "reuse" \
   | "abort" \
   | "certification_drift"
 
-/**
- * Which question a decision is answering, named so a refusal reason cannot be
- * misread as coming from the wrong moment.
- *
- * `certification` is a separate step entirely (`hosted-platform-certification`,
- * decided before this module runs at all) and never appears here. This module
- * answers exactly two: whether the release candidate, drift and all, may be
- * admitted onto main (`main_tag_admission`, decided before any merge exists),
- * and whether the commit that landed may have the immutable tag minted on it
- * (`tag`, decided once a merge SHA exists). A run that predicted a refusal "at
- * the tag decision" and found instead that main never let the candidate merge
- * is the confusion this field exists to prevent.
- */
+/** Whether the candidate is being admitted to main or the landed commit tagged. */
 pub type ReleaseMainTagPhase = "main_tag_admission" | "tag"
 
 pub type ReleaseMainTagDecision = {
@@ -111,6 +101,8 @@ pub type ReleaseCertificationTrees = {
   candidate_commit: string,
   candidate_tree: string,
   merged_commit: string,
+  /** The merged commit's first parent: the exact main base GitHub merged onto. */
+  merged_base_commit: string,
   merged_tree: string,
   drifted_paths: list<string>,
 }
@@ -223,6 +215,15 @@ pub fn release_certification_trees_agree(
   if candidate == merged {
     return true
   }
+  // The changed paths below are meaningful only for the exact main snapshot
+  // the merge gate observed. If main advances after that observation, a later
+  // commit can touch the same path and path containment would otherwise
+  // misidentify unobserved content as the content the receipt recorded.
+  const merged_base = tree_oid(trees.merged_base_commit)
+  const observed_main = tree_oid(drift.observed_main)
+  if !exact_commit(merged_base) || !exact_commit(observed_main) || merged_base != observed_main {
+    return false
+  }
   // The trees differ, which is legitimate exactly when every file that differs
   // is one the recorded drift already accounts for. A record that was never
   // written, or one that describes another pair of heads, accounts for nothing.
@@ -240,7 +241,26 @@ pub fn release_certification_trees_agree(
   return true
 }
 
-fn drift_reason(tag: string, trees: ReleaseCertificationTrees) -> string {
+/** True only for a proved post-admission base race, not for a failed probe. */
+fn release_merge_base_moved(
+  trees: ReleaseCertificationTrees,
+  drift: ReleaseCertificationDrift,
+) -> bool {
+  const candidate = tree_oid(trees.candidate_tree)
+  const merged = tree_oid(trees.merged_tree)
+  const merged_base = tree_oid(trees.merged_base_commit)
+  const observed_main = tree_oid(drift.observed_main)
+  return candidate != "" && merged != "" && candidate != merged
+    && exact_commit(merged_base)
+    && exact_commit(observed_main)
+    && merged_base != observed_main
+}
+
+fn drift_reason(
+  tag: string,
+  trees: ReleaseCertificationTrees,
+  drift: ReleaseCertificationDrift,
+) -> string {
   const named = if len(trees.drifted_paths) == 0 {
     "no paths reported"
   } else {
@@ -250,8 +270,21 @@ fn drift_reason(tag: string, trees: ReleaseCertificationTrees) -> string {
     + " certified. The release certified ${tree_oid(trees.candidate_commit)}"
     + " (tree ${tree_oid(trees.candidate_tree)}) but the merged main commit"
     + " ${tree_oid(trees.merged_commit)} carries tree ${tree_oid(trees.merged_tree)}."
+    + " Its main parent is ${tree_oid(trees.merged_base_commit)}, while the merge gate"
+    + " observed ${tree_oid(drift.observed_main)}."
     + " Drifted paths: ${named}. "
     + release_stranded_recovery_advice(tag, trees.merged_commit)
+}
+
+fn merge_base_race_reason(
+  tag: string,
+  trees: ReleaseCertificationTrees,
+  drift: ReleaseCertificationDrift,
+) -> string {
+  return "main advanced after the final merge admission, so ${tag} would name a tree nobody"
+    + " certified. GitHub squashed the release onto ${tree_oid(trees.merged_base_commit)},"
+    + " but the release admitted ${tree_oid(drift.observed_main)}. Refusing the tag and"
+    + " unfolding merged main commit ${tree_oid(trees.merged_commit)}."
 }
 
 fn exact_commit(value: string?) {
@@ -275,10 +308,14 @@ fn release_open_pr_merge_decision(
   if pull_request?.in_merge_queue ?? false {
     return main_tag_decision("wait", "release pull request is inside the merge queue")
   }
-  const gate = merge_gate(pull_request)
+  return observed_release_merge_decision(merge_gate(pull_request))
+}
+
+/** Apply the one merge-admission policy to any observation, including refreshes. */
+fn observed_release_merge_decision(gate: ReleaseMergeGateState?) -> ReleaseMainTagDecision {
   if gate == nil {
     return main_tag_decision(
-      "abort",
+      "defer",
       "could not observe origin/main against the certified base; refusing to release the merge without that proof",
     )
   }
@@ -290,7 +327,10 @@ fn release_open_pr_merge_decision(
     return main_tag_decision("defer", gated.reason, "", gated.bearing_paths, gate.observed_main)
   }
   if gated.action == "abort" {
-    return main_tag_decision("abort", gated.reason)
+    // A malformed or absent gate observation is not evidence that an already
+    // armed PR is harmless. Treat it as a deferral so the driver confirms that
+    // stale auto-merge authority is gone before it returns.
+    return main_tag_decision("defer", gated.reason, "", gated.bearing_paths, gate.observed_main)
   }
   return main_tag_decision("wait", gated.reason, "", [], gate.observed_main)
 }
@@ -370,10 +410,18 @@ pub fn release_main_tag_decision(
       merge_sha,
     )
   }
+  if release_merge_base_moved(trees, receipt.certification_drift) {
+    return main_tag_decision(
+      "unfold_merge_race",
+      merge_base_race_reason(receipt.tag, trees, receipt.certification_drift),
+      merge_sha,
+      trees.drifted_paths,
+    )
+  }
   if !release_certification_trees_agree(trees, receipt.certification_drift) {
     return main_tag_decision(
       "certification_drift",
-      drift_reason(receipt.tag, trees),
+      drift_reason(receipt.tag, trees, receipt.certification_drift),
       merge_sha,
       trees.drifted_paths,
     )
@@ -738,7 +786,7 @@ fn release_main_delta_dispatch(
 /**
  * Open the pull request that reverts a bump which merged but must not ship.
  *
- * The revert is `git revert -m 1` of the release merge commit: one diff that
+ * The revert is a plain `git revert` of the one-parent squash commit: one diff that
  * restores the development version and every folded changelog fragment,
  * because folding and bumping were the only things the release did.
  */
@@ -782,7 +830,7 @@ pub fn release_open_unfold_pull_request(
   if !branched.success {
     return unfold_failed(decision, "could not create ${decision.branch}")
   }
-  const reverted = run_git(git, cfg, ["revert", "--no-edit", "-m", "1", lowercase(trim(merge_sha))])
+  const reverted = run_git(git, cfg, release_unfold_revert_args(merge_sha))
   if !reverted.success {
     return unfold_failed(decision, "could not revert ${lowercase(trim(merge_sha))}")
   }
@@ -925,7 +973,8 @@ fn default_release_main_tag_adapter(
       }
       const candidate_tree = run_git(git, cfg, ["rev-parse", "--verify", "${candidate}^{tree}"])
       const merged_tree = run_git(git, cfg, ["rev-parse", "--verify", "${merged}^{tree}"])
-      if !candidate_tree.success || !merged_tree.success {
+      const merged_base = run_git(git, cfg, ["rev-parse", "--verify", "${merged}^1"])
+      if !candidate_tree.success || !merged_tree.success || !merged_base.success {
         return nil
       }
       const diffed = run_git(git, cfg, ["diff", "--name-only", candidate, merged])
@@ -937,6 +986,7 @@ fn default_release_main_tag_adapter(
         candidate_commit: candidate,
         candidate_tree: trim(candidate_tree.stdout),
         merged_commit: merged,
+        merged_base_commit: trim(merged_base.stdout),
         merged_tree: trim(merged_tree.stdout),
         drifted_paths: paths,
       }
@@ -1073,6 +1123,150 @@ pub fn release_certification_drift_from_gate(
   }
 }
 
+type RefreshedReleaseMergeAction = "merged" | "wait" | "refuse"
+
+type RefreshedReleaseMergeResult = {
+  action: RefreshedReleaseMergeAction,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+  disarm_pending: bool,
+}
+
+/** Confirm stale auto-merge authority is gone before a safe refusal returns. */
+fn release_auto_merge_disarmed(
+  adapter: ReleaseMainTagAdapter,
+  pull_request: ReleaseMainTagPullRequest?,
+  observed_main: string,
+) -> bool {
+  if pull_request == nil || !(pull_request?.auto_merge_armed ?? false) {
+    return true
+  }
+  return adapter.disarm(pull_request, observed_main)
+}
+
+/** Re-observe an unresolved disarm until GitHub reports no live merge authority. */
+fn release_auto_merge_authority_still_held(
+  adapter: ReleaseMainTagAdapter,
+  pull_request: ReleaseMainTagPullRequest?,
+) -> bool {
+  if pull_request == nil {
+    return true
+  }
+  if (pull_request?.merged ?? false)
+    || lowercase(trim(pull_request?.github_state ?? "")) != "open"
+    || !(pull_request?.auto_merge_armed ?? false) {
+    return false
+  }
+  const gate = adapter.merge_gate(pull_request)
+  const observed_main = trim(to_string(gate?.observed_main ?? ""))
+  return !adapter.disarm(pull_request, observed_main)
+}
+
+fn release_disarm_monitoring_required(
+  adapter: ReleaseMainTagAdapter,
+  pending: bool,
+  pull_request: ReleaseMainTagPullRequest?,
+) -> bool {
+  return pending && release_auto_merge_authority_still_held(adapter, pull_request)
+}
+
+fn next_release_poll(
+  adapter: ReleaseMainTagAdapter,
+  poll: int,
+  options: {max_polls: int, interval_ms: int},
+) -> int {
+  const next = poll + 1
+  if next < options.max_polls && options.interval_ms > 0 {
+    adapter.wait(options.interval_ms)
+  }
+  return next
+}
+
+type ReleaseEarlyControlAction = "continue" | "monitor_disarm" | "stop"
+
+type ReleaseEarlyControl = {action: ReleaseEarlyControlAction, reason: string}
+
+/** Resolve pre-merge terminal decisions without letting stale auto-merge escape. */
+fn release_early_control(
+  adapter: ReleaseMainTagAdapter,
+  pull_request: ReleaseMainTagPullRequest?,
+  decision: ReleaseMainTagDecision,
+) -> ReleaseEarlyControl {
+  if decision.action == "defer" {
+    const disarmed = release_auto_merge_disarmed(adapter, pull_request, decision.observed_main)
+    return if disarmed {
+      {action: "stop", reason: decision.reason}
+    } else {
+      {
+        action: "monitor_disarm",
+        reason: "merge admission failed, but auto-merge could not be confirmed disabled",
+      }
+    }
+  }
+  if decision.action == "abort" || decision.action == "certification_drift" {
+    return {action: "stop", reason: decision.reason}
+  }
+  return {action: "continue", reason: ""}
+}
+
+/** Refresh, admit, record, and perform one release merge as one owned operation. */
+fn run_refreshed_release_merge(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseMainTagAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  pull_request: ReleaseMainTagPullRequest?,
+  poll: int,
+) -> RefreshedReleaseMergeResult {
+  if pull_request == nil {
+    return {
+      action: "refuse",
+      reason: "release pull request disappeared before its merge observation",
+      receipt: receipt,
+      disarm_pending: false,
+    }
+  }
+  const gate = adapter.merge_gate(pull_request)
+  const refreshed = observed_release_merge_decision(gate)
+  if refreshed.action != "merge" {
+    const disarmed = release_auto_merge_disarmed(adapter, pull_request, refreshed.observed_main)
+    return {
+      action: if !disarmed {
+        "wait"
+      } else if refreshed.action == "defer" || refreshed.action == "abort" {
+        "refuse"
+      } else {
+        "wait"
+      },
+      reason: if disarmed {
+        refreshed.reason
+      } else {
+        "fresh merge admission failed, but auto-merge could not be confirmed disabled;"
+          + " retaining the watcher until GitHub reports that merge authority gone"
+      },
+      receipt: receipt,
+      disarm_pending: !disarmed,
+    }
+  }
+  // Write only admitted evidence before the merge, so a merged release is
+  // never one whose record says nobody looked or records a rejected head.
+  const recorded = release_watch_receipt_record_certification_drift(
+    receipt,
+    release_certification_drift_from_gate(gate),
+    adapter.now(poll),
+  )
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, recorded)
+  if !adapter.merge(pull_request) {
+    return {
+      action: "refuse",
+      reason: "release pull request merge was refused at its observed head",
+      receipt: recorded,
+      disarm_pending: false,
+    }
+  }
+  return {action: "merged", reason: refreshed.reason, receipt: recorded, disarm_pending: false}
+}
+
 /** Wait for the exact release PR to merge, then create or verify its immutable tag. */
 pub fn run_release_main_tag(
   harness: Harness,
@@ -1090,9 +1284,16 @@ pub fn run_release_main_tag(
   // operator that sends them to cut again against a branch that refuses it.
   let last_action = ""
   let last_merge_sha = ""
+  let disarm_pending = false
   let poll = 0
   while poll < options.max_polls {
     const pull_request = adapter.pull_request(poll)
+    if release_disarm_monitoring_required(adapter, disarm_pending, pull_request) {
+      last_action = "disarm_pending"
+      poll = next_release_poll(adapter, poll, options)
+      continue
+    }
+    disarm_pending = false
     const decision = release_main_tag_decision(
       receipt,
       pull_request,
@@ -1102,31 +1303,22 @@ pub fn run_release_main_tag(
       adapter.main_delta,
       poll,
     )
-    if decision.action == "defer" {
-      // Nothing merged, so main still carries the development version and a
-      // fresh cut is admissible. Take the merge back first: a pull request left
-      // armed by an earlier run would otherwise squash on its own.
-      if pull_request != nil && (pull_request?.auto_merge_armed ?? false) {
-        adapter.disarm(pull_request, decision.observed_main)
-      }
+    const early = release_early_control(adapter, pull_request, decision)
+    if early.action == "stop" {
       return {
         status: 2,
-        reason: decision.reason,
+        reason: early.reason,
         receipt: receipt,
         steps: [],
         polls: poll + 1,
         phase: decision.phase,
       }
     }
-    if decision.action == "abort" || decision.action == "certification_drift" {
-      return {
-        status: 2,
-        reason: decision.reason,
-        receipt: receipt,
-        steps: [],
-        polls: poll + 1,
-        phase: decision.phase,
-      }
+    if early.action == "monitor_disarm" {
+      disarm_pending = true
+      last_action = "disarm_pending"
+      poll = next_release_poll(adapter, poll, options)
+      continue
     }
     if decision.action == "unfold" {
       // The merged tree failed a lane only a release runs. No tag was minted,
@@ -1151,6 +1343,17 @@ pub fn run_release_main_tag(
         phase: decision.phase,
       }
     }
+    if decision.action == "unfold_merge_race" {
+      const unfolded = adapter.unfold(decision.merge_sha)
+      return {
+        status: 2,
+        reason: decision.reason + " ${unfolded.reason}.",
+        receipt: receipt,
+        steps: [],
+        polls: poll + 1,
+        phase: decision.phase,
+      }
+    }
     if decision.action == "certify_main" {
       // Start the lanes and keep polling. The tag stays unminted until they
       // report, and an unreadable report refuses rather than tags.
@@ -1166,19 +1369,24 @@ pub fn run_release_main_tag(
         }
       }
     } else if decision.action == "merge" {
-      // Write the evidence before the irreversible act, so a merged release is
-      // never one whose record says nobody looked.
-      const gate = adapter.merge_gate(pull_request)
-      receipt = release_watch_receipt_record_certification_drift(
+      // Refresh immediately before the irreversible act, then apply the same
+      // admission policy as the first observation. Recording an unvalidated
+      // refresh would let newly red same-path content become the parent lease
+      // and pass the later path-containment check.
+      const merged = run_refreshed_release_merge(
+        {fs: harness.fs, random: harness.random},
+        adapter,
         receipt,
-        release_certification_drift_from_gate(gate),
-        adapter.now(poll),
+        receipt_path,
+        pull_request,
+        poll,
       )
-      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
-      if pull_request == nil || !adapter.merge(pull_request) {
+      receipt = merged.receipt
+      disarm_pending = merged.disarm_pending
+      if merged.action == "refuse" {
         return {
           status: 2,
-          reason: "release pull request merge was refused at its observed head",
+          reason: merged.reason,
           receipt: receipt,
           steps: [],
           polls: poll + 1,
@@ -1226,14 +1434,21 @@ pub fn run_release_main_tag(
         phase: decision.phase,
       }
     }
-    last_action = decision.action
+    last_action = if disarm_pending {
+      "disarm_pending"
+    } else {
+      decision.action
+    }
     last_merge_sha = decision.merge_sha
     poll = poll + 1
     if poll < options.max_polls && options.interval_ms > 0 {
       adapter.wait(options.interval_ms)
     }
   }
-  const exhausted = if last_action == "certify_main" || last_action == "wait" {
+  const exhausted = if last_action == "disarm_pending" {
+    "auto-merge could not be confirmed disabled after fresh merge admission failed;"
+      + " the release watcher exhausted its bounded polls while retaining that authority"
+  } else if last_action == "certify_main" || last_action == "wait" {
     if trim(last_merge_sha) == "" {
       "release PR did not merge within ${to_string(options.max_polls)} polls"
     } else {
@@ -1280,67 +1495,5 @@ pub fn run_release_unfold(
     },
     reason: decision.reason,
     steps: [{name: "open-release-unfold", success: opened, reason: decision.reason}],
-  }
-}
-
-pub fn mock_release_main_tag_adapter(receipt: ReleaseWatchReceipt) -> ReleaseMainTagAdapter {
-  const merge_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  return {
-    pull_request: fn(_poll) { return {
-      number: 1,
-      merged: true,
-      merge_commit_oid: merge_sha,
-      github_state: "merged",
-      auto_merge_armed: false,
-      in_merge_queue: false,
-      base: {ref: "main"},
-      head: {ref: receipt.publication.remote_ref, sha: receipt.publication.head_oid},
-    } },
-    remote_tag_target: fn(_poll) { return "" },
-    // The mock release never advances main, so the certified tree and the
-    // merged tree are the same tree.
-    certification_trees: fn(sha) { return {
-      candidate_commit: receipt.publication.head_oid,
-      candidate_tree: "cccccccccccccccccccccccccccccccccccccccc",
-      merged_commit: sha,
-      merged_tree: "cccccccccccccccccccccccccccccccccccccccc",
-      drifted_paths: [],
-    } },
-    // The mock release never advances main, so the merge gate always sees the
-    // certified base and a pull request GitHub would merge now.
-    merge_gate: fn(_pr) { return {
-      certified_base: receipt.pin_sha,
-      observed_main: receipt.pin_sha,
-      mergeable_state: "clean",
-      mergeable_resolved: true,
-      drifted_paths: [],
-      evidence: nil,
-      release_only_checks: [],
-    } },
-    merge: fn(_pr) { return true },
-    main_delta: fn(mock_merge_sha, _poll) { return {
-      state: "skipped_tree_already_certified",
-      commit: mock_merge_sha,
-      lanes: [],
-      checks: [],
-      failing_check: "",
-      observed_at: "",
-    } },
-    dispatch_main_delta: fn(_merge_sha) { return true },
-    unfold: fn(_merge_sha) { return release_unfold_decision(
-      {
-        tag: receipt.tag,
-        version: "",
-        merge_commit: "",
-        development_version: "",
-        tag_published: false,
-        open_pull_number: 0,
-      },
-    ) },
-    disarm: fn(_pr, _observed_main) { return true },
-    merged_main_ancestor: fn(sha) { return sha == merge_sha },
-    push_tag: fn(sha) { return [{name: "push-release-tag", success: sha == merge_sha}] },
-    now: fn(_poll) { return "2026-07-13T00:00:01Z" },
-    wait: fn(_delay_ms) { return nil },
   }
 }
