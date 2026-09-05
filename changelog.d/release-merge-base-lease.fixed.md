@@ -1,1 +1,1 @@
-Release merging now revalidates its fresh gate observation, and tagging refuses a squash parent that differs from the exact admitted main commit.
+Release merging now revalidates its fresh gate observation, retains monitoring until stale auto-merge is confirmed disabled, and automatically reverts a bump squashed onto an unadmitted main parent.
