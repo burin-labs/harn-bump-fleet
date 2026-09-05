@@ -13,13 +13,15 @@ pub type ConsumerPretagRunRow = {
  * Everything the pre-tag gate does to the outside world, in one injected shape.
  *
  * `runs` lists this workflow's dispatched runs; the gate keeps only the ones
- * whose name carries the candidate commit, which is how it binds a run to ITS
- * dispatch. GitHub does not echo dispatch inputs back on a run, so identity
- * comes from the run name, and two matches are refused rather than resolved by
- * picking the newest.
+ * whose name carries the exact candidate version and commit. That lookup is
+ * recovery-only: a fresh dispatch returns its authoritative run id directly.
+ * An existing unique match is the durable checkpoint for a resumed release,
+ * and ambiguity is always refused rather than resolved by picking the newest.
  */
+pub type ConsumerPretagDispatchReceipt = {run_id: int}
+
 pub type ConsumerPretagGateAdapter = {
-  dispatch: fn(ConsumerPretagGateTarget) -> Result<nil, dict>,
+  dispatch: fn(ConsumerPretagGateTarget) -> Result<ConsumerPretagDispatchReceipt, dict>,
   runs: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
   run: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagRunRow, dict>,
   wait: fn(int) -> nil,
@@ -36,14 +38,40 @@ pub type ConsumerPretagGateAdapter = {
  */
 pub type ConsumerPretagRunRecorder = fn(string, int) -> nil
 
-pub type ConsumerPretagGatePolicy = {poll_interval_ms: int, deadline_ms: int}
+pub type ConsumerPretagGatePolicy = {
+  poll_interval_ms: int,
+  deadline_ms: int,
+  recovery_visibility_ms?: int,
+}
 
 pub const CONSUMER_PRETAG_GATE_POLICY: ConsumerPretagGatePolicy = {
   poll_interval_ms: 30000,
-  deadline_ms: 3600000,
+  // A consumer may queue behind scarce self-hosted capacity before its own
+  // workflow starts doing useful work. Keep this below the hosted release
+  // owner's five-hour bound while allowing one hour of queueing plus the
+  // consumer's long integration proof.
+  deadline_ms: 180 * 60 * 1000,
 }
 
-type PendingGate = {target: ConsumerPretagGateTarget, run_id: int}
+type PendingGate = {target: ConsumerPretagGateTarget, run_id: int, visibility_error?: string}
+
+type CandidateResolution = {
+  receipts: list<ConsumerPretagGateReceipt>,
+  pending: list<PendingGate>,
+  unseen: list<PendingGate>,
+}
+
+/** Fresh cuts mutate immediately; only a resumed checkpoint reconciles visibility first. */
+pub fn consumer_pretag_gate_policy(pre_tag_resume: bool) -> ConsumerPretagGatePolicy {
+  return CONSUMER_PRETAG_GATE_POLICY
+    + {
+      recovery_visibility_ms: if pre_tag_resume {
+        60000
+      } else {
+        0
+      },
+    }
+}
 
 fn unreadable(target: ConsumerPretagGateTarget, detail: string) -> ConsumerPretagGateReceipt {
   return {
@@ -53,6 +81,14 @@ fn unreadable(target: ConsumerPretagGateTarget, detail: string) -> ConsumerPreta
     run_url: "",
     detail: detail,
   }
+}
+
+fn candidate_runs(
+  target: ConsumerPretagGateTarget,
+  rows: list<ConsumerPretagRunRow>,
+) -> list<ConsumerPretagRunRow> {
+  const title = "Harn candidate ${target.version} @ ${target.revision}"
+  return rows.filter({ row -> trim(row.display_title) == title }).to_list()
 }
 
 fn settle(
@@ -77,16 +113,104 @@ fn settle(
       "unreadable"
     },
     run_url: row.html_url,
-    detail: "run ${to_string(row.id)} concluded '${row.conclusion}'",
+    detail: if settled {
+      "run ${to_string(row.id)} concluded '${row.conclusion}'"
+    } else {
+      "run ${to_string(row.id)} concluded '${row.conclusion}' without judging the candidate"
+    },
   }
 }
 
+fn resolve_candidate_rows(
+  target: ConsumerPretagGateTarget,
+  rows: list<ConsumerPretagRunRow>,
+  recorder: ConsumerPretagRunRecorder?,
+  ambiguity_context: string,
+) -> CandidateResolution {
+  const found = candidate_runs(target, rows)
+  if len(found) == 0 {
+    return {receipts: [], pending: [], unseen: [{target: target, run_id: 0, visibility_error: nil}]}
+  }
+  if len(found) > 1 {
+    return {
+      receipts: [
+        unreadable(
+          target,
+          "${to_string(len(found))} ${ambiguity_context} runs name this candidate; refusing to "
+            + "guess which one judged it",
+        ),
+      ],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const row = found[0]
+    ?? {id: 0, status: "completed", conclusion: "startup_failure", html_url: "", display_title: ""}
+  const receipt = settle(target, row)
+  if receipt != nil {
+    return {
+      receipts: [receipt ?? unreadable(target, "candidate run produced no terminal receipt")],
+      pending: [],
+      unseen: [],
+    }
+  }
+  if recorder != nil {
+    let _ = (recorder ?? fn(_slug, _id) { return nil })(target.slug, row.id)
+  }
+  return {receipts: [], pending: [{target: target, run_id: row.id}], unseen: []}
+}
+
+fn dispatch_unseen_candidates(
+  gates: list<PendingGate>,
+  adapter: ConsumerPretagGateAdapter,
+  recovery_visibility_ms: int,
+  recorder: ConsumerPretagRunRecorder?,
+) -> CandidateResolution {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  let pending: list<PendingGate> = []
+  for gate in gates {
+    const target = gate.target
+    if recovery_visibility_ms > 0 && gate.visibility_error != nil {
+      receipts = receipts
+        + [
+          unreadable(
+            target,
+            "could not reconcile a previously accepted recovery dispatch before mutation: "
+              + to_string(gate.visibility_error),
+          ),
+        ]
+      continue
+    }
+    const dispatched = adapter.dispatch(target)
+    if is_err(dispatched) {
+      receipts = receipts
+        + [unreadable(target, "dispatch failed: " + to_string(unwrap_err(dispatched)))]
+      continue
+    }
+    const run_id = unwrap(dispatched).run_id
+    if run_id <= 0 {
+      receipts = receipts + [unreadable(target, "dispatch returned no valid run identity")]
+      continue
+    }
+    // Publish the accepted run before any suspension point. A sibling can fail
+    // immediately after dispatch, and cancellation must already be able to
+    // reach the hosted work without waiting for list visibility.
+    if recorder != nil {
+      (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
+    }
+    pending = pending + [gate + {run_id: run_id}]
+  }
+  return {receipts: receipts, pending: pending, unseen: []}
+}
+
 /**
- * Dispatch every consumer gate, then wait for all of them together.
+ * Resume or dispatch every consumer gate, then wait for all of them together.
  *
- * Dispatching first and polling second is what keeps the wall clock at the
- * slowest consumer rather than the sum of them, without a task group whose
- * cancellation semantics would then have to be reasoned about here.
+ * A unique candidate-named run is adopted before mutation. A fresh dispatch
+ * binds the exact run id from its mutation receipt and publishes it before any
+ * wait. Resolving every target before polling any of them keeps the wall clock
+ * at the slowest consumer rather than the sum of them, without a task group
+ * whose cancellation semantics would then have to be reasoned about here.
  *
  * A gate still running when the deadline passes is reported `pending`, not
  * failed and not passed: the release must not tag on an unanswered question,
@@ -98,51 +222,81 @@ pub fn run_consumer_pretag_gates(
   policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
   recorder: ConsumerPretagRunRecorder? = nil,
 ) -> list<ConsumerPretagGateReceipt> {
+  // Recovery reconciliation and consumer polling share this one bound. The
+  // grace period must not silently extend the release's advertised deadline.
+  const stop_at_ms = adapter.now_ms() + policy.deadline_ms
   let receipts: list<ConsumerPretagGateReceipt> = []
   let pending: list<PendingGate> = []
+  let awaiting_dispatch: list<PendingGate> = []
   for target in targets {
-    const dispatched = adapter.dispatch(target)
-    if is_err(dispatched) {
+    const before = adapter.runs(target)
+    if is_err(before) {
       receipts = receipts
-        + [unreadable(target, "dispatch failed: " + to_string(unwrap_err(dispatched)))]
+        + [
+          unreadable(
+            target,
+            "could not inventory existing runs before dispatch: "
+              + to_string(unwrap_err(before)),
+          ),
+        ]
       continue
     }
-    pending = pending + [{target: target, run_id: 0}]
+    const resolved = resolve_candidate_rows(target, unwrap(before), recorder, "existing")
+    receipts = receipts + resolved.receipts
+    pending = pending + resolved.pending
+    awaiting_dispatch = awaiting_dispatch + resolved.unseen
   }
-  const stop_at_ms = adapter.now_ms() + policy.deadline_ms
+  const visibility_ms = policy.recovery_visibility_ms ?? 0
+  const requested_visibility_stop_ms = adapter.now_ms() + visibility_ms
+  const visibility_stop_ms = if requested_visibility_stop_ms < stop_at_ms {
+    requested_visibility_stop_ms
+  } else {
+    stop_at_ms
+  }
+  while len(awaiting_dispatch) > 0
+    && visibility_ms > 0
+    && adapter.now_ms() < visibility_stop_ms {
+    const remaining_ms = visibility_stop_ms - adapter.now_ms()
+    adapter.wait(
+      if policy.poll_interval_ms < remaining_ms {
+        policy.poll_interval_ms
+      } else {
+        remaining_ms
+      },
+    )
+    let still_unseen: list<PendingGate> = []
+    for gate in awaiting_dispatch {
+      const observed = adapter.runs(gate.target)
+      if is_err(observed) {
+        still_unseen = still_unseen
+          + [gate + {visibility_error: to_string(unwrap_err(observed))}]
+        continue
+      }
+      const rows = unwrap(observed)
+      const resolved = resolve_candidate_rows(gate.target, rows, recorder, "recovery-visible")
+      receipts = receipts + resolved.receipts
+      pending = pending + resolved.pending
+      still_unseen = still_unseen + resolved.unseen
+    }
+    awaiting_dispatch = still_unseen
+  }
+  if len(awaiting_dispatch) > 0 && adapter.now_ms() < stop_at_ms {
+    const dispatched = dispatch_unseen_candidates(
+      awaiting_dispatch,
+      adapter,
+      visibility_ms,
+      recorder,
+    )
+    receipts = receipts + dispatched.receipts
+    pending = pending + dispatched.pending
+  } else {
+    pending = pending + awaiting_dispatch
+  }
   while len(pending) > 0 && adapter.now_ms() < stop_at_ms {
     let still_pending: list<PendingGate> = []
     for gate in pending {
       if gate.run_id == 0 {
-        const rows = adapter.runs(gate.target)
-        if is_err(rows) {
-          still_pending = still_pending + [gate]
-          continue
-        }
-        const found = unwrap(rows).filter(
-          { row -> contains(row.display_title, gate.target.revision) },
-        )
-          .to_list()
-        if len(found) == 0 {
-          still_pending = still_pending + [gate]
-          continue
-        }
-        if len(found) > 1 {
-          receipts = receipts
-            + [
-              unreadable(
-                gate.target,
-                "${to_string(len(found))} runs name this candidate; refusing to guess which "
-                  + "one judged it",
-              ),
-            ]
-          continue
-        }
-        const bound = (found[0] ?? {id: 0}).id
-        if recorder != nil {
-          (recorder ?? fn(_slug, _id) { return nil })(gate.target.slug, bound)
-        }
-        still_pending = still_pending + [gate + {run_id: bound}]
+        still_pending = still_pending + [gate]
         continue
       }
       const row = adapter.run(gate.target, gate.run_id)
@@ -159,7 +313,16 @@ pub fn run_consumer_pretag_gates(
     }
     pending = still_pending
     if len(pending) > 0 {
-      adapter.wait(policy.poll_interval_ms)
+      const remaining_ms = stop_at_ms - adapter.now_ms()
+      if remaining_ms > 0 {
+        adapter.wait(
+          if policy.poll_interval_ms < remaining_ms {
+            policy.poll_interval_ms
+          } else {
+            remaining_ms
+          },
+        )
+      }
     }
   }
   for gate in pending {
