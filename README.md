@@ -904,6 +904,11 @@ Options:
   The tag selects the prepared and certified commit parented at this pin;
   subsequent main commits cannot change the published version. Honors
   `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
+- `--consumer-proof-runs-json '{"owner/repository":123}'` resumes a consumer
+  pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
+  must name the declared workflow, candidate version and SHA, workflow-dispatch
+  event, and its own 40-character consumer source revision; current consumer
+  `main` is not substituted and no newest-run guess is made.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
   `HARN_RELEASE_*`, then shared planner env, then the OpenRouter cloud cell in

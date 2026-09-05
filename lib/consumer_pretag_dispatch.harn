@@ -8,6 +8,39 @@ pub type ConsumerPretagRunRow = {
   html_url: string,
   display_title: string,
   head_sha: string,
+  workflow_path?: string,
+  event?: string,
+}
+
+/** Operator-selected exact consumer proof runs, keyed by repository slug. */
+pub type ConsumerPretagProofRuns = dict<string, int>
+
+/** Parse and canonicalize the explicit recovery input before any dispatch. */
+pub fn parse_consumer_pretag_proof_runs_json(text: string) -> ConsumerPretagProofRuns {
+  if trim(text) == "" {
+    return {}
+  }
+  const parsed = try {
+    json_parse(text)
+  } catch (error) {
+    throw "consumer proof runs must be a JSON object mapping repository slugs to positive run IDs: "
+      + to_string(error)
+  }
+  if type_of(parsed) != "dict" {
+    throw "consumer proof runs must be a JSON object mapping repository slugs to positive run IDs"
+  }
+  let normalized: ConsumerPretagProofRuns = {}
+  for slug in parsed.keys().sorted() {
+    const run_id = parsed[slug]
+    if len(regex_captures("^[^/[:space:]]+/[^/[:space:]]+$", slug)) == 0 {
+      throw "consumer proof run key '${slug}' must be a repository slug like owner/repository"
+    }
+    if type_of(run_id) != "int" || run_id <= 0 {
+      throw "consumer proof run for ${slug} must be a positive integer GitHub Actions run ID"
+    }
+    normalized[slug] = run_id
+  }
+  return normalized
 }
 
 /**
@@ -138,6 +171,60 @@ fn settle(
   }
 }
 
+/** Bind an explicit run to its own source revision without reading current main. */
+fn resolve_explicit_run(
+  declared_target: ConsumerPretagGateTarget,
+  run_id: int,
+  adapter: ConsumerPretagGateAdapter,
+  recorder: ConsumerPretagRunRecorder?,
+) -> CandidateResolution {
+  const read = adapter.run(declared_target, run_id)
+  if is_err(read) {
+    return {
+      receipts: [
+        unreadable(
+          declared_target,
+          "explicit run ${run_id} could not be read: " + to_string(unwrap_err(read)),
+        ),
+      ],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const row = unwrap(read)
+  const expected_title = "Harn candidate ${declared_target.version} @ ${declared_target.revision}"
+  const expected_workflow = ".github/workflows/${declared_target.workflow}"
+  let identity_error = ""
+  if row.id != run_id {
+    identity_error = "explicit run lookup returned another run ID"
+  } else if trim(row.workflow_path ?? "") != expected_workflow {
+    identity_error = "explicit run ${run_id} does not name declared workflow ${expected_workflow}"
+  } else if trim(row.event ?? "") != "workflow_dispatch" {
+    identity_error = "explicit run ${run_id} was not started by workflow_dispatch"
+  } else if trim(row.display_title) != expected_title {
+    identity_error = "explicit run ${run_id} does not name candidate ${declared_target.version} @ ${declared_target.revision}"
+  } else if len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 0 {
+    identity_error = "explicit run ${run_id} has no valid consumer source revision"
+  }
+  if identity_error != "" {
+    return {receipts: [unreadable(declared_target, identity_error)], pending: [], unseen: []}
+  }
+  const target = declared_target + {consumer_revision: row.head_sha}
+  if recorder != nil {
+    (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
+  }
+  const receipt = settle(target, row, run_id)
+  return if receipt == nil {
+    {receipts: [], pending: [{target: target, run_id: run_id}], unseen: []}
+  } else {
+    {
+      receipts: [receipt ?? unreadable(target, "explicit run produced no terminal receipt")],
+      pending: [],
+      unseen: [],
+    }
+  }
+}
+
 fn resolve_candidate_rows(
   target: ConsumerPretagGateTarget,
   rows: list<ConsumerPretagRunRow>,
@@ -264,6 +351,28 @@ fn capture_consumer_revision(
   return Ok(target + {consumer_revision: unwrap(revision)})
 }
 
+fn unknown_explicit_run_receipts(
+  targets: list<ConsumerPretagGateTarget>,
+  explicit_runs: ConsumerPretagProofRuns,
+) -> list<ConsumerPretagGateReceipt> {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  for slug in explicit_runs.keys() {
+    if !targets.any({ target -> target.slug == slug }) {
+      receipts = receipts
+        + [
+          {
+            slug: slug,
+            workflow: "",
+            status: "unreadable",
+            run_url: "",
+            detail: "explicit consumer proof run names a repository with no declared pre-tag gate",
+          },
+        ]
+    }
+  }
+  return receipts
+}
+
 /**
  * Resume or dispatch every consumer gate, then wait for all of them together.
  *
@@ -275,19 +384,27 @@ fn capture_consumer_revision(
  * A gate still running at the deadline is pending and leaves the release
  * unproven; the consumer has not yet answered.
  */
-pub fn run_consumer_pretag_gates(
+fn run_consumer_pretag_gates_validated(
   targets: list<ConsumerPretagGateTarget>,
   adapter: ConsumerPretagGateAdapter,
   policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
   recorder: ConsumerPretagRunRecorder? = nil,
+  explicit_runs: ConsumerPretagProofRuns = {},
 ) -> list<ConsumerPretagGateReceipt> {
+  let receipts: list<ConsumerPretagGateReceipt> = []
   // Recovery reconciliation and consumer polling share this one bound. The
   // grace period must not silently extend the release's advertised deadline.
   const stop_at_ms = adapter.now_ms() + policy.deadline_ms
-  let receipts: list<ConsumerPretagGateReceipt> = []
   let pending: list<PendingGate> = []
   let awaiting_dispatch: list<PendingGate> = []
   for declared_target in targets {
+    const explicit_run_id = explicit_runs[declared_target.slug]
+    if explicit_run_id != nil {
+      const resolved = resolve_explicit_run(declared_target, explicit_run_id, adapter, recorder)
+      receipts = receipts + resolved.receipts
+      pending = pending + resolved.pending
+      continue
+    }
     const captured = capture_consumer_revision(declared_target, adapter)
     if is_err(captured) {
       receipts = receipts + [unreadable(declared_target, unwrap_err(captured))]
@@ -407,4 +524,19 @@ pub fn run_consumer_pretag_gates(
       ]
   }
   return receipts
+}
+
+/** Validate the complete explicit-run map before the gate performs any I/O. */
+pub fn run_consumer_pretag_gates(
+  targets: list<ConsumerPretagGateTarget>,
+  adapter: ConsumerPretagGateAdapter,
+  policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
+  recorder: ConsumerPretagRunRecorder? = nil,
+  explicit_runs: ConsumerPretagProofRuns = {},
+) -> list<ConsumerPretagGateReceipt> {
+  const invalid = unknown_explicit_run_receipts(targets, explicit_runs)
+  if len(invalid) > 0 {
+    return invalid
+  }
+  return run_consumer_pretag_gates_validated(targets, adapter, policy, recorder, explicit_runs)
 }
