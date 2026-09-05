@@ -778,6 +778,7 @@ landed after it froze — so a gate the fix was meant to satisfy keeps failing.
 
 ```sh
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --attempt-oid <sha>
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox --approve-risky git.push abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
 ```
 
@@ -788,16 +789,20 @@ retires them. It reports them as `orphaned_by_shipped_tag`.
 
 It renames each unclaimed attempt to `release-failed/vX.Y.Z/<oid>-abandoned`
 rather than deleting it, so the commit stays on origin and the sweep still
-inventories it through the normal proof path. Archiving always precedes the
-delete, so an interruption leaves a recoverable copy instead of losing the
-attempt. The archive step fetches the advertised source ref into the operator
-clone and verifies its content-addressed OID before pushing the second name;
-recovery therefore works from a clean clone and a ref that moved after the
-inventory fails closed. An attempt claimed by a tag, a published release, or
-an open PR is retained, and a live claim blocks the whole operation: pre-tag,
-freeing a subset would leave recovery wedged on the remainder. A tag-recovered
-attempt is the exception — it is terminal and the sweep retires it, so it does
-not block the orphans beside it.
+inventories it through the normal proof path. GitHub's create-only ref claim
+creates the archive only while its destination is absent; an existing archive
+is adopted only when it points at the same exact OID. The source is deleted
+afterward through an exact-OID Git lease. An interruption or source race can
+therefore leave both refs, but never loses a commit or overwrites an archive,
+and the receipt marks that recoverable partial state explicitly. An attempt
+claimed by a tag, a published release, or an open PR is retained, and a live
+claim blocks whole-version mode. `--attempt-oid` narrows the authority to one
+exact attempt, so a stale unclaimed sibling can be retired while the attempt
+behind the active release PR remains untouched. A tag-recovered attempt is
+terminal and the sweep retires it, so it does not block the orphans beside it.
+The checkout's `origin` fetch URL and sole push URL must both resolve to the
+exact `--slug`; the harness refuses before either release lane is acquired when
+those identities differ or either side cannot be read unambiguously.
 
 Every claim above is terminal, and a release that has not tagged yet has none
 of them: its in-flight candidate looks exactly like an unclaimed orphan. So
