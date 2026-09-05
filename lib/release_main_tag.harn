@@ -34,7 +34,7 @@ import {
   release_merge_gate_decision,
   release_stranded_recovery_advice,
 } from "./release_merge_gate"
-import { release_only_check_set, release_pull_request_lane_set } from "./release_only_checks"
+import { release_only_check_set } from "./release_only_checks"
 import { remote_tag_target_sha } from "./release_repin"
 import { release_git_remote_refs, run_git } from "./release_runtime"
 import { ensure_release_tag_pushed_at } from "./release_tag"
@@ -54,6 +54,7 @@ import {
   release_watch_receipt_record_main_delta,
   release_watch_receipt_write,
 } from "./release_watch_state"
+import { release_workflow_inventory_at_revision } from "./release_workflow_inventory"
 
 pub type ReleaseMainTagAction = "wait" \
   | "merge" \
@@ -540,12 +541,14 @@ pub fn release_main_release_only_checks(fs: HarnessFs, cfg: dict) -> list<string
  * every code drift waits for a lane that was never going to report.
  */
 fn release_main_pull_request_lanes(
-  fs: HarnessFs,
+  harness: {env: HarnessEnv, process: HarnessProcess},
   cfg: dict,
   required: list<string>,
+  revision: string,
 ) -> list<string> {
-  return release_pull_request_lane_set(release_certification_workflow_entries(fs, cfg)).checks
-    .filter({ lane -> !required.contains(lane) })
+  return release_workflow_inventory_at_revision(harness, cfg, revision).pull_request.checks.filter(
+    { lane -> !required.contains(lane) },
+  )
     .to_list()
 }
 
@@ -570,7 +573,17 @@ pub fn release_main_drift_evidence(
   const required = release_required_contexts_from_rulesets(unwrap(rulesets))
   // Lanes a drifted commit can be held to. Computed here, beside the required
   // set, because a lane the branch already requires is not an extra obligation.
-  const pull_request_lanes = release_main_pull_request_lanes(harness.fs, cfg, required)
+  const pull_request_lanes = try {
+    release_main_pull_request_lanes(
+      {env: harness.env, process: harness.process},
+      cfg,
+      required,
+      observed_main,
+    )
+  }
+  if is_err(pull_request_lanes) {
+    return nil
+  }
   const git = {env: harness.env, process: harness.process}
   const listed = run_git(git, cfg, ["log", "--format=%H", "${certified_base}..${observed_main}"])
   if !listed.success {
@@ -590,7 +603,7 @@ pub fn release_main_drift_evidence(
     const changed_paths = split(trim(changed.stdout), "\n").filter({ path -> trim(path) != "" })
       .to_list()
     const lanes = release_drift_lane_contexts(
-      pull_request_lanes,
+      unwrap(pull_request_lanes),
       changed_paths,
       release_certification_bearing_paths(changed_paths),
     )
@@ -643,27 +656,6 @@ pub fn release_main_drift_evidence(
   )
 }
 
-/** The workflow files whose lanes only a release runs, for dispatch. */
-fn release_main_delta_workflow_paths(fs: HarnessFs, cfg: dict) -> list<string> {
-  let entries = []
-  for path in RELEASE_CERTIFICATION_WORKFLOWS {
-    const source = try {
-      fs.read_text(path_join(to_string(cfg?.repo ?? ""), path))
-    }
-    if is_err(source) {
-      continue
-    }
-    const decoded = try {
-      decode_github_workflow(unwrap(source))
-    }
-    if is_err(decoded) {
-      continue
-    }
-    entries = entries + [{path: path, workflow: unwrap(decoded)}]
-  }
-  return release_only_check_set(entries).source_workflows
-}
-
 /**
  * Where the release-only lanes stand on the merged main commit.
  *
@@ -681,22 +673,48 @@ fn release_main_delta_observation(
   receipt: ReleaseWatchReceipt,
   merge_sha: string,
 ) -> ReleaseMainDelta {
-  const lanes = release_main_release_only_checks(harness.fs, cfg)
-  if len(lanes) == 0 {
+  const inventory = try {
+    release_workflow_inventory_at_revision(
+      {env: harness.env, process: harness.process},
+      cfg,
+      merge_sha,
+    )
+  }
+  if is_err(inventory) {
     return release_main_delta_unobserved()
   }
+  const final_inventory = unwrap(inventory)
+  const lanes = final_inventory.release_only.checks
+  const drift_lanes = final_inventory.pull_request.checks.filter(
+    { lane -> !receipt.certification_drift.required_contexts.contains(lane) },
+  )
+    .to_list()
   // Every drifted commit already proved these lanes on its own pull request,
-  // and the merge gate would not have merged otherwise, so there is nothing
-  // left for them to say about this tree.
-  if release_main_delta_proved_by_drift(
-    receipt.certification_drift.state,
-    receipt.certification_drift.commits,
-    lanes,
-  ) {
+  // so there is nothing left for them to say about this tree.
+  if len(lanes) == 0
+    && release_main_delta_proved_by_drift(
+      receipt.certification_drift.state,
+      receipt.certification_drift.commits,
+      drift_lanes,
+    ) {
     return {
       state: "skipped_tree_already_certified",
       commit: lowercase(trim(merge_sha)),
-      lanes: lanes,
+      lanes: drift_lanes,
+      checks: [],
+      failing_check: "",
+      observed_at: harness.clock.date_iso(),
+    }
+  }
+  // A complete inventory with no release-only jobs is a measured zero, not an
+  // unread result. The decision layer can now skip an unchanged/non-bearing
+  // tree, while bearing drift without complete pull-request proof still fails
+  // closed instead of passing vacuously.
+  if len(lanes) == 0 {
+    return {
+      state: "not_started",
+      commit: lowercase(trim(merge_sha)),
+      lanes: [],
       checks: [],
       failing_check: "",
       observed_at: harness.clock.date_iso(),
@@ -756,7 +774,17 @@ fn release_main_delta_dispatch(
   receipt: ReleaseWatchReceipt,
   merge_sha: string,
 ) -> bool {
-  const paths = release_main_delta_workflow_paths(harness.fs, cfg)
+  const inventory = try {
+    release_workflow_inventory_at_revision(
+      {env: harness.env, process: harness.process},
+      cfg,
+      merge_sha,
+    )
+  }
+  if is_err(inventory) {
+    return false
+  }
+  const paths = unwrap(inventory).release_only.source_workflows
   if len(paths) == 0 {
     return false
   }
@@ -1026,7 +1054,17 @@ fn default_release_main_tag_adapter(
       }
       const git = {env: harness.env, process: harness.process}
       const drifted = release_main_git_drifted_paths(git, cfg, certified_base, observed_main)
-      const release_only = release_main_release_only_checks(harness.fs, cfg)
+      const inventory = try {
+        release_workflow_inventory_at_revision(
+          {env: harness.env, process: harness.process},
+          cfg,
+          observed_main,
+        )
+      }
+      if is_err(inventory) {
+        return nil
+      }
+      const release_only = unwrap(inventory).release_only.checks
       const evidence = release_main_drift_evidence(
         harness,
         cfg,
