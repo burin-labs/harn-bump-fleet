@@ -30,6 +30,8 @@ omits this controller fails before promotion writes.
 To omit separately managed consumers, use `--skip-consumers-json` instead.
 It accepts a nonempty JSON list of managed repository slugs and resolves it to
 the exact remaining selection. Hosted releases expose this input as `skip_consumers`.
+Leave `skip_consumers` blank when no consumer is excluded. Do not enter `[]`:
+blank is the only no-exclusion spelling, while an explicit empty list is rejected.
 Don't combine inclusion and exclusion inputs. Skipping every consumer fails.
 Skipping `burin-labs/harn-bump-fleet` also fails because its controller policy is required.
 
