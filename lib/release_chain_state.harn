@@ -7,6 +7,7 @@ pub type ReleaseChainStage = "preflight" \
   | "tag" \
   | "publish" \
   | "prove" \
+  | "baseline" \
   | "promote" \
   | "repin" \
   | "converge"
@@ -36,6 +37,8 @@ pub type ReleaseChainCause = "development_version_missing" \
   | "consumer_pin_stale" \
   | "consumer_update_failed" \
   | "convergence_proof_missing" \
+  | "baseline_unproven" \
+  | "target_superseded" \
   | "stopped" \
   | "credential_unavailable" \
   | "lease_unavailable" \
@@ -65,6 +68,7 @@ pub type ReleaseChainUnprovenSubject = {
 pub type ReleaseChainEffectKind = "dispatch_development_cutover" \
   | "open_fragment_fold_pr" \
   | "recover_binary_assets" \
+  | "refresh_size_baseline" \
   | "promote_anchor" \
   | "dispatch_consumer_repin" \
   | "dispatch_convergence_proof"
@@ -114,6 +118,80 @@ pub type ReleaseChainReceipt = {
   stages: list<ReleaseChainStageReceipt>,
   created_at: string,
   updated_at: string,
+  published_start?: {release_commit_oid: string, watch_identity: string},
+}
+
+const PUBLISHED_STAGES: list<ReleaseChainStage> = [
+  "prove",
+  "baseline",
+  "promote",
+  "repin",
+  "converge",
+]
+
+pub fn release_chain_latest_stage(
+  receipt: ReleaseChainReceipt,
+  stage: ReleaseChainStage,
+) -> ReleaseChainStageReceipt? {
+  let latest: ReleaseChainStageReceipt? = nil
+  for row in receipt.stages {
+    if row.stage == stage {
+      latest = row
+    }
+  }
+  return latest
+}
+
+pub fn release_chain_has_proven(receipt: ReleaseChainReceipt, stage: ReleaseChainStage) -> bool {
+  const latest = release_chain_latest_stage(receipt, stage)
+  return latest != nil && latest.status == "proven" && release_chain_stage_proven(latest)
+}
+
+fn published_pending_stage(receipt: ReleaseChainReceipt) -> ReleaseChainStage? {
+  for stage in PUBLISHED_STAGES {
+    if !release_chain_has_proven(receipt, stage) {
+      return stage
+    }
+  }
+  return nil
+}
+
+fn validate_published_history(receipt: ReleaseChainReceipt) -> ReleaseChainReceipt {
+  const start = receipt.published_start
+  if start == nil || !exact_sha(start.release_commit_oid)
+    || !regex_match("^[0-9a-f]{64}$", start.watch_identity) {
+    throw "published release chain requires exact release and watch identities"
+  }
+  let prior = receipt + {stages: []}
+  for stage in receipt.stages {
+    release_chain_validate_stage(stage)
+    if !contains(PUBLISHED_STAGES, stage.stage) {
+      throw "published release tail cannot prepare, certify, or tag"
+    }
+    const latest = release_chain_latest_stage(prior, stage.stage)
+    if stage.attempt != (latest?.attempt ?? 0) + 1 {
+      throw "published release stage attempts must be contiguous"
+    }
+    if stage.stage != "prove" && !release_chain_has_proven(prior, "prove") {
+      throw "published release effects require publication proof"
+    }
+    if (stage.stage == "repin" || stage.stage == "converge")
+      && !release_chain_has_proven(prior, "promote") {
+      throw "published release convergence requires promotion proof"
+    }
+    if stage.stage == "converge" && !release_chain_has_proven(prior, "repin") {
+      throw "published release convergence requires an exact accepted dispatch"
+    }
+    prior = prior + {stages: prior.stages + [stage]}
+  }
+  const pending = published_pending_stage(receipt)
+  if receipt.current_stage != (pending ?? "converge") {
+    throw "published release current stage must name its first unproven stage"
+  }
+  if receipt.status == "complete" && pending != nil {
+    throw "published release cannot complete with unproven stages"
+  }
+  return receipt
 }
 
 pub type ReleaseChainControlKind = "stop" | "steer"
@@ -256,6 +334,9 @@ pub fn release_chain_validate_receipt(receipt: ReleaseChainReceipt) -> ReleaseCh
   if receipt.revision != len(receipt.stages) {
     throw "release chain revision must equal the append-only stage count"
   }
+  if receipt.published_start != nil {
+    return validate_published_history(receipt)
+  }
   let expected: ReleaseChainStage = "preflight"
   let expected_attempt = 1
   for stage in receipt.stages {
@@ -319,6 +400,17 @@ pub fn release_chain_new(
   )
 }
 
+/** Start at publication proof without inventing receipts for a fresh cut. */
+pub fn release_chain_from_published(
+  chain_id: string,
+  target: ReleaseChainTarget,
+  origin: {release_commit_oid: string, watch_identity: string},
+  created_at: string,
+) -> ReleaseChainReceipt {
+  const receipt = release_chain_new(chain_id, target, created_at)
+  return release_chain_validate_receipt(receipt + {current_stage: "prove", published_start: origin})
+}
+
 pub fn release_chain_append_stage(
   receipt: ReleaseChainReceipt,
   stage: ReleaseChainStageReceipt,
@@ -329,12 +421,35 @@ pub fn release_chain_append_stage(
   if receipt.status != "active" {
     throw "release chain cannot append a stage after ${receipt.status}"
   }
-  if stage.stage != receipt.current_stage {
+  if receipt.published_start == nil && stage.stage != receipt.current_stage {
     throw "release chain cannot append ${stage.stage} while current stage is ${receipt.current_stage}"
   }
   const expected_hash = release_chain_receipt_hash(receipt)
   if stage.input_receipt_hash != expected_hash {
     throw "release chain stage does not bind the prior receipt hash"
+  }
+  if receipt.published_start != nil {
+    const appended = receipt + {stages: receipt.stages + [stage]}
+    const pending = published_pending_stage(appended)
+    const status: ReleaseChainStatus = if stage.status == "stopped" {
+      "stopped"
+    } else if stage.cause == "target_superseded"
+      || stage.cause == "unknown" {
+      "escalated"
+    } else if pending == nil {
+      "complete"
+    } else {
+      "active"
+    }
+    return release_chain_validate_receipt(
+      appended
+        + {
+          revision: receipt.revision + 1,
+          current_stage: pending ?? "converge",
+          status: status,
+          updated_at: updated_at,
+        },
+    )
   }
   const next = release_chain_next_stage(stage.stage)
   const status: ReleaseChainStatus = if stage.status == "stopped" {

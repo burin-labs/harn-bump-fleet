@@ -596,6 +596,10 @@ scripts/watch_harn_release.sh --tag vX.Y.Z --hosted-run RUN_ID --yes-live-releas
 
 ### Running the release on hosted runners
 
+If publication succeeded but the remaining work stopped, see
+[Resume a published release](docs/how-to/resume-a-published-release.md).
+That path selects an exact tag and retains the original release-chain journal.
+
 `.github/workflows/hosted-release.yml` runs the same harness on hosted Linux
 capacity, normally an eight-CPU Blacksmith runner. If that provider cannot
 assign a runner, set the repository variable
