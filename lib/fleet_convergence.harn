@@ -1,6 +1,7 @@
 import { strip_v } from "std/semver"
 import { harn_pin_decision } from "./bump_decision"
 import { HarnPinProbe, harn_pin_text_probe } from "./bump_pins"
+import { fleet_default_branch_proof } from "./fleet_default_branch_proof"
 import { FleetDispatchContinuationReceipt } from "./fleet_dispatch_continuation"
 import {
   FleetManifest,
@@ -37,6 +38,8 @@ pub type FleetConvergenceRow = {
   reason: string,
   pin?: string,
   default_branch_pin?: string,
+  default_branch_head_sha?: string,
+  default_branch_check_proof?: dict,
   pr_number?: int,
   pr_url?: string,
   check_state?: string,
@@ -322,11 +325,19 @@ pub fn remote_pin(
   return remote_pin_probe(harness, spec, ref, options).pin
 }
 
-fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, main_pin: string?) {
+fn merged_update_proof(
+  harness: Harness,
+  spec: HarnUpdateSpec,
+  target: string,
+  main_pin: string?,
+  default_head_sha: string,
+  options: GithubClientOptions,
+) {
   const listed = github_pr_list(
     harness,
     spec.repository,
     merged_update_pull_request_query(spec.base_branch),
+    options,
   )
   if is_err(listed) {
     return {ok: false, reason: "merged_update_pull_request_probe_failed"}
@@ -335,7 +346,7 @@ fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, m
     if !(pr?.merged ?? false) || trim(pr?.merge_commit_oid ?? "") == "" {
       continue
     }
-    const head_pin = remote_pin(harness, spec, pr?.head?.sha ?? "")
+    const head_pin = remote_pin(harness, spec, pr?.head?.sha ?? "", options)
     if head_pin == nil {
       continue
     }
@@ -343,7 +354,7 @@ fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, m
     if !head_decision.ok || !head_decision.satisfies_target {
       continue
     }
-    const checks = github_pr_checks(harness, spec.repository, pr.number)
+    const checks = github_pr_checks(harness, spec.repository, pr.number, pr.head.sha, options)
     if is_err(checks) {
       return {ok: false, reason: "merged_update_checks_probe_failed"}
     }
@@ -352,16 +363,11 @@ fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, m
       harness,
       spec.repository,
       pr.merge_commit_oid ?? "",
-      spec.base_branch,
+      default_head_sha,
+      options,
     )
     if is_err(reachability) {
       return {ok: false, reason: "merged_update_reachability_probe_failed"}
-    }
-    const default_head_result = github_branch_head(harness, spec.repository, spec.base_branch)
-    const default_head_sha = if is_err(default_head_result) {
-      ""
-    } else {
-      unwrap(default_head_result).oid
     }
     const reachable: bool = if unwrap(reachability).reachable {
       true
@@ -395,24 +401,84 @@ fn merged_update_proof(harness: Harness, spec: HarnUpdateSpec, target: string, m
   return {ok: false, reason: "missing_update_pull_request_lineage"}
 }
 
+fn merged_convergence_row(
+  harness: Harness,
+  spec: HarnUpdateSpec,
+  target: string,
+  pin: string,
+  head_sha: string,
+  options: GithubClientOptions,
+) -> FleetConvergenceRow {
+  const proof = merged_update_proof(harness, spec, target, pin, head_sha, options)
+  const main_proof = fleet_default_branch_proof(
+    harness,
+    spec.repository,
+    spec.base_branch,
+    head_sha,
+    options,
+  )
+  const proven = (proof.ok ?? false) && main_proof.ok
+  return {
+    repo: spec.repository,
+    state: if proven {
+      "proven"
+    } else if (proof.ok ?? false) && main_proof.state == "pending" {
+      "waiting"
+    } else {
+      "failed"
+    },
+    reason: if proven {
+      "exact_green_update_merged"
+    } else if !main_proof.ok {
+      "default_branch_checks_unproven: " + main_proof.unproven.join(", ")
+    } else {
+      proof.reason ?? "update_proof_failed"
+    },
+    pin: pin,
+    default_branch_pin: pin,
+    default_branch_head_sha: head_sha,
+    default_branch_check_proof: main_proof,
+    pr_number: proof.pull_request_number,
+    pr_url: proof.pull_request_url,
+    head_sha: proof.checked_head_sha,
+    merge_commit_sha: proof.merge_commit_sha,
+    update_proof: proof,
+  }
+}
+
 /** Observe each consumer through connector-owned, typed GitHub surfaces. */
 pub fn fleet_convergence_snapshot(
   harness: Harness,
   manifest: FleetManifest,
   repositories: list<FleetRepository>,
   target: string,
+  options: GithubClientOptions = github_connector_options(),
 ) -> FleetConvergenceSnapshot {
   const wanted = strip_v(target)
   let rows = []
   for repo in repositories {
     const spec = resolve_harn_update_spec(manifest, repo, target)
-    const pin = remote_pin(harness, spec)
-    const main_decision = if pin == nil {
-      nil
-    } else {
-      harn_pin_decision(pin, wanted)
+    const head = github_branch_head(harness, spec.repository, spec.base_branch, options)
+    if is_err(head) {
+      rows = rows + [{repo: repo.slug, state: "waiting", reason: "default_branch_head_unobserved"}]
+      continue
     }
-    if main_decision != nil && !main_decision.ok {
+    const head_sha = unwrap(head).oid
+    const pin = remote_pin(harness, spec, head_sha, options)
+    if pin == nil {
+      rows = rows
+        + [
+          {
+            repo: repo.slug,
+            state: "waiting",
+            reason: "exact_default_branch_pin_unobserved",
+            default_branch_head_sha: head_sha,
+          },
+        ]
+      continue
+    }
+    const main_decision = harn_pin_decision(pin, wanted)
+    if !main_decision.ok {
       rows = rows
         + [
           {
@@ -425,37 +491,15 @@ pub fn fleet_convergence_snapshot(
         ]
       continue
     }
-    if main_decision?.satisfies_target ?? false {
-      const proof = merged_update_proof(harness, spec, target, pin)
-      rows = rows
-        + [
-          {
-            repo: repo.slug,
-            state: if proof.ok ?? false {
-              "proven"
-            } else {
-              "failed"
-            },
-            reason: if proof.ok ?? false {
-              "exact_green_update_merged"
-            } else {
-              proof.reason ?? "update_proof_failed"
-            },
-            pin: pin,
-            default_branch_pin: pin,
-            pr_number: proof.pull_request_number,
-            pr_url: proof.pull_request_url,
-            head_sha: proof.checked_head_sha,
-            merge_commit_sha: proof.merge_commit_sha,
-            update_proof: proof,
-          },
-        ]
+    if main_decision.satisfies_target {
+      rows = rows + [merged_convergence_row(harness, spec, target, pin, head_sha, options)]
       continue
     }
     const listed = github_pr_list(
       harness,
       repo.slug,
       {head: spec.branch, base: spec.base_branch, state: "open", limit: 1},
+      options,
     )
     if is_err(listed) {
       rows = rows
@@ -476,7 +520,7 @@ pub fn fleet_convergence_snapshot(
       // an eventually-consistent branch comparison as equal. Preserve that
       // signed branch as a recoverable exact-head lease instead of collapsing
       // it into the same state as a workflow that never produced a bump.
-      const branch = github_branch_head(harness, repo.slug, spec.branch)
+      const branch = github_branch_head(harness, repo.slug, spec.branch, options)
       const branch_head = if is_err(branch) {
         nil
       } else {
@@ -485,7 +529,7 @@ pub fn fleet_convergence_snapshot(
       const branch_pin = if branch_head == nil {
         nil
       } else {
-        remote_pin(harness, spec, branch_head?.oid ?? spec.branch)
+        remote_pin(harness, spec, branch_head?.oid ?? spec.branch, options)
       }
       const branch_decision = if branch_pin == nil {
         nil
@@ -514,7 +558,7 @@ pub fn fleet_convergence_snapshot(
       continue
     }
     const pr = prs[0]
-    const pr_pin = remote_pin(harness, spec, pr?.head?.sha ?? "")
+    const pr_pin = remote_pin(harness, spec, pr?.head?.sha ?? "", options)
     const pr_decision = if pr_pin == nil {
       nil
     } else {

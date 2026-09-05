@@ -1,3 +1,4 @@
+import { fleet_convergence_snapshot } from "../lib/fleet_convergence"
 import { FleetManifest } from "../lib/fleet_manifest"
 import {
   fleet_operation_scope,
@@ -34,6 +35,181 @@ import { GithubWorkflowRun, GithubWorkflowRuns } from "harn-github-connector/def
 const SHA = "1111111111111111111111111111111111111111"
 
 const NOW = "2026-09-05T00:00:00Z"
+
+pipeline test_read_only_tail_observes_exact_main_without_waiting_for_legacy_title(
+  harness: Harness,
+) {
+  const input = request(harness.fs) + {repositories_json: "[\"fixture/consumer\"]"}
+  const manifest: FleetManifest = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow: "owner/policy/.github/workflows/package.yml@${SHA}",
+      bump_workflow: "owner/policy/.github/workflows/bump.yml@${SHA}",
+    },
+    repositories: [{slug: "fixture/consumer", directory: "consumer", harn_bump: true}],
+  }
+  const api = "https://tail-observation.test"
+  const check = {
+    id: 1,
+    name: "CI status",
+    head_sha: SHA,
+    status: "completed",
+    conclusion: "success",
+  }
+  harness.testing.http_mock_clear()
+  for row in [
+    {path: "/branches/main", body: {commit: {sha: SHA}}},
+    {
+      path: "/contents/.harn-version?ref=${SHA}",
+      body: {
+        type: "file",
+        encoding: "base64",
+        content: base64_encode("0.10.125\n"),
+        sha: SHA,
+        size: 9,
+        name: ".harn-version",
+        path: ".harn-version",
+      },
+    },
+    {
+      path: "/pulls?state=closed&base=main&per_page=20",
+      body: [
+        {
+          number: 125,
+          title: "Bump Harn runtime",
+          state: "closed",
+          merged_at: NOW,
+          merge_commit_sha: SHA,
+          html_url: "https://github.com/fixture/consumer/pull/125",
+          head: {sha: SHA, ref: "bump"},
+          base: {ref: "main", repo: {full_name: "fixture/consumer"}},
+        },
+      ],
+    },
+    {path: "/commits/${SHA}/check-runs", body: {total_count: 1, check_runs: [check]}},
+    {
+      path: "/commits/${SHA}/check-runs?filter=latest&per_page=100",
+      body: {total_count: 1, check_runs: [check]},
+    },
+    {path: "/compare/${SHA}...${SHA}", body: {status: "identical"}},
+    {
+      path: "/rules/branches/main",
+      body: [
+        {
+          type: "required_status_checks",
+          parameters: {required_status_checks: [{context: "CI status"}]},
+        },
+      ],
+    },
+  ] {
+    harness.testing.http_mock(
+      "GET",
+      api + "/repos/fixture/consumer" + row.path,
+      {status: 200, body: json_stringify(row.body)},
+    )
+  }
+  const live = published_tail_live_adapter(
+    harness,
+    input,
+    input.state_root,
+    fn(_request, apply) {
+      assert(!apply)
+      return proven("baseline")
+    },
+    fn(_request, apply) {
+      assert(!apply)
+      return proven("promotion")
+    },
+    {no_wait: false, reconcile_only: true},
+    manifest,
+    {api_base_url: api, installation_token: "fixture-only-token", allow_gh_auth_fallback: false},
+  )
+  // No workflow endpoint is mocked: consulting the rejected legacy title cannot pass.
+  live.baseline(input, true)
+  live.promote(input, true)
+  const observed = live.converge(input, {run_id: 125, run_url: accepted_run().url})
+  assert_eq(observed.state, "proven")
+  assert_eq(observed.evidence[0].subject, "fixture/consumer")
+  assert_eq(observed.evidence[0].observed, "0.10.125")
+  assert_eq(observed.evidence[0].identity, SHA)
+  const no_dispatch = try {
+    live.dispatch(input)
+    false
+  } catch (_) {
+    true
+  }
+  assert(no_dispatch)
+  const no_acceptance = try {
+    live.converge(input, {run_id: 0, run_url: ""})
+    false
+  } catch (_) {
+    true
+  }
+  assert(no_acceptance)
+  const seed = successful_adapter()
+    + {
+      current_targets: fn() { return [{subject: "fixture/consumer", version: "v0.10.125"}] },
+      converge: fn(_request, _run) { return proven("fixture/consumer") + {state: "pending"} },
+    }
+  run_published_release_tail(harness, input, seed)
+  const resumed = run_published_release_tail(
+    harness,
+    input,
+    seed
+      + {
+        find_dispatch: fn(_request) {
+          throw "accepted dispatch must not be rediscovered by title"
+        },
+        dispatch: live.dispatch,
+        converge: live.converge,
+      },
+  )
+  assert_eq(release_chain_latest_stage(resumed, "converge")?.status, "proven")
+  const missing_input = request(harness.fs) + {repositories_json: input.repositories_json}
+  const missing_dispatch = try {
+    run_published_release_tail(
+      harness,
+      missing_input,
+      seed
+        + {
+          dispatch: live.dispatch,
+          converge: fn(_request, _run) {
+            throw "must not observe convergence without acceptance"
+          },
+        },
+    )
+    "unexpected completion"
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(missing_dispatch, "read-only reconciliation cannot dispatch"))
+  for observation in [
+    {total_count: 1, check_runs: [check + {conclusion: "skipped"}]},
+    {total_count: 1, check_runs: [check + {status: "in_progress", conclusion: ""}]},
+    {total_count: 0, check_runs: []},
+    {total_count: 2, check_runs: [check]},
+  ] {
+    harness.testing.http_mock(
+      "GET",
+      api + "/repos/fixture/consumer/commits/${SHA}/check-runs?filter=latest&per_page=100",
+      {status: 200, body: json_stringify(observation)},
+    )
+    assert_eq(live.converge(input, {run_id: 125, run_url: accepted_run().url}).state, "pending")
+    const snapshot = fleet_convergence_snapshot(
+      harness,
+      manifest,
+      manifest.repositories,
+      input.tag,
+      {api_base_url: api, installation_token: "fixture-only-token", allow_gh_auth_fallback: false},
+    )
+    assert_eq(len(snapshot.repositories), 1)
+    assert_eq(snapshot.repositories[0]?.state, "waiting")
+    assert_eq(snapshot.pending_count, 1)
+    assert_eq(snapshot.failing_count, 0)
+  }
+  harness.testing.http_mock_clear()
+}
 
 pipeline test_large_scope_title_stays_compact_and_never_adopts_truncated_or_other_scope(
   harness: Harness,
@@ -146,7 +322,7 @@ pipeline test_published_cli_hydrates_only_selected_contracts_before_reading_pins
     input.state_root,
     fn(_request, _apply) { return proven("baseline") },
     fn(_request, _apply) { return proven("promotion") },
-    false,
+    {no_wait: false, reconcile_only: false},
     manifest,
     options,
   )
@@ -212,7 +388,7 @@ pipeline test_published_cli_hydrates_only_selected_contracts_before_reading_pins
       fn(_request, _apply) {
         throw "unexpected promotion"
       },
-      false,
+      {no_wait: false, reconcile_only: false},
       manifest,
       options,
     )
