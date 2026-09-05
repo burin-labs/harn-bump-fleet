@@ -23,8 +23,14 @@
 //   harn run refresh_release_binary_size_baseline.harn -- --tag vX.Y.Z --repo PATH [--apply]
 import { ParserSpec } from "std/cli/argparse"
 import { compare_release, is_v_release_semver, strip_v } from "std/semver"
+import {
+  GithubWorkflowJobs,
+  GithubWorkflowRun,
+  GithubWorkflowRuns,
+} from "harn-github-connector/default"
 import { cli_options } from "lib/cli_options"
 import {
+  github_actions_run_jobs,
   github_branch_commit,
   github_branch_head,
   github_claim_ref,
@@ -46,7 +52,11 @@ import {
   baseline_refresh_pull_request_body,
   refresh_binary_size_baseline,
 } from "lib/release_size_baseline"
-import { read_release_size_report, release_size_report_rejection } from "lib/release_size_report"
+import {
+  ReleaseSizeReport,
+  read_release_size_report,
+  release_size_report_rejection,
+} from "lib/release_size_report"
 
 type Options = {
   tag: string,
@@ -563,16 +573,61 @@ fn production_proposal_adapter(harness: Harness) -> BaselineProposalAdapter {
   }
 }
 
-/**
- * The tag-push run that built the release.
- *
- * A tag push sets `head_branch` to the tag, so the release's own build is
- * identifiable without guessing from timestamps. Only a successful run is
- * eligible: a failed one may still have uploaded a report, and reading bytes
- * out of a build that did not finish would record a number for an artifact
- * nobody shipped.
- */
-fn released_build_run(harness: Harness, slug: string, tag: string) -> Result<dict, string> {
+/** Select the exact source build independently of later publication jobs. */
+pub fn release_baseline_build_evidence(
+  slug: string,
+  tag: string,
+  commit: string,
+  listed: GithubWorkflowRuns,
+  read_jobs: fn(int) -> Result<GithubWorkflowJobs, string>,
+) -> Result<GithubWorkflowRun, string> {
+  if listed.repo != slug || listed.page != 1 || listed.total_count != len(listed.runs) {
+    return Err("release build run census is incomplete or belongs to another repository")
+  }
+  const candidates = listed.runs.filter(
+    { run ->
+      run.repo == slug && run.head_branch == tag
+        && run.head_sha == commit
+        && run.event == "push"
+        && run.workflow_path == ".github/workflows/" + RELEASE_WORKFLOW
+    },
+  )
+    .to_list()
+  if len(candidates) == 0 {
+    return Err("no exact-source ${RELEASE_WORKFLOW} run is recorded for ${tag}@${commit}")
+  }
+  const run = candidates.sort_by({ item -> -item.id })[0]
+  if run.id < 1 || run.status != "completed" {
+    return Err("exact release build run is not completed")
+  }
+  const read = read_jobs(run.id)
+  if is_err(read) {
+    return Err(unwrap_err(read))
+  }
+  const jobs = unwrap(read)
+  if jobs.repo != slug || jobs.run_id != run.id || jobs.page != 1
+    || jobs.total_count != len(jobs.jobs) {
+    return Err("release build job census is incomplete or belongs to another run")
+  }
+  const builds = jobs.jobs.filter({ job -> job.name == "Build " + SIZE_TARGET }).to_list()
+  if len(builds) != 1 {
+    return Err("release build requires exactly one ${SIZE_TARGET} job")
+  }
+  const build = builds[0]
+  if build.id < 1 || build.run_id != run.id || build.head_sha != commit
+    || build.status != "completed"
+    || build.conclusion != "success" {
+    return Err("exact ${SIZE_TARGET} build job is not proven successful")
+  }
+  return Ok(run)
+}
+
+pub fn released_build_run(
+  harness: Harness,
+  slug: string,
+  tag: string,
+  commit: string,
+) -> Result<GithubWorkflowRun, string> {
   const listed = github_workflow_runs(
     harness,
     slug,
@@ -585,19 +640,20 @@ fn released_build_run(harness: Harness, slug: string, tag: string) -> Result<dic
       "could not list ${RELEASE_WORKFLOW} runs for ${tag}: " + to_string(unwrap_err(listed)),
     )
   }
-  let best = nil
-  for run in unwrap(listed).runs {
-    if run.status != "completed" || (run.conclusion ?? "") != "success" {
-      continue
-    }
-    if best == nil || run.id > best.id {
-      best = run
-    }
-  }
-  if best == nil {
-    return Err("no successful ${RELEASE_WORKFLOW} run is recorded for ${tag}")
-  }
-  return Ok(best)
+  return release_baseline_build_evidence(
+    slug,
+    tag,
+    commit,
+    unwrap(listed),
+    fn(run_id) {
+      const jobs = github_actions_run_jobs(harness, slug, run_id, "latest")
+      return if is_err(jobs) {
+        Err("could not read exact build jobs: " + to_string(unwrap_err(jobs)))
+      } else {
+        Ok(unwrap(jobs))
+      }
+    },
+  )
 }
 
 fn released_commit(
@@ -607,6 +663,57 @@ fn released_commit(
 ) -> string {
   const resolved = run_git(git, {repo: repo, mock: false}, ["rev-list", "-n", "1", tag])
   return lowercase(trim(resolved.stdout ?? ""))
+}
+
+/** Read immutable size evidence without opening or changing a baseline proposal. */
+pub fn read_release_baseline_report(
+  harness: Harness,
+  input: {slug: string, tag: string, commit: string, repo: string},
+  adapter: SizeReportAdapter? = nil,
+) -> Result<{run: GithubWorkflowRun, report: ReleaseSizeReport}, string> {
+  const selected = released_build_run(harness, input.slug, input.tag, input.commit)
+  if is_err(selected) {
+    return Err(unwrap_err(selected))
+  }
+  const run = unwrap(selected)
+  const report = download_release_baseline_report(
+    harness.fs,
+    run,
+    input.commit,
+    adapter ?? production_adapter(harness.process, input.repo),
+  )
+  if is_err(report) {
+    return Err(unwrap_err(report))
+  }
+  return Ok({run: run, report: unwrap(report)})
+}
+
+/** Validate a selected build's exact artifact before its bytes can enter policy. */
+pub fn download_release_baseline_report(
+  fs: HarnessFs,
+  run: GithubWorkflowRun,
+  commit: string,
+  adapter: SizeReportAdapter,
+) -> Result<ReleaseSizeReport, string> {
+  const artifact = pre_tag_binary_size_report_artifact(commit)
+  const destination = fs.mkdtemp_in_workspace("release-size-report")
+  const downloaded = adapter.download(run.id, artifact, destination)
+  if !downloaded.success {
+    return Err("could not download ${artifact} from run ${run.id}: ${downloaded.message}")
+  }
+  const parsed = read_release_size_report(fs, "${destination}/binary-size.json")
+  if is_err(parsed) {
+    return Err(
+      "run ${run.id} published ${artifact} without a readable binary-size.json: "
+        + json_stringify(unwrap_err(parsed)),
+    )
+  }
+  const report = unwrap(parsed)
+  const rejection = release_size_report_rejection(report, SIZE_TARGET, commit)
+  if rejection != nil {
+    return Err("refusing to refresh: ${rejection}")
+  }
+  return Ok(report)
 }
 
 fn baseline_receipt(
@@ -778,39 +885,16 @@ pub fn run_release_binary_size_baseline(
           "local ${request.tag} resolves to ${commit}; expected ${request.release_commit_oid}",
       }
   }
-  const run = released_build_run(harness, request.slug, request.tag)
-  if is_err(run) {
-    return observed + {state: "failed", ok: false, detail: unwrap_err(run)}
+  const evidence = read_release_baseline_report(
+    harness,
+    {slug: request.slug, tag: request.tag, commit: commit, repo: request.repo},
+    injected_report_adapter,
+  )
+  if is_err(evidence) {
+    return observed + {state: "failed", ok: false, detail: unwrap_err(evidence)}
   }
-  const build_run = unwrap(run)
-  const artifact = pre_tag_binary_size_report_artifact(commit)
-  const destination = harness.fs.mkdtemp_in_workspace("release-size-report")
-  const downloaded = (injected_report_adapter ?? production_adapter(harness.process, request.repo))
-    .download(build_run.id, artifact, destination)
-  if !downloaded.success {
-    return observed
-      + {
-        state: "failed",
-        ok: false,
-        detail: "could not download ${artifact} from run ${build_run.id}: ${downloaded.message}",
-      }
-  }
-  const report_result = read_release_size_report(harness.fs, "${destination}/binary-size.json")
-  if !is_ok(report_result) {
-    return observed
-      + {
-        state: "failed",
-        ok: false,
-        detail: "run ${build_run.id} published ${artifact} without a readable binary-size.json: "
-          + json_stringify(unwrap_err(report_result)),
-      }
-  }
-  const report = unwrap(report_result)
-  const rejection = release_size_report_rejection(report, SIZE_TARGET, commit)
-  if rejection != nil {
-    return observed
-      + {state: "failed", ok: false, detail: "refusing to refresh: ${rejection}"}
-  }
+  const build_run = unwrap(evidence).run
+  const report = unwrap(evidence).report
   const refreshed = refresh_binary_size_baseline(
     policy,
     {
