@@ -586,7 +586,7 @@ scripts/run_harn_release.sh --mode prepare --yes-live-release
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
 scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
 
-# Resume the post-PR handoff through merged-main tagging and publication.
+# Resume the post-PR handoff through certified-candidate tagging and publication.
 # Safe to stop and rerun.
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 
@@ -644,7 +644,7 @@ scripts/dispatch_hosted_release.sh \
 
 `mode: audit` is read-only. `mode: prepare` builds and certifies the candidate.
 `mode: ship-pr` opens the release PR and hands its receipt to the watcher. The
-watcher waits for merge, tags the exact merged-main commit, and monitors
+watcher tags the immutable certified candidate, arms the release PR, and monitors
 publication, so a release needs no local step.
 
 With `update_fleet: true`, the hosted run also follows the complete bounded
@@ -884,8 +884,8 @@ critical path, and the SHA-256 of the exact-candidate Harn CLI. The joined
 candidate receipt also preserves the independent Linux size-run identity,
 the candidate-archive run identity, and their verdicts. The release PR remains
 impossible until the hosted/local lane, Linux size lane, archive lane, and
-residual audit are all green. After merge, the tag-derived workflows build the
-merged-main source directly; the pre-merge candidate archive is certification
+residual audit are all green. The tag-derived workflows build the
+certified candidate source directly; the candidate archive is certification
 evidence, not a publishable substitute. `force_rebuild` remains audited
 recovery only. `--local-audit` remains useful for read-only diagnosis but
 cannot bypass hosted certification for live preparation.
@@ -901,8 +901,8 @@ Options:
   at run start). The local release branch is parented at this commit, an
   OID-qualified immutable `release-attempt/...` ref is published from the
   prepared head, and `latest_tag..<pin>` bounds every changelog/audit walk.
-  The eventual tag still selects the PR's merged-main commit; this option pins
-  preparation evidence, not a divergent publish commit. Honors
+  The tag selects the prepared and certified commit parented at this pin;
+  subsequent main commits cannot change the published version. Honors
   `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
@@ -940,7 +940,7 @@ re-verifies the remote ref, signed commit, sole parent, cutoff ancestry, and
 exact-SHA Linux size gate. A previous successful gate run is reused only when
 its workflow, event, branch, head SHA, target job, and required size step all
 match. The harness then creates the PR without rebuilding or re-signing the
-candidate; the watcher tags only its later merged-main commit.
+candidate; the watcher tags that exact certified commit.
 
 If an explicit pin makes that checkpoint ineligible for direct resume, the
 harness supersedes it with a newly certified candidate on fresh base. That
