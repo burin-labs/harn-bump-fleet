@@ -1,4 +1,5 @@
 import { shell_quote } from "std/runtime"
+import { with_temp_dir } from "std/testing"
 import { decode_github_workflow } from "../lib/github_workflow"
 
 fn hosted_release_workflow(fs: HarnessFs) -> string {
@@ -21,6 +22,44 @@ fn recovery_artifact_upload_preserves_hidden_receipts(upload: any) -> bool {
   return upload.with?.get("path") == "harn-bump-fleet/.harn-runs/**"
     && upload.with?.get("include-hidden-files") == true
     && upload.with?.get("if-no-files-found") == "error"
+}
+
+fn recovery_fixture_shell(process: HarnessProcess, command: string) {
+  const result = process.shell(command)
+  if !result.success {
+    throw "recovery fixture command failed: ${command}\n${result.combined}"
+  }
+  return result
+}
+
+fn matching_tag_resumes_publication(steps: list<any>) -> bool {
+  const resume = steps.find({ step -> step.name == "Resume publication from the durable receipt" })
+  return resume != nil
+    && resume?.get("if") == nil
+    && contains(resume?.run ?? "", "./scripts/watch_hosted_harn_release.sh")
+    && contains(resume?.run ?? "", "| tee .harn-runs/recover-release-watch.json")
+}
+
+fn run_recovery_identity_guard(
+  process: HarnessProcess,
+  repo: string,
+  output: string,
+  guard_run: string,
+  tag: string,
+  merge_oid: string,
+) {
+  return process.shell(
+    "cd "
+      + shell_quote(repo)
+      + " && TAG="
+      + shell_quote(tag)
+      + " MERGE_OID="
+      + shell_quote(merge_oid)
+      + " GITHUB_OUTPUT="
+      + shell_quote(output)
+      + " bash -c "
+      + shell_quote(guard_run),
+  )
 }
 
 /**
@@ -113,6 +152,163 @@ pipeline test_recovery_upload_cannot_succeed_without_its_hidden_source_receipts(
     ),
     false,
     "an empty successful upload must fire the control",
+  )
+}
+
+/**
+ * An exact tag proves identity, not complete release publication. The recovery
+ * watcher must still observe and repair missing assets and write its durable
+ * receipt. A mismatched tag remains a hard refusal before that path starts.
+ */
+pipeline test_matching_tag_resumes_publication_while_mismatch_still_refuses(
+  harness: Harness,
+  task: any,
+) {
+  const steps = decode_github_workflow(recovery_release_workflow(harness.fs)).jobs.get("recover")
+    ?.steps
+    ?? []
+  assert(
+    matching_tag_resumes_publication(steps),
+    "an exact existing tag must not skip publication proof and its receipt",
+  )
+  const resume = steps.find({ step -> step.name == "Resume publication from the durable receipt" })
+  assert_eq(
+    matching_tag_resumes_publication(
+      steps.map(
+        { step ->
+          if step.name == resume?.name {
+            step + {if: "steps.guard.outputs.already_published != 'true'"}
+          } else {
+            step
+          }
+        },
+      ),
+    ),
+    false,
+    "the retired matching-tag skip must fire the negative control",
+  )
+  const guard_step = steps.find({ step -> step.name == "Verify exact release recovery identity" })
+  assert(guard_step != nil)
+  with_temp_dir(
+    harness.fs,
+    { root ->
+      const origin = path_join(root, "origin.git")
+      const repo = path_join(root, "repo")
+      const output = path_join(root, "guard-output")
+      recovery_fixture_shell(harness.process, "git init --bare -q " + shell_quote(origin))
+      recovery_fixture_shell(harness.process, "git init -q " + shell_quote(repo))
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config user.email test@example.com",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config user.name test",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config tag.gpgSign false",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " checkout -q -b main",
+      )
+      harness.fs.write_text(path_join(repo, "release.txt"), "first\n")
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " add release.txt && git -C " + shell_quote(repo)
+          + " -c commit.gpgsign=false commit -q -m first",
+      )
+      const wrong_oid = trim(
+        recovery_fixture_shell(harness.process, "git -C " + shell_quote(repo) + " rev-parse HEAD")
+          .stdout,
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " tag v1.2.3 " + shell_quote(wrong_oid),
+      )
+      harness.fs.write_text(path_join(repo, "release.txt"), "second\n")
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " -c commit.gpgsign=false commit -q -am second",
+      )
+      const merge_oid = trim(
+        recovery_fixture_shell(harness.process, "git -C " + shell_quote(repo) + " rev-parse HEAD")
+          .stdout,
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " remote add origin " + shell_quote(origin),
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " push -q -u origin main refs/tags/v1.2.3",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git --git-dir=" + shell_quote(origin) + " symbolic-ref HEAD refs/heads/main",
+      )
+      const mismatch = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.3",
+        merge_oid,
+      )
+      assert_eq(mismatch.success, false)
+      assert(contains(mismatch.combined, "not ${merge_oid}; refusing"), mismatch.combined)
+      const absent = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.5",
+        merge_oid,
+      )
+      assert(absent.success, absent.combined)
+      assert(contains(absent.combined, "v1.2.5 does not exist yet"), absent.combined)
+      recovery_fixture_shell(
+        harness.process,
+        "git -C "
+          + shell_quote(repo)
+          + " tag v1.2.4 "
+          + shell_quote(merge_oid)
+          + " && git -C "
+          + shell_quote(repo)
+          + " push -q origin refs/tags/v1.2.4",
+      )
+      const matching = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.4",
+        merge_oid,
+      )
+      assert(matching.success, matching.combined)
+      assert(contains(matching.combined, "resume publication"), matching.combined)
+      recovery_fixture_shell(
+        harness.process,
+        "git -C "
+          + shell_quote(repo)
+          + " tag -a -m release v1.2.6 "
+          + shell_quote(merge_oid)
+          + " && git -C "
+          + shell_quote(repo)
+          + " push -q origin refs/tags/v1.2.6",
+      )
+      const annotated = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.6",
+        merge_oid,
+      )
+      assert(annotated.success, annotated.combined)
+      assert(contains(annotated.combined, "resume publication"), annotated.combined)
+    },
   )
 }
 
