@@ -1,6 +1,8 @@
 import { command_result_fail, command_result_ok } from "std/command"
 import {
+  CONSUMER_PRETAG_GATE_POLICY,
   ConsumerPretagGateAdapter,
+  ConsumerPretagRunRecorder,
   ConsumerPretagRunRow,
   run_consumer_pretag_gates,
 } from "./consumer_pretag_dispatch"
@@ -13,9 +15,87 @@ import {
 import { hydrate_remote_consumer_repositories } from "./consumer_projection_manifest"
 import { read_fleet_manifest } from "./fleet_manifest"
 import { github_actions_run, github_actions_runs, github_workflow_dispatch } from "./github"
+import { github_actions_run_cancel_exact } from "./platform_certification"
 import { recorded_step } from "./release_execution"
 
 pub type ConsumerPretagCertification = {success: bool, steps: list<dict>}
+
+/** One cancelled consumer gate run, in the shape the certification cleanup carries. */
+pub type ConsumerPretagCancellationReceipt = {
+  slug: string,
+  run_id: int,
+  success: bool,
+  provider: "github" | "mock",
+  error: string?,
+}
+
+/** Where dispatched consumer run ids are published so a canceller can reach them. */
+pub type ConsumerPretagDispatchRegistry = {handle: any}
+
+pub fn consumer_pretag_dispatch_registry(
+  runtime: HarnessRuntime,
+  key: string,
+) -> ConsumerPretagDispatchRegistry {
+  return {handle: runtime.shared_map({scope: "task_group", key: key})}
+}
+
+pub fn record_consumer_pretag_dispatch(
+  runtime: HarnessRuntime,
+  registry: ConsumerPretagDispatchRegistry,
+  slug: string,
+  run_id: int,
+) -> nil {
+  runtime.shared_map_set(registry.handle, slug, {run_id: run_id})
+  return nil
+}
+
+/**
+ * Cancel the consumer runs recorded before this lane was interrupted.
+ *
+ * A consumer gate is a full runtime build on that consumer's largest runner
+ * class, so a run left behind by a cancelled certification holds a scarce lane
+ * for tens of minutes after the release already decided to stop. The targets
+ * are passed in rather than read back out of the registry because a target that
+ * never reached a run id has nothing to cancel and must not look like one that
+ * did.
+ */
+pub fn cancel_recorded_consumer_pretag_runs(
+  harness: Harness,
+  targets: list<ConsumerPretagGateTarget>,
+  registry: ConsumerPretagDispatchRegistry,
+  mock: bool = false,
+) -> list<ConsumerPretagCancellationReceipt> {
+  let receipts: list<ConsumerPretagCancellationReceipt> = []
+  for target in targets {
+    const dispatch = harness.runtime.shared_map_get(registry.handle, target.slug, nil)
+    if dispatch == nil {
+      continue
+    }
+    if mock {
+      receipts = receipts
+        + [
+          {slug: target.slug, run_id: dispatch.run_id, success: true, provider: "mock", error: nil},
+        ]
+      continue
+    }
+    const result = github_actions_run_cancel_exact(harness, target.slug, dispatch.run_id)
+    receipts = receipts
+      + [
+        {
+          slug: target.slug,
+          run_id: dispatch.run_id,
+          success: is_ok(result),
+          provider: "github",
+          error: if is_err(result) {
+            to_string(unwrap_err(result))
+          } else {
+            nil
+          },
+        },
+      ]
+  }
+  return receipts
+}
 
 fn run_row(run: any) -> ConsumerPretagRunRow {
   return {
@@ -85,6 +165,7 @@ pub fn run_consumer_pretag_certification(
   candidate: ConsumerPretagCandidate,
   targets: list<ConsumerPretagGateTarget>? = nil,
   adapter: ConsumerPretagGateAdapter? = nil,
+  recorder: ConsumerPretagRunRecorder? = nil,
 ) -> ConsumerPretagCertification {
   if cfg.mock ?? false {
     return {
@@ -102,6 +183,8 @@ pub fn run_consumer_pretag_certification(
   const receipts = run_consumer_pretag_gates(
     resolved,
     adapter ?? consumer_pretag_gate_adapter(harness),
+    CONSUMER_PRETAG_GATE_POLICY,
+    recorder,
   )
   const verdict = consumer_pretag_gate_verdict(resolved, receipts)
   return {
@@ -122,4 +205,59 @@ pub fn run_consumer_pretag_certification(
       },
     ],
   }
+}
+
+/**
+ * The consumer gates this candidate must clear, resolved once before the lanes
+ * start so the canceller in the parent knows who to reach.
+ *
+ * A resolution failure is carried rather than thrown, because throwing here
+ * would fail the whole certification for a reason the consumer lane owns, and
+ * returning an empty list would make "could not read the consumers" and "no
+ * consumer declared a gate" the same answer.
+ */
+pub type ConsumerPretagPlan = {targets: list<ConsumerPretagGateTarget>, error: string?}
+
+pub fn resolve_consumer_pretag_plan(
+  harness: Harness,
+  cfg: dict,
+  candidate: ConsumerPretagCandidate,
+) -> ConsumerPretagPlan {
+  if cfg.mock ?? false {
+    return {targets: [], error: nil}
+  }
+  return try {
+    {targets: consumer_pretag_targets_for_candidate(harness, candidate), error: nil}
+  } catch (error) {
+    {targets: [], error: to_string(error)}
+  }
+}
+
+/** Judge this candidate through an already-resolved plan. */
+pub fn run_consumer_pretag_certification_plan(
+  harness: Harness,
+  cfg: dict,
+  candidate: ConsumerPretagCandidate,
+  plan: ConsumerPretagPlan,
+  adapter: ConsumerPretagGateAdapter? = nil,
+  recorder: ConsumerPretagRunRecorder? = nil,
+) -> ConsumerPretagCertification {
+  if plan.error != nil {
+    return {
+      success: false,
+      steps: [
+        recorded_step(
+          "consumer-pretag-gate",
+          "read the consumers' pre-tag contracts",
+          command_result_fail(
+            2,
+            "could not resolve consumer pre-tag gates, so this candidate was judged by none of "
+              + "them: "
+              + to_string(plan.error),
+          ),
+        ),
+      ],
+    }
+  }
+  return run_consumer_pretag_certification(harness, cfg, candidate, plan.targets, adapter, recorder)
 }
