@@ -1,26 +1,29 @@
 import { ConsumerPretagGateReceipt, ConsumerPretagGateTarget } from "./consumer_pretag_gate"
 
-/** A workflow run row, reduced to the four fields a verdict needs. */
+/** Workflow identity and the fields needed to judge its result. */
 pub type ConsumerPretagRunRow = {
   id: int,
   status: string,
   conclusion: string,
   html_url: string,
   display_title: string,
+  head_sha: string,
 }
 
 /**
  * Everything the pre-tag gate does to the outside world, in one injected shape.
  *
  * `runs` lists this workflow's dispatched runs; the gate keeps only the ones
- * whose name carries the exact candidate version and commit. That lookup is
+ * whose name carries the exact candidate version and commit and whose source
+ * commit matches the captured consumer revision. That lookup is
  * recovery-only: a fresh dispatch returns its authoritative run id directly.
  * An existing unique match is the durable checkpoint for a resumed release,
  * and ambiguity is always refused rather than resolved by picking the newest.
  */
-pub type ConsumerPretagDispatchReceipt = {run_id: int}
+pub type ConsumerPretagDispatchReceipt = {run_id: int, head_sha: string}
 
 pub type ConsumerPretagGateAdapter = {
+  consumer_revision: fn(ConsumerPretagGateTarget) -> Result<string, dict>,
   dispatch: fn(ConsumerPretagGateTarget) -> Result<ConsumerPretagDispatchReceipt, dict>,
   runs: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
   run: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagRunRow, dict>,
@@ -88,13 +91,27 @@ fn candidate_runs(
   rows: list<ConsumerPretagRunRow>,
 ) -> list<ConsumerPretagRunRow> {
   const title = "Harn candidate ${target.version} @ ${target.revision}"
-  return rows.filter({ row -> trim(row.display_title) == title }).to_list()
+  return rows.filter(
+    { row ->
+      trim(row.display_title) == title
+        && row.head_sha == target.consumer_revision
+    },
+  )
+    .to_list()
 }
 
 fn settle(
   target: ConsumerPretagGateTarget,
   row: ConsumerPretagRunRow,
+  expected_run_id: int,
 ) -> ConsumerPretagGateReceipt? {
+  if row.id != expected_run_id
+    || trim(row.display_title) != "Harn candidate ${target.version} @ ${target.revision}" {
+    return unreadable(target, "run lookup returned a different run or candidate identity")
+  }
+  if row.head_sha != target.consumer_revision {
+    return unreadable(target, "run ${row.id} does not name the captured consumer revision")
+  }
   if row.status != "completed" {
     return nil
   }
@@ -127,6 +144,19 @@ fn resolve_candidate_rows(
   recorder: ConsumerPretagRunRecorder?,
   ambiguity_context: string,
 ) -> CandidateResolution {
+  const title = "Harn candidate ${target.version} @ ${target.revision}"
+  if rows.any(
+    { row ->
+      trim(row.display_title) == title
+        && len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 0
+    },
+  ) {
+    return {
+      receipts: [unreadable(target, "candidate run has no valid consumer source revision")],
+      pending: [],
+      unseen: [],
+    }
+  }
   const found = candidate_runs(target, rows)
   if len(found) == 0 {
     return {receipts: [], pending: [], unseen: [{target: target, run_id: 0, visibility_error: nil}]}
@@ -136,7 +166,7 @@ fn resolve_candidate_rows(
       receipts: [
         unreadable(
           target,
-          "${to_string(len(found))} ${ambiguity_context} runs name this candidate; refusing to "
+          "${to_string(len(found))} ${ambiguity_context} runs name this candidate and consumer revision; refusing to "
             + "guess which one judged it",
         ),
       ],
@@ -145,8 +175,15 @@ fn resolve_candidate_rows(
     }
   }
   const row = found[0]
-    ?? {id: 0, status: "completed", conclusion: "startup_failure", html_url: "", display_title: ""}
-  const receipt = settle(target, row)
+    ?? {
+      id: 0,
+      status: "completed",
+      conclusion: "startup_failure",
+      html_url: "",
+      display_title: "",
+      head_sha: "",
+    }
+  const receipt = settle(target, row, row.id)
   if receipt != nil {
     return {
       receipts: [receipt ?? unreadable(target, "candidate run produced no terminal receipt")],
@@ -198,23 +235,45 @@ fn dispatch_unseen_candidates(
     if recorder != nil {
       (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
     }
+    if unwrap(dispatched).head_sha != target.consumer_revision {
+      receipts = receipts
+        + [
+          unreadable(
+            target,
+            "consumer main moved during dispatch; run ${run_id} does not prove the captured revision",
+          ),
+        ]
+      continue
+    }
     pending = pending + [gate + {run_id: run_id}]
   }
   return {receipts: receipts, pending: pending, unseen: []}
 }
 
+fn capture_consumer_revision(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+) -> Result<ConsumerPretagGateTarget, string> {
+  const revision = adapter.consumer_revision(target)
+  if is_err(revision) {
+    return Err("could not resolve consumer revision: " + to_string(unwrap_err(revision)))
+  }
+  if len(regex_captures("^[0-9a-f]{40}$", unwrap(revision))) == 0 {
+    return Err("consumer revision must be a 40-character commit SHA")
+  }
+  return Ok(target + {consumer_revision: unwrap(revision)})
+}
+
 /**
  * Resume or dispatch every consumer gate, then wait for all of them together.
  *
- * A unique candidate-named run is adopted before mutation. A fresh dispatch
- * binds the exact run id from its mutation receipt and publishes it before any
- * wait. Resolving every target before polling any of them keeps the wall clock
- * at the slowest consumer rather than the sum of them, without a task group
- * whose cancellation semantics would then have to be reasoned about here.
+ * A unique run naming the candidate and captured consumer revision is adopted
+ * before mutation. A fresh dispatch binds its authoritative run id before any
+ * wait and must report the captured consumer revision. Resolving every target
+ * before polling keeps the wall clock at the slowest consumer.
  *
- * A gate still running when the deadline passes is reported `pending`, not
- * failed and not passed: the release must not tag on an unanswered question,
- * and it must not blame a consumer for a slow runner either.
+ * A gate still running at the deadline is pending and leaves the release
+ * unproven; the consumer has not yet answered.
  */
 pub fn run_consumer_pretag_gates(
   targets: list<ConsumerPretagGateTarget>,
@@ -228,7 +287,13 @@ pub fn run_consumer_pretag_gates(
   let receipts: list<ConsumerPretagGateReceipt> = []
   let pending: list<PendingGate> = []
   let awaiting_dispatch: list<PendingGate> = []
-  for target in targets {
+  for declared_target in targets {
+    const captured = capture_consumer_revision(declared_target, adapter)
+    if is_err(captured) {
+      receipts = receipts + [unreadable(declared_target, unwrap_err(captured))]
+      continue
+    }
+    const target = unwrap(captured)
     const before = adapter.runs(target)
     if is_err(before) {
       receipts = receipts
@@ -304,7 +369,7 @@ pub fn run_consumer_pretag_gates(
         still_pending = still_pending + [gate]
         continue
       }
-      const settled = settle(gate.target, unwrap(row))
+      const settled = settle(gate.target, unwrap(row), gate.run_id)
       if settled == nil {
         still_pending = still_pending + [gate]
         continue
