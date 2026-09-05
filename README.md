@@ -908,7 +908,14 @@ Options:
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch
   event, and its own 40-character consumer source revision; current consumer
-  `main` is not substituted and no newest-run guess is made.
+  `main` is not substituted and no newest-run guess is made. A repository value
+  may instead be an attestation object with `run_id`, `proof_job_id`,
+  `proof_step`, `excluded_job_ids`, `excluded_checks`, `baseline_run_id`,
+  `baseline_job_id`, and `baseline_workflow_path`. That form accepts a failed
+  candidate run only when the named proof job and step succeeded, every other
+  non-success job is explicitly listed, and the exact baseline job is a failure
+  from the named workflow's completed `main` push. All identities are retained
+  in the release receipt.
 - `--agent` gives the configured planner a bounded read/search/run tool
   surface for release readiness review. Defaults come from
   `HARN_RELEASE_*`, then shared planner env, then the OpenRouter cloud cell in
