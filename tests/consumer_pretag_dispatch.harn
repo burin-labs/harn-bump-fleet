@@ -1,7 +1,9 @@
 import {
+  CONSUMER_PRETAG_GATE_POLICY,
   ConsumerPretagGateAdapter,
   ConsumerPretagGatePolicy,
   ConsumerPretagRunRow,
+  consumer_pretag_gate_policy,
   run_consumer_pretag_gates,
 } from "../lib/consumer_pretag_dispatch"
 import { ConsumerPretagGateTarget, consumer_pretag_gate_verdict } from "../lib/consumer_pretag_gate"
@@ -16,6 +18,7 @@ fn target(slug: string = "owner/consumer") -> ConsumerPretagGateTarget {
   return {
     slug: slug,
     workflow: "candidate-gate.yml",
+    version: "v0.10.130",
     revision: REVISION,
     inputs: {source_revision: REVISION},
   }
@@ -46,9 +49,19 @@ fn adapter(
 ) -> ConsumerPretagGateAdapter {
   let cursor = 0
   let clock = 0
+  let dispatched = false
   const base: dict = {
-    dispatch: fn(_target) { return Ok(nil) },
-    runs: fn(_target) { return Ok([row(11, "queued", "")]) },
+    dispatch: fn(_target) {
+      dispatched = true
+      return Ok({run_id: 11})
+    },
+    runs: fn(_target) { return Ok(
+      if dispatched {
+        [row(11, "queued", "")]
+      } else {
+        []
+      },
+    ) },
     run: fn(_target, _run_id) {
       const answer = sequence[cursor] ?? sequence[len(sequence) - 1]
       cursor = cursor + 1
@@ -66,13 +79,238 @@ fn adapter(
 pipeline test_a_green_consumer_run_proves_the_candidate() {
   const receipts = run_consumer_pretag_gates(
     [target()],
-    adapter([row(11, "in_progress", ""), row(11, "completed", "success")]),
+    adapter([row(11, "completed", "success")]),
     FAST,
   )
   assert_eq(len(receipts), 1)
   assert_eq(receipts[0]?.status, "passed")
   assert_eq(receipts[0]?.run_url, "https://runs.test/11")
   assert(consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_completed_candidate_run_is_adopted_without_redispatch() {
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11})
+        },
+        runs: fn(_target) { return Ok([row(11, "completed", "success")]) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/11")
+}
+
+pipeline test_an_active_candidate_run_is_adopted_until_success_without_redispatch() {
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", ""), row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11})
+        },
+        runs: fn(_target) { return Ok([row(11, "in_progress", "")]) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_a_consumer_that_settles_after_seventy_one_minutes_is_still_observed() {
+  const seventy_one_minutes = 71 * 60 * 1000
+  let now = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", ""), row(11, "completed", "success")],
+      {
+        wait: fn(ms) {
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {poll_interval_ms: seventy_one_minutes, deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms},
+  )
+  assert_eq(CONSUMER_PRETAG_GATE_POLICY.deadline_ms, 180 * 60 * 1000)
+  assert_eq(now, seventy_one_minutes)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_a_consumer_still_running_at_the_three_hour_bound_stays_pending() {
+  const one_hour = 60 * 60 * 1000
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "in_progress", "")]),
+    {poll_interval_ms: one_hour, deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms},
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "still running at the gate deadline"))
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_recovery_visibility_is_inside_the_three_hour_total_deadline() {
+  const one_hour = 60 * 60 * 1000
+  let now = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", "")],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 11}) },
+        runs: fn(_target) { return Ok([]) },
+        wait: fn(ms) {
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {
+      poll_interval_ms: one_hour,
+      deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms,
+      recovery_visibility_ms: 60 * 1000,
+    },
+  )
+  assert_eq(now, CONSUMER_PRETAG_GATE_POLICY.deadline_ms)
+  assert_eq(receipts[0]?.status, "pending")
+}
+
+pipeline test_recovery_reconciles_an_accepted_dispatch_before_it_becomes_visible() {
+  let now = 0
+  let visible = false
+  // One dispatch was already accepted by the process that crashed. This
+  // invocation must adopt it instead of sending a second one.
+  let total_dispatches = 1
+  const recovery = consumer_pretag_gate_policy(true)
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          total_dispatches = total_dispatches + 1
+          return Ok({run_id: 11})
+        },
+        runs: fn(_target) { return Ok(
+          if visible {
+            [row(11, "completed", "success")]
+          } else {
+            []
+          },
+        ) },
+        wait: fn(ms) {
+          now = now + ms
+          visible = true
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    recovery,
+  )
+  assert_eq(consumer_pretag_gate_policy(false).recovery_visibility_ms ?? -1, 0)
+  assert_eq(recovery.recovery_visibility_ms ?? -1, 60 * 1000)
+  assert_eq(total_dispatches, 1)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_same_commit_under_a_different_version_is_not_adopted() {
+  let list_reads = 0
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(12, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 12})
+        },
+        runs: fn(_target) {
+          list_reads = list_reads + 1
+          return Ok([row(11, "completed", "success", "Harn candidate v0.10.129 @ ${REVISION}")])
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 1)
+  assert_eq(list_reads, 1)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
+}
+
+pipeline test_preexisting_nonjudging_terminal_runs_escalate_without_dispatch_or_registration() {
+  for conclusion in ["cancelled", "stale", "startup_failure"] {
+    let dispatches = 0
+    let registrations = 0
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      adapter(
+        [row(11, "completed", conclusion)],
+        {
+          dispatch: fn(_target) {
+            dispatches = dispatches + 1
+            return Ok({run_id: 11})
+          },
+          runs: fn(_target) { return Ok([row(11, "completed", conclusion)]) },
+        },
+      ),
+      FAST,
+      fn(_slug, _run_id) {
+        registrations = registrations + 1
+        return nil
+      },
+    )
+    assert_eq(dispatches, 0)
+    assert_eq(registrations, 0)
+    assert_eq(receipts[0]?.status, "unreadable")
+    assert(contains(receipts[0]?.detail ?? "", "without judging the candidate"))
+  }
+}
+
+pipeline test_a_fresh_dispatch_binds_the_authoritative_receipt_without_list_visibility() {
+  let list_reads = 0
+  let bound_run_id = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(12, "completed", "success")],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 12}) },
+        runs: fn(_target) {
+          list_reads = list_reads + 1
+          return Ok(
+            [row(11, "completed", "success", "Harn candidate v0.10.129 @ ${OTHER_REVISION}")],
+          )
+        },
+        run: fn(_target, run_id) {
+          bound_run_id = run_id
+          return Ok(row(run_id, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(list_reads, 1)
+  assert_eq(bound_run_id, 12)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
 }
 
 pipeline test_a_red_consumer_run_refuses_the_candidate() {
@@ -109,22 +347,30 @@ pipeline test_a_run_that_never_finishes_is_pending_not_passed() {
   assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
 }
 
-pipeline test_a_dispatch_that_produced_no_run_is_not_a_pass() {
+pipeline test_a_dispatch_without_a_valid_run_identity_is_not_a_pass() {
   const receipts = run_consumer_pretag_gates(
     [target()],
-    adapter([row(11, "completed", "success")], {runs: fn(_target) { return Ok([]) }}),
+    adapter(
+      [row(11, "completed", "success")],
+      {dispatch: fn(_target) { return Ok({run_id: 0}) }, runs: fn(_target) { return Ok([]) }},
+    ),
     FAST,
   )
-  assert_eq(receipts[0]?.status, "pending")
-  assert(contains(receipts[0]?.detail ?? "", "no run naming this candidate appeared"))
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "no valid run identity"))
 }
 
-pipeline test_two_runs_for_one_dispatch_are_refused_rather_than_guessed_between() {
+pipeline test_multiple_existing_candidate_runs_are_refused_without_redispatch() {
+  let dispatches = 0
   const receipts = run_consumer_pretag_gates(
     [target()],
     adapter(
       [row(11, "completed", "success")],
       {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11})
+        },
         runs: fn(_target) { return Ok(
           [row(11, "completed", "success"), row(12, "completed", "failure")],
         ) },
@@ -132,6 +378,7 @@ pipeline test_two_runs_for_one_dispatch_are_refused_rather_than_guessed_between(
     ),
     FAST,
   )
+  assert_eq(dispatches, 0)
   assert_eq(receipts[0]?.status, "unreadable")
   assert(contains(receipts[0]?.detail ?? "", "refusing to guess"))
 }
@@ -158,8 +405,9 @@ pipeline test_every_target_is_dispatched_before_any_is_waited_on() {
       {
         dispatch: fn(gate) {
           order = order + ["dispatch:${gate.slug}"]
-          return Ok(nil)
+          return Ok({run_id: 11})
         },
+        runs: fn(_gate) { return Ok([]) },
         run: fn(gate, _run_id) {
           order = order + ["poll:${gate.slug}"]
           return Ok(row(11, "completed", "success"))
@@ -174,23 +422,4 @@ pipeline test_every_target_is_dispatched_before_any_is_waited_on() {
   assert_eq(order[0], "dispatch:owner/a")
   assert_eq(order[1], "dispatch:owner/b")
   assert(starts_with(order[2] ?? "", "poll:"))
-}
-
-pipeline test_a_run_that_does_not_name_this_candidate_is_not_this_gates_run() {
-  // Without this, a leftover run of the same workflow from an earlier candidate
-  // would be adopted, and the gate would report on a tree it never judged.
-  const receipts = run_consumer_pretag_gates(
-    [target()],
-    adapter(
-      [row(11, "completed", "success")],
-      {
-        runs: fn(_target) { return Ok(
-          [row(11, "completed", "success", "Harn candidate v0.10.129 @ ${OTHER_REVISION}")],
-        ) },
-      },
-    ),
-    FAST,
-  )
-  assert_eq(receipts[0]?.status, "pending")
-  assert(contains(receipts[0]?.detail ?? "", "no run naming this candidate appeared"))
 }
