@@ -18,6 +18,24 @@ Replace the example tag and run ID with the receipt's release and original
 hosted run. The checkout's development version doesn't select the target.
 This command can't prepare, certify, tag, or publish another release.
 
+To update selected repositories, add `--repositories-json` with a nonempty JSON
+list of managed repository slugs. For example,
+`--repositories-json '["burin-labs/harn-cloud","burin-labs/homebrew-burin"]'`
+updates those repositories without updating other consumers. This also limits
+consumer workflow projections, repair, successor rounds, and convergence proof.
+The release baseline and the controller's own workflow policy remain release-wide.
+
+To omit separately managed consumers, use `--skip-consumers-json` instead.
+It accepts a nonempty JSON list of managed repository slugs and resolves it to
+the exact remaining selection. Hosted releases expose this input as `skip_consumers`.
+Don't combine inclusion and exclusion inputs. Skipping every consumer fails.
+
+Use the same selection when resuming. An existing full-fleet journal can't become
+a selected-repository journal. Empty, duplicate, and unknown selections fail;
+omitting the option retains full-fleet behavior. Hosted releases accept the same
+JSON through `repositories_json`. This option doesn't narrow pre-tag certification:
+every declared consumer must still pass before publication.
+
 For a hosted handoff, download `release-run-<run ID>` from that exact run.
 Use its extracted directory as `--state-root` and its
 `release-harn/watches/<tag>.json` as `--receipt`. Don't discard the

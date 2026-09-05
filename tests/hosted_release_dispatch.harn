@@ -1,3 +1,6 @@
+import { shell_quote } from "std/runtime"
+import { hosted_release_repository_scope } from "../dispatch_hosted_release"
+import { harn_bump_repositories, read_fleet_manifest } from "../lib/fleet_manifest"
 import {
   HostedReleaseDispatchAdapter,
   HostedReleaseDispatchReceipt,
@@ -20,6 +23,15 @@ const REF = "main"
 const POLICY_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 const RELEASE_SHA = "98a2d2b9c046a1a93078c6bcd27b1b2bc8c761dd"
+
+fn refused(call: closure) -> bool {
+  try {
+    call()
+    return false
+  } catch (_error) {
+    return true
+  }
+}
 
 fn inputs() -> HostedReleaseInputs {
   return {
@@ -103,6 +115,7 @@ pipeline test_dispatch_receipt_retains_complete_nondefault_input_tuple(task: any
   assert_eq(receipt.inputs.bump, "patch")
   assert_eq(receipt.inputs.prerelease_identifier, "")
   assert_eq(receipt.inputs.converge_fleet, true)
+  assert_eq(receipt.inputs.repositories_json, nil)
   assert_eq(receipt.inputs.expected_prs, [6664])
   assert_eq(receipt.run_id, 1001)
   assert_eq(receipt.replacement, nil)
@@ -169,6 +182,134 @@ pipeline test_legacy_receipt_inputs_normalize_without_expected_prs(task: any) {
   assert_eq(observed?.expected_prs, [])
   // A v1 receipt predates the resume input; replaying it must not resume.
   assert_eq(observed?.resume_tagged_release, false)
+  // Absence is the legacy full-fleet spelling; it must not become an explicit
+  // empty scope, which the scope owner correctly refuses.
+  assert_eq(observed?.repositories_json, nil)
+}
+
+pipeline test_explicit_repository_scope_is_normalized_and_persisted(task: any) {
+  let observed: HostedReleaseInputs? = nil
+  const adapter: HostedReleaseDispatchAdapter = {
+    dispatch: fn(request) {
+      observed = request
+      return Ok(dispatch_receipt(1001))
+    },
+    run: fn(_id) { return Err({code: "unexpected_run_lookup"}) },
+    cancel: fn(_id) { return Err({code: "unexpected_cancel"}) },
+  }
+  const scoped = inputs()
+    + {repositories_json: "[\"burin-labs/harn-cloud\", \"burin-labs/20eq\"]"}
+  const result = hosted_release_dispatch(REPO, WORKFLOW, REF, scoped, adapter)
+  assert(is_ok(result))
+  const normalized = "[\"burin-labs/20eq\",\"burin-labs/harn-cloud\"]"
+  assert_eq(observed?.repositories_json, normalized)
+  assert_eq(unwrap(result).inputs.repositories_json, normalized)
+}
+
+pipeline test_skip_consumers_becomes_one_exact_durable_inclusion_scope(
+  harness: Harness,
+  task: any,
+) {
+  const manifest = read_fleet_manifest(
+    harness.fs,
+    path_join(dirname(harness.fs.cwd()), "fleet.toml"),
+  )
+  const managed = harn_bump_repositories(manifest).map({ repo -> repo.slug }).to_list().sort()
+  assert(len(managed) > 1)
+  const skipped = managed[0]
+  const normalized = hosted_release_repository_scope(manifest, nil, json_stringify([skipped]))
+  assert_eq(normalized, json_stringify(managed.filter({ slug -> slug != skipped }).to_list()))
+  assert_eq(contains(json_parse(unwrap(normalized)), skipped), false)
+  let observed: HostedReleaseInputs? = nil
+  const adapter: HostedReleaseDispatchAdapter = {
+    dispatch: fn(request) {
+      observed = request
+      return Ok(dispatch_receipt(1001))
+    },
+    run: fn(_id) { return Err({code: "unexpected_run_lookup"}) },
+    cancel: fn(_id) { return Err({code: "unexpected_cancel"}) },
+  }
+  const dispatched = hosted_release_dispatch(
+    REPO,
+    WORKFLOW,
+    REF,
+    inputs() + {repositories_json: unwrap(normalized)},
+    adapter,
+  )
+  assert(is_ok(dispatched))
+  assert_eq(observed?.repositories_json, normalized)
+  assert_eq(unwrap(dispatched).inputs.repositories_json, normalized)
+  assert(
+    refused(
+      { ->
+        hosted_release_repository_scope(
+          manifest,
+          json_stringify([managed[1]]),
+          json_stringify([skipped]),
+        )
+      },
+    ),
+    "public inclusion and exclusion selectors must not create competing scope identities",
+  )
+}
+
+pipeline test_empty_or_duplicate_repository_scope_fails_before_dispatch(task: any) {
+  let dispatches = 0
+  const adapter: HostedReleaseDispatchAdapter = {
+    dispatch: fn(_request) {
+      dispatches = dispatches + 1
+      return Ok(dispatch_receipt(1001))
+    },
+    run: fn(_id) { return Err({code: "unexpected_run_lookup"}) },
+    cancel: fn(_id) { return Err({code: "unexpected_cancel"}) },
+  }
+  for repositories_json in ["[]", "[\"burin-labs/harn\",\"burin-labs/harn\"]", "not-json"] {
+    const result = hosted_release_dispatch(
+      REPO,
+      WORKFLOW,
+      REF,
+      inputs() + {repositories_json: repositories_json},
+      adapter,
+    )
+    assert(is_err(result))
+    assert_eq(unwrap_err(result).code, "invalid_inputs")
+  }
+  assert_eq(dispatches, 0)
+}
+
+pipeline test_dispatcher_refuses_unknown_scope_and_replacement_retarget_before_github(
+  harness: Harness,
+  task: any,
+) {
+  const root = dirname(harness.fs.cwd())
+  const harn = path_join(root, ".harn", "bin", "harn")
+  const entry = path_join(root, "dispatch_hosted_release.harn")
+  const prefix = "cd "
+    + shell_quote(root)
+    + " && "
+    + shell_quote(harn)
+    + " run --no-sandbox "
+    + shell_quote(entry)
+    + " -- "
+  const unknown = harness.process.shell(
+    prefix + "--mode ship-pr --repositories-json '[\"burin-labs/not-managed\"]'",
+  )
+  assert_eq(unknown.success, false)
+  assert(contains(unknown.combined, "not a managed Harn bump repository"), unknown.combined)
+  const retarget = harness.process.shell(
+    prefix
+      + "--replace-receipt missing.json --repositories-json '[\"burin-labs/harn-cloud\"]'",
+  )
+  assert_eq(retarget.success, false)
+  assert(contains(retarget.combined, "release input flags are not accepted"), retarget.combined)
+  const unknown_skip = harness.process.shell(
+    prefix + "--mode ship-pr --skip-consumers-json '[\"burin-labs/not-managed\"]'",
+  )
+  assert_eq(unknown_skip.success, false)
+  assert(
+    contains(unknown_skip.combined, "not a managed Harn bump repository"),
+    unknown_skip.combined,
+  )
 }
 
 /**
@@ -223,7 +364,12 @@ pipeline test_hosted_source_repo_accepts_only_canonical_checkout(task: any) {
 }
 
 pipeline test_replacement_replays_prior_tuple_and_records_both_run_ids(task: any) {
-  const prior = initial_receipt()
+  const original = initial_receipt()
+  const prior = original
+    + {
+      inputs: original.inputs
+        + {repositories_json: "[\"burin-labs/20eq\",\"burin-labs/harn-cloud\"]"},
+    }
   let observed: HostedReleaseInputs? = nil
   let run_lookups = 0
   let cancelled_ids: list<int> = []
