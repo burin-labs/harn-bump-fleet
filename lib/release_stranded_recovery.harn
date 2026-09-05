@@ -15,6 +15,7 @@
  * whole gate exists to prevent.
  */
 import { github_commit_pull_requests } from "./github"
+import { admission_state_is_passing, admission_state_is_unfinished } from "./pr_admission"
 import { workspace_version_from_manifest } from "./release_analysis"
 import { execution_failed } from "./release_execution"
 import {
@@ -56,6 +57,12 @@ pub type ReleaseStrandedReceiptIdentity = {
   pull_number: int,
   pull_url: string,
   merged_at: string,
+}
+
+pub type ReleaseStrandedReceiptRefresh = {
+  state: "ready" | "pending" | "failed",
+  reason: string,
+  receipt?: ReleaseWatchReceipt,
 }
 
 /**
@@ -103,14 +110,92 @@ pub fn release_stranded_receipt_identity(
   return matches[0]
 }
 
-/** Rebuild a lost watch receipt from GitHub's immutable merged-PR evidence. */
-pub fn reconstruct_release_stranded_watch_receipt(
+fn pending_stranded_admission(gate: ReleaseMergeGateState) -> bool {
+  const evidence = gate.evidence
+  if evidence == nil {
+    return false
+  }
+  const candidate = evidence.commits.filter({ commit -> commit.sha == evidence.observed_main })
+    .to_list()
+  if len(candidate) != 1 {
+    return false
+  }
+  let unfinished = false
+  for check in candidate[0].checks.filter({ check -> !check.release_only }).to_list() {
+    if admission_state_is_passing(check.state) {
+      continue
+    }
+    if !admission_state_is_unfinished(check.state) {
+      return false
+    }
+    unfinished = true
+  }
+  return unfinished
+}
+
+/** Apply one freshly observed admission to the immutable stranded-release identity. */
+pub fn release_stranded_receipt_refresh(
+  tag: string,
+  identity: ReleaseStrandedReceiptIdentity,
+  pin_sha: string,
+  gate: ReleaseMergeGateState,
+  observed_at: string,
+  existing: ReleaseWatchReceipt? = nil,
+) -> ReleaseStrandedReceiptRefresh {
+  const expected_ref = "release-attempt/${tag}/${identity.candidate_commit}"
+  if existing != nil
+    && (existing.tag != tag
+      || existing.slug != "burin-labs/harn"
+      || existing.pin_sha != pin_sha
+      || existing.publication.head_oid != identity.candidate_commit
+      || existing.publication.remote_ref != expected_ref
+      || existing.pr_url != identity.pull_url) {
+    return {
+      state: "failed",
+      reason: "existing watch receipt does not match the exact stranded release identity",
+    }
+  }
+  const base = existing
+    ?? release_watch_receipt(
+      {
+        tag: tag,
+        slug: "burin-labs/harn",
+        pin_sha: pin_sha,
+        publication: {
+          version: tag.substring(1),
+          local_branch: "release/${tag}",
+          remote_ref: expected_ref,
+          head_oid: identity.candidate_commit,
+        },
+        pr_url: identity.pull_url,
+        created_at: identity.merged_at,
+      },
+    )
+  const decision = release_merge_gate_decision(gate)
+  if decision.action == "merge" {
+    return {
+      state: "ready",
+      reason: decision.reason,
+      receipt: release_watch_receipt_record_certification_drift(
+        base,
+        release_certification_drift_from_gate(gate),
+        observed_at,
+      ),
+    }
+  }
+  if decision.action == "defer" && pending_stranded_admission(gate) {
+    return {state: "pending", reason: decision.reason, receipt: base}
+  }
+  return {state: "failed", reason: decision.reason}
+}
+
+fn observe_release_stranded_watch_receipt(
   harness: Harness,
   cfg: dict,
   tag: string,
   target_commit: string,
-  receipt_path: string,
-) -> ReleaseWatchReceipt {
+  existing: ReleaseWatchReceipt? = nil,
+) -> ReleaseStrandedReceiptRefresh {
   const slug = "burin-labs/harn"
   const pulls = github_commit_pull_requests(harness, slug, target_commit)
   if is_err(pulls) {
@@ -177,32 +262,49 @@ pub fn reconstruct_release_stranded_watch_receipt(
       target_commit,
     ).release_only.checks,
   }
-  const drift_decision = release_merge_gate_decision(gate)
-  if drift_decision.action != "merge" {
-    throw "could not re-prove the main drift that ${tag} merged over: ${drift_decision.reason}"
-  }
-  const base_receipt = release_watch_receipt(
-    {
-      tag: tag,
-      slug: slug,
-      pin_sha: lowercase(trim(pin ?? "")),
-      publication: {
-        version: tag.substring(1),
-        local_branch: "release/${tag}",
-        remote_ref: "release-attempt/${tag}/${identity.candidate_commit}",
-        head_oid: identity.candidate_commit,
-      },
-      pr_url: identity.pull_url,
-      created_at: identity.merged_at,
-    },
-  )
-  const receipt = release_watch_receipt_record_certification_drift(
-    base_receipt,
-    release_certification_drift_from_gate(gate),
+  return release_stranded_receipt_refresh(
+    tag,
+    identity,
+    lowercase(trim(pin ?? "")),
+    gate,
     harness.clock.date_iso(),
+    existing,
   )
-  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
-  return receipt
+}
+
+/** Reobserve admission for the exact merged parent without trusting stale receipt drift. */
+pub fn refresh_release_stranded_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  target_commit: string,
+  existing: ReleaseWatchReceipt,
+) -> ReleaseStrandedReceiptRefresh {
+  return try {
+    observe_release_stranded_watch_receipt(harness, cfg, tag, target_commit, existing)
+  } catch (error) {
+    {state: "failed", reason: to_string(error)}
+  }
+}
+
+/** Rebuild a lost watch receipt from GitHub's immutable merged-PR evidence. */
+pub fn reconstruct_release_stranded_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  target_commit: string,
+  receipt_path: string,
+) -> ReleaseWatchReceipt {
+  const refreshed = observe_release_stranded_watch_receipt(harness, cfg, tag, target_commit)
+  if refreshed.state == "failed" || refreshed.receipt == nil {
+    throw "could not re-prove the main drift that ${tag} merged over: ${refreshed.reason}"
+  }
+  release_watch_receipt_write(
+    {fs: harness.fs, random: harness.random},
+    receipt_path,
+    refreshed.receipt,
+  )
+  return refreshed.receipt
 }
 
 pub type ReleaseStrandedRecoveryAdapter = {
@@ -457,10 +559,12 @@ pub fn run_release_stranded_recovery(
   receipt_path: string,
   target_commit: string,
   injected_adapter: ReleaseStrandedRecoveryAdapter? = nil,
-  options: {max_polls: int, interval_ms: int} = {max_polls: 1, interval_ms: 0},
+  options: {
+    max_polls: int,
+    interval_ms: int,
+    refresh?: fn(ReleaseWatchReceipt) -> ReleaseStrandedReceiptRefresh,
+  } = {max_polls: 1, interval_ms: 0},
 ) -> ReleaseStrandedRecoveryResult {
-  const adapter = injected_adapter
-    ?? default_release_stranded_recovery_adapter(harness, cfg, receipt, target_commit)
   if options.max_polls < 1 {
     return {
       status: 2,
@@ -471,14 +575,86 @@ pub fn run_release_stranded_recovery(
     }
   }
   const receipt_io = {fs: harness.fs, random: harness.random}
-  let result = release_stranded_recovery_poll(receipt_io, receipt, receipt_path, adapter)
-  let poll = 1
-  while result.status == 3 && poll < options.max_polls {
-    if options.interval_ms > 0 {
-      adapter.wait(options.interval_ms)
+  let active_receipt = receipt
+  let result: ReleaseStrandedRecoveryResult? = nil
+  let poll = 0
+  while poll < options.max_polls {
+    let adapter = injected_adapter
+    let admission_ready = true
+    if adapter == nil || options.refresh != nil {
+      const refreshed = if options.refresh != nil {
+        options.refresh(active_receipt)
+      } else {
+        refresh_release_stranded_watch_receipt(
+          harness,
+          cfg,
+          receipt.tag,
+          target_commit,
+          active_receipt,
+        )
+      }
+      if refreshed.state == "failed" {
+        return {
+          status: 2,
+          action: "refuse",
+          reason: refreshed.reason,
+          receipt: active_receipt,
+          steps: [],
+        }
+      }
+      if refreshed.state == "pending" {
+        admission_ready = false
+        result = {
+          status: 3,
+          action: "wait",
+          reason: refreshed.reason,
+          receipt: active_receipt,
+          steps: [],
+        }
+      } else {
+        if refreshed.receipt == nil {
+          return {
+            status: 2,
+            action: "refuse",
+            reason: "fresh stranded-release admission returned no receipt",
+            receipt: active_receipt,
+            steps: [],
+          }
+        }
+        active_receipt = refreshed.receipt
+        release_watch_receipt_write(receipt_io, receipt_path, active_receipt)
+        if adapter == nil {
+          adapter = default_release_stranded_recovery_adapter(
+            harness,
+            cfg,
+            active_receipt,
+            target_commit,
+          )
+        }
+      }
     }
-    result = release_stranded_recovery_poll(receipt_io, receipt, receipt_path, adapter)
+    if admission_ready && adapter != nil {
+      result = release_stranded_recovery_poll(receipt_io, active_receipt, receipt_path, adapter)
+      active_receipt = result.receipt
+    }
     poll = poll + 1
+    if result?.status != 3 || poll >= options.max_polls {
+      break
+    }
+    if options.interval_ms > 0 {
+      if adapter != nil {
+        adapter.wait(options.interval_ms)
+      } else {
+        harness.clock.sleep_ms(options.interval_ms)
+      }
+    }
   }
   return result
+    ?? {
+      status: 2,
+      action: "refuse",
+      reason: "stranded release recovery produced no observation",
+      receipt: active_receipt,
+      steps: [],
+    }
 }
