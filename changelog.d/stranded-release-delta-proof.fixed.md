@@ -1,1 +1,1 @@
-Stranded release recovery now runs any release-only checks on the exact merge commit before tagging it, and unfolds the bump when that proof fails.
+Stranded release recovery now runs any missing release-only checks on the exact merge commit before tagging it, resumes partial dispatch without rerunning active workflows, and unfolds the bump when that proof fails.

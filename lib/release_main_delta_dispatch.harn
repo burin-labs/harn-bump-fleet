@@ -1,0 +1,110 @@
+import {
+  ExactWorkflowRunProvider,
+  ExactWorkflowRunRequest,
+  acquire_exact_workflow_run,
+} from "./exact_workflow_run"
+/** Idempotently acquire only the release-only workflows still absent on main. */
+import {
+  github_actions_run_cancel,
+  github_actions_run_rerun,
+  github_workflow_dispatch,
+  github_workflow_runs,
+} from "./github"
+import { ReleaseMainDelta } from "./release_main_delta"
+import { release_only_source_workflows_for_checks } from "./release_only_checks"
+import { run_git } from "./release_runtime"
+import { ReleaseWatchReceipt } from "./release_watch_state"
+import { release_workflow_inventory_at_revision } from "./release_workflow_inventory"
+
+fn connector_result(value: any) {
+  return if is_err(value) {
+    value
+  } else {
+    Ok(unwrap(value))
+  }
+}
+
+fn missing_check_names(delta: ReleaseMainDelta) -> list<string> {
+  return delta.checks.filter({ check -> uppercase(trim(check.state)) == "MISSING" }).map(
+    { check -> check.name },
+  )
+    .to_list()
+}
+
+fn exact_run_provider(harness: Harness, slug: string) -> ExactWorkflowRunProvider {
+  return {
+    list: fn(request) { return connector_result(
+      github_workflow_runs(
+        harness,
+        request.repo,
+        request.workflow_path,
+        {branch: request.ref, event: "workflow_dispatch"},
+        100,
+      ),
+    ) },
+    dispatch: fn(request) { return connector_result(
+      github_workflow_dispatch(harness, request.repo, request.workflow_path, {}, request.ref),
+    ) },
+    rerun: fn(run_id) { return connector_result(github_actions_run_rerun(harness, slug, run_id)) },
+    cancel:
+      fn(run_id) { return connector_result(github_actions_run_cancel(harness, slug, run_id)) },
+    wait: fn(ms) {
+      harness.clock.sleep_ms(ms)
+      return nil
+    },
+  }
+}
+
+/**
+ * Start or adopt the exact-revision workflows whose checks are still missing.
+ *
+ * Workflow acquisition is idempotent, so provider visibility lag and a resumed
+ * watcher reuse an active exact run instead of dispatching it again.
+ */
+pub fn release_main_delta_dispatch(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  delta: ReleaseMainDelta,
+) -> bool {
+  const commit = lowercase(trim(delta.commit))
+  const inventory = try {
+    release_workflow_inventory_at_revision(
+      {env: harness.env, process: harness.process},
+      cfg,
+      commit,
+    )
+  }
+  if is_err(inventory) {
+    return false
+  }
+  const missing = missing_check_names(delta)
+  const paths = release_only_source_workflows_for_checks(unwrap(inventory).entries, missing)
+  if len(missing) == 0 || len(paths) == 0 {
+    return false
+  }
+  // `workflow_dispatch` takes a ref, not a bare commit. Every acquisition is
+  // bound to this immutable commit even if main advances while the lanes run.
+  const ref = "release-certify/" + commit
+  const pushed = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["push", "--force-with-lease", "origin", "${commit}:refs/heads/${ref}"],
+  )
+  if !pushed.success {
+    return false
+  }
+  const provider = exact_run_provider(harness, receipt.slug)
+  for path in paths {
+    const request: ExactWorkflowRunRequest = {
+      repo: receipt.slug,
+      workflow_path: path,
+      ref: ref,
+      head_sha: commit,
+    }
+    if is_err(acquire_exact_workflow_run(request, provider)) {
+      return false
+    }
+  }
+  return true
+}
