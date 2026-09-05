@@ -1,0 +1,167 @@
+import { ConsumerPretagGateReceipt, ConsumerPretagGateTarget } from "./consumer_pretag_gate"
+
+/** A workflow run row, reduced to the four fields a verdict needs. */
+pub type ConsumerPretagRunRow = {
+  id: int,
+  status: string,
+  conclusion: string,
+  html_url: string,
+  display_title: string,
+}
+
+/**
+ * Everything the pre-tag gate does to the outside world, in one injected shape.
+ *
+ * `runs` lists this workflow's dispatched runs; the gate keeps only the ones
+ * whose name carries the candidate commit, which is how it binds a run to ITS
+ * dispatch. GitHub does not echo dispatch inputs back on a run, so identity
+ * comes from the run name, and two matches are refused rather than resolved by
+ * picking the newest.
+ */
+pub type ConsumerPretagGateAdapter = {
+  dispatch: fn(ConsumerPretagGateTarget) -> Result<nil, dict>,
+  runs: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
+  run: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagRunRow, dict>,
+  wait: fn(int) -> nil,
+  now_ms: fn() -> int,
+}
+
+pub type ConsumerPretagGatePolicy = {poll_interval_ms: int, deadline_ms: int}
+
+pub const CONSUMER_PRETAG_GATE_POLICY: ConsumerPretagGatePolicy = {
+  poll_interval_ms: 30000,
+  deadline_ms: 3600000,
+}
+
+type PendingGate = {target: ConsumerPretagGateTarget, run_id: int}
+
+fn unreadable(target: ConsumerPretagGateTarget, detail: string) -> ConsumerPretagGateReceipt {
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: "unreadable",
+    run_url: "",
+    detail: detail,
+  }
+}
+
+fn settle(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+) -> ConsumerPretagGateReceipt? {
+  if row.status != "completed" {
+    return nil
+  }
+  const passed = row.conclusion == "success"
+  // `cancelled`, `stale` and `startup_failure` never judged the candidate, so
+  // they are unreadable rather than a verdict either way.
+  const settled = passed || row.conclusion == "failure" || row.conclusion == "timed_out"
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: if passed {
+      "passed"
+    } else if settled {
+      "failed"
+    } else {
+      "unreadable"
+    },
+    run_url: row.html_url,
+    detail: "run ${to_string(row.id)} concluded '${row.conclusion}'",
+  }
+}
+
+/**
+ * Dispatch every consumer gate, then wait for all of them together.
+ *
+ * Dispatching first and polling second is what keeps the wall clock at the
+ * slowest consumer rather than the sum of them, without a task group whose
+ * cancellation semantics would then have to be reasoned about here.
+ *
+ * A gate still running when the deadline passes is reported `pending`, not
+ * failed and not passed: the release must not tag on an unanswered question,
+ * and it must not blame a consumer for a slow runner either.
+ */
+pub fn run_consumer_pretag_gates(
+  targets: list<ConsumerPretagGateTarget>,
+  adapter: ConsumerPretagGateAdapter,
+  policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
+) -> list<ConsumerPretagGateReceipt> {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  let pending: list<PendingGate> = []
+  for target in targets {
+    const dispatched = adapter.dispatch(target)
+    if is_err(dispatched) {
+      receipts = receipts
+        + [unreadable(target, "dispatch failed: " + to_string(unwrap_err(dispatched)))]
+      continue
+    }
+    pending = pending + [{target: target, run_id: 0}]
+  }
+  const stop_at_ms = adapter.now_ms() + policy.deadline_ms
+  while len(pending) > 0 && adapter.now_ms() < stop_at_ms {
+    let still_pending: list<PendingGate> = []
+    for gate in pending {
+      if gate.run_id == 0 {
+        const rows = adapter.runs(gate.target)
+        if is_err(rows) {
+          still_pending = still_pending + [gate]
+          continue
+        }
+        const found = unwrap(rows).filter(
+          { row -> contains(row.display_title, gate.target.revision) },
+        )
+          .to_list()
+        if len(found) == 0 {
+          still_pending = still_pending + [gate]
+          continue
+        }
+        if len(found) > 1 {
+          receipts = receipts
+            + [
+              unreadable(
+                gate.target,
+                "${to_string(len(found))} runs name this candidate; refusing to guess which "
+                  + "one judged it",
+              ),
+            ]
+          continue
+        }
+        still_pending = still_pending + [gate + {run_id: (found[0] ?? {id: 0}).id}]
+        continue
+      }
+      const row = adapter.run(gate.target, gate.run_id)
+      if is_err(row) {
+        still_pending = still_pending + [gate]
+        continue
+      }
+      const settled = settle(gate.target, unwrap(row))
+      if settled == nil {
+        still_pending = still_pending + [gate]
+        continue
+      }
+      receipts = receipts + [settled ?? unreadable(gate.target, "unreachable")]
+    }
+    pending = still_pending
+    if len(pending) > 0 {
+      adapter.wait(policy.poll_interval_ms)
+    }
+  }
+  for gate in pending {
+    receipts = receipts
+      + [
+        {
+          slug: gate.target.slug,
+          workflow: gate.target.workflow,
+          status: "pending",
+          run_url: "",
+          detail: if gate.run_id == 0 {
+            "no run naming this candidate appeared before the gate deadline"
+          } else {
+            "run ${to_string(gate.run_id)} was still running at the gate deadline"
+          },
+        },
+      ]
+  }
+  return receipts
+}
