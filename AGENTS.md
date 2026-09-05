@@ -248,9 +248,10 @@ tag; no candidate archive is promoted as the release artifact.
 
 A release whose bump merged without a tag is recovered by
 `recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
-cut the release preflight refuses. That mode tags the stranded merge commit
-only when its tree is the certified one, or differs from it only in paths
-certification does not depend on, and refuses otherwise.
+cut the release preflight refuses. That mode tags the stranded merge commit only
+after it re-proves admitted drift and runs any release-only lanes on the exact
+commit. Unreadable or stale proof refuses the tag, and a red lane unfolds the
+bump.
 
 The opposite recovery is `unfold-merged-bump`, for a bump that merged and must
 not be published. It opens the revert that returns main to its development
