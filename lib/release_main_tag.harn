@@ -292,7 +292,11 @@ fn release_open_pr_merge_decision(
   if pull_request?.in_merge_queue ?? false {
     return main_tag_decision("wait", "release pull request is inside the merge queue")
   }
-  const gate = merge_gate(pull_request)
+  return observed_release_merge_decision(merge_gate(pull_request))
+}
+
+/** Apply the one merge-admission policy to any observation, including refreshes. */
+fn observed_release_merge_decision(gate: ReleaseMergeGateState?) -> ReleaseMainTagDecision {
   if gate == nil {
     return main_tag_decision(
       "abort",
@@ -1092,6 +1096,64 @@ pub fn release_certification_drift_from_gate(
   }
 }
 
+type RefreshedReleaseMergeAction = "merged" | "wait" | "refuse"
+
+type RefreshedReleaseMergeResult = {
+  action: RefreshedReleaseMergeAction,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+}
+
+/** Refresh, admit, record, and perform one release merge as one owned operation. */
+fn run_refreshed_release_merge(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseMainTagAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  pull_request: ReleaseMainTagPullRequest?,
+  poll: int,
+) -> RefreshedReleaseMergeResult {
+  if pull_request == nil {
+    return {
+      action: "refuse",
+      reason: "release pull request disappeared before its merge observation",
+      receipt: receipt,
+    }
+  }
+  const gate = adapter.merge_gate(pull_request)
+  const refreshed = observed_release_merge_decision(gate)
+  if refreshed.action != "merge" {
+    if pull_request?.auto_merge_armed ?? false {
+      adapter.disarm(pull_request, refreshed.observed_main)
+    }
+    return {
+      action: if refreshed.action == "defer" || refreshed.action == "abort" {
+        "refuse"
+      } else {
+        "wait"
+      },
+      reason: refreshed.reason,
+      receipt: receipt,
+    }
+  }
+  // Write only admitted evidence before the merge, so a merged release is
+  // never one whose record says nobody looked or records a rejected head.
+  const recorded = release_watch_receipt_record_certification_drift(
+    receipt,
+    release_certification_drift_from_gate(gate),
+    adapter.now(poll),
+  )
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, recorded)
+  if !adapter.merge(pull_request) {
+    return {
+      action: "refuse",
+      reason: "release pull request merge was refused at its observed head",
+      receipt: recorded,
+    }
+  }
+  return {action: "merged", reason: refreshed.reason, receipt: recorded}
+}
+
 /** Wait for the exact release PR to merge, then create or verify its immutable tag. */
 pub fn run_release_main_tag(
   harness: Harness,
@@ -1185,19 +1247,23 @@ pub fn run_release_main_tag(
         }
       }
     } else if decision.action == "merge" {
-      // Write the evidence before the irreversible act, so a merged release is
-      // never one whose record says nobody looked.
-      const gate = adapter.merge_gate(pull_request)
-      receipt = release_watch_receipt_record_certification_drift(
+      // Refresh immediately before the irreversible act, then apply the same
+      // admission policy as the first observation. Recording an unvalidated
+      // refresh would let newly red same-path content become the parent lease
+      // and pass the later path-containment check.
+      const merged = run_refreshed_release_merge(
+        {fs: harness.fs, random: harness.random},
+        adapter,
         receipt,
-        release_certification_drift_from_gate(gate),
-        adapter.now(poll),
+        receipt_path,
+        pull_request,
+        poll,
       )
-      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
-      if pull_request == nil || !adapter.merge(pull_request) {
+      receipt = merged.receipt
+      if merged.action == "refuse" {
         return {
           status: 2,
-          reason: "release pull request merge was refused at its observed head",
+          reason: merged.reason,
           receipt: receipt,
           steps: [],
           polls: poll + 1,

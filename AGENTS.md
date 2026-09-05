@@ -216,11 +216,12 @@ The release pull request opens unarmed, and the merge is the release's own act
 rather than GitHub's. The shipped tree is the certified tree plus commits that
 passed main's own required checks, verified at merge time and recorded in the
 receipt. The watcher reads the branch's required contexts from its rulesets,
-resolves every commit that landed since certification against them, and merges
-under the pull request's exact head lease. Before tagging, the watcher also
-verifies that the squash commit's first parent is the exact main commit the gate
-observed, so a later commit to an already-recorded path cannot cross the lease
-through path containment. A drifted commit carrying a red or
+resolves every commit that landed since certification against them, re-applies
+that admission policy to a fresh observation immediately before merging, and
+merges under the pull request's exact head lease. Before tagging, the watcher
+also verifies that the squash commit's first parent is the exact main commit the
+gate observed, so a later commit to an already-recorded path cannot cross the
+lease through path containment. A drifted commit carrying a red or
 unreported required check stops the release with nothing merged, so main keeps
 its development version and a fresh cut stays admissible. Green drift merges
 whatever it touched: the lanes only a release runs take about thirty-four

@@ -1,1 +1,1 @@
-Release tagging now refuses a squash merge whose parent differs from the exact main commit observed by the merge gate.
+Release merging now revalidates its fresh gate observation, and tagging refuses a squash parent that differs from the exact admitted main commit.
