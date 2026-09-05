@@ -29,7 +29,7 @@ fn entry(cmd: any, result: any) {
 }
 
 /**
- * A stale, dirty release branch with all three discard gates satisfied by
+ * A stale, dirty release branch with all three preservation gates satisfied by
  * default (crashed reclaim, no open PR, no unique commits). Each falsifier flips
  * exactly one field.
  */
@@ -63,14 +63,14 @@ fn stale_dirty_decision(overrides: PreflightRemediationInputs) {
 }
 
 pipeline test_stale_release_branch_crashed_reclaim_triple_gate(task: any) {
-  // All three gates pass + dirty -> discard the crashed run's dirty tree.
-  const discard = stale_dirty_decision({})
-  assert_eq(discard.action, "remediate")
-  assert_eq(discard.discard_dirty, true)
+  // All three gates pass + dirty -> preserve the crashed run's dirty tree.
+  const preserve = stale_dirty_decision({})
+  assert_eq(preserve.action, "remediate")
+  assert_eq(preserve.preserve_dirty_current, true)
   // Falsifier: no crashed reclaim -> fail loud (dirty tree preserved).
   const no_reclaim = stale_dirty_decision({crashed_reclaim: false})
   assert_eq(no_reclaim.action, "fail")
-  assert_eq(no_reclaim.discard_dirty ?? false, false)
+  assert_eq(no_reclaim.preserve_dirty_current ?? false, false)
   // Current target branch + dirty tree is not a stale delete/recreate case;
   // preserve it so prepare can resume transactionally in place.
   const current_dirty = stale_dirty_decision(
@@ -88,15 +88,22 @@ pipeline test_stale_release_branch_crashed_reclaim_triple_gate(task: any) {
   )
   assert_eq(current_dirty_stale_remote.action, "noop")
   assert_eq(current_dirty_stale_remote.resume_dirty_current, true)
+  // A reclaimed dead owner is not an intentional resume. Preservation wins,
+  // and the caller must stop before treating that dirty tree as a fresh run.
+  const reclaimed_current = stale_dirty_decision(
+    {current_branch: "release/v1.2.3", resume_current_dirty: true},
+  )
+  assert_eq(reclaimed_current.action, "remediate")
+  assert_eq(reclaimed_current.preserve_dirty_current, true)
   // Falsifier: an open PR -> fail, even with the reclaim signal.
   assert_eq(stale_dirty_decision({has_open_pr: true}).action, "fail")
   // Falsifier: unique un-pushed commits on a non-resume path -> fail, even with
   // the reclaim signal.
   assert_eq(stale_dirty_decision({unique_unpushed: true}).action, "fail")
-  // Reclaim signal but a CLEAN tree -> ordinary delete, never a dirty discard.
+  // Reclaim signal but a CLEAN tree -> ordinary delete, never dirty preservation.
   const clean = stale_dirty_decision({dirty_tree: false})
   assert_eq(clean.action, "remediate")
-  assert_eq(clean.discard_dirty ?? false, false)
+  assert_eq(clean.preserve_dirty_current ?? false, false)
 }
 
 pipeline test_preflight_remediation_decision(task: any) {
@@ -694,40 +701,85 @@ pipeline test_stale_release_branch_dogfood_unique(harness: Harness, task: any) {
 }
 
 fn setup_crashed_dirty_release_branch(process: HarnessProcess, repo: any) {
-  // A crashed prepare: standing on the release branch with a tracked
-  // modification and an untracked generated file left behind.
+  // A crashed prepare with distinct staged, unstaged, executable, binary, and
+  // symlink state. Detaching at the same commit must preserve every category.
   sh(process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3 main")
-  sh(process, "printf 'prepare\\n' >> '" + repo.work + "/f.txt'")
-  sh(process, "printf 'generated\\n' > '" + repo.work + "/generated.txt'")
+  sh(process, "printf 'staged\\n' >> '" + repo.work + "/f.txt'")
+  sh(process, "git -C '" + repo.work + "' add f.txt")
+  sh(process, "printf 'unstaged\\n' >> '" + repo.work + "/f.txt'")
+  sh(process, "chmod +x '" + repo.work + "/f.txt'")
+  sh(process, "printf '\\001\\002binary\\000' > '" + repo.work + "/generated.bin'")
+  sh(process, ": > '" + repo.work + "/generated-empty'")
+  sh(process, "chmod +x '" + repo.work + "/generated-empty'")
+  sh(process, "printf '#!/bin/sh\\nexit 0\\n' > '" + repo.work + "/generated-tool'")
+  sh(process, "chmod +x '" + repo.work + "/generated-tool'")
+  sh(process, "ln -s generated-tool '" + repo.work + "/generated-link'")
 }
 
 @serial(group: "git-worktree-dogfood")
-pipeline test_stale_release_branch_dogfood_discards_crashed_dirty(harness: Harness, task: any) {
+pipeline test_stale_release_branch_dogfood_preserves_crashed_dirty(harness: Harness, task: any) {
   const repo = setup_repo_with_origin(harness.process)
+  sh(harness.process, "printf 'sentinel\\n' > '" + repo.work + "/stash-sentinel.txt'")
+  sh(harness.process, "git -C '" + repo.work + "' stash push -q -u -m sentinel")
+  const stash_before = trim(
+    sh(harness.process, "git -C '" + repo.work + "' rev-parse refs/stash").stdout,
+  )
   setup_crashed_dirty_release_branch(harness.process, repo)
   const git = git_runner_for(harness.process, repo.work)
   const head_before = trim(git(["rev-parse", "release/v1.2.3"]).stdout)
+  const status_before = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout
+  const index_before = git(["diff", "--cached", "--binary", "--no-ext-diff"]).stdout
+  const worktree_before = git(["diff", "--binary", "--no-ext-diff"]).stdout
+  const binary_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated.bin"],
+  ).stdout
+  const executable_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-tool"],
+  ).stdout
+  const symlink_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-link"],
+  ).stdout
   // Triple gate satisfied (crashed_reclaim + no open PR + no unique commits):
-  // the dirty tree is the dead run's regenerable artifact, so quarantine it.
+  // the dirty tree belongs to the dead run, so preserve and quarantine it.
   const result = preflight_remediate_stale_release_branch(
     harness.tools,
     git,
     { _b -> 0 },
-    {version: "v1.2.3", base: "main", crashed_reclaim: true},
+    {version: "v1.2.3", base: "main", crashed_reclaim: true, resume_current_dirty: true},
   )
-  assert_eq(result.action, "remediate")
+  assert_eq(result.action, "fail")
   assert_eq(result.remediated, true)
   assert_eq(result.verified, true)
+  assert(contains(result.reason, "rerun"))
   // Forensic receipt names the branch, its head sha, and the dirty file count.
   assert(result.discarded != nil)
   assert_eq(result.discarded.branch, "release/v1.2.3")
   assert_eq(result.discarded.head_sha, head_before)
-  assert(result.discarded.dirty_file_count >= 2)
-  assert(result.discarded.recovery_stash != "")
-  // Branch gone, tree clean, back on base.
+  assert(result.discarded.dirty_file_count >= 4)
+  assert(ends_with(result.discarded.preserved_workspace, "/work"))
+  assert_eq(result.discarded.diff_preserved, true)
+  // Branch is free, while the detached workspace retains every byte and mode.
   assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
-  assert_eq(trim(git(["status", "--porcelain", "--untracked-files=normal"]).stdout), "")
-  assert_eq(trim(git(["branch", "--show-current"]).stdout), "main")
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "")
+  assert_eq(git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout, status_before)
+  assert_eq(git(["diff", "--cached", "--binary", "--no-ext-diff"]).stdout, index_before)
+  assert_eq(git(["diff", "--binary", "--no-ext-diff"]).stdout, worktree_before)
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated.bin"])
+      .stdout,
+    binary_before,
+  )
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-tool"])
+      .stdout,
+    executable_before,
+  )
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-link"])
+      .stdout,
+    symlink_before,
+  )
+  assert_eq(trim(git(["rev-parse", "refs/stash"]).stdout), stash_before)
   harness.fs.delete(repo.root)
 }
 
