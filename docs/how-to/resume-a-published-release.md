@@ -20,15 +20,18 @@ This command can't prepare, certify, tag, or publish another release.
 
 To update selected repositories, add `--repositories-json` with a nonempty JSON
 list of managed repository slugs. For example,
-`--repositories-json '["burin-labs/harn-cloud","burin-labs/homebrew-burin"]'`
+`--repositories-json '["burin-labs/harn-bump-fleet","burin-labs/harn-cloud"]'`
 updates those repositories without updating other consumers. This also limits
 consumer workflow projections, repair, successor rounds, and convergence proof.
-The release baseline and the controller's own workflow policy remain release-wide.
+The release baseline remains release-wide. Include `burin-labs/harn-bump-fleet`:
+its policy projection is required before consumer dispatch. A release scope that
+omits this controller fails before promotion writes.
 
 To omit separately managed consumers, use `--skip-consumers-json` instead.
 It accepts a nonempty JSON list of managed repository slugs and resolves it to
 the exact remaining selection. Hosted releases expose this input as `skip_consumers`.
 Don't combine inclusion and exclusion inputs. Skipping every consumer fails.
+Skipping `burin-labs/harn-bump-fleet` also fails because its controller policy is required.
 
 Use the same selection when resuming. An existing full-fleet journal can't become
 a selected-repository journal. Empty, duplicate, and unknown selections fail;
