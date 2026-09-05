@@ -1,6 +1,7 @@
 import { command_result_fail, command_result_ok } from "std/command"
 import { ReleaseAgentReviewResult, logged_github_operation_step } from "./release_agent"
 import { execution_failed, recorded_step } from "./release_execution"
+import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
 import {
   ReleasePublication,
   release_publication_pr_decision,
@@ -17,15 +18,42 @@ import {
   release_log_event,
   release_repo_slug,
   release_run_root,
+  run_git,
 } from "./release_runtime"
 import { ReleaseShipCertified } from "./release_ship_certify"
 import {
+  ReleaseWatchReceipt,
   release_watch_receipt,
+  release_watch_receipt_bind_main_commit,
   release_watch_receipt_path,
+  release_watch_receipt_read,
+  release_watch_receipt_retarget_pr,
   release_watch_receipt_write,
 } from "./release_watch_state"
 
 pub type ReleaseShipPrResult = {steps: list<dict>, handed_off: bool, pr_url: string}
+
+/** Paperwork changes the PR identity, never the publication or its proof. */
+pub fn release_fixup_watch_handoff(
+  original: ReleaseWatchReceipt,
+  publication: ReleasePublication,
+  tag_target: string,
+  pr_url: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  if original.publication != publication {
+    throw "post-publish fixup cannot replace the certified publication identity"
+  }
+  const published_oid = if trim(tag_target) != "" {
+    trim(tag_target)
+  } else if original.release_commit_oid != "" {
+    original.release_commit_oid
+  } else {
+    publication.head_oid
+  }
+  const bound = release_watch_receipt_bind_main_commit(original, published_oid, observed_at)
+  return release_watch_receipt_retarget_pr(bound, pr_url, observed_at)
+}
 
 /** Persist the handoff that lets another process wait for merge, tag, and publish. */
 fn persist_release_watch_receipt(
@@ -43,7 +71,7 @@ fn persist_release_watch_receipt(
   const tag = "v${version}"
   const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
   const path = release_watch_receipt_path(release_run_root(harness.fs), tag)
-  const receipt = release_watch_receipt(
+  let receipt = release_watch_receipt(
     {
       tag: tag,
       slug: slug,
@@ -53,6 +81,48 @@ fn persist_release_watch_receipt(
       created_at: harness.clock.date_iso(),
     },
   )
+  if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false) {
+    const original_publication = cfg.fixup_publication
+    if original_publication == nil {
+      throw "published fixup has no certified publication"
+    }
+    const git = {env: harness.env, process: harness.process}
+    const target = run_git(git, cfg, ["rev-parse", "--verify", "${tag}^{commit}"])
+    const parent = run_git(
+      git,
+      cfg,
+      ["rev-parse", "--verify", "${original_publication.head_oid}^1"],
+    )
+    if !parent.success {
+      throw "cannot recover published fixup tag and pinned parent"
+    }
+    const existing = release_watch_receipt_read(harness.fs, path)
+    if existing == nil && harness.fs.exists(path) {
+      throw "existing published watch receipt is invalid"
+    }
+    const original = existing
+      ?? release_watch_receipt(
+        {
+          tag: tag,
+          slug: slug,
+          pin_sha: trim(parent.stdout),
+          publication: original_publication,
+          pr_url: pr_url,
+          created_at: harness.clock.date_iso(),
+        },
+      )
+    receipt = release_fixup_watch_handoff(
+      original,
+      original_publication,
+      if target.success {
+        trim(target.stdout)
+      } else {
+        ""
+      },
+      pr_url,
+      harness.clock.date_iso(),
+    )
+  }
   const written = try {
     release_watch_receipt_write({fs: harness.fs, random: harness.random}, path, receipt)
   }
@@ -187,7 +257,25 @@ pub fn release_ship_pr_phase(
   if !prior_attempts.success {
     return {steps: steps, handed_off: false, pr_url: ""}
   }
-  for prior in superseded_release_attempts(publication, prior_attempts.value) {
+  const obsolete_fixup_url = if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false)
+    && cfg.fixup_pr_url != pr_url {
+    cfg.fixup_pr_url
+  } else {
+    ""
+  }
+  for prior in superseded_release_attempts(publication, prior_attempts.value, obsolete_fixup_url) {
+    if prior.head.ref == "release/v${version}" {
+      const original_publication = cfg.fixup_publication
+      if original_publication == nil {
+        throw "obsolete paperwork has no certified publication"
+      }
+      verify_tagged_fixup_handoff(
+        {env: harness.env, process: harness.process},
+        {repo: cfg.repo, mock: cfg.mock},
+        original_publication,
+        prior,
+      )
+    }
     const closed = logged_github_operation_step(
       {clock: harness.clock, fs: harness.fs},
       steps,

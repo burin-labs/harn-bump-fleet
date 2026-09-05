@@ -9,6 +9,7 @@ import {
   github_workflow_dispatch,
   github_workflow_runs,
 } from "./github"
+import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
 import { newest_run_for_workflow } from "./release_health"
 import { release_pr_watchdog_decision } from "./release_pr_watchdog"
 import { harn_release_readiness, required_harn_release_assets } from "./release_readiness"
@@ -44,6 +45,7 @@ const WARM_CACHE_WORKFLOW = "build-release-binaries.yml"
 pub type ReleaseWatchProgressSink = fn(ReleaseWatchRuntimeProgress, string, int) -> nil
 
 pub type ReleaseWatchRuntimeOptions = {
+  repo?: string,
   max_polls?: int,
   interval_ms?: int,
   dispatch_recovery?: bool,
@@ -65,6 +67,7 @@ pub type ReleaseWatchRuntimeAdapter = {
   warm_jobs: fn(string, int, int) -> ReleaseWatchConnectorResult,
   pr_probe: fn(string, string) -> ReleaseWatchConnectorResult,
   replacement_prs?: fn(string, string, int) -> ReleaseWatchConnectorResult,
+  verify_replacement?: fn(ReleaseWatchReceipt, dict) -> bool,
   enable_auto_merge: fn(string, dict) -> ReleaseWatchConnectorResult,
 }
 
@@ -129,7 +132,7 @@ fn github_adapter_result(result: any) {
   }
 }
 
-fn default_watch_adapter(harness: Harness) -> ReleaseWatchRuntimeAdapter {
+fn default_watch_adapter(harness: Harness, repo: string) -> ReleaseWatchRuntimeAdapter {
   return {
     now: fn(_poll) { return harness.clock.date_iso() },
     workflow_runs: fn(slug, workflow, _poll) {
@@ -185,6 +188,20 @@ fn default_watch_adapter(harness: Harness) -> ReleaseWatchRuntimeAdapter {
         }
       }
       return {pull_requests: pull_requests}
+    },
+    verify_replacement: fn(receipt, pr) {
+      if repo == "" {
+        return false
+      }
+      const verified = try {
+        verify_tagged_fixup_handoff(
+          {env: harness.env, process: harness.process},
+          {repo: repo, mock: false},
+          receipt.publication,
+          {number: pr.number, url: pr.url, head: pr.head},
+        )
+      }
+      return is_ok(verified)
     },
     enable_auto_merge: fn(slug, pr) { return github_adapter_result(
       github_enable_auto_merge(harness, slug, pr.number, pr.head.sha, "squash"),
@@ -255,6 +272,12 @@ fn keep_release_pr_armed(adapter: any, receipt: ReleaseWatchReceipt) {
     return {action: "skip", reason: "pull_request_probe_failed", error: unwrap_err(probe)}
   }
   const decision = release_pr_watchdog_decision(probe)
+  if decision.action != "skip" && receipt.release_commit_oid != ""
+    && probe?.head?.sha != receipt.publication.head_oid {
+    if adapter.verify_replacement == nil || !adapter.verify_replacement(receipt, probe) {
+      return {action: "blocked", reason: "replacement_release_pr_unverified"}
+    }
+  }
   if decision.action != "rearm" {
     return decision
   }
@@ -293,12 +316,14 @@ pub fn release_watch_replacement_pr(
       && head_ref
         == "release-certify/${head_sha}"
     const canonical_attempt = head_ref == attempt_prefix + head_sha
+    const tagged_paperwork = receipt.release_commit_oid != ""
+      && head_ref == "release/${receipt.tag}"
     if url != receipt.pr_url
       && url.starts_with(prefix)
       && trim(to_string(pull_request?.base?.ref ?? "")) == "main"
       && trim(to_string(pull_request?.title ?? ""))
         == expected_title
-      && (canonical_attempt || exact_merged_candidate)
+      && (canonical_attempt || exact_merged_candidate || tagged_paperwork)
       && active {
       candidates = candidates + [pull_request]
     }
@@ -349,6 +374,16 @@ fn reconcile_replacement_release_pr(
   }
   if replacement.action != "retarget" {
     return {receipt: receipt, watchdog: watchdog}
+  }
+  const selected = replacement.pull_request
+  if selected.head.sha != receipt.publication.head_oid {
+    if receipt.release_commit_oid == "" || adapter.verify_replacement == nil
+      || !adapter.verify_replacement(receipt, selected) {
+      return {
+        receipt: receipt,
+        watchdog: {action: "blocked", reason: "replacement_release_pr_unverified"},
+      }
+    }
   }
   const retargeted = release_watch_receipt_retarget_pr(
     receipt,
@@ -596,7 +631,7 @@ pub fn run_release_watch(
     ?? !env_bool(harness.env, "HARN_EXT_RELEASE_DISABLE_POST_PUBLISH_WARM_CACHE", false)
   const keep_pr_armed = opts.keep_pr_armed ?? true
   const on_progress = opts.on_progress
-  const adapter = injected_adapter ?? default_watch_adapter(harness)
+  const adapter = injected_adapter ?? default_watch_adapter(harness, opts.repo ?? "")
   let receipt = initial_receipt
   let poll = 0
   let last_watchdog: dict = {action: "skip", reason: "not_polled"}
@@ -634,8 +669,11 @@ pub fn run_release_watch(
         polls: poll + 1,
         watchdog: last_watchdog,
         progress: last_progress,
-        reason:
-          "release PR conflicts with main; resume the canonical release command for post-publish fixup while preserving the published tag and immutable candidate",
+        reason: if last_watchdog.reason == "release_pr_conflicted" {
+          "release PR conflicts with main; resume the canonical release command for post-publish fixup while preserving the published tag and immutable candidate"
+        } else {
+          "replacement release PR signature, release notes, or identity verification failed; the published tag and certified candidate remain unchanged"
+        },
       }
     }
     const runs = collect_runs(adapter, receipt, poll)
