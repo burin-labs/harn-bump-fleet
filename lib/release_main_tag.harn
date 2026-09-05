@@ -28,13 +28,14 @@ import {
   release_main_delta_unobserved,
 } from "./release_main_delta"
 import {
+  ReleaseDriftPathObservation,
   ReleaseMergeGateState,
   release_certification_bearing_paths,
   release_merge_gate_decision,
   release_stranded_recovery_advice,
 } from "./release_merge_gate"
 import { remote_tag_target_sha } from "./release_repin"
-import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ReleaseCommandResult, release_git_remote_refs, run_git } from "./release_runtime"
 import { ensure_release_tag_pushed_at } from "./release_tag"
 import {
   ReleaseUnfoldDecision,
@@ -474,28 +475,89 @@ pub fn release_main_tag_decision(
 }
 
 /**
- * Paths that changed on main since the certified base.
+ * One exact observation of paths changed on main since the certified base.
  *
- * An empty list means "nothing changed", which the gate only ever reads
- * alongside two equal heads. A failed comparison returns an empty list too, so
- * every caller must check the heads first and treat an unexplained difference
- * as unproved rather than clean.
+ * A completed comparison that measured no paths is structurally distinct from
+ * a fetch or diff that answered nothing. The watcher can therefore report the
+ * operation and failure Git returned instead of manufacturing a clean-looking
+ * empty list.
  */
-pub fn release_main_git_drifted_paths(
+pub type ReleaseMainGitRunner = fn(list<string>) -> ReleaseCommandResult
+
+fn unreadable_drift_paths(
+  operation: "fetch" | "diff",
+  result: ReleaseCommandResult,
+  certified_base: string,
+  observed_main: string,
+) -> ReleaseDriftPathObservation {
+  const error = trim(result.stderr)
+  const reported = if error == "" {
+    "Git returned no error text"
+  } else {
+    error
+  }
+  return {
+    state: "unreadable",
+    paths: [],
+    failed_operation: operation,
+    exit_code: result.exit_code,
+    detail: "could not ${operation} while comparing ${lowercase(trim(certified_base))}"
+      + "..${lowercase(trim(observed_main))} (exit ${to_string(result.exit_code ?? -1)}): ${reported}",
+  }
+}
+
+pub fn release_main_git_drift_observation_with(
+  git: ReleaseMainGitRunner,
+  certified_base: string,
+  observed_main: string,
+) -> ReleaseDriftPathObservation {
+  const fetched = git(["fetch", "origin", "--quiet", "main"])
+  if !fetched.success {
+    return unreadable_drift_paths("fetch", fetched, certified_base, observed_main)
+  }
+  const diffed = git(["diff", "--name-only", certified_base, observed_main])
+  if !diffed.success {
+    return unreadable_drift_paths("diff", diffed, certified_base, observed_main)
+  }
+  const paths = split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
+  return {
+    state: "measured",
+    paths: paths,
+    failed_operation: "",
+    exit_code: diffed.exit_code,
+    detail: if len(paths) == 0 {
+      "Git successfully compared ${lowercase(trim(certified_base))}"
+        + "..${lowercase(trim(observed_main))} and measured zero changed paths"
+    } else {
+      "Git measured ${to_string(len(paths))} changed path(s)"
+    },
+  }
+}
+
+pub fn release_main_git_drift_observation(
   git: {env: HarnessEnv, process: HarnessProcess},
   cfg: dict,
   certified_base: string,
   observed_main: string,
-) -> list<string> {
-  const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
-  if !fetched.success {
-    return []
-  }
-  const diffed = run_git(git, cfg, ["diff", "--name-only", certified_base, observed_main])
-  if !diffed.success {
-    return []
-  }
-  return split(trim(diffed.stdout), "\n").filter({ path -> trim(path) != "" }).to_list()
+) -> ReleaseDriftPathObservation {
+  return release_main_git_drift_observation_with(
+    { args -> return run_git(git, cfg, args) },
+    certified_base,
+    observed_main,
+  )
+}
+
+/** Attach the exact Git observation to the merge gate it governs. */
+pub fn release_main_merge_gate_observe_drift_with(
+  gate: ReleaseMergeGateState,
+  git: ReleaseMainGitRunner,
+) -> ReleaseMergeGateState {
+  const observation = release_main_git_drift_observation_with(
+    git,
+    gate.certified_base,
+    gate.observed_main,
+  )
+  return gate + {drifted_paths: observation.paths, path_observation: observation}
 }
 
 /**
@@ -982,6 +1044,7 @@ fn default_release_main_tag_adapter(
         mergeable_state: merge_state,
         mergeable_resolved: resolved,
         drifted_paths: [],
+        path_observation: nil,
         evidence: nil,
         release_only_checks: [],
       }
@@ -989,7 +1052,13 @@ fn default_release_main_tag_adapter(
         return stable
       }
       const git = {env: harness.env, process: harness.process}
-      const drifted = release_main_git_drifted_paths(git, cfg, certified_base, observed_main)
+      const observed_gate = release_main_merge_gate_observe_drift_with(
+        stable,
+        { args -> return run_git(git, cfg, args) },
+      )
+      if observed_gate.path_observation?.state == "unreadable" {
+        return observed_gate
+      }
       const inventory = try {
         release_workflow_inventory_at_revision(
           {env: harness.env, process: harness.process},
@@ -1008,8 +1077,8 @@ fn default_release_main_tag_adapter(
         certified_base,
         observed_main,
       )
-      return stable
-        + {drifted_paths: drifted, evidence: evidence, release_only_checks: release_only}
+      return observed_gate
+        + {evidence: evidence, release_only_checks: release_only}
     },
     merged_main_ancestor: fn(merge_sha) {
       const fetched = run_git(
