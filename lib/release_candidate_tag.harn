@@ -1,0 +1,183 @@
+import { execution_failed } from "./release_execution"
+import { remote_tag_target_sha } from "./release_repin"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ensure_release_tag_pushed_at, verify_existing_remote_release_tag } from "./release_tag"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+
+pub type ReleaseCandidateTagAdapter = {
+  candidate_parent: fn() -> string,
+  certify_target: fn() -> string,
+  tag_target: fn() -> string,
+  push_tag: fn(string) -> list<dict>,
+  verify_tag: fn(string) -> list<dict>,
+  now: fn() -> string,
+}
+
+fn candidate_tag_adapter(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+) -> ReleaseCandidateTagAdapter {
+  const candidate = receipt.publication.head_oid
+  return {
+    candidate_parent: fn() {
+      if cfg.mock {
+        return receipt.pin_sha
+      }
+      const git = {env: harness.env, process: harness.process}
+      const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", candidate])
+      if !fetched.success {
+        return ""
+      }
+      const parent = run_git(git, cfg, ["rev-parse", "--verify", "${candidate}^1"])
+      return if parent.success {
+        lowercase(trim(parent.stdout))
+      } else {
+        ""
+      }
+    },
+    certify_target: fn() {
+      if cfg.mock {
+        return candidate
+      }
+      const observed = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/heads/release-certify/${candidate}"],
+      )
+      if !observed.success {
+        return ""
+      }
+      return remote_tag_target_sha(observed.refs)
+    },
+    tag_target: fn() {
+      if cfg.mock {
+        return ""
+      }
+      const observed = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/tags/${receipt.tag}", "refs/tags/${receipt.tag}^{}"],
+      )
+      if !observed.success {
+        return "unreadable"
+      }
+      return remote_tag_target_sha(observed.refs)
+    },
+    verify_tag: fn(target) {
+      const observed = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/tags/${receipt.tag}", "refs/tags/${receipt.tag}^{}"],
+      )
+      if !observed.success || remote_tag_target_sha(observed.refs) != target {
+        return []
+      }
+      const verified = verify_existing_remote_release_tag(
+        harness,
+        cfg,
+        [],
+        receipt.tag,
+        target,
+        observed.refs,
+        "release-candidate-tag-${receipt.tag}",
+      )
+      return if verified.success {
+        verified.steps
+      } else {
+        []
+      }
+    },
+    push_tag: fn(target) { return ensure_release_tag_pushed_at(
+      harness,
+      cfg,
+      receipt.publication.version,
+      target,
+      [],
+      "release-candidate-tag-${receipt.tag}",
+      {candidate_oid: candidate},
+    ) },
+    now: fn() { return harness.clock.date_iso() },
+  }
+}
+
+/** Publish the certified commit; the release pull request can merge independently. */
+pub fn run_release_candidate_tag(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  injected_adapter: ReleaseCandidateTagAdapter? = nil,
+) -> {
+  status: int,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+  steps: list<dict>,
+  polls: int,
+  phase: string,
+} {
+  const adapter = injected_adapter ?? candidate_tag_adapter(harness, cfg, receipt)
+  const candidate = receipt.publication.head_oid
+  const tag_target = adapter.tag_target()
+  const legacy = receipt.release_commit_oid != "" && receipt.release_commit_oid != candidate
+  if legacy {
+    const verified = if tag_target == receipt.release_commit_oid {
+      adapter.verify_tag(tag_target)
+    } else {
+      []
+    }
+    return {
+      status: if len(verified) > 0 && !execution_failed(verified) {
+        0
+      } else {
+        2
+      },
+      reason: "verify previously published release without creating or moving its tag",
+      receipt: receipt,
+      steps: verified,
+      polls: 1,
+      phase: "tag",
+    }
+  }
+  let reason = ""
+  if tag_target != "" && tag_target != candidate {
+    reason = "existing tag does not select the certified candidate"
+  } else if adapter.candidate_parent() != receipt.pin_sha {
+    reason = "candidate first parent does not match the pinned release source"
+  } else if tag_target == "" && adapter.certify_target() != candidate {
+    reason = "immutable certification ref is missing or no longer selects the candidate"
+  }
+  if reason != "" {
+    return {status: 2, reason: reason, receipt: receipt, steps: [], polls: 1, phase: "tag"}
+  }
+  // Recovery must never recreate a tag that disappeared after observation.
+  const steps = if tag_target == candidate {
+    adapter.verify_tag(candidate)
+  } else {
+    adapter.push_tag(candidate)
+  }
+  if len(steps) == 0 || execution_failed(steps) {
+    return {
+      status: 2,
+      reason: "candidate tag publication was not proven",
+      receipt: receipt,
+      steps: steps,
+      polls: 1,
+      phase: "tag",
+    }
+  }
+  const bound = release_watch_receipt_bind_main_commit(receipt, candidate, adapter.now())
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, bound)
+  return {
+    status: 0,
+    reason: "signed tag selects the immutable certified candidate",
+    receipt: bound,
+    steps: steps,
+    polls: 1,
+    phase: "tag",
+  }
+}
