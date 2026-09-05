@@ -1,0 +1,209 @@
+import { FleetRepository } from "./fleet_manifest"
+
+/** The two candidate facts a consumer gate may be handed, and nothing else. */
+pub const CONSUMER_PRETAG_PLACEHOLDERS: list<string> = ["{revision}", "{version}"]
+
+/** The candidate a pre-tag gate judges: a version with no tag yet, and its commit. */
+pub type ConsumerPretagCandidate = {version: string, revision: string}
+
+/**
+ * One consumer's resolved gate dispatch.
+ *
+ * `revision` is carried alongside the inputs because it is also the run's
+ * identity: GitHub does not echo dispatch inputs back on a workflow run, so the
+ * gate finds ITS run by the candidate commit appearing in the run's name. A
+ * consumer therefore has to name its runs after the revision it was handed,
+ * which is the same `display_title` match the fleet bump chain already relies on.
+ */
+pub type ConsumerPretagGateTarget = {
+  slug: string,
+  workflow: string,
+  revision: string,
+  inputs: dict<string, string>,
+}
+
+pub type ConsumerPretagGateStatus = "passed" | "failed" | "pending" | "unreadable"
+
+/** What one dispatched consumer gate reported back. */
+pub type ConsumerPretagGateReceipt = {
+  slug: string,
+  workflow: string,
+  status: ConsumerPretagGateStatus,
+  run_url: string,
+  detail: string,
+}
+
+/**
+ * The verdict over every declared consumer gate.
+ *
+ * `declared` is carried separately from `proven` on purpose. A run where no
+ * consumer declares a gate and a run where every consumer passed both have an
+ * empty failing list, and collapsing them to one boolean is how a gate that
+ * measured nothing comes to read as a gate that measured zero failures.
+ */
+pub type ConsumerPretagGateVerdict = {
+  proven: bool,
+  declared: int,
+  passed: list<string>,
+  failing: list<string>,
+  pending: list<string>,
+  unreadable: list<string>,
+  summary: string,
+}
+
+/** Refuse a pre-tag contract that cannot be dispatched, rather than skipping it. */
+pub fn validate_consumer_pretag_contract(
+  gate_workflow: string,
+  inputs: dict<string, string>,
+) -> nil {
+  const workflow = trim(gate_workflow)
+  if len(regex_captures("^[A-Za-z0-9._-]+\\.ya?ml$", workflow)) == 0 {
+    throw "consumer pretag gate_workflow must be one workflow file name, not '${gate_workflow}'"
+  }
+  if len(inputs.keys()) == 0 {
+    throw "consumer pretag inputs must name at least one workflow input"
+  }
+  let carries_revision = false
+  for key in inputs.keys() {
+    if len(regex_captures("^[A-Za-z_][A-Za-z0-9_-]*$", key)) == 0 {
+      throw "consumer pretag input name '${key}' is not a workflow input identifier"
+    }
+    const template = to_string(inputs[key] ?? "")
+    if trim(template) == "" {
+      throw "consumer pretag input '${key}' has an empty template"
+    }
+    // Strip the two the contract defines; anything brace-shaped that survives is
+    // a placeholder this gate would pass through to the workflow uninterpreted.
+    let stripped = template
+    for known in CONSUMER_PRETAG_PLACEHOLDERS {
+      stripped = replace(stripped, known, "")
+    }
+    const unknown = regex_captures("(\\{[^}]*\\})", stripped)
+    if len(unknown) > 0 {
+      throw "consumer pretag input '${key}' uses unknown placeholder '${unknown[1] ?? ""}'"
+    }
+    if contains(template, "{revision}") {
+      carries_revision = true
+    }
+  }
+  // Without the commit, the gate would judge whatever the consumer resolves on
+  // its own — a published pin, most likely — and pass while never having seen
+  // the candidate. That is the exact shape of a gate that cannot fail.
+  if !carries_revision {
+    throw "consumer pretag inputs must pass {revision}, or the gate never sees the candidate"
+  }
+  return nil
+}
+
+/** Fill one consumer's input templates with this candidate's identity. */
+pub fn resolve_consumer_pretag_inputs(
+  inputs: dict<string, string>,
+  candidate: ConsumerPretagCandidate,
+) -> dict<string, string> {
+  let resolved: dict<string, string> = {}
+  for key in inputs.keys() {
+    resolved[key] = replace(
+      replace(to_string(inputs[key] ?? ""), "{version}", candidate.version),
+      "{revision}",
+      candidate.revision,
+    )
+  }
+  return resolved
+}
+
+/** Every repository that declares a pre-tag gate, resolved against this candidate. */
+pub fn consumer_pretag_gate_targets(
+  repositories: list<FleetRepository>,
+  candidate: ConsumerPretagCandidate,
+) -> list<ConsumerPretagGateTarget> {
+  if len(regex_captures("^[0-9a-f]{40}$", candidate.revision)) == 0 {
+    throw "consumer pretag candidate revision must be a 40-character commit SHA"
+  }
+  if len(regex_captures("^v[0-9]+\\.[0-9]+\\.[0-9]+", candidate.version)) == 0 {
+    throw "consumer pretag candidate version must be a release version like v0.10.130"
+  }
+  let targets: list<ConsumerPretagGateTarget> = []
+  for repo in repositories {
+    const workflow = trim(repo.pretag_gate_workflow ?? "")
+    if workflow == "" {
+      continue
+    }
+    const inputs = repo.pretag_gate_inputs ?? {}
+    validate_consumer_pretag_contract(workflow, inputs)
+    targets = targets
+      + [
+        {
+          slug: repo.slug,
+          workflow: workflow,
+          revision: candidate.revision,
+          inputs: resolve_consumer_pretag_inputs(inputs, candidate),
+        },
+      ]
+  }
+  return targets
+}
+
+/**
+ * Decide the pre-tag consumer verdict from the receipts, and say what was
+ * measured alongside it.
+ *
+ * Only `passed` proves anything. A pending gate has not answered and an
+ * unreadable one could not be asked; both leave the candidate unproven, because
+ * a release that tags on "nothing came back red" is a release that tags on
+ * silence.
+ */
+pub fn consumer_pretag_gate_verdict(
+  targets: list<ConsumerPretagGateTarget>,
+  receipts: list<ConsumerPretagGateReceipt>,
+) -> ConsumerPretagGateVerdict {
+  let passed: list<string> = []
+  let failing: list<string> = []
+  let pending: list<string> = []
+  let unreadable: list<string> = []
+  let seen: dict<string, bool> = {}
+  for receipt in receipts {
+    seen[receipt.slug] = true
+    const name = "${receipt.slug}:${receipt.workflow}"
+    if receipt.status == "passed" {
+      passed = passed + [name]
+    } else if receipt.status == "failed" {
+      failing = failing + [name]
+    } else if receipt.status == "pending" {
+      pending = pending + [name]
+    } else {
+      unreadable = unreadable + [name]
+    }
+  }
+  // A target that produced no receipt at all is the quietest failure mode here,
+  // so it is named rather than left out of every list.
+  for target in targets {
+    if !(seen[target.slug] ?? false) {
+      unreadable = unreadable + ["${target.slug}:${target.workflow} (no receipt)"]
+    }
+  }
+  const declared = len(targets)
+  const proven = len(failing) == 0 && len(pending) == 0 && len(unreadable) == 0
+  const summary = if declared == 0 {
+    "no consumer declared a pre-tag gate; this candidate was judged by nothing downstream"
+  } else if proven {
+    "${len(passed)}/${declared} consumer pre-tag gates passed"
+  } else {
+    "consumer pre-tag gates unproven: "
+      + "${len(passed)} passed, ${len(failing)} failing, ${len(pending)} pending, "
+      + "${len(unreadable)} unreadable"
+      + if len(failing) > 0 {
+        " (failing: " + failing.join(", ") + ")"
+      } else {
+        ""
+      }
+  }
+  return {
+    proven: proven,
+    declared: declared,
+    passed: passed,
+    failing: failing,
+    pending: pending,
+    unreadable: unreadable,
+    summary: summary,
+  }
+}

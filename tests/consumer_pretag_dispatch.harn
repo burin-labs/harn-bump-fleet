@@ -1,0 +1,196 @@
+import {
+  ConsumerPretagGateAdapter,
+  ConsumerPretagGatePolicy,
+  ConsumerPretagRunRow,
+  run_consumer_pretag_gates,
+} from "../lib/consumer_pretag_dispatch"
+import { ConsumerPretagGateTarget, consumer_pretag_gate_verdict } from "../lib/consumer_pretag_gate"
+
+const FAST: ConsumerPretagGatePolicy = {poll_interval_ms: 1, deadline_ms: 50}
+
+const REVISION = "1234567890abcdef1234567890abcdef12345678"
+
+const OTHER_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
+
+fn target(slug: string = "owner/consumer") -> ConsumerPretagGateTarget {
+  return {
+    slug: slug,
+    workflow: "candidate-gate.yml",
+    revision: REVISION,
+    inputs: {source_revision: REVISION},
+  }
+}
+
+fn row(id: int, status: string, conclusion: string, title: string = "") -> ConsumerPretagRunRow {
+  return {
+    id: id,
+    status: status,
+    conclusion: conclusion,
+    html_url: "https://runs.test/${to_string(id)}",
+    display_title: if title == "" {
+      "Harn candidate v0.10.130 @ ${REVISION}"
+    } else {
+      title
+    },
+  }
+}
+
+/**
+ * An adapter over a scripted run timeline. `sequence` is read once per poll of
+ * the same run, so a test can hand back "running, running, completed" and prove
+ * the gate actually waited instead of reading one answer and stopping.
+ */
+fn adapter(
+  sequence: list<ConsumerPretagRunRow>,
+  overrides: dict = {},
+) -> ConsumerPretagGateAdapter {
+  let cursor = 0
+  let clock = 0
+  const base: dict = {
+    dispatch: fn(_target) { return Ok(nil) },
+    runs: fn(_target) { return Ok([row(11, "queued", "")]) },
+    run: fn(_target, _run_id) {
+      const answer = sequence[cursor] ?? sequence[len(sequence) - 1]
+      cursor = cursor + 1
+      return Ok(answer ?? row(11, "completed", "success"))
+    },
+    wait: fn(ms) { clock = clock + ms },
+    now_ms: fn() {
+      clock = clock + 1
+      return clock
+    },
+  }
+  return schema_expect(base + overrides, ConsumerPretagGateAdapter)
+}
+
+pipeline test_a_green_consumer_run_proves_the_candidate() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "in_progress", ""), row(11, "completed", "success")]),
+    FAST,
+  )
+  assert_eq(len(receipts), 1)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/11")
+  assert(consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_red_consumer_run_refuses_the_candidate() {
+  // The falsifier: the same path with the conclusion flipped must not prove.
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "failure")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "failed")
+  const verdict = consumer_pretag_gate_verdict([target()], receipts)
+  assert(!verdict.proven)
+  assert_eq(verdict.failing, ["owner/consumer:candidate-gate.yml"])
+}
+
+pipeline test_a_cancelled_run_judged_nothing_and_says_so() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "cancelled")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_run_that_never_finishes_is_pending_not_passed() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "in_progress", "")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "still running at the gate deadline"))
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_dispatch_that_produced_no_run_is_not_a_pass() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "success")], {runs: fn(_target) { return Ok([]) }}),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "no run naming this candidate appeared"))
+}
+
+pipeline test_two_runs_for_one_dispatch_are_refused_rather_than_guessed_between() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        runs: fn(_target) { return Ok(
+          [row(11, "completed", "success"), row(12, "completed", "failure")],
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "refusing to guess"))
+}
+
+pipeline test_a_failed_dispatch_is_reported_not_swallowed() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {dispatch: fn(_target) { return Err({code: "dispatch_failed"}) }},
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "dispatch failed"))
+}
+
+pipeline test_every_target_is_dispatched_before_any_is_waited_on() {
+  let order: list<string> = []
+  const receipts = run_consumer_pretag_gates(
+    [target("owner/a"), target("owner/b")],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(gate) {
+          order = order + ["dispatch:${gate.slug}"]
+          return Ok(nil)
+        },
+        run: fn(gate, _run_id) {
+          order = order + ["poll:${gate.slug}"]
+          return Ok(row(11, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(len(receipts), 2)
+  // Both dispatches must precede the first poll, or the gate costs the sum of
+  // its consumers' run times rather than the slowest one.
+  assert_eq(order[0], "dispatch:owner/a")
+  assert_eq(order[1], "dispatch:owner/b")
+  assert(starts_with(order[2] ?? "", "poll:"))
+}
+
+pipeline test_a_run_that_does_not_name_this_candidate_is_not_this_gates_run() {
+  // Without this, a leftover run of the same workflow from an earlier candidate
+  // would be adopted, and the gate would report on a tree it never judged.
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        runs: fn(_target) { return Ok(
+          [row(11, "completed", "success", "Harn candidate v0.10.129 @ ${OTHER_REVISION}")],
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "no run naming this candidate appeared"))
+}
