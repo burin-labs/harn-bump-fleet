@@ -1,0 +1,1 @@
+Hosted releases now install the checksum-pinned upstream ripgrep binary directly for either runner architecture, so an Ubuntu package mirror stall cannot consume the release bootstrap budget before certification starts.
