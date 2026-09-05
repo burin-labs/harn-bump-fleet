@@ -17,17 +17,24 @@
 // bump's target tag, resolved per dispatch, and it is a different question from
 // which orchestration contract performs the bump.
 import { ParserSpec } from "std/cli/argparse"
+import { api_call } from "harn-github-connector/default"
 import {
   bump_workflow_promotion_targets,
   promote_bump_workflow_manifest,
   promote_bump_workflow_manifest_text,
+  released_bump_workflow_reference,
 } from "lib/bump_workflow_promotion"
 import { cli_options } from "lib/cli_options"
 import {
   manifest_with_consumer_contracts,
   read_remote_consumer_projection_manifests,
 } from "lib/consumer_projection_manifest"
-import { FleetFileProjection, read_fleet_manifest } from "lib/fleet_manifest"
+import {
+  FleetFileProjection,
+  FleetManifest,
+  parse_fleet_manifest,
+  parse_workflow_policy_reference,
+} from "lib/fleet_manifest"
 import {
   FleetProjectionTarget,
   fleet_projection_sources,
@@ -35,16 +42,64 @@ import {
   group_projection_targets_by_repository,
   projection_source_key,
 } from "lib/fleet_projection_targets"
-import { github_file_text_at_ref } from "lib/github"
+import {
+  github_connector_options,
+  github_file_text_at_ref,
+  github_file_text_at_ref_result,
+} from "lib/github"
 import { PrerequisiteProjectionLease } from "lib/prerequisite_prs"
 import {
   PrerequisiteWaitReceipt,
   prerequisite_wait_not_required,
   wait_prerequisite,
 } from "lib/prerequisite_wait"
-import { RemoteConvergenceResult, converge_remote_repository } from "lib/remote_projection"
+import {
+  RemoteConvergenceResult,
+  converge_remote_repository,
+  observe_remote_projection_effect,
+} from "lib/remote_projection"
 
 type Options = {commit_oid: string, timeout_s: int, interval_s: int}
+
+pub type BumpWorkflowPromotionRequest = {
+  commit_oid: string,
+  timeout_s: int,
+  interval_s: int,
+  apply: bool,
+}
+
+pub type BumpWorkflowPromotionReceipt = {
+  state: "proven" | "pending" | "failed",
+  detail: string,
+  requested_commit_oid: string,
+  effective_commit_oid: string,
+  preserved_advanced: bool,
+  workflow_reference: string,
+  consumer_manifest_refs: dict<string, string>,
+  consumer_manifest_sha256: dict<string, string>,
+  policy?: RemoteConvergenceResult,
+  repositories: list<RemoteConvergenceResult>,
+  prerequisite_waits: list<PrerequisiteWaitReceipt>,
+  expected_target_count: int,
+  observed_clean_count: int,
+  effect_absent: bool,
+}
+
+pub type BumpWorkflowCommitSelection = {
+  state: "selected" | "failed",
+  effective_commit_oid: string,
+  preserved_advanced: bool,
+  detail: string,
+}
+
+pub type BumpWorkflowProjectionObservation = {
+  state: "proven" | "pending" | "failed",
+  expected_target_count: int,
+  observed_clean_count: int,
+  effect_absent: bool,
+}
+
+pub type BumpWorkflowProjectionRead = {result: RemoteConvergenceResult, target_count: int}
 
 const ARG_SPEC: ParserSpec = {
   name: "promote-bump-workflow",
@@ -78,7 +133,7 @@ fn wait_for_proposal(
   result: RemoteConvergenceResult,
   base_ref: string,
   targets: list<FleetProjectionTarget>,
-  options: Options,
+  options: BumpWorkflowPromotionRequest,
 ) -> PrerequisiteWaitReceipt {
   if result.status == "clean" {
     return prerequisite_wait_not_required(result.slug, result.commit ?? "")
@@ -102,6 +157,325 @@ fn wait_for_proposal(
       + json_stringify(waited)
   }
   return waited
+}
+
+/** Select the requested orchestration pin without rolling back a proved descendant. */
+pub fn select_bump_workflow_commit(
+  current_commit_oid: string,
+  requested_commit_oid: string,
+  requested_to_current_relation: string,
+) -> BumpWorkflowCommitSelection {
+  // Reuse the owning validator for both values before reasoning about history.
+  released_bump_workflow_reference(current_commit_oid)
+  released_bump_workflow_reference(requested_commit_oid)
+  if current_commit_oid == requested_commit_oid {
+    return {
+      state: "selected",
+      effective_commit_oid: requested_commit_oid,
+      preserved_advanced: false,
+      detail: "the orchestration pin already names the requested commit",
+    }
+  }
+  const relation = lowercase(trim(requested_to_current_relation))
+  if relation == "ahead" {
+    return {
+      state: "selected",
+      effective_commit_oid: current_commit_oid,
+      preserved_advanced: true,
+      detail: "the current orchestration pin is a descendant of the requested release commit",
+    }
+  }
+  if relation == "behind" {
+    return {
+      state: "selected",
+      effective_commit_oid: requested_commit_oid,
+      preserved_advanced: false,
+      detail: "the current orchestration pin predates the requested release commit",
+    }
+  }
+  return {
+    state: "failed",
+    effective_commit_oid: "",
+    preserved_advanced: false,
+    detail:
+      "current and requested orchestration pins have incomparable source history (${relation})",
+  }
+}
+
+fn compare_bump_workflow_commits(
+  harness: Harness,
+  requested_commit_oid: string,
+  current_commit_oid: string,
+) -> Result<string, string> {
+  const compared = api_call(
+    harness,
+    {
+      path: "/repos/burin-labs/harn/compare/${requested_commit_oid}...${current_commit_oid}",
+      options: github_connector_options(),
+    },
+  )
+  if is_err(compared) {
+    return Err("could not compare orchestration commits: " + to_string(unwrap_err(compared)))
+  }
+  const relation = lowercase(trim(to_string(unwrap(compared)?.status ?? "")))
+  if !["ahead", "behind", "identical", "diverged"].contains(relation) {
+    return Err("GitHub compare omitted a recognized orchestration history relation")
+  }
+  return Ok(relation)
+}
+
+fn remote_fleet_source(harness: Harness) -> Result<string, string> {
+  const source = github_file_text_at_ref_result(
+    harness,
+    "burin-labs/harn-bump-fleet",
+    "fleet.toml",
+    "main",
+  )
+  if is_err(source) {
+    return Err("could not read fleet.toml on main: " + to_string(unwrap_err(source)))
+  }
+  if unwrap(source) == nil {
+    return Err("burin-labs/harn-bump-fleet has no fleet.toml on main")
+  }
+  return Ok(unwrap(source) ?? "")
+}
+
+fn failed_promotion(request: BumpWorkflowPromotionRequest, detail: string) {
+  return {
+    state: "failed",
+    detail: detail,
+    requested_commit_oid: request.commit_oid,
+    effective_commit_oid: "",
+    preserved_advanced: false,
+    workflow_reference: "",
+    consumer_manifest_refs: {},
+    consumer_manifest_sha256: {},
+    repositories: [],
+    prerequisite_waits: [],
+    expected_target_count: 0,
+    observed_clean_count: 0,
+    effect_absent: false,
+  }
+}
+
+/** Preserve the target census so an empty or partial read cannot pass vacuously. */
+pub fn observe_bump_workflow_projection_results(
+  results: list<BumpWorkflowProjectionRead>,
+  prerequisite_waits: list<PrerequisiteWaitReceipt>,
+  require_exact_waits: bool,
+) -> BumpWorkflowProjectionObservation {
+  let expected = 0
+  let clean = 0
+  let failed = false
+  let unproven = false
+  let absent = 0
+  let absence_unknown = false
+  for entry in results {
+    if entry.target_count < 1 {
+      failed = true
+      continue
+    }
+    expected = expected + entry.target_count
+    if entry.result.status == "clean" {
+      clean = clean + entry.target_count
+    } else if entry.result.effect_absent ?? false {
+      absent = absent + entry.target_count
+      unproven = true
+    } else if entry.result.status == "pending" || entry.result.status == "applied" {
+      const pull_request = entry.result.pull_request ?? 0
+      const commit = entry.result.commit ?? ""
+      const proved = pull_request > 0 && regex_match("^[0-9a-f]{40}$", commit) != nil
+        && prerequisite_waits.any(
+          { wait ->
+            wait.ok && wait.status == "satisfied" && wait.repo == entry.result.slug
+              && wait.number == pull_request
+              && wait.expected_head_oid == commit
+          },
+        )
+      if proved {
+        clean = clean + entry.target_count
+      } else if require_exact_waits {
+        failed = true
+      } else {
+        unproven = true
+      }
+    } else {
+      unproven = true
+      absence_unknown = true
+    }
+    if entry.result.status == "error" {
+      failed = true
+    }
+  }
+  return {
+    state: if failed || expected == 0 {
+      "failed"
+    } else if !unproven && clean == expected {
+      "proven"
+    } else {
+      "pending"
+    },
+    expected_target_count: expected,
+    observed_clean_count: clean,
+    effect_absent: !failed && absent > 0 && !absence_unknown && clean + absent == expected,
+  }
+}
+
+/** Reconcile every projection derived from one immutable orchestration pin. */
+pub fn run_bump_workflow_promotion(
+  harness: Harness,
+  request: BumpWorkflowPromotionRequest,
+) -> BumpWorkflowPromotionReceipt {
+  released_bump_workflow_reference(request.commit_oid)
+  if request.timeout_s < 1 || request.interval_s < 1 {
+    throw "promotion polling bounds must be positive"
+  }
+  return try {
+    const source_result = remote_fleet_source(harness)
+    if is_err(source_result) {
+      return failed_promotion(request, unwrap_err(source_result))
+    }
+    const source = unwrap(source_result)
+    const current = parse_fleet_manifest(toml_parse(source))
+    const current_commit = parse_workflow_policy_reference(current.policy.bump_workflow).ref
+    const relation = if current_commit == request.commit_oid {
+      "identical"
+    } else {
+      const compared = compare_bump_workflow_commits(harness, request.commit_oid, current_commit)
+      if is_err(compared) {
+        return failed_promotion(request, unwrap_err(compared))
+      }
+      unwrap(compared)
+    }
+    const selected = select_bump_workflow_commit(current_commit, request.commit_oid, relation)
+    if selected.state == "failed" {
+      return failed_promotion(request, selected.detail)
+    }
+    const effective = selected.effective_commit_oid
+    const manifest = promote_bump_workflow_manifest(current, effective)
+    const promoted_text = promote_bump_workflow_manifest_text(source, current, effective)
+    const consumer_resolution = read_remote_consumer_projection_manifests(
+      harness,
+      manifest,
+      manifest.fleet.default_branch,
+    )
+    if len(consumer_resolution.errors) > 0 {
+      return failed_promotion(
+        request,
+        "consumer projection manifests are invalid: " + join(consumer_resolution.errors, "; "),
+      )
+    }
+    const runtime_manifest = manifest_with_consumer_contracts(manifest, consumer_resolution)
+    const self_targets = bump_workflow_promotion_targets(manifest, promoted_text)
+    const self_result = if request.apply {
+      converge_remote_repository(
+        harness,
+        "burin-labs/harn-bump-fleet",
+        manifest.fleet.default_branch,
+        self_targets,
+        true,
+        true,
+      )
+    } else {
+      observe_remote_projection_effect(
+        harness,
+        "burin-labs/harn-bump-fleet",
+        manifest.fleet.default_branch,
+        self_targets,
+      )
+    }
+    let waits: list<PrerequisiteWaitReceipt> = []
+    if request.apply {
+      require_convergence(self_result)
+      waits = waits
+        + [
+          wait_for_proposal(
+            harness,
+            self_result,
+            manifest.fleet.default_branch,
+            self_targets,
+            request,
+          ),
+        ]
+    }
+    let results: list<{result: RemoteConvergenceResult, targets: list<FleetProjectionTarget>}> = []
+    const targets = fleet_projection_targets(
+      runtime_manifest,
+      resolved_sources(harness, runtime_manifest, consumer_resolution.projections),
+      consumer_resolution.projections,
+    )
+    for group in group_projection_targets_by_repository(targets) {
+      const result = if request.apply {
+        converge_remote_repository(
+          harness,
+          group.slug,
+          manifest.fleet.default_branch,
+          group.targets,
+          true,
+          true,
+        )
+      } else {
+        observe_remote_projection_effect(
+          harness,
+          group.slug,
+          manifest.fleet.default_branch,
+          group.targets,
+        )
+      }
+      if request.apply {
+        require_convergence(result)
+      }
+      results = results + [{result: result, targets: group.targets}]
+    }
+    if request.apply {
+      for entry in results {
+        waits = waits
+          + [
+            wait_for_proposal(
+              harness,
+              entry.result,
+              manifest.fleet.default_branch,
+              entry.targets,
+              request,
+            ),
+          ]
+      }
+    }
+    const observation = observe_bump_workflow_projection_results(
+      [{result: self_result, target_count: len(self_targets)}]
+        + results.map({ entry -> {result: entry.result, target_count: len(entry.targets)} })
+          .to_list(),
+      waits,
+      request.apply,
+    )
+    const state = observation.state
+    const expected = observation.expected_target_count
+    const clean = observation.observed_clean_count
+    return {
+      state: state,
+      detail: if state == "proven" {
+        "observed ${expected} exact workflow projection target(s) for ${effective}"
+      } else if state == "pending" {
+        "${expected - clean} of ${expected} workflow projection target(s) remain unproven"
+      } else {
+        "workflow projection observation failed"
+      },
+      requested_commit_oid: request.commit_oid,
+      effective_commit_oid: effective,
+      preserved_advanced: selected.preserved_advanced,
+      workflow_reference: manifest.policy.bump_workflow,
+      consumer_manifest_refs: consumer_resolution.contract_refs,
+      consumer_manifest_sha256: consumer_resolution.contract_sha256,
+      policy: self_result,
+      repositories: results.map({ entry -> entry.result }).to_list(),
+      prerequisite_waits: waits,
+      expected_target_count: expected,
+      observed_clean_count: clean,
+      effect_absent: observation.effect_absent,
+    }
+  } catch (error) {
+    failed_promotion(request, to_string(error))
+  }
 }
 
 fn resolved_sources(
@@ -128,82 +502,34 @@ fn resolved_sources(
 
 pipeline main(harness: Harness) -> int {
   const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
-  if options.timeout_s < 1 || options.interval_s < 1 {
-    throw "promotion polling bounds must be positive"
-  }
-  const source = harness.fs.read_text("fleet.toml")
-  const current = read_fleet_manifest(harness.fs)
-  const manifest = promote_bump_workflow_manifest(current, options.commit_oid)
-  const promoted_text = promote_bump_workflow_manifest_text(source, current, options.commit_oid)
-  const consumer_resolution = read_remote_consumer_projection_manifests(
+  const receipt = run_bump_workflow_promotion(
     harness,
-    manifest,
-    manifest.fleet.default_branch,
+    {
+      commit_oid: options.commit_oid,
+      timeout_s: options.timeout_s,
+      interval_s: options.interval_s,
+      apply: true,
+    },
   )
-  if len(consumer_resolution.errors) > 0 {
-    throw "consumer projection manifests are invalid: " + join(consumer_resolution.errors, "; ")
-  }
-  const runtime_manifest = manifest_with_consumer_contracts(manifest, consumer_resolution)
-  const self_targets = bump_workflow_promotion_targets(manifest, promoted_text)
-  const self_result = converge_remote_repository(
-    harness,
-    "burin-labs/harn-bump-fleet",
-    manifest.fleet.default_branch,
-    self_targets,
-    true,
-    true,
-  )
-  require_convergence(self_result)
-  const self_wait = wait_for_proposal(
-    harness,
-    self_result,
-    manifest.fleet.default_branch,
-    self_targets,
-    options,
-  )
-  let results = []
-  const targets = fleet_projection_targets(
-    runtime_manifest,
-    resolved_sources(harness, runtime_manifest, consumer_resolution.projections),
-    consumer_resolution.projections,
-  )
-  for group in group_projection_targets_by_repository(targets) {
-    const result = converge_remote_repository(
-      harness,
-      group.slug,
-      manifest.fleet.default_branch,
-      group.targets,
-      true,
-      true,
-    )
-    require_convergence(result)
-    results = results + [{result: result, targets: group.targets}]
-  }
-  let prerequisite_waits = [self_wait]
-  for entry in results {
-    const waited = wait_for_proposal(
-      harness,
-      entry.result,
-      manifest.fleet.default_branch,
-      entry.targets,
-      options,
-    )
-    prerequisite_waits = prerequisite_waits + [waited]
-  }
   harness.stdio.println(
     json_stringify_pretty(
       {
         schema_version: "harn.bump-workflow-promotion.v1",
-        ok: true,
+        ok: receipt.state == "proven",
         released_commit_oid: options.commit_oid,
-        workflow_reference: manifest.policy.bump_workflow,
-        consumer_manifest_refs: consumer_resolution.contract_refs,
-        consumer_manifest_sha256: consumer_resolution.contract_sha256,
-        policy: self_result,
-        repositories: results.map({ entry -> entry.result }).to_list(),
-        prerequisite_waits: prerequisite_waits,
+        workflow_reference: receipt.workflow_reference,
+        consumer_manifest_refs: receipt.consumer_manifest_refs,
+        consumer_manifest_sha256: receipt.consumer_manifest_sha256,
+        policy: receipt.policy,
+        repositories: receipt.repositories,
+        prerequisite_waits: receipt.prerequisite_waits,
+        detail: receipt.detail,
       },
     ),
   )
-  return 0
+  return if receipt.state == "proven" {
+    0
+  } else {
+    1
+  }
 }

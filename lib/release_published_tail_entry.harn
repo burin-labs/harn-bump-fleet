@@ -1,0 +1,202 @@
+import { env_str } from "std/config"
+import { strip_v } from "std/semver"
+import { run_bump_workflow_promotion } from "../promote_bump_workflow"
+import { run_release_binary_size_baseline } from "../refresh_release_binary_size_baseline"
+import {
+  ReleaseChainReceipt,
+  release_chain_latest_stage,
+  release_chain_replay,
+} from "./release_chain_state"
+import { claim_release_lane, finish_release_lane } from "./release_lane_lock"
+import {
+  PublishedTailRead,
+  PublishedTailRequest,
+  published_tail_identity,
+  run_published_release_tail,
+} from "./release_published_tail"
+import { published_tail_live_adapter } from "./release_published_tail_live"
+import { release_watch_guard_acquire, release_watch_guard_finish } from "./release_watch_guard"
+
+pub type PublishedTailEntryOptions = {repo: string, no_wait: bool, reconcile_only: bool}
+
+fn baseline(
+  harness: Harness,
+  request: PublishedTailRequest,
+  repo: string,
+  apply: bool,
+) -> PublishedTailRead {
+  const result = run_release_binary_size_baseline(
+    harness,
+    {
+      tag: request.tag,
+      repo: repo,
+      slug: request.watch.slug,
+      release_commit_oid: request.watch.release_commit_oid,
+      apply: apply,
+      auto_merge: true,
+    },
+  )
+  const now = harness.clock.date_iso()
+  return {
+    state: result.state,
+    detail: result.detail,
+    effect_absent: result.effect_absent,
+    evidence: [
+      {
+        subject: "release size baseline",
+        kind: "baseline_policy",
+        status: if result.state == "proven" {
+          "observed"
+        } else {
+          "broken"
+        },
+        expected: result.expected_version + "@" + result.expected_source_sha,
+        observed: result.observed_version + "@" + result.observed_source_sha,
+        source: request.watch.slug,
+        ref: "main",
+        identity: result.base_oid,
+        observed_at: now,
+      },
+    ],
+  }
+}
+
+fn promotion(harness: Harness, request: PublishedTailRequest, apply: bool) -> PublishedTailRead {
+  const result = run_bump_workflow_promotion(
+    harness,
+    {commit_oid: request.watch.release_commit_oid, timeout_s: 10800, interval_s: 20, apply: apply},
+  )
+  return {
+    state: result.state,
+    detail: result.detail,
+    effect_absent: result.effect_absent,
+    evidence: [
+      {
+        subject: "fleet workflow projections",
+        kind: "projection_census",
+        status: if result.state == "proven" && result.expected_target_count > 0
+          && result.expected_target_count == result.observed_clean_count {
+          "observed"
+        } else {
+          "broken"
+        },
+        expected: to_string(result.expected_target_count),
+        observed: to_string(result.observed_clean_count),
+        source: "fleet.toml",
+        ref: "main",
+        identity: result.effective_commit_oid,
+        observed_at: harness.clock.date_iso(),
+      },
+    ],
+  }
+}
+
+fn run_owned_tail(
+  harness: Harness,
+  request: PublishedTailRequest,
+  options: PublishedTailEntryOptions,
+) -> ReleaseChainReceipt {
+  const adapter = published_tail_live_adapter(
+    harness,
+    request,
+    options.repo,
+    fn(actual, apply) { return baseline(
+      harness,
+      actual,
+      options.repo,
+      apply && !options.reconcile_only,
+    ) },
+    fn(actual, apply) { return promotion(harness, actual, apply && !options.reconcile_only) },
+    options.no_wait,
+  )
+  const selected = if options.reconcile_only {
+    adapter
+      + {
+        dispatch: fn(_actual) {
+          throw "read-only reconciliation cannot dispatch a missing fleet run"
+        },
+      }
+  } else {
+    adapter
+  }
+  return run_published_release_tail(harness, request, selected)
+}
+
+/** Local single-writer protection plus the existing cross-host exact-ref lease owner. */
+pub fn run_published_tail_entry(
+  harness: Harness,
+  request: PublishedTailRequest,
+  options: PublishedTailEntryOptions,
+) -> ReleaseChainReceipt {
+  published_tail_identity(request)
+  if trim(options.repo) == "" {
+    throw "published tail requires --repo for signed-tag proof"
+  }
+  if options.reconcile_only {
+    const history = release_chain_replay(harness.fs, request.state_root, request.chain_id)
+    if len(history) == 0 {
+      throw "read-only reconciliation requires the original tail journal"
+    }
+  }
+  const local_guard = release_watch_guard_acquire(
+    harness.host_lease,
+    {tag: request.tag, receipt_path: request.state_root, domain: "release-published-tail"},
+  )
+  const result: ReleaseChainReceipt = try {
+    // A read-only handoff consumer changes only its journal, not remote release state.
+    if options.reconcile_only {
+      run_owned_tail(harness, request, options)
+    } else {
+      const host = harness.process.run({program: "hostname", args: []})
+      if !host.success || trim(host.stdout) == "" {
+        throw "cannot identify published-tail lease owner"
+      }
+      const workflow_id = to_int(env_str(harness.env, "GITHUB_RUN_ID") ?? "") ?? 0
+      const workflow_attempt = to_int(env_str(harness.env, "GITHUB_RUN_ATTEMPT") ?? "") ?? 0
+      const claim = claim_release_lane(
+        harness,
+        {
+          slug: "burin-labs/harn-bump-fleet",
+          base_branch: "main",
+          version: strip_v(request.tag),
+          holder: {
+            run_id: "published-tail-" + harness.random.uuid_v7(),
+            host: trim(host.stdout),
+            mode: "published-tail",
+            started_at: harness.clock.date_iso(),
+            workflow_run_id: workflow_id,
+            workflow_run_attempt: workflow_attempt,
+          },
+          now: harness.clock.date_iso(),
+        },
+      )
+      if claim.state != "acquired" {
+        throw "published tail lease refused: ${claim.message}"
+      }
+      try {
+        run_owned_tail(harness, request, options)
+      } finally {
+        const finished = finish_release_lane(harness, "burin-labs/harn-bump-fleet", claim)
+        if !finished.released {
+          harness.stdio.eprintln("published tail lease cleanup remains ${finished.reason}")
+        }
+      }
+    }
+  } finally {
+    release_watch_guard_finish(harness.host_lease, local_guard)
+  }
+  return result
+}
+
+/** Handoff is successful admission, never terminal completion or a hidden baseline success. */
+pub fn published_tail_exit_code(receipt: ReleaseChainReceipt, no_wait: bool) -> int {
+  if receipt.status == "complete" {
+    return 0
+  }
+  const accepted = release_chain_latest_stage(receipt, "repin")
+  return if no_wait && receipt.status == "active" && accepted?.status == "proven" {
+    0
+  } else {
+    1
+  }
+}

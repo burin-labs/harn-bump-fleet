@@ -1,0 +1,343 @@
+import { strip_v } from "std/semver"
+import { observe_release_publication } from "../prove_release_published"
+import { fleet_convergence_snapshot, remote_pin } from "./fleet_convergence"
+import { plan_fleet_dispatch } from "./fleet_dispatch"
+import {
+  FleetManifest,
+  read_fleet_manifest,
+  resolve_harn_update_spec,
+  scoped_harn_bump_repositories,
+} from "./fleet_manifest"
+import { fleet_workflow_chain_title, wait_fleet_workflow_chain } from "./fleet_workflow_run"
+import { github_workflow_dispatch, github_workflow_runs } from "./github"
+import { ReleaseChainEvidenceRead } from "./release_chain_state"
+import {
+  PublishedTailAdapter,
+  PublishedTailDispatch,
+  PublishedTailRead,
+  PublishedTailRequest,
+} from "./release_published_tail"
+import { run_git } from "./release_runtime"
+import { release_tag_identity_verification } from "./release_tag_identity"
+import { GithubWorkflowRun, GithubWorkflowRuns } from "harn-github-connector/default"
+
+const FLEET = "burin-labs/harn-bump-fleet"
+
+const WORKFLOW = "bump-fleet.yml"
+
+const MAX_ROUNDS = 4
+
+fn value_read(
+  subject: string,
+  expected: string,
+  observed: string,
+  readable: bool,
+  identity: string,
+  now: string,
+) -> ReleaseChainEvidenceRead {
+  return {
+    subject: subject,
+    kind: "release_tail",
+    expected: expected,
+    observed: observed,
+    status: if !readable {
+      "missing"
+    } else if expected != observed {
+      "broken"
+    } else {
+      "observed"
+    },
+    source: "GitHub",
+    ref: "main",
+    identity: identity,
+    observed_at: now,
+  }
+}
+
+/** Require remote annotated identity as well as the publication owner's assets/packages proof. */
+pub fn published_tail_publication(
+  harness: Harness,
+  request: PublishedTailRequest,
+  repo: string,
+) -> PublishedTailRead {
+  if request.watch.slug != "burin-labs/harn" {
+    throw "published tail supports the Harn publication owner only"
+  }
+  const observation = observe_release_publication(harness, request.tag, repo)
+  const git = {env: harness.env, process: harness.process}
+  const cfg = {repo: repo, mock: false}
+  const remote = run_git(git, cfg, ["ls-remote", "--tags", "origin", "refs/tags/${request.tag}"])
+  const fields = trim(remote.stdout ?? "").split("\t")
+  const object_oid = if remote.success && len(fields) == 2
+    && fields[1] == "refs/tags/${request.tag}" {
+    fields[0]
+  } else {
+    ""
+  }
+  const peeled = run_git(git, cfg, ["rev-parse", "refs/tags/${request.tag}^{commit}"])
+  const contents = run_git(git, cfg, ["cat-file", "tag", "refs/tags/${request.tag}"])
+  const identity = release_tag_identity_verification(
+    request.tag,
+    object_oid,
+    request.watch.release_commit_oid,
+    observation.tag_object_oid,
+    if peeled.success {
+      trim(peeled.stdout ?? "")
+    } else {
+      ""
+    },
+    if contents.success {
+      contents.stdout ?? ""
+    } else {
+      ""
+    },
+    observation.evidence.tag_signature_verified,
+  )
+  const published = observation.proof.published && len(observation.evidence.required_assets) > 0
+  const now = harness.clock.date_iso()
+  return {
+    state: if identity.success && published {
+      "proven"
+    } else {
+      "failed"
+    },
+    detail: identity.reason + "; " + observation.proof.detail,
+    evidence: [
+      value_read(
+        "signed remote release",
+        request.watch.release_commit_oid,
+        identity.peeled_target_oid,
+        identity.success,
+        object_oid,
+        now,
+      ),
+      value_read(
+        "publication assets and packages",
+        "published",
+        if published {
+          "published"
+        } else {
+          "unproven"
+        },
+        true,
+        request.tag,
+        now,
+      ),
+    ],
+  }
+}
+
+pub fn published_tail_dispatch_matches(
+  run: GithubWorkflowRun,
+  request: PublishedTailRequest,
+) -> bool {
+  return run.repo == FLEET && run.workflow_path == ".github/workflows/${WORKFLOW}"
+    && run.event == "workflow_dispatch"
+    && run.head_branch == "main"
+    && regex_match("^[0-9a-f]{40}$", run.head_sha) != nil
+    && run.display_title == fleet_workflow_chain_title(request.tag, request.chain_id, 1, MAX_ROUNDS)
+    && run.id > 0
+    && run.url == "https://github.com/${FLEET}/actions/runs/${run.id}"
+}
+
+/** A bounded, complete census: a truncated page is never absence authorizing dispatch. */
+pub fn published_tail_find_dispatch(
+  harness: Harness,
+  request: PublishedTailRequest,
+) -> list<PublishedTailDispatch> {
+  return published_tail_find_dispatch_with_adapter(
+    request,
+    fn(page) {
+      const listed = github_workflow_runs(
+        harness,
+        FLEET,
+        WORKFLOW,
+        {
+          branch: "main",
+          event: "workflow_dispatch",
+          created: ">=${request.watch.created_at}",
+          page: page,
+        },
+        100,
+      )
+      if is_err(listed) {
+        throw "cannot reconcile accepted fleet dispatch: " + to_string(unwrap_err(listed))
+      }
+      return unwrap(listed)
+    },
+  )
+}
+
+pub fn published_tail_find_dispatch_with_adapter(
+  request: PublishedTailRequest,
+  read_page: fn(int) -> GithubWorkflowRuns,
+) -> list<PublishedTailDispatch> {
+  let matches: list<PublishedTailDispatch> = []
+  let observed = 0
+  for page in range(1, 11) {
+    const census = read_page(page)
+    if census.repo != FLEET || census.workflow_id != WORKFLOW || census.total_count < 0 {
+      throw "fleet dispatch census returned an unexpected identity or count"
+    }
+    if census.page != page || census.per_page != 100 {
+      throw "fleet dispatch census returned an unexpected page"
+    }
+    observed += len(census.runs)
+    for run in census.runs {
+      if published_tail_dispatch_matches(run, request) {
+        matches = matches + [{run_id: run.id, run_url: run.url}]
+      }
+    }
+    if observed >= census.total_count {
+      return matches
+    }
+    if len(census.runs) < 100 {
+      throw "fleet dispatch census is incomplete"
+    }
+  }
+  throw "fleet dispatch census exceeded its bounded history; refusing to infer absence"
+}
+
+fn dispatch(
+  harness: Harness,
+  manifest: FleetManifest,
+  request: PublishedTailRequest,
+) -> PublishedTailDispatch {
+  const plan = plan_fleet_dispatch(manifest, request.tag, "", request.chain_id)
+  const accepted = github_workflow_dispatch(
+    harness,
+    FLEET,
+    WORKFLOW,
+    plan.workflow_inputs + {max_rounds: to_string(MAX_ROUNDS)},
+    "main",
+  )
+  if is_err(accepted) {
+    throw "fleet dispatch acceptance uncertain: " + to_string(unwrap_err(accepted))
+  }
+  const run = unwrap(accepted)
+  return {run_id: run.run_id, run_url: run.url}
+}
+
+fn current_targets(
+  harness: Harness,
+  manifest: FleetManifest,
+  request: PublishedTailRequest,
+) -> list<{subject: string, version: string}> {
+  return scoped_harn_bump_repositories(manifest, nil).map(
+    { repository ->
+      const pin = remote_pin(harness, resolve_harn_update_spec(manifest, repository, request.tag))
+      if pin == nil {
+        throw "missing current runtime pin for ${repository.slug}"
+      }
+      return {subject: repository.slug, version: "v" + strip_v(pin)}
+    },
+  )
+    .to_list()
+}
+
+fn convergence(
+  harness: Harness,
+  manifest: FleetManifest,
+  request: PublishedTailRequest,
+) -> PublishedTailRead {
+  const snapshot = fleet_convergence_snapshot(
+    harness,
+    manifest,
+    scoped_harn_bump_repositories(manifest, nil),
+    request.tag,
+  )
+  const now = harness.clock.date_iso()
+  return {
+    state: if snapshot.complete {
+      "proven"
+    } else if snapshot.failing_count > 0 {
+      "failed"
+    } else {
+      "pending"
+    },
+    detail:
+      "${snapshot.total_count} consumers; ${snapshot.pending_count} pending; ${snapshot.failing_count} failed",
+    evidence: snapshot.repositories.map(
+      { row ->
+        return value_read(
+          row.repo,
+          strip_v(request.tag),
+          row.default_branch_pin ?? row.pin ?? "",
+          row.state == "proven",
+          row.merge_commit_sha ?? "",
+          now,
+        )
+      },
+    )
+      .to_list(),
+  }
+}
+
+/** The proposal owners remain responsible for their own exact-head mutation leases. */
+pub fn published_tail_live_adapter(
+  harness: Harness,
+  request: PublishedTailRequest,
+  repo: string,
+  baseline: fn(PublishedTailRequest, bool) -> PublishedTailRead,
+  promotion: fn(PublishedTailRequest, bool) -> PublishedTailRead,
+  no_wait: bool = false,
+) -> PublishedTailAdapter {
+  const manifest = read_fleet_manifest(harness.fs)
+  return {
+    publication: fn(actual) { return published_tail_publication(harness, actual, repo) },
+    current_targets: fn() { return current_targets(harness, manifest, request) },
+    baseline: baseline,
+    promote: promotion,
+    find_dispatch: fn(actual) { return published_tail_find_dispatch(harness, actual) },
+    dispatch: fn(actual) { return dispatch(harness, manifest, actual) },
+    converge: fn(actual, accepted) {
+      if no_wait {
+        return {
+          state: "pending",
+          detail: "accepted fleet dispatch handed to the bounded convergence owner",
+          evidence: [
+            value_read(
+              "fleet convergence",
+              actual.tag,
+              "",
+              false,
+              accepted.run_url,
+              harness.clock.date_iso(),
+            ),
+          ],
+        }
+      }
+      const watched = wait_fleet_workflow_chain(
+        harness,
+        {
+          target: actual.tag,
+          scope: {kind: "full_fleet"},
+          chain_id: actual.chain_id,
+          initial_run_id: accepted.run_id,
+          initial_run_url: accepted.run_url,
+          max_rounds: MAX_ROUNDS,
+          timeout_s: 10800,
+          successor_timeout_s: 180,
+          interval_s: 30,
+        },
+      )
+      if watched.status != "completed" || watched.conclusion != "success" {
+        return {
+          state: "failed",
+          detail: "exact fleet chain ${watched.status}/${watched.conclusion}",
+          evidence: [
+            value_read(
+              "fleet workflow chain",
+              "success",
+              watched.conclusion,
+              true,
+              accepted.run_url,
+              harness.clock.date_iso(),
+            ),
+          ],
+        }
+      }
+      return convergence(harness, manifest, actual)
+    },
+  }
+}

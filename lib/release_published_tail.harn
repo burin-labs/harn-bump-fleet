@@ -1,0 +1,485 @@
+import { compare_release, is_v_semver, strip_v } from "std/semver"
+import {
+  ReleaseChainCause,
+  ReleaseChainEvidenceRead,
+  ReleaseChainReceipt,
+  ReleaseChainStage,
+  ReleaseChainStageReceipt,
+  ReleaseChainStageStatus,
+  ReleaseChainUnprovenSubject,
+  release_chain_append_stage,
+  release_chain_from_published,
+  release_chain_has_proven,
+  release_chain_latest_stage,
+  release_chain_pending_controls,
+  release_chain_receipt_hash,
+  release_chain_receipt_write,
+  release_chain_replay,
+} from "./release_chain_state"
+import { ReleaseWatchReceipt } from "./release_watch_state"
+
+pub type PublishedTailRequest = {
+  tag: string,
+  watch: ReleaseWatchReceipt,
+  chain_id: string,
+  state_root: string,
+}
+
+pub type PublishedTailRead = {
+  state: "proven" | "pending" | "failed",
+  evidence: list<ReleaseChainEvidenceRead>,
+  detail: string,
+  effect_absent?: bool,
+}
+
+pub type PublishedTailDispatch = {run_id: int, run_url: string}
+
+/** Effects intentionally exclude preparation, certification, tagging and publication. */
+pub type PublishedTailAdapter = {
+  publication: fn(PublishedTailRequest) -> PublishedTailRead,
+  current_targets: fn() -> list<{subject: string, version: string}>,
+  baseline: fn(PublishedTailRequest, bool) -> PublishedTailRead,
+  promote: fn(PublishedTailRequest, bool) -> PublishedTailRead,
+  find_dispatch: fn(PublishedTailRequest) -> list<PublishedTailDispatch>,
+  dispatch: fn(PublishedTailRequest) -> PublishedTailDispatch,
+  converge: fn(PublishedTailRequest, PublishedTailDispatch) -> PublishedTailRead,
+}
+
+pub fn published_tail_identity(request: PublishedTailRequest) -> string {
+  const watch = request.watch
+  if !is_v_semver(request.tag) || watch.tag != request.tag
+    || watch.publication.version != strip_v(request.tag) {
+    throw "published tail tag must match its watch receipt"
+  }
+  if !regex_match("^[0-9a-f]{40}$", watch.release_commit_oid)
+    || !regex_match("^[0-9a-f]{40}$", watch.pin_sha)
+    || !regex_match("^[0-9a-f]{40}$", watch.publication.head_oid)
+    || !regex_match("^[1-9][0-9]*$", request.chain_id) {
+    throw "published tail requires exact release identities and the original hosted chain ID"
+  }
+  return sha256_hex(
+    json_stringify(
+      {
+        tag: watch.tag,
+        slug: watch.slug,
+        pin: watch.pin_sha,
+        candidate: watch.publication.head_oid,
+        released: watch.release_commit_oid,
+        pr: watch.pr_url,
+      },
+    ),
+  )
+}
+
+fn record(
+  harness: Harness,
+  request: PublishedTailRequest,
+  receipt: ReleaseChainReceipt,
+  stage: ReleaseChainStage,
+  read: PublishedTailRead,
+  cause: ReleaseChainCause,
+  pending: bool = false,
+  stopped_cursor: int? = nil,
+) -> ReleaseChainReceipt {
+  const complete = read_proven(read)
+  const evidence = read.evidence.map(
+    { item ->
+      return if item.status == "observed" && trim(item.observed) == "" {
+        item + {status: "missing"}
+      } else {
+        item
+      }
+    },
+  )
+    .to_list()
+  const proven_count = evidence.filter({ item -> item.status == "observed" }).count()
+  const now = harness.clock.date_iso()
+  const prior = release_chain_latest_stage(receipt, stage)
+  const status: ReleaseChainStageStatus = if stopped_cursor != nil {
+    "stopped"
+  } else if complete {
+    "proven"
+  } else if pending || read.state == "pending" {
+    "pending"
+  } else {
+    "failed"
+  }
+  const unproven: list<ReleaseChainUnprovenSubject> = if complete {
+    []
+  } else {
+    evidence.filter({ item -> item.status != "observed" }).map(
+      { item ->
+        {subject: item.subject, cause: cause, retryable: status == "pending", detail: read.detail}
+      },
+    )
+      .to_list()
+  }
+  let row: ReleaseChainStageReceipt = {
+    stage: stage,
+    attempt: (prior?.attempt ?? 0) + 1,
+    status: status,
+    predicate: "observe ${stage} for immutable ${request.tag}",
+    subject_count: len(evidence),
+    proven_count: proven_count,
+    unproven_count: len(evidence) - proven_count,
+    evidence: evidence,
+    unproven: unproven,
+    input_receipt_hash: release_chain_receipt_hash(receipt),
+    started_at: now,
+    finished_at: now,
+  }
+  if status == "failed" {
+    row = row + {cause: cause}
+  }
+  const next = release_chain_append_stage(receipt, row, now)
+    + {control_cursor: stopped_cursor ?? receipt.control_cursor}
+  release_chain_receipt_write({fs: harness.fs, random: harness.random}, request.state_root, next)
+  return next
+}
+
+fn read_proven(read: PublishedTailRead) -> bool {
+  return read.state == "proven" && len(read.evidence) > 0
+    && read.evidence.all({ item -> item.status == "observed" && trim(item.observed) != "" })
+}
+
+fn dispatch_read(
+  request: PublishedTailRequest,
+  dispatch: PublishedTailDispatch?,
+  now: string,
+) -> PublishedTailRead {
+  return {
+    state: if dispatch != nil {
+      "proven"
+    } else {
+      "pending"
+    },
+    evidence: [
+      {
+        subject: "fleet dispatch",
+        kind: "workflow_run",
+        status: if dispatch == nil {
+          "missing"
+        } else {
+          "observed"
+        },
+        expected: request.tag,
+        observed: if dispatch == nil {
+          ""
+        } else {
+          to_string(dispatch.run_id)
+        },
+        source: "bump-fleet.yml",
+        ref: request.tag,
+        identity: dispatch?.run_url ?? "",
+        observed_at: now,
+      },
+    ],
+    detail: "fleet dispatch acceptance is not yet observed; reconcile rather than dispatch twice",
+  }
+}
+
+fn stop_checkpoint(
+  harness: Harness,
+  request: PublishedTailRequest,
+  receipt: ReleaseChainReceipt,
+) -> ReleaseChainReceipt? {
+  const controls = release_chain_pending_controls(harness.fs, request.state_root, receipt)
+  if len(controls) == 0 {
+    return nil
+  }
+  const latest = controls[len(controls) - 1]
+  if latest == nil {
+    throw "pending release control disappeared"
+  }
+  return record(
+    harness,
+    request,
+    receipt,
+    receipt.current_stage,
+    pending_effect(receipt.current_stage, request, harness.clock.date_iso())
+      + {detail: "stopped for control ${latest.sequence}: ${latest.reason}"},
+    "stopped",
+    false,
+    latest.sequence,
+  )
+}
+
+fn pending_effect(
+  stage: ReleaseChainStage,
+  request: PublishedTailRequest,
+  now: string,
+) -> PublishedTailRead {
+  return {
+    state: "pending",
+    detail: "effect intent recorded; later invocations reconcile without repeating the write",
+    evidence: [
+      {
+        subject: stage,
+        kind: "effect_intent",
+        status: "missing",
+        expected: request.tag,
+        observed: "",
+        source: "published_tail",
+        ref: request.tag,
+        identity: request.chain_id,
+        observed_at: now,
+      },
+    ],
+  }
+}
+
+/** Persist intent before either proposal writer, including a crash before its reply. */
+fn proposal_stage(
+  harness: Harness,
+  request: PublishedTailRequest,
+  receipt: ReleaseChainReceipt,
+  stage: ReleaseChainStage,
+  cause: ReleaseChainCause,
+  observe: fn(PublishedTailRequest, bool) -> PublishedTailRead,
+) -> ReleaseChainReceipt {
+  const prior = release_chain_latest_stage(receipt, stage)
+  const apply = prior == nil
+  const failed_before = receipt.stages.any({ row -> row.stage == stage && row.status == "failed" })
+  let started = if apply {
+    record(
+      harness,
+      request,
+      receipt,
+      stage,
+      pending_effect(stage, request, harness.clock.date_iso()),
+      cause,
+    )
+  } else {
+    receipt
+  }
+  const stopped = stop_checkpoint(harness, request, started)
+  if stopped != nil {
+    return stopped
+  }
+  let read = try {
+    observe(request, apply)
+  } catch (error) {
+    pending_effect(stage, request, harness.clock.date_iso())
+      + {state: "failed", detail: to_string(error)}
+  }
+  if !apply && !failed_before && prior.status == "pending" && read.state == "pending"
+    && (read.effect_absent ?? false) {
+    // Only the owning adapter can establish affirmative absence. Unknown or
+    // failed effects never acquire retry authority from a missing local reply.
+    started = record(harness, request, started, stage, read, cause)
+    const recovery_stop = stop_checkpoint(harness, request, started)
+    if recovery_stop != nil {
+      return recovery_stop
+    }
+    read = try {
+      observe(request, true)
+    } catch (error) {
+      pending_effect(stage, request, harness.clock.date_iso())
+        + {state: "failed", detail: to_string(error)}
+    }
+  }
+  return record(harness, request, started, stage, read, cause)
+}
+
+fn load_chain(harness: Harness, request: PublishedTailRequest) -> ReleaseChainReceipt {
+  const identity = published_tail_identity(request)
+  const history = release_chain_replay(harness.fs, request.state_root, request.chain_id)
+  let receipt: ReleaseChainReceipt = if len(history) == 0 {
+    release_chain_from_published(
+      request.chain_id,
+      {
+        version: strip_v(request.tag),
+        tag: request.tag,
+        source_repo: request.watch.slug,
+        base_ref: "main",
+        initial_pin_sha: request.watch.pin_sha,
+      },
+      {release_commit_oid: request.watch.release_commit_oid, watch_identity: identity},
+      harness.clock.date_iso(),
+    )
+  } else {
+    const latest = history[len(history) - 1]
+    if latest == nil {
+      throw "published tail journal lost its latest receipt"
+    }
+    latest
+  }
+  if receipt.published_start?.watch_identity != identity || receipt.target.tag != request.tag {
+    throw "published tail receipt cannot be rebound to another release"
+  }
+  if len(history) == 0 {
+    release_chain_receipt_write(
+      {fs: harness.fs, random: harness.random},
+      request.state_root,
+      receipt,
+    )
+  }
+  return receipt
+}
+
+fn superseded_target(
+  request: PublishedTailRequest,
+  adapter: PublishedTailAdapter,
+  now: string,
+) -> PublishedTailRead? {
+  const targets = adapter.current_targets()
+  if len(targets) == 0 {
+    throw "published tail must observe current target versions before effects"
+  }
+  for target in targets {
+    if !is_v_semver(target.version) {
+      throw "unreadable current target: ${target.subject}"
+    }
+    if compare_release(target.version, request.tag) > 0 {
+      return {
+        state: "failed",
+        detail:
+          "published tail ${request.tag} is superseded at ${target.subject} by ${target.version}; refusing downgrade",
+        evidence: [
+          {
+            subject: target.subject,
+            kind: "current_target",
+            status: "broken",
+            expected: request.tag,
+            observed: target.version,
+            source: "consumer",
+            ref: "main",
+            identity: request.chain_id,
+            observed_at: now,
+          },
+        ],
+      }
+    }
+  }
+  return nil
+}
+
+fn preflight_checkpoint(
+  harness: Harness,
+  request: PublishedTailRequest,
+  receipt: ReleaseChainReceipt,
+  adapter: PublishedTailAdapter,
+) -> ReleaseChainReceipt {
+  if receipt.status != "active" {
+    return receipt
+  }
+  const initial_stop = stop_checkpoint(harness, request, receipt)
+  if initial_stop != nil {
+    return initial_stop
+  }
+  const superseded = superseded_target(request, adapter, harness.clock.date_iso())
+  if superseded != nil {
+    return record(harness, request, receipt, "prove", superseded, "target_superseded")
+  }
+  return receipt
+}
+
+/** Resume only published work; current workspace version is deliberately not an input. */
+pub fn run_published_release_tail(
+  harness: Harness,
+  request: PublishedTailRequest,
+  adapter: PublishedTailAdapter,
+) -> ReleaseChainReceipt {
+  let receipt = preflight_checkpoint(harness, request, load_chain(harness, request), adapter)
+  if receipt.status != "active" {
+    return receipt
+  }
+  // Re-prove immutable publication even when an earlier invocation passed it.
+  const published = adapter.publication(request)
+  receipt = record(harness, request, receipt, "prove", published, "assets_missing")
+  if !read_proven(published) {
+    return receipt
+  }
+  if !release_chain_has_proven(receipt, "baseline") {
+    const stopped = stop_checkpoint(harness, request, receipt)
+    if stopped != nil {
+      return stopped
+    }
+    receipt = proposal_stage(
+      harness,
+      request,
+      receipt,
+      "baseline",
+      "baseline_unproven",
+      adapter.baseline,
+    )
+  }
+  if receipt.status != "active" {
+    return receipt
+  }
+  if !release_chain_has_proven(receipt, "promote") {
+    const stopped = stop_checkpoint(harness, request, receipt)
+    if stopped != nil {
+      return stopped
+    }
+    receipt = proposal_stage(harness, request, receipt, "promote", "anchor_stale", adapter.promote)
+  }
+  if receipt.status != "active" || !release_chain_has_proven(receipt, "promote") {
+    return receipt
+  }
+  let dispatch: PublishedTailDispatch? = nil
+  const accepted = release_chain_latest_stage(receipt, "repin")
+  if accepted != nil && accepted.status == "proven" {
+    const evidence = accepted.evidence[0]
+    dispatch = {run_id: to_int(evidence.observed) ?? 0, run_url: evidence.identity}
+  } else {
+    const found = adapter.find_dispatch(request)
+    if len(found) > 1 {
+      throw "multiple fleet dispatches claim the same published release chain"
+    }
+    if len(found) == 1 {
+      dispatch = found[0]
+    } else if accepted == nil {
+      const stopped = stop_checkpoint(harness, request, receipt)
+      if stopped != nil {
+        return stopped
+      }
+      receipt = record(
+        harness,
+        request,
+        receipt,
+        "repin",
+        dispatch_read(request, nil, harness.clock.date_iso()),
+        "convergence_proof_missing",
+        true,
+      )
+      const stopped_after_intent = stop_checkpoint(harness, request, receipt)
+      if stopped_after_intent != nil {
+        return stopped_after_intent
+      }
+      dispatch = adapter.dispatch(request)
+    }
+    if dispatch == nil {
+      return receipt
+    }
+    if dispatch.run_id < 1 || trim(dispatch.run_url) == "" {
+      throw "fleet dispatch omitted exact accepted identity"
+    }
+    receipt = record(
+      harness,
+      request,
+      receipt,
+      "repin",
+      dispatch_read(request, dispatch, harness.clock.date_iso()),
+      "convergence_proof_missing",
+    )
+  }
+  if dispatch == nil || dispatch.run_id < 1 {
+    throw "published tail lost accepted fleet run identity"
+  }
+  if !release_chain_has_proven(receipt, "converge") {
+    const stopped = stop_checkpoint(harness, request, receipt)
+    if stopped != nil {
+      return stopped
+    }
+    receipt = record(
+      harness,
+      request,
+      receipt,
+      "converge",
+      adapter.converge(request, dispatch),
+      "consumer_pin_stale",
+    )
+  }
+  return receipt
+}
