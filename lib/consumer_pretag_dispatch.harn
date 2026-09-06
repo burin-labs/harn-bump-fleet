@@ -244,6 +244,7 @@ fn settle(
   target: ConsumerPretagGateTarget,
   row: ConsumerPretagRunRow,
   expected_run_id: int,
+  adapter: ConsumerPretagGateAdapter,
 ) -> ConsumerPretagGateReceipt? {
   if row.id != expected_run_id
     || trim(row.display_title) != "Harn candidate ${target.version} @ ${target.revision}" {
@@ -251,6 +252,9 @@ fn settle(
   }
   if row.head_sha != target.consumer_revision {
     return unreadable(target, "run ${row.id} does not name the captured consumer revision")
+  }
+  if target.proof_job != nil {
+    return settle_declared_job(target, row, adapter)
   }
   if row.status != "completed" {
     return nil
@@ -292,6 +296,106 @@ fn exact_jobs(
     }
   }
   return Ok(page.jobs)
+}
+
+fn settle_declared_job(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt? {
+  if adapter.jobs == nil {
+    return unreadable(target, "consumer proof adapter cannot inspect the declared workflow job")
+  }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const page = read_jobs(target, row.id)
+  if is_err(page) {
+    return nil
+  }
+  const exact = exact_jobs(unwrap(page), target, row.id)
+  if is_err(exact) {
+    return unreadable(target, to_string(unwrap_err(exact)))
+  }
+  const jobs = unwrap(exact)
+  const selector = target.proof_job ?? {name: "", step: ""}
+  const selected = jobs.filter({ job -> job.name == selector.name }).to_list()
+  if len(selected) == 0 {
+    return if row.status == "completed" {
+      unreadable(target, "completed run did not contain the declared candidate proof job")
+    } else {
+      nil
+    }
+  }
+  if len(selected) != 1 {
+    return unreadable(target, "run contained the declared candidate proof job more than once")
+  }
+  const job = selected[0]
+    ?? {
+      id: 0,
+      run_id: row.id,
+      name: "",
+      status: "",
+      conclusion: "",
+      head_sha: row.head_sha,
+      steps: [],
+    }
+  if job.status != "completed" {
+    return nil
+  }
+  const selected_steps = job.steps.filter({ step -> step.name == selector.step }).to_list()
+  if len(selected_steps) != 1 {
+    return unreadable(
+      target,
+      if len(selected_steps) == 0 {
+        "candidate proof job did not contain the declared proof step"
+      } else {
+        "candidate proof job contained the declared proof step more than once"
+      },
+    )
+  }
+  const step = selected_steps[0] ?? {name: "", status: "", conclusion: ""}
+  if step.status != "completed" {
+    return nil
+  }
+  const passed = job.conclusion == "success" && step.conclusion == "success"
+  const failed = [job.conclusion, step.conclusion].any(
+    { conclusion -> conclusion == "failure" || conclusion == "timed_out" },
+  )
+  const advisory = jobs.filter({ candidate -> candidate.id != job.id }).map(
+    { candidate ->
+      {
+        id: candidate.id,
+        name: candidate.name,
+        status: candidate.status,
+        conclusion: candidate.conclusion,
+      }
+    },
+  )
+    .to_list()
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: if passed {
+      "passed"
+    } else if failed {
+      "failed"
+    } else {
+      "unreadable"
+    },
+    run_url: row.html_url,
+    detail: if passed {
+      "declared candidate proof job and step passed"
+    } else if failed {
+      "declared candidate proof job or step failed"
+    } else {
+      "declared candidate proof job or step did not report a judging conclusion"
+    },
+    job_proof: {
+      run_id: row.id,
+      job: {id: job.id, name: job.name, step: selector.step},
+      advisory_jobs: advisory,
+    },
+  }
 }
 
 fn one_job(
@@ -489,7 +593,7 @@ fn resolve_explicit_run(
     const attestation = schema_expect(selection, ConsumerPretagFailureAttestation)
     attested_failure_receipt(target, row, attestation, adapter)
   } else {
-    settle(target, row, run_id)
+    settle(target, row, run_id, adapter)
   }
   return if receipt == nil {
     {receipts: [], pending: [{target: target, run_id: run_id}], unseen: []}
@@ -505,6 +609,7 @@ fn resolve_explicit_run(
 fn resolve_candidate_rows(
   target: ConsumerPretagGateTarget,
   rows: list<ConsumerPretagRunRow>,
+  adapter: ConsumerPretagGateAdapter,
   recorder: ConsumerPretagRunRecorder?,
   ambiguity_context: string,
 ) -> CandidateResolution {
@@ -547,7 +652,7 @@ fn resolve_candidate_rows(
       display_title: "",
       head_sha: "",
     }
-  const receipt = settle(target, row, row.id)
+  const receipt = settle(target, row, row.id, adapter)
   if receipt != nil {
     return {
       receipts: [receipt ?? unreadable(target, "candidate run produced no terminal receipt")],
@@ -650,6 +755,16 @@ fn unknown_explicit_run_receipts(
   return receipts
 }
 
+fn pending_gate_detail(gate: PendingGate) -> string {
+  if gate.run_id == 0 {
+    return "no run naming this candidate appeared before the gate deadline"
+  }
+  if gate.target.proof_job != nil {
+    return "run ${to_string(gate.run_id)} did not produce terminal declared-job proof before the gate deadline"
+  }
+  return "run ${to_string(gate.run_id)} was still running at the gate deadline"
+}
+
 /**
  * Resume or dispatch every consumer gate, then wait for all of them together.
  *
@@ -700,7 +815,7 @@ fn run_consumer_pretag_gates_validated(
         ]
       continue
     }
-    const resolved = resolve_candidate_rows(target, unwrap(before), recorder, "existing")
+    const resolved = resolve_candidate_rows(target, unwrap(before), adapter, recorder, "existing")
     receipts = receipts + resolved.receipts
     pending = pending + resolved.pending
     awaiting_dispatch = awaiting_dispatch + resolved.unseen
@@ -732,7 +847,13 @@ fn run_consumer_pretag_gates_validated(
         continue
       }
       const rows = unwrap(observed)
-      const resolved = resolve_candidate_rows(gate.target, rows, recorder, "recovery-visible")
+      const resolved = resolve_candidate_rows(
+        gate.target,
+        rows,
+        adapter,
+        recorder,
+        "recovery-visible",
+      )
       receipts = receipts + resolved.receipts
       pending = pending + resolved.pending
       still_unseen = still_unseen + resolved.unseen
@@ -763,7 +884,7 @@ fn run_consumer_pretag_gates_validated(
         still_pending = still_pending + [gate]
         continue
       }
-      const settled = settle(gate.target, unwrap(row), gate.run_id)
+      const settled = settle(gate.target, unwrap(row), gate.run_id, adapter)
       if settled == nil {
         still_pending = still_pending + [gate]
         continue
@@ -792,11 +913,7 @@ fn run_consumer_pretag_gates_validated(
           workflow: gate.target.workflow,
           status: "pending",
           run_url: "",
-          detail: if gate.run_id == 0 {
-            "no run naming this candidate appeared before the gate deadline"
-          } else {
-            "run ${to_string(gate.run_id)} was still running at the gate deadline"
-          },
+          detail: pending_gate_detail(gate),
         },
       ]
   }

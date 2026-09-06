@@ -126,6 +126,22 @@ runtime-bump commands as named fields. Private consumers instead own those
 details in `.harn/fleet-projections.toml`, so the public manifest carries no
 private path or command inventory.
 
+A consumer pre-tag contract may name the exact workflow job and step that
+prove the candidate:
+
+```toml
+[pretag]
+gate_workflow = "candidate-gate.yml"
+inputs = { target = "{version}", source_revision = "{revision}" }
+proof_job = { name = "Candidate product proof", step = "Exercise the candidate" }
+```
+
+When `proof_job` is present, that one job and step must complete successfully.
+The gate retains every sibling job's status and conclusion as advisory evidence,
+but a red or still-running sibling does not block the tag. Missing, duplicate,
+skipped, failed, or incomplete proof evidence still fails closed. Consumers
+that omit `proof_job` retain the stricter whole-workflow verdict.
+
 The same manifest owns each first-party connector's required secret ids and
 trust direction. `policy.connector_secret_schema` selects one generated
 `[providers.setup].required_secrets` shape for all connector repositories.
