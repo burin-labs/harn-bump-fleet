@@ -59,6 +59,26 @@ pub type FleetConvergenceRow = {
   workflow_run_url?: string,
 }
 
+/**
+ * Whether one completed bump run actually moved a ref to the target.
+ *
+ * Tri-state on purpose. A successful process that wrote nothing and a pin
+ * surface nobody could read are different facts, and collapsing the second
+ * into the first is how a transport failure would start terminating
+ * repositories. Only `no` is a proven no-op; `unknown` keeps the wait.
+ */
+pub type FleetTargetChangeState = "yes" | "no" | "unknown"
+
+/** Post-run pin evidence for one accepted run, read after the run concluded. */
+pub type FleetTargetChangeProbe = {
+  changed: FleetTargetChangeState,
+  target: string,
+  default_branch_pin: string?,
+  branch_pin: string?,
+  pin_path: string?,
+  evidence: string,
+}
+
 pub type FleetDispatchRunObservation = {
   repository: string,
   run_id: int,
@@ -68,6 +88,8 @@ pub type FleetDispatchRunObservation = {
   status: string,
   conclusion: string,
   detail: string,
+  /** Present only for a completed run whose exact pull request is missing. */
+  target_change?: FleetTargetChangeProbe,
 }
 
 pub fn convergence_snapshot_from_rows(
@@ -115,6 +137,88 @@ pub fn fleet_convergence_snapshot_with_continuation(
   )
 }
 
+fn pin_satisfies_target(probe: HarnPinProbe?, wanted: string) -> bool {
+  const pin = probe?.pin
+  if pin == nil {
+    return false
+  }
+  const decision = harn_pin_decision(pin, wanted)
+  return decision.ok && decision.satisfies_target
+}
+
+fn target_change_probe(
+  changed: FleetTargetChangeState,
+  wanted: string,
+  default_branch: HarnPinProbe,
+  branch: HarnPinProbe?,
+  evidence: string,
+) -> FleetTargetChangeProbe {
+  return {
+    changed: changed,
+    target: wanted,
+    default_branch_pin: default_branch.pin,
+    branch_pin: branch?.pin,
+    pin_path: default_branch.path,
+    evidence: evidence,
+  }
+}
+
+/**
+ * Decide whether one completed bump run left every ref on a stale pin.
+ *
+ * Both refs are asked, because a landed bump has two shapes: the default
+ * branch already carrying the target, or the bump branch carrying it while its
+ * pull request is still catching up. Only when neither ref reached the target,
+ * and the default branch pin was actually read, is the run a proven no-op.
+ *
+ * A default branch whose pin surface could not be read is `unknown`. A missing
+ * read is not a missing bump, and no repository may be terminated on one.
+ */
+pub fn bump_target_change_probe(
+  target: string,
+  default_branch: HarnPinProbe,
+  branch: HarnPinProbe? = nil,
+  branch_ref: string = "the bump branch",
+) -> FleetTargetChangeProbe {
+  const wanted = strip_v(target)
+  if pin_satisfies_target(default_branch, wanted) || pin_satisfies_target(branch, wanted) {
+    return target_change_probe(
+      "yes",
+      wanted,
+      default_branch,
+      branch,
+      "a ref reached ${wanted} after the run: " + default_branch.evidence,
+    )
+  }
+  if default_branch.pin == nil {
+    return target_change_probe(
+      "unknown",
+      wanted,
+      default_branch,
+      branch,
+      "the default branch pin surface could not be read after the run: "
+        + default_branch.evidence,
+    )
+  }
+  const branch_state = if branch == nil {
+    "${branch_ref} does not exist"
+  } else if branch.pin == nil {
+    "${branch_ref} exists but carries no readable pin: ${branch.evidence}"
+  } else {
+    "${branch_ref} still pins ${branch.pin}"
+  }
+  return target_change_probe(
+    "no",
+    wanted,
+    default_branch,
+    branch,
+    "the bump workflow completed successfully and wrote no target change: "
+      + "${default_branch.evidence} on the default branch, ${branch_state}, "
+      + "and ${wanted} was never written. Re-dispatch the owning bump workflow with the "
+      + "correct target projection, or name the mutation its adapter cannot make.",
+  )
+}
+
 /** Reclassify only a missing exact branch/PR through its accepted workflow run. */
 pub fn continue_fleet_convergence(
   snapshot: FleetConvergenceSnapshot,
@@ -147,6 +251,17 @@ pub fn continue_fleet_convergence(
           + {state: "waiting", reason: "accepted_bump_run_in_progress: " + observed.status}
       }
       if observed.conclusion == "success" {
+        const change = observed.target_change
+        if change != nil && change.changed == "no" {
+          return row
+            + lineage
+            + {
+              state: "failed",
+              reason: "run_success_no_target_change: " + change.evidence,
+              default_branch_pin: change.default_branch_pin ?? row.default_branch_pin,
+              branch_pin: change.branch_pin ?? row.branch_pin,
+            }
+        }
         return row
           + lineage
           + {state: "waiting", reason: "accepted_bump_run_completed_awaiting_exact_pr"}
@@ -240,6 +355,12 @@ pub fn dispatch_run_observations(
       continue
     }
     const observed = unwrap(run)
+    const conclusion = observed.conclusion ?? ""
+    const change = if observed.status == "completed" && conclusion == "success" {
+      post_run_target_change(harness, spec, target)
+    } else {
+      nil
+    }
     observations = observations
       + [
         {
@@ -249,12 +370,67 @@ pub fn dispatch_run_observations(
           contract_matches: true,
           probe_ok: true,
           status: observed.status,
-          conclusion: observed.conclusion ?? "",
-          detail: "exact accepted workflow run concluded ${observed.conclusion ?? "unknown"}",
+          conclusion: conclusion,
+          detail: "exact accepted workflow run concluded ${observed.conclusion ?? "unknown"}"
+            + if change == nil {
+              ""
+            } else {
+              "; " + change.evidence
+            },
+          target_change: change,
         },
       ]
   }
   return observations
+}
+
+/**
+ * Read both refs after the run concluded, so a no-op verdict rests on evidence
+ * the run itself could have produced rather than on a snapshot taken while the
+ * run was still writing.
+ */
+fn post_run_target_change(
+  harness: Harness,
+  spec: HarnUpdateSpec?,
+  target: string,
+) -> FleetTargetChangeProbe {
+  if spec == nil {
+    return {
+      changed: "unknown",
+      target: strip_v(target),
+      default_branch_pin: nil,
+      branch_pin: nil,
+      pin_path: nil,
+      evidence: "no resolved update contract to read a post-run pin through",
+    }
+  }
+  const probed = try {
+    const options = github_connector_options()
+    const default_probe = remote_pin_probe(harness, spec, spec.base_branch, options)
+    const branch = github_branch_head(harness, spec.repository, spec.branch, options)
+    const branch_head = if is_err(branch) {
+      nil
+    } else {
+      unwrap(branch)
+    }
+    const branch_probe = if branch_head == nil {
+      nil
+    } else {
+      remote_pin_probe(harness, spec, branch_head.oid, options)
+    }
+    bump_target_change_probe(target, default_probe, branch_probe, spec.branch)
+  }
+  if is_err(probed) {
+    return {
+      changed: "unknown",
+      target: strip_v(target),
+      default_branch_pin: nil,
+      branch_pin: nil,
+      pin_path: nil,
+      evidence: "post-run pin read failed: " + to_string(unwrap_err(probed)),
+    }
+  }
+  return unwrap(probed)
 }
 
 pub type FleetConvergenceSnapshot = {
