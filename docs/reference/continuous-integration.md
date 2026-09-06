@@ -18,6 +18,12 @@ published `harn-cli` version pinned by `.harn-version` through Harn's
 checksum-verifying setup action. `scripts/install_harn.sh` remains the local
 developer bootstrap.
 
+The unit job checks out full history and scans the pull-request title,
+description, and every commit subject and body before it runs the suite.
+Authenticated assistant-session links are refused by structure. The diagnostic
+names the commit and policy but omits the session identifier and any URL query
+values, so the refusal is safe to publish in a CI log.
+
 This repo also ships `.github/workflows/bump-harn.yml`, so future fleet runs
 can update `harn-bump-fleet` itself through the same
 `automation/bump-harn-runtime` PR flow as the connector repos. This repository
