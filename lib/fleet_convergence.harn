@@ -18,19 +18,25 @@ import {
   github_pr_checks,
   github_pr_list,
 } from "./github"
+import { github_commit_pull_requests, github_path_commits } from "./github_commits"
 import { HarnUpdateProofFacts, HarnUpdatePullRequestProof, harn_update_proof } from "./harn_update"
+import {
+  HarnPinHistoryEntry,
+  harn_update_lineage_commit,
+  harn_update_lineage_pull_request,
+} from "./harn_update_lineage"
 import { operator_pr_patrol } from "./operator_pr_patrol"
 import { GithubClientOptions } from "harn-github-connector/default"
 
 /**
- * Candidate merged PRs are selected by destination and state, not by the
- * fleet's preferred source branch. Another trusted workflow may land the same
- * exact target first; the proof below still requires its immutable head pin,
- * green checks, merge commit, and reachability from main.
+ * How far back the pin file's history is read on the default branch.
+ *
+ * This is a page size, not a policy. A repository that changed its pin surface
+ * more than this many times without ever leaving the target is reported as
+ * unresolved rather than proven, so a page that ends before the transition
+ * cannot be mistaken for the transition itself.
  */
-pub fn merged_update_pull_request_query(base_branch: string = "main") -> dict {
-  return {base: base_branch, state: "closed", limit: 20}
-}
+const PIN_HISTORY_PAGE: int = 100
 
 pub type FleetConvergenceRow = {
   repo: string,
@@ -274,22 +280,30 @@ pub fn pin_probe_at_ref(
   read_file: HarnRefFileReader,
 ) -> HarnPinProbe {
   if spec.pin.kind != "auto" {
-    const declared = read_file(spec.pin.path ?? "", ref)
+    const declared_path = spec.pin.path ?? ""
+    const declared = read_file(declared_path, ref)
     if declared == nil || trim(declared) == "" {
       return {
         pin: nil,
-        evidence: "declared ${spec.pin.kind} pin '${spec.pin.path ?? ""}' is missing at ${ref}",
+        evidence: "declared ${spec.pin.kind} pin '${declared_path}' is missing at ${ref}",
+        path: declared_path,
       }
     }
-    return harn_pin_text_probe(declared, spec.pin)
+    let probe = harn_pin_text_probe(declared, spec.pin)
+    probe.path = declared_path
+    return probe
   }
   const version = read_file(".harn-version", ref)
   if version != nil && trim(version) != "" {
-    return harn_pin_text_probe(version, {kind: "version_file", path: ".harn-version"})
+    let probe = harn_pin_text_probe(version, {kind: "version_file", path: ".harn-version"})
+    probe.path = ".harn-version"
+    return probe
   }
   const cargo = read_file("Cargo.toml", ref)
   if cargo != nil && trim(cargo) != "" {
-    return harn_pin_text_probe(cargo, {kind: "cargo", path: "Cargo.toml"})
+    let probe = harn_pin_text_probe(cargo, {kind: "cargo", path: "Cargo.toml"})
+    probe.path = "Cargo.toml"
+    return probe
   }
   return {pin: nil, evidence: "no .harn-version or Cargo.toml pin surface found at ${ref}"}
 }
@@ -325,6 +339,27 @@ pub fn remote_pin(
   return remote_pin_probe(harness, spec, ref, options).pin
 }
 
+/** Read the pin the default branch carried at one exact commit. */
+fn pin_at_commit(
+  harness: Harness,
+  spec: HarnUpdateSpec,
+  commit_sha: string,
+  options: GithubClientOptions,
+) -> string? {
+  return remote_pin(harness, spec, commit_sha, options)
+}
+
+/**
+ * Prove the update by the record that made it, not by whatever landed most
+ * recently.
+ *
+ * The lineage commit is found from the pin file's own history on the default
+ * branch, so it is identified by having set the pin to the target. Every
+ * predicate the earlier candidate loop applied still applies, on that one pull
+ * request: it must be merged, its checks must be green at the exact head those
+ * checks ran on, and its merge commit must be reachable from the default
+ * branch. What changed is only which pull request is asked.
+ */
 fn merged_update_proof(
   harness: Harness,
   spec: HarnUpdateSpec,
@@ -333,72 +368,113 @@ fn merged_update_proof(
   default_head_sha: string,
   options: GithubClientOptions,
 ) {
-  const listed = github_pr_list(
+  const pin_probe = remote_pin_probe(harness, spec, default_head_sha, options)
+  const pin_path = trim(pin_probe.path ?? "")
+  if pin_path == "" {
+    return {ok: false, reason: "pin_surface_unresolved_on_default_branch"}
+  }
+  const history = github_path_commits(
     harness,
     spec.repository,
-    merged_update_pull_request_query(spec.base_branch),
+    pin_path,
+    spec.base_branch,
+    PIN_HISTORY_PAGE,
     options,
   )
-  if is_err(listed) {
-    return {ok: false, reason: "merged_update_pull_request_probe_failed"}
+  if is_err(history) {
+    return {ok: false, reason: "pin_history_probe_failed"}
   }
-  for pr in unwrap(listed) {
-    if !(pr?.merged ?? false) || trim(pr?.merge_commit_oid ?? "") == "" {
+  const commits = unwrap(history)
+  let entries: list<HarnPinHistoryEntry> = []
+  for commit in commits {
+    const sha = trim(to_string(commit?.sha ?? ""))
+    if sha == "" {
       continue
     }
-    const head_pin = remote_pin(harness, spec, pr?.head?.sha ?? "", options)
-    if head_pin == nil {
-      continue
-    }
-    const head_decision = harn_pin_decision(head_pin, strip_v(target))
-    if !head_decision.ok || !head_decision.satisfies_target {
-      continue
-    }
-    const checks = github_pr_checks(harness, spec.repository, pr.number, pr.head.sha, options)
-    if is_err(checks) {
-      return {ok: false, reason: "merged_update_checks_probe_failed"}
-    }
-    const observed_checks = unwrap(checks)
-    const reachability = github_commit_reachable_from_branch(
-      harness,
-      spec.repository,
-      pr.merge_commit_oid ?? "",
-      default_head_sha,
-      options,
-    )
-    if is_err(reachability) {
-      return {ok: false, reason: "merged_update_reachability_probe_failed"}
-    }
-    const reachable: bool = if unwrap(reachability).reachable {
-      true
+    entries = entries + [{commit_sha: sha, pin: pin_at_commit(harness, spec, sha, options)}]
+  }
+  const lineage = harn_update_lineage_commit(
+    entries,
+    strip_v(target),
+    len(commits) < PIN_HISTORY_PAGE,
+  )
+  if !lineage.found {
+    return {ok: false, reason: lineage.reason}
+  }
+  const associated = github_commit_pull_requests(
+    harness,
+    spec.repository,
+    lineage.commit_sha,
+    options,
+  )
+  if is_err(associated) {
+    return {ok: false, reason: "lineage_pull_request_probe_failed"}
+  }
+  const selected = harn_update_lineage_pull_request(
+    unwrap(associated),
+    lineage.commit_sha,
+    spec.base_branch,
+  )
+  if !selected.found {
+    return {ok: false, reason: selected.reason}
+  }
+  const pulls = unwrap(associated)
+  const pr = pulls.find({ value -> (to_int(value?.number ?? 0) ?? 0) == selected.number })
+  if pr == nil {
+    return {ok: false, reason: "lineage_pull_request_record_unavailable"}
+  }
+  const head_sha = trim(to_string(pr?.head?.sha ?? ""))
+  if head_sha == "" {
+    return {ok: false, reason: "lineage_pull_request_head_unavailable"}
+  }
+  const head_pin = remote_pin(harness, spec, head_sha, options)
+  if head_pin == nil {
+    return {ok: false, reason: "lineage_pull_request_head_pin_unreadable"}
+  }
+  const checks = github_pr_checks(harness, spec.repository, selected.number, head_sha, options)
+  if is_err(checks) {
+    return {ok: false, reason: "merged_update_checks_probe_failed"}
+  }
+  const observed_checks = unwrap(checks)
+  const merge_commit_sha = to_string(pr?.merge_commit_sha ?? "")
+  const reachability = github_commit_reachable_from_branch(
+    harness,
+    spec.repository,
+    merge_commit_sha,
+    default_head_sha,
+    options,
+  )
+  if is_err(reachability) {
+    return {ok: false, reason: "merged_update_reachability_probe_failed"}
+  }
+  const reachable: bool = if unwrap(reachability).reachable {
+    true
+  } else {
+    false
+  }
+  const pull_request: HarnUpdatePullRequestProof = {
+    number: selected.number,
+    url: to_string(pr?.html_url ?? ""),
+    state: if trim(to_string(pr?.merged_at ?? "")) != "" {
+      "merged"
     } else {
-      false
-    }
-    const pull_request: HarnUpdatePullRequestProof = {
-      number: to_int(pr.number) ?? 0,
-      url: to_string(pr.url),
-      state: if pr.merged {
-        "merged"
-      } else {
-        to_string(pr.state)
-      },
-      head_sha: to_string(pr.head.sha),
-      head_pin: head_pin,
-      check_state: to_string(observed_checks?.rollup?.state ?? observed_checks?.state ?? "unknown"),
-      checks_head_sha: to_string(observed_checks.head_sha ?? ""),
-      merge_commit_sha: to_string(pr.merge_commit_oid ?? ""),
-      merge_reachable_from_default_branch: reachable,
-    }
-    const facts: HarnUpdateProofFacts = {
-      repository: spec.repository,
-      target: target,
-      default_branch_pin: main_pin ?? "",
-      default_branch_head_sha: default_head_sha,
-      pull_request: pull_request,
-    }
-    return harn_update_proof(facts)
+      to_string(pr?.state ?? "unknown")
+    },
+    head_sha: head_sha,
+    head_pin: head_pin,
+    check_state: to_string(observed_checks?.rollup?.state ?? observed_checks?.state ?? "unknown"),
+    checks_head_sha: to_string(observed_checks.head_sha ?? ""),
+    merge_commit_sha: merge_commit_sha,
+    merge_reachable_from_default_branch: reachable,
   }
-  return {ok: false, reason: "missing_update_pull_request_lineage"}
+  const facts: HarnUpdateProofFacts = {
+    repository: spec.repository,
+    target: target,
+    default_branch_pin: main_pin ?? "",
+    default_branch_head_sha: default_head_sha,
+    pull_request: pull_request,
+  }
+  return harn_update_proof(facts)
 }
 
 fn merged_convergence_row(
