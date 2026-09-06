@@ -187,12 +187,19 @@ pub type ConsumerPretagGateAdapter = {
 pub type ConsumerPretagRunRecorder = fn(string, int) -> nil
 
 pub type ConsumerPretagGatePolicy = {
+  dispatch_visibility_ms?: int,
+  initial_poll_interval_ms?: int,
   poll_interval_ms: int,
   deadline_ms: int,
   recovery_visibility_ms?: int,
 }
 
 pub const CONSUMER_PRETAG_GATE_POLICY: ConsumerPretagGatePolicy = {
+  dispatch_visibility_ms: 60000,
+  // GitHub's read-after-dispatch view normally settles within seconds. Start
+  // there, then back off to the ordinary fleet polling interval so visibility
+  // lag is cheap without making a long consumer run noisy.
+  initial_poll_interval_ms: 1000,
   poll_interval_ms: 30000,
   // A consumer may queue behind scarce self-hosted capacity before its own
   // workflow starts doing useful work. Keep this below the hosted release
@@ -201,7 +208,13 @@ pub const CONSUMER_PRETAG_GATE_POLICY: ConsumerPretagGatePolicy = {
   deadline_ms: 180 * 60 * 1000,
 }
 
-type PendingGate = {target: ConsumerPretagGateTarget, run_id: int, visibility_error?: string}
+type PendingGate = {
+  target: ConsumerPretagGateTarget,
+  run_id: int,
+  dispatched?: bool,
+  visibility_error?: string,
+  visibility_stop_ms?: int,
+}
 
 type CandidateResolution = {
   receipts: list<ConsumerPretagGateReceipt>,
@@ -915,6 +928,7 @@ fn dispatch_unseen_candidates(
   gates: list<PendingGate>,
   adapter: ConsumerPretagGateAdapter,
   recovery_visibility_ms: int,
+  dispatch_visibility_ms: int,
   recorder: ConsumerPretagRunRecorder?,
 ) -> CandidateResolution {
   let receipts: list<ConsumerPretagGateReceipt> = []
@@ -959,7 +973,15 @@ fn dispatch_unseen_candidates(
         ]
       continue
     }
-    pending = pending + [gate + {run_id: run_id}]
+    pending = pending
+      + [
+        gate
+          + {
+            run_id: run_id,
+            dispatched: true,
+            visibility_stop_ms: adapter.now_ms() + dispatch_visibility_ms,
+          },
+      ]
   }
   return {receipts: receipts, pending: pending, unseen: []}
 }
@@ -1004,10 +1026,64 @@ fn pending_gate_detail(gate: PendingGate) -> string {
   if gate.run_id == 0 {
     return "no run naming this candidate appeared before the gate deadline"
   }
+  if gate.visibility_error != nil {
+    return if gate.dispatched ?? false {
+      "run ${to_string(gate.run_id)} did not become readable as the exact dispatched candidate "
+        + "before the gate deadline: ${gate.visibility_error ?? "unknown visibility error"}"
+    } else {
+      "run ${to_string(gate.run_id)} could not be read before the gate deadline: "
+        + (gate.visibility_error ?? "unknown read error")
+    }
+  }
   if gate.target.proof_job != nil {
     return "run ${to_string(gate.run_id)} did not produce terminal declared-job proof before the gate deadline"
   }
   return "run ${to_string(gate.run_id)} was still running at the gate deadline"
+}
+
+/** Read every bound run once without turning read-after-dispatch lag into a verdict. */
+fn poll_pending_gates(
+  pending: list<PendingGate>,
+  adapter: ConsumerPretagGateAdapter,
+) -> CandidateResolution {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  let still_pending: list<PendingGate> = []
+  for gate in pending {
+    if gate.run_id == 0 {
+      still_pending = still_pending + [gate]
+      continue
+    }
+    const row = adapter.run(gate.target, gate.run_id)
+    if is_err(row) {
+      const detail = "exact run lookup failed: " + to_string(unwrap_err(row))
+      if (gate.dispatched ?? false)
+        && adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
+        receipts = receipts + [unreadable(gate.target, detail)]
+      } else {
+        still_pending = still_pending + [gate + {visibility_error: detail}]
+      }
+      continue
+    }
+    const observed = unwrap(row)
+    const expected_title = "Harn candidate ${gate.target.version} @ ${gate.target.revision}"
+    if (gate.dispatched ?? false)
+      && (observed.id != gate.run_id || trim(observed.display_title) != expected_title) {
+      const detail = "run lookup returned a different run or candidate identity"
+      if adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
+        receipts = receipts + [unreadable(gate.target, detail)]
+      } else {
+        still_pending = still_pending + [gate + {visibility_error: detail}]
+      }
+      continue
+    }
+    const settled = settle(gate.target, observed, gate.run_id, adapter)
+    if settled == nil {
+      still_pending = still_pending + [gate + {visibility_error: nil}]
+      continue
+    }
+    receipts = receipts + [settled ?? unreadable(gate.target, "unreachable")]
+  }
+  return {receipts: receipts, pending: still_pending, unseen: []}
 }
 
 /**
@@ -1110,6 +1186,7 @@ fn run_consumer_pretag_gates_validated(
       awaiting_dispatch,
       adapter,
       visibility_ms,
+      policy.dispatch_visibility_ms ?? policy.deadline_ms,
       recorder,
     )
     receipts = receipts + dispatched.receipts
@@ -1117,36 +1194,29 @@ fn run_consumer_pretag_gates_validated(
   } else {
     pending = pending + awaiting_dispatch
   }
+  let poll_interval_ms = policy.initial_poll_interval_ms ?? policy.poll_interval_ms
+  if poll_interval_ms <= 0 || poll_interval_ms > policy.poll_interval_ms {
+    poll_interval_ms = policy.poll_interval_ms
+  }
   while len(pending) > 0 && adapter.now_ms() < stop_at_ms {
-    let still_pending: list<PendingGate> = []
-    for gate in pending {
-      if gate.run_id == 0 {
-        still_pending = still_pending + [gate]
-        continue
-      }
-      const row = adapter.run(gate.target, gate.run_id)
-      if is_err(row) {
-        still_pending = still_pending + [gate]
-        continue
-      }
-      const settled = settle(gate.target, unwrap(row), gate.run_id, adapter)
-      if settled == nil {
-        still_pending = still_pending + [gate]
-        continue
-      }
-      receipts = receipts + [settled ?? unreadable(gate.target, "unreachable")]
-    }
-    pending = still_pending
+    const polled = poll_pending_gates(pending, adapter)
+    receipts = receipts + polled.receipts
+    pending = polled.pending
     if len(pending) > 0 {
       const remaining_ms = stop_at_ms - adapter.now_ms()
       if remaining_ms > 0 {
         adapter.wait(
-          if policy.poll_interval_ms < remaining_ms {
-            policy.poll_interval_ms
+          if poll_interval_ms < remaining_ms {
+            poll_interval_ms
           } else {
             remaining_ms
           },
         )
+        poll_interval_ms = if poll_interval_ms < policy.poll_interval_ms / 2 {
+          poll_interval_ms * 2
+        } else {
+          policy.poll_interval_ms
+        }
       }
     }
   }
@@ -1156,7 +1226,11 @@ fn run_consumer_pretag_gates_validated(
         {
           slug: gate.target.slug,
           workflow: gate.target.workflow,
-          status: "pending",
+          status: if (gate.dispatched ?? false) && gate.visibility_error != nil {
+            "unreadable"
+          } else {
+            "pending"
+          },
           run_url: "",
           detail: pending_gate_detail(gate),
         },
