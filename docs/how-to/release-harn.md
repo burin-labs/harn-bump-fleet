@@ -140,7 +140,13 @@ the same release run ID in its display name. The first incomplete round leases
 an exact-OID `harn-update-chain/<release-run-id>` branch; later rounds dispatch
 only from that immutable controller, and the terminal round releases it under
 the same lease. Installing the requested Harn release remains a separate,
-explicit startup step. Success means every repository proves the target pin on
+explicit startup step. A round that dies before it can run that release leaves
+the lease held; the scheduled `Reap held convergence chain leases` workflow runs
+`reap_chain_refs.harn` and clears only the leases whose every owning run reached
+a terminal conclusion more than an hour ago. A chain with a live run, an
+unreadable run list, or no resolvable run is reported and left held, and the
+receipt distinguishes reading zero leases from failing to read the remote.
+Success means every repository proves the target pin on
 `main` with green checks; an independently opened PR is accepted when its
 merged commit supplies that same immutable proof. The terminal artifact
 `hosted-release-and-update-cost-receipt.json` combines the release and every

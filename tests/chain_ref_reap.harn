@@ -1,0 +1,281 @@
+import {
+  ChainRefReapAdapter,
+  ChainRefRun,
+  chain_ref_identity,
+  classify_chain_ref,
+  run_chain_ref_reap_with_adapter,
+} from "../lib/chain_ref_reap"
+import { GithubRefRelease } from "harn-github-connector/default"
+
+const LEASE = "refs/heads/harn-update-chain/33659789177"
+
+const OID = "1111111111111111111111111111111111111111"
+
+const NOW = "2026-09-06T12:00:00Z"
+
+const LONG_AGO = "2026-09-05T12:00:00Z"
+
+fn now_s() -> int {
+  return to_int(date_parse(NOW)) ?? 0
+}
+
+fn finished(id: int) -> ChainRefRun {
+  return {id: id, status: "completed", conclusion: "failure", updated_at: LONG_AGO}
+}
+
+fn live(id: int) -> ChainRefRun {
+  return {id: id, status: "in_progress", conclusion: "", updated_at: NOW}
+}
+
+fn released(ref: string, oid: string) -> GithubRefRelease {
+  return {
+    repo: "burin-labs/harn-bump-fleet",
+    ref: ref,
+    oid: oid,
+    released: true,
+    reason: "released",
+  }
+}
+
+fn adapter(
+  refs: list<{ref: string, oid: string}>,
+  runs: fn(string) -> list<ChainRefRun>,
+  clear: fn(string, string) -> GithubRefRelease,
+) -> ChainRefReapAdapter {
+  return {refs: fn() { return refs }, runs: runs, clear: clear}
+}
+
+pipeline test_chain_ref_identity_accepts_only_the_canonical_lease(harness: Harness, task: any) {
+  assert_eq(chain_ref_identity(LEASE), "33659789177")
+  assert_eq(chain_ref_identity("refs/heads/harn-update-preflight/33659789177"), nil)
+  assert_eq(chain_ref_identity("refs/heads/release-attempt/v0.10.131/" + OID), nil)
+  assert_eq(chain_ref_identity("refs/heads/harn-update-chain/0"), nil)
+  assert_eq(chain_ref_identity("refs/heads/harn-update-chain/not-a-run"), nil)
+}
+
+/**
+ * A chain whose every round is terminal is the only thing the reaper clears.
+ *
+ * This is the positive control for the refusal test below: the two differ only
+ * in the status of one run, so a reaper that ignored status would pass both.
+ */
+pipeline test_a_terminal_chain_is_planned_and_then_cleared(harness: Harness, task: any) {
+  let deleted: list<string> = []
+  const reap = adapter(
+    [{ref: LEASE, oid: OID}],
+    fn(_chain) { return [finished(33659789177), finished(33659800000)] },
+    fn(ref, oid) {
+      deleted = deleted + [ref]
+      return released(ref, oid)
+    },
+  )
+  const planned = run_chain_ref_reap_with_adapter("dry_run", reap, now_s())
+  assert_eq(planned.state, "clean")
+  assert_eq(planned.inventory, "read")
+  assert_eq(planned.examined_count, 1)
+  assert_eq(planned.planned_count, 1)
+  assert_eq(planned.cleared_count, 0)
+  assert_eq(len(deleted), 0, "a dry run must not delete anything")
+  assert_eq(unwrap(planned.refs[0]).runs_examined, 2)
+  const applied = run_chain_ref_reap_with_adapter("apply", reap, now_s())
+  assert_eq(applied.cleared_count, 1)
+  assert_eq(applied.retained_count, 0)
+  assert_eq(deleted, [LEASE])
+}
+
+/**
+ * The negative control the issue names: a chain ref whose run is still running.
+ *
+ * The lease exists precisely so a live round can use it, so the reaper has to
+ * refuse and say which chain and how many runs held it back.
+ */
+pipeline test_a_live_run_stops_the_reaper(harness: Harness, task: any) {
+  let deleted: list<string> = []
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: LEASE, oid: OID}],
+      fn(_chain) { return [finished(33659789177), live(33659800000)] },
+      fn(ref, oid) {
+        deleted = deleted + [ref]
+        return released(ref, oid)
+      },
+    ),
+    now_s(),
+  )
+  assert_eq(len(deleted), 0, "the reaper must not delete a lease a live round can still use")
+  assert_eq(receipt.cleared_count, 0)
+  assert_eq(receipt.retained_count, 1)
+  assert_eq(receipt.examined_count, 1)
+  const row = unwrap(receipt.refs[0])
+  assert_eq(row.action, "retain")
+  assert_eq(row.reason_code, "owning_run_in_progress")
+  assert_eq(row.runs_examined, 2)
+  assert_eq(row.runs_unfinished, 1)
+  assert(contains(row.message, "33659789177"))
+}
+
+/**
+ * The measured-nothing control.
+ *
+ * Reading the remote and finding no lease is a clean fleet. Failing to read the
+ * remote is not, and the two must not produce the same receipt.
+ */
+pipeline test_reading_zero_refs_is_not_the_same_as_failing_to_read(harness: Harness, task: any) {
+  const measured_zero = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter([], fn(_chain) { return [] }, fn(ref, oid) { return released(ref, oid) }),
+    now_s(),
+  )
+  assert_eq(measured_zero.state, "clean")
+  assert_eq(measured_zero.inventory, "read")
+  assert_eq(measured_zero.examined_count, 0)
+  assert_eq(measured_zero.inventory_failure, nil)
+  const unreadable = run_chain_ref_reap_with_adapter(
+    "apply",
+    {
+      refs: fn() {
+        throw "ls-remote exited 128: could not read from remote repository"
+      },
+      runs: fn(_chain) { return [] },
+      clear: fn(ref, oid) { return released(ref, oid) },
+    },
+    now_s(),
+  )
+  assert_eq(unreadable.state, "blocked")
+  assert_eq(unreadable.inventory, "unreadable")
+  assert_eq(unreadable.examined_count, 0)
+  assert(contains(to_string(unreadable.inventory_failure ?? ""), "ls-remote exited 128"))
+  // The distinction is the whole point: the two receipts agree on every count
+  // and must still be told apart.
+  assert_eq(measured_zero.examined_count, unreadable.examined_count)
+  assert(measured_zero.inventory != unreadable.inventory)
+  assert(measured_zero.state != unreadable.state)
+}
+
+/** An unreadable run list is a broken instrument, never an idle chain. */
+pipeline test_an_unreadable_run_list_retains_the_lease(harness: Harness, task: any) {
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: LEASE, oid: OID}],
+      fn(_chain) {
+        throw "github.actions.runs failed: 502"
+      },
+      fn(ref, oid) { return released(ref, oid) },
+    ),
+    now_s(),
+  )
+  assert_eq(receipt.retained_count, 1)
+  assert_eq(receipt.cleared_count, 0)
+  const row = unwrap(receipt.refs[0])
+  assert_eq(row.reason_code, "owning_runs_unreadable")
+  assert(contains(row.message, "502"))
+}
+
+/** A chain with no resolvable run proves nothing, so the lease stays. */
+pipeline test_a_chain_with_no_resolvable_run_retains_the_lease(harness: Harness, task: any) {
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: LEASE, oid: OID}],
+      fn(_chain) { return [] },
+      fn(ref, oid) { return released(ref, oid) },
+    ),
+    now_s(),
+  )
+  assert_eq(receipt.retained_count, 1)
+  assert_eq(unwrap(receipt.refs[0]).reason_code, "owning_runs_unresolved")
+}
+
+/** A ref the reaper does not own is reported, not deleted. */
+pipeline test_an_unowned_ref_is_reported_and_left(harness: Harness, task: any) {
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: "refs/heads/harn-update-preflight/33659789177", oid: OID}],
+      fn(_chain) { return [finished(1)] },
+      fn(ref, oid) { return released(ref, oid) },
+    ),
+    now_s(),
+  )
+  assert_eq(receipt.examined_count, 1)
+  assert_eq(receipt.retained_count, 1)
+  assert_eq(unwrap(receipt.refs[0]).reason_code, "malformed_chain_ref")
+}
+
+/** A lease that moved between the inventory and the delete is not this reaper's. */
+pipeline test_a_moved_lease_is_retained(harness: Harness, task: any) {
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: LEASE, oid: OID}],
+      fn(_chain) { return [finished(33659789177)] },
+      fn(ref, oid) { return {
+        repo: "burin-labs/harn-bump-fleet",
+        ref: ref,
+        oid: oid,
+        released: false,
+        reason: "held_by_another",
+      } },
+    ),
+    now_s(),
+  )
+  assert_eq(receipt.cleared_count, 0)
+  assert_eq(unwrap(receipt.refs[0]).reason_code, "moved_ref")
+}
+
+/** A delete that fails blocks the receipt rather than reporting a clean sweep. */
+pipeline test_a_failed_delete_blocks_the_receipt(harness: Harness, task: any) {
+  const receipt = run_chain_ref_reap_with_adapter(
+    "apply",
+    adapter(
+      [{ref: LEASE, oid: OID}],
+      fn(_chain) { return [finished(33659789177)] },
+      fn(_ref, _oid) {
+        throw "403 Resource not accessible by integration"
+      },
+    ),
+    now_s(),
+  )
+  assert_eq(receipt.state, "blocked")
+  assert_eq(receipt.failed_count, 1)
+  assert_eq(receipt.cleared_count, 0)
+  assert_eq(unwrap(receipt.refs[0]).reason_code, "delete_failed")
+}
+
+/**
+ * A predecessor completes seconds before its successor run appears, so a chain
+ * whose every run is terminal but only just is still a live handoff.
+ */
+pipeline test_a_fresh_handoff_is_not_a_dead_chain(harness: Harness, task: any) {
+  const just_finished = classify_chain_ref(
+    {
+      ref: LEASE,
+      oid: OID,
+      runs: [{id: 1, status: "completed", conclusion: "failure", updated_at: NOW}],
+    },
+    now_s(),
+    3600,
+  )
+  assert_eq(just_finished.action, "retain")
+  assert_eq(just_finished.reason_code, "chain_recently_terminal")
+  const settled = classify_chain_ref({ref: LEASE, oid: OID, runs: [finished(1)]}, now_s(), 3600)
+  assert_eq(settled.action, "clear")
+  const timeless = classify_chain_ref(
+    {ref: LEASE, oid: OID, runs: [{id: 1, status: "completed", conclusion: "failure"}]},
+    now_s(),
+    3600,
+  )
+  assert_eq(timeless.action, "retain")
+  assert_eq(timeless.reason_code, "owning_run_time_unreadable")
+}
+
+/** The classifier is pure, so the two decisions can be compared side by side. */
+pipeline test_the_classifier_separates_live_from_terminal(harness: Harness, task: any) {
+  const terminal = classify_chain_ref({ref: LEASE, oid: OID, runs: [finished(1)]}, now_s(), 3600)
+  const running = classify_chain_ref({ref: LEASE, oid: OID, runs: [live(1)]}, now_s(), 3600)
+  assert_eq(terminal.action, "clear")
+  assert_eq(running.action, "retain")
+  assert_eq(terminal.chain_id, running.chain_id)
+}
