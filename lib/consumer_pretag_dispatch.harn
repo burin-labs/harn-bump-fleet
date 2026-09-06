@@ -167,6 +167,11 @@ pub type ConsumerPretagGateAdapter = {
   runs: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
   run: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagRunRow, dict>,
   jobs?: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagJobsPage, dict>,
+  // The consumer's own `main` push history for the declared workflow. It is
+  // what makes a consumer-side red attributable: a job already failing on the
+  // consumer's default branch is not a job this candidate broke. Without it
+  // the gate cannot derive an exclusion and every red fails the release.
+  main_runs?: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
   wait: fn(int) -> nil,
   now_ms: fn() -> int,
 }
@@ -216,6 +221,100 @@ pub fn consumer_pretag_gate_policy(pre_tag_resume: bool) -> ConsumerPretagGatePo
     }
 }
 
+/**
+ * What the harness concluded about a consumer-side red on its own, with no
+ * operator-typed JSON.
+ *
+ * `unbacked` names the failing jobs the consumer's own `main` does not already
+ * fail, which are the jobs this candidate is answerable for. `succeeded` is
+ * carried because an exclusion set that covers every job excludes the whole
+ * proof: a run where nothing passed proved nothing, however well its failures
+ * are explained.
+ */
+pub type ConsumerPretagDerivedExclusions = {
+  admissible: bool,
+  excluded: list<{id: int, name: string}>,
+  unbacked: list<string>,
+  succeeded: int,
+  reason: string,
+}
+
+/**
+ * Decide, from job censuses alone, whether every red in a consumer proof run
+ * is a red the candidate could not have caused.
+ *
+ * A failing job is attributable to the consumer's own default branch when a
+ * job of the same name completed as a failure on the baseline. Anything else
+ * is the candidate's. An empty baseline census is never an exclusion: it means
+ * the question was not answered, and a red with no baseline is the candidate's
+ * by default.
+ */
+pub fn derive_consumer_pretag_exclusions(
+  candidate_jobs: list<ConsumerPretagJobRow>,
+  baseline_jobs: list<ConsumerPretagJobRow>,
+) -> ConsumerPretagDerivedExclusions {
+  const failed = candidate_jobs.filter({ job -> job.conclusion != "success" }).to_list()
+  const succeeded = len(candidate_jobs.filter({ job -> job.conclusion == "success" }).to_list())
+  if len(failed) == 0 {
+    return {
+      admissible: false,
+      excluded: [],
+      unbacked: [],
+      succeeded: succeeded,
+      reason: "no failing job to attribute",
+    }
+  }
+  if len(baseline_jobs) == 0 {
+    return {
+      admissible: false,
+      excluded: [],
+      unbacked: failed.map({ job -> job.name }).to_list(),
+      succeeded: succeeded,
+      reason:
+        "consumer main baseline reported no jobs, so ${len(failed)} failing job(s) stay attributed to the candidate",
+    }
+  }
+  let excluded: list<{id: int, name: string}> = []
+  let unbacked: list<string> = []
+  for job in failed {
+    const backed = baseline_jobs.any(
+      { row -> row.name == job.name && row.status == "completed" && row.conclusion == "failure" },
+    )
+    if backed {
+      excluded = excluded + [{id: job.id, name: job.name}]
+    } else {
+      unbacked = unbacked + [job.name]
+    }
+  }
+  if len(unbacked) > 0 {
+    return {
+      admissible: false,
+      excluded: excluded,
+      unbacked: unbacked,
+      succeeded: succeeded,
+      reason: "${len(unbacked)} failing job(s) the consumer's main does not already fail: "
+        + join(unbacked, ", "),
+    }
+  }
+  if succeeded == 0 {
+    return {
+      admissible: false,
+      excluded: excluded,
+      unbacked: [],
+      succeeded: 0,
+      reason: "every job in the run failed, so excluding all of them would prove nothing",
+    }
+  }
+  return {
+    admissible: true,
+    excluded: excluded,
+    unbacked: [],
+    succeeded: succeeded,
+    reason: "${len(excluded)} failing job(s) already failing on the consumer's main; "
+      + "${succeeded} job(s) proved the candidate",
+  }
+}
+
 fn unreadable(target: ConsumerPretagGateTarget, detail: string) -> ConsumerPretagGateReceipt {
   return {
     slug: target.slug,
@@ -240,6 +339,128 @@ fn candidate_runs(
     .to_list()
 }
 
+/**
+ * The consumer's newest completed failing `main` push run of the declared
+ * workflow, with its jobs. This is the baseline a derived exclusion is
+ * measured against.
+ */
+fn consumer_main_baseline(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+) -> Result<{run: ConsumerPretagRunRow, jobs: list<ConsumerPretagJobRow>}, string> {
+  if adapter.main_runs == nil || adapter.jobs == nil {
+    return Err("adapter cannot read the consumer's main baseline")
+  }
+  const list_main = adapter.main_runs
+    ?? fn(_target) { return Err({message: "main run reader unavailable"}) }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const listed = list_main(target)
+  if is_err(listed) {
+    return Err("could not read the consumer's main history: " + to_string(unwrap_err(listed)))
+  }
+  const workflow_path = ".github/workflows/${target.workflow}"
+  const failing = unwrap(listed).filter(
+    { row ->
+      trim(row.workflow_path ?? "") == workflow_path
+        && trim(row.event ?? "") == "push"
+        && trim(row.head_branch ?? "") == "main"
+        && row.status == "completed"
+        && row.conclusion == "failure"
+        && len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 1
+    },
+  )
+    .to_list()
+  if len(failing) == 0 {
+    return Err("consumer main has no completed failing ${workflow_path} push to attribute against")
+  }
+  const baseline = failing[0]
+    ?? {id: 0, status: "", conclusion: "", html_url: "", display_title: "", head_sha: ""}
+  const baseline_target = target + {consumer_revision: baseline.head_sha}
+  const page = read_jobs(baseline_target, baseline.id)
+  if is_err(page) {
+    return Err("could not read consumer main baseline jobs: " + to_string(unwrap_err(page)))
+  }
+  const jobs = exact_jobs(unwrap(page), baseline_target, baseline.id)
+  if is_err(jobs) {
+    return Err(to_string(unwrap_err(jobs)))
+  }
+  return Ok({run: baseline, jobs: unwrap(jobs)})
+}
+
+/**
+ * Attribute a consumer-side red before it fails the release.
+ *
+ * A red on a job the candidate cannot reach is excluded here, structurally,
+ * from evidence the harness reads itself. The operator JSON form remains, as
+ * an override for cases this cannot decide — it is no longer the only way a
+ * pre-existing consumer breakage stops failing a tag.
+ *
+ * Returns nil whenever the failure stands, so every path that cannot prove an
+ * exclusion keeps the red.
+ */
+fn derived_failure_receipt(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt? {
+  if adapter.jobs == nil || adapter.main_runs == nil {
+    return nil
+  }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const candidate_page = read_jobs(target, row.id)
+  if is_err(candidate_page) {
+    return nil
+  }
+  const candidate_jobs = exact_jobs(unwrap(candidate_page), target, row.id)
+  if is_err(candidate_jobs) {
+    return nil
+  }
+  const jobs = unwrap(candidate_jobs)
+  if jobs.any({ job -> job.status != "completed" }) {
+    return nil
+  }
+  const baseline = consumer_main_baseline(target, adapter)
+  if is_err(baseline) {
+    return nil
+  }
+  const baseline_run = unwrap(baseline).run
+  const derived = derive_consumer_pretag_exclusions(jobs, unwrap(baseline).jobs)
+  if !derived.admissible {
+    return nil
+  }
+  const first_excluded = derived.excluded[0] ?? {id: 0, name: ""}
+  const baseline_job = unwrap(baseline).jobs.filter(
+    { job -> job.name == first_excluded.name && job.conclusion == "failure" },
+  )
+    .to_list()[0]
+    ?? {id: 0, name: first_excluded.name}
+  const proof_job = jobs.filter({ job -> job.conclusion == "success" }).to_list()[0]
+    ?? {id: 0, name: "", steps: []}
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: "passed",
+    run_url: row.html_url,
+    detail: "derived attestation: " + derived.reason,
+    attestation: {
+      candidate_run_id: row.id,
+      candidate_revision: target.revision,
+      consumer_revision: row.head_sha,
+      proof_job: {id: proof_job.id, name: proof_job.name, step: ""},
+      excluded_jobs: derived.excluded,
+      excluded_checks: derived.excluded.map({ job -> job.name }).to_list(),
+      baseline_run: {
+        id: baseline_run.id,
+        workflow_path: baseline_run.workflow_path ?? "",
+        head_sha: baseline_run.head_sha,
+      },
+      baseline_job: {id: baseline_job.id, name: baseline_job.name},
+    },
+  }
+}
+
 fn settle(
   target: ConsumerPretagGateTarget,
   row: ConsumerPretagRunRow,
@@ -260,6 +481,14 @@ fn settle(
     return nil
   }
   const passed = row.conclusion == "success"
+  // A red is attributed before it becomes a verdict. Only a failure can be
+  // attributed: `timed_out` never reported per-job conclusions to compare.
+  if !passed && row.conclusion == "failure" {
+    const derived = derived_failure_receipt(target, row, adapter)
+    if derived != nil {
+      return derived
+    }
+  }
   // `cancelled`, `stale` and `startup_failure` never judged the candidate, so
   // they are unreadable rather than a verdict either way.
   const settled = passed || row.conclusion == "failure" || row.conclusion == "timed_out"
