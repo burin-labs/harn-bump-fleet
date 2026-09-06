@@ -82,6 +82,26 @@ jobs:
           # that; the release job has carried this setting ever since.
           persist-credentials: false
 
+      # The chain lease is claimed by the predecessor round and released by this
+      # one, so its identity has to be resolvable before anything that can fail.
+      # It used to be read only from `update-plan`, which meant a round that died
+      # in or before that step skipped the release entirely and leaked the ref.
+      # The expression is the same one `run-name` and `concurrency` already use,
+      # so the three cannot disagree about which chain this round belongs to.
+      - name: Resolve the chain lease identity
+        id: chain-lease
+        env:
+          REQUESTED_CHAIN_ID: ${{ inputs.chain_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chain_id="${REQUESTED_CHAIN_ID:-$GITHUB_RUN_ID}"
+          if [[ ! "$chain_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "chain id must be a positive integer, got '$chain_id'" >&2
+            exit 1
+          fi
+          echo "chain_id=$chain_id" >> "$GITHUB_OUTPUT"
+
       - name: Resolve exact update target and bounded round
         id: update-plan
         env:
@@ -94,7 +114,7 @@ jobs:
           REQUESTED_ROUND: ${{ inputs.update_round || '1' }}
           REQUESTED_MAX_ROUNDS: ${{ inputs.max_rounds || '4' }}
           REQUESTED_REPAIR: ${{ inputs.enable_repair }}
-          REQUESTED_CHAIN_ID: ${{ inputs.chain_id }}
+          REQUESTED_CHAIN_ID: ${{ steps.chain-lease.outputs.chain_id }}
           REQUESTED_PREDECESSOR_RUN_ID: ${{ inputs.predecessor_run_id }}
           REQUESTED_PREDECESSOR_RUN_ATTEMPT: ${{ inputs.predecessor_run_attempt }}
         shell: bash
@@ -147,7 +167,7 @@ jobs:
             echo "round=$REQUESTED_ROUND"
             echo "max_rounds=$REQUESTED_MAX_ROUNDS"
             echo "repair_enabled=$repair"
-            echo "chain_id=${REQUESTED_CHAIN_ID:-$GITHUB_RUN_ID}"
+            echo "chain_id=$REQUESTED_CHAIN_ID"
             echo "controller_run_attempt=$GITHUB_RUN_ATTEMPT"
             echo "needs_predecessor=$needs_predecessor"
             echo "predecessor_round=$predecessor_round"
@@ -749,34 +769,41 @@ jobs:
       # be started around it. This runs last and always, including after the
       # proof gate above exits 1, and it refuses to act when it cannot prove a
       # successor was not dispatched.
+      #
+      # It is gated only on the chain identity, which the second step of the job
+      # resolves. Gating it on the update plan or on release readiness put the
+      # release behind the very failures it exists for: a round that dies in
+      # either place already holds the lease its predecessor claimed for it.
       - name: Mint chain lease release GitHub App token
         id: lease-token
-        if: >-
-          always() &&
-          steps.update-plan.outcome == 'success' &&
-          steps.require-release-ready.outcome == 'success'
+        if: always() && steps.chain-lease.outcome == 'success'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with: *fleet-app-token
 
       - name: Release the chain lease when this round ends without a successor
         if: >-
           always() &&
-          steps.update-plan.outcome == 'success' &&
+          steps.chain-lease.outcome == 'success' &&
           steps.lease-token.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.lease-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.lease-token.outputs.token }}
-          CHAIN_ID: ${{ steps.update-plan.outputs.chain_id }}
+          CHAIN_ID: ${{ steps.chain-lease.outputs.chain_id }}
           SCHEDULER_OUTCOME: ${{ steps.schedule-successor.outcome }}
         shell: bash
         run: |
           set -euo pipefail
-          # This step runs even when the round died before the runtime was
-          # installed. Say so and name the ref rather than failing on a missing
-          # binary, which would bury the real failure under a second one.
+          # A round that died before the runtime install still owns the lease, so
+          # bootstrap the pinned runtime here rather than warning and leaving the
+          # ref held. The pin is a release that exists by definition, and the
+          # release call reaches GitHub through the locked connector package.
           if ! command -v harn >/dev/null 2>&1; then
-            echo "::warning::the Harn runtime was never installed in this round, so refs/heads/harn-update-chain/${CHAIN_ID} could not be released and may still be held" >&2
-            exit 0
+            if scripts/install_harn.sh >&2 && .harn/bin/harn install --locked >&2; then
+              export PATH="$PWD/.harn/bin:$PATH"
+            else
+              echo "::error::the Harn runtime could not be bootstrapped, so refs/heads/harn-update-chain/${CHAIN_ID} is still held; reap_chain_refs.harn clears it once every run in this chain is terminal" >&2
+              exit 1
+            fi
           fi
           harn run --no-sandbox release_harn_update_chain.harn -- \
             --chain-id "$CHAIN_ID" \

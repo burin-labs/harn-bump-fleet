@@ -1,0 +1,1 @@
+The hosted fleet update releases its convergence chain lease on every round exit. The lease identity now resolves before the update plan, so a round that dies early no longer skips the release, and a round that never installed the runtime bootstraps the pinned one instead of warning and leaving the ref held.
