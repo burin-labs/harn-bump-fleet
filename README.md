@@ -924,8 +924,14 @@ Options:
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch
   event, and its own 40-character consumer source revision; current consumer
-  `main` is not substituted and no newest-run guess is made. A repository value
-  may instead be an attestation object with `run_id`, `proof_job_id`,
+  `main` is not substituted and no newest-run guess is made. This flag is an
+  override, not the ordinary path: a consumer proof run that fails only on jobs
+  the consumer's own `main` already fails is attributed and excluded by the
+  harness itself, with the derived attestation retained in the receipt. That
+  derivation needs a completed failing `main` push of the same workflow to
+  measure against, requires at least one candidate job to have succeeded, and
+  excludes nothing when the consumer's history cannot be read. A repository
+  value may instead be an attestation object with `run_id`, `proof_job_id`,
   `proof_step`, `excluded_job_ids`, `excluded_checks`, `baseline_run_id`,
   `baseline_job_id`, and `baseline_workflow_path`. That form accepts a failed
   candidate run only when the named proof job and step succeeded, every other
