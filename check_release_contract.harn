@@ -23,6 +23,8 @@
 //
 // Usage: harn run check_release_contract.harn -- --repo /path/to/target
 import { compare_release, parse_release, version_from_tag } from "std/semver"
+import { remote_url_to_slug } from "lib/git"
+import { github_latest_release_tag } from "lib/github"
 import {
   HarnReleaseContract,
   contract_development_release_target,
@@ -47,13 +49,18 @@ pub type ReleaseContractCheckPhase = {state: "evaluate", version: string} \
   | {state: "publication_pending", version: string} \
   | {state: "pending_contract_changed", version: string}
 
-pub type ReleaseContractCheckHarness = {fs: HarnessFs, println: fn(string) -> nil}
+pub type ReleaseContractCheckHarness = {
+  fs: HarnessFs,
+  println: fn(string) -> nil,
+  latest_published_release_tag: fn(string) -> string,
+}
 
 /**
  * Classify the one repository phase where release-cut checks are inapplicable.
  *
- * The stable bump reaches main before its tag is published. That exact shape
- * can be stranded, so this records publication as pending rather than proven.
+ * The stable bump reaches main before its GitHub Release is published. That
+ * exact shape can be stranded, so this records publication as pending rather
+ * than proven.
  * A contract change cannot borrow the base's transient state to evade the
  * semantic checks that are supposed to validate it.
  */
@@ -61,10 +68,10 @@ pub fn release_contract_check_phase(
   contract: HarnReleaseContract,
   workspace_version: string,
   changelog_version: string,
-  latest_tag: string,
+  latest_published_tag: string,
   contract_changed: bool,
 ) -> ReleaseContractCheckPhase {
-  const published = version_from_tag(trim(latest_tag))
+  const published = version_from_tag(trim(latest_published_tag))
   const parsed = parse_release(published)
   if parsed == nil || parsed.prerelease != nil {
     return {state: "evaluate", version: ""}
@@ -104,14 +111,14 @@ fn git_capture(process: HarnessProcess, repo: string, args: list<string>) -> str
   return result.stdout
 }
 
-/** Resolve the newest `vX.Y.Z` tag the target repo's origin advertises. */
-fn latest_origin_release_tag(process: HarnessProcess, repo: string) -> string {
+/** Resolve every stable `vX.Y.Z` tag the target repo's origin advertises. */
+fn origin_release_tags(process: HarnessProcess, repo: string) -> list<string> {
   const listed = git_capture(
     process,
     repo,
     ["ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"],
   )
-  let best = ""
+  let tags: list<string> = []
   for line in split(trim(listed), "\n") {
     const parts = split(trim(line), "refs/tags/")
     if len(parts) < 2 {
@@ -121,12 +128,22 @@ fn latest_origin_release_tag(process: HarnessProcess, repo: string) -> string {
     if len(regex_captures("^v[0-9]+[.][0-9]+[.][0-9]+$", tag)) == 0 {
       continue
     }
+    if !tags.contains(tag) {
+      tags = tags + [tag]
+    }
+  }
+  if len(tags) == 0 {
+    throw "no vX.Y.Z tags found on origin in ${repo}; cannot evaluate the release contract"
+  }
+  return tags
+}
+
+fn latest_origin_release_tag(tags: list<string>) -> string {
+  let best = ""
+  for tag in tags {
     if best == "" || compare_release(tag, best) > 0 {
       best = tag
     }
-  }
-  if best == "" {
-    throw "no vX.Y.Z tags found on origin in ${repo}; cannot evaluate the release contract"
   }
   return best
 }
@@ -151,7 +168,20 @@ pub fn run_release_contract_check(
   output.println("   base : origin/${base}")
   output.println("   contract : ${contract_ref}")
   // Gather the SAME evidence the live gate gathers, from the same places.
-  const latest_tag = latest_origin_release_tag(process, repo)
+  const origin_tags = origin_release_tags(process, repo)
+  const latest_tag = latest_origin_release_tag(origin_tags)
+  const latest_published_tag = output.latest_published_release_tag(repo)
+  const published_version = version_from_tag(trim(latest_published_tag))
+  const parsed_published = parse_release(published_version)
+  if parsed_published == nil || parsed_published.prerelease != nil {
+    throw "latest GitHub Release ${latest_published_tag} is not a stable vX.Y.Z release"
+  }
+  if !origin_tags.contains(trim(latest_published_tag)) {
+    throw "latest GitHub Release ${latest_published_tag} has no matching origin source tag; refusing incomplete release evidence"
+  }
+  if compare_release(latest_published_tag, latest_tag) > 0 {
+    throw "latest GitHub Release ${latest_published_tag} has no matching origin source tag; refusing incomplete release evidence"
+  }
   const cargo_toml = git_capture(process, repo, ["show", "origin/${base}:Cargo.toml"])
   const changelog = git_capture(process, repo, ["show", "origin/${base}:CHANGELOG.md"])
   const contract_text = git_capture(
@@ -170,14 +200,20 @@ pub fn run_release_contract_check(
   )
   const workspace_version = workspace_version_from_manifest(cargo_toml)
   const changelog_top = changelog_top_from_text(changelog)
-  output.println("   tag  : ${latest_tag}")
+  output.println("   tag  : ${latest_tag} (latest source)")
+  output.println("   release : ${latest_published_tag} (latest published)")
+  if compare_release(latest_tag, latest_published_tag) > 0 {
+    output.println(
+      "   phase : ${latest_tag} is an unpublished source tag; prior-release fold remains anchored at ${latest_published_tag}",
+    )
+  }
   output.println("   workspace : ${workspace_version}")
   output.println("   changelog : v${changelog_top}")
   const phase = release_contract_check_phase(
     contract,
     workspace_version,
     changelog_top,
-    latest_tag,
+    latest_published_tag,
     contract_text != base_contract_text,
   )
   if phase.state == "publication_pending" {
@@ -202,7 +238,7 @@ pub fn run_release_contract_check(
   //    when the target repo adopted post-release development versions.
   const evidence = prior_release_fold_base_evidence(
     "origin/${base}",
-    latest_tag,
+    latest_published_tag,
     cargo_toml,
     changelog,
     contract,
@@ -218,7 +254,7 @@ pub fn run_release_contract_check(
   //    understand throws here rather than at the cut.
   let next_version = ""
   try {
-    next_version = contract_next_release_version(contract, workspace_version, latest_tag)
+    next_version = contract_next_release_version(contract, workspace_version, latest_published_tag)
     output.println("   ✓ release target: ${workspace_version} -> ${next_version}")
   } catch (error) {
     output.println("   ✗ release target: ${error.message}")
@@ -229,17 +265,21 @@ pub fn run_release_contract_check(
   //    GitHub release by this name, so it must name a tag that EXISTS. A
   //    resolver that returns the raw workspace version names `X.Y.Z-dev`,
   //    which is never published.
-  const published = contract_last_published_release_version(contract, workspace_version, latest_tag)
+  const published = contract_last_published_release_version(
+    contract,
+    workspace_version,
+    latest_published_tag,
+  )
   const body_target = published
-  if published == version_from_tag(latest_tag) {
+  if published == version_from_tag(latest_published_tag) {
     output.println("   ✓ published release: ${published}")
   } else {
     output.println(
-      "   ✗ published release: resolved ${published}, expected ${version_from_tag(latest_tag)}",
+      "   ✗ published release: resolved ${published}, expected ${version_from_tag(latest_published_tag)}",
     )
     failures = failures
       + [
-        "published-release resolver returned ${published}, which is not the latest tag ${latest_tag}; the release-body gate would look up a release that does not exist",
+        "published-release resolver returned ${published}, which is not the latest GitHub Release ${latest_published_tag}; the release-body gate would look up a release that does not exist",
       ]
   }
   if body_target != published {
@@ -314,7 +354,18 @@ pub fn run_release_contract_check(
 pipeline main(harness: Harness) {
   return run_release_contract_check(
     harness.process,
-    {fs: harness.fs, println: fn(line) { return harness.stdio.println(line) }},
+    {
+      fs: harness.fs,
+      println: fn(line) { return harness.stdio.println(line) },
+      latest_published_release_tag: fn(repo) {
+        const remote = git_capture(harness.process, repo, ["remote", "get-url", "origin"])
+        const slug = remote_url_to_slug(trim(remote))
+        if slug == nil {
+          throw "origin in ${repo} is not a canonical GitHub remote"
+        }
+        return github_latest_release_tag(harness, unwrap(slug))
+      },
+    },
     argv,
   )
 }
