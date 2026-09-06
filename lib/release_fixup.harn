@@ -7,7 +7,7 @@ import {
 } from "./release_publication"
 import { RegistryVersionProbe } from "./release_readiness"
 import { ReleaseAnalysis } from "release_analysis"
-import { ReleaseConfig, ReleaseNotesScope, run_git } from "release_runtime"
+import { ReleaseConfig, ReleaseNotesScope, ReleaseRepoConfig, run_git } from "release_runtime"
 
 pub type ReleaseFixupState = {
   publication: ReleasePublication,
@@ -23,6 +23,7 @@ pub type ReleaseFixupState = {
   pre_tag_resume: bool,
   pre_tag_supersede?: bool,
   tooling_drift?: ReleaseCheckpointToolingDrift,
+  tooling_integrity?: ReleaseCheckpointToolingIntegrity,
   tagged_fixup_pr?: ReleasePullRequestIdentity?,
 }
 
@@ -277,24 +278,94 @@ pub fn release_checkpoint_supersede_advisory(drift: ReleaseCheckpointToolingDrif
 }
 
 /**
- * Refuse a resume the harness has already concluded cannot pass.
+ * Whether the tooling the resume will actually execute is byte-identical to
+ * the tooling this candidate was certified against.
  *
- * Printing the advisory and continuing costs a full gate run to reach the
- * failure the advisory predicted — 40 minutes on a hosted runner for run
- * 30824705839. Drift is only ever reported for a resumable checkpoint, so a
- * stale verdict here always means the run is about to re-execute the same
- * frozen gate that already failed.
- *
- * Both escapes are explicit pins, which is why this needs no new flag:
- * `--at-sha <newer>` routes to supersede, and `--at-sha <the checkpoint's own
- * pin>` makes `base` and the frozen tree agree so no drift is reported.
+ * `verified` names the paths proven identical, `tampered` the paths whose
+ * bytes moved between the frozen pin and the attempt the resume checks out,
+ * and `unproven` the paths neither side could be read for. `unproven` exists
+ * so an unreadable tree cannot be mistaken for a clean one: an empty read of
+ * both sides yields every declared path pending, never `intact`.
  */
-pub fn release_checkpoint_resume_block(drift: ReleaseCheckpointToolingDrift) -> string? {
-  const advisory = release_checkpoint_supersede_advisory(drift)
-  if advisory == nil {
+pub type ReleaseCheckpointToolingIntegrity = {
+  intact: bool,
+  pin: string,
+  attempt: string,
+  verified: list<string>,
+  tampered: list<string>,
+  unproven: list<string>,
+}
+
+/**
+ * Decide integrity from two blob censuses over `RELEASE_GATE_TOOLING_PATHS`.
+ *
+ * `frozen` maps a declared path to its blob OID at the certified pin;
+ * `attempt` maps the same path to its blob OID in the immutable attempt the
+ * resume will run. A path missing from either census is pending, not clean.
+ */
+pub fn release_checkpoint_tooling_integrity(
+  frozen: dict<string, string>,
+  attempt: dict<string, string>,
+  pin: string,
+  attempt_oid: string,
+) -> ReleaseCheckpointToolingIntegrity {
+  let verified: list<string> = []
+  let tampered: list<string> = []
+  let unproven: list<string> = []
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    const frozen_oid = lowercase(trim(to_string(frozen[path] ?? "")))
+    const attempt_blob = lowercase(trim(to_string(attempt[path] ?? "")))
+    if frozen_oid == "" || attempt_blob == "" {
+      unproven = unproven + [path]
+    } else if frozen_oid != attempt_blob {
+      tampered = tampered + [path]
+    } else {
+      verified = verified + [path]
+    }
+  }
+  return {
+    intact: len(tampered) == 0 && len(unproven) == 0,
+    pin: trim(pin),
+    attempt: trim(attempt_oid),
+    verified: verified,
+    tampered: tampered,
+    unproven: unproven,
+  }
+}
+
+/**
+ * Refuse a resume whose frozen gate tooling is not the tooling that was
+ * certified.
+ *
+ * This is the only tooling condition that refuses a tag. A change landing on
+ * `base` under one of these paths is reported by
+ * `release_checkpoint_supersede_advisory` and left to the operator: the
+ * checkpoint executes its own frozen copy, so what `base` now holds cannot
+ * change this run's outcome either way. Refusing on that comparison cost the
+ * v0.10.131 release its tag over a function rename and two log strings in
+ * `scripts/release_ship.sh` that the frozen gate never reaches.
+ *
+ * The refusal names the failing paths and the pending count, so an unreadable
+ * tree reads as unproven rather than as agreement.
+ */
+pub fn release_checkpoint_resume_block(integrity: ReleaseCheckpointToolingIntegrity) -> string? {
+  if integrity.intact {
     return nil
   }
-  return "refusing to resume a pre-tag checkpoint with stale gate tooling: " + advisory
+  let reasons: list<string> = []
+  if len(integrity.tampered) > 0 {
+    reasons = reasons
+      + ["${len(integrity.tampered)} changed since the pin (${join(integrity.tampered, ", ")})"]
+  }
+  if len(integrity.unproven) > 0 {
+    reasons = reasons
+      + ["${len(integrity.unproven)} unreadable (${join(integrity.unproven, ", ")})"]
+  }
+  return "refusing to resume a pre-tag checkpoint whose frozen gate tooling is not the certified tooling: "
+    + join(reasons, "; ")
+    + "; verified ${len(integrity.verified)} of ${len(RELEASE_GATE_TOOLING_PATHS)} declared paths"
+    + " between pin ${integrity.pin} and attempt ${integrity.attempt}"
+    + "; the attempt ref is preserved — cut fresh with abandon_release_attempts.harn rather than resuming tooling nobody certified"
 }
 
 /**
@@ -322,6 +393,54 @@ pub fn recovered_checkpoint_tooling_drift(
   return release_checkpoint_tooling_drift(
     split(trim(changed.stdout ?? ""), "\n"),
     trim(base_head.stdout ?? ""),
+  )
+}
+
+fn gate_tooling_blob_census(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseRepoConfig,
+  commit: string,
+) -> dict<string, string> {
+  let census: dict<string, string> = {}
+  if trim(commit) == "" {
+    return census
+  }
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    const shown = run_git(harness, cfg, ["rev-parse", "${trim(commit)}:${path}"])
+    if shown.success {
+      const oid = lowercase(trim(shown.stdout ?? ""))
+      if len(regex_captures("^[0-9a-f]{40}$", oid)) == 1 {
+        census[path] = oid
+      }
+    }
+  }
+  return census
+}
+
+/**
+ * Prove the resume will execute the tooling this candidate was certified with.
+ *
+ * The frozen side is the recovered pin; the executed side is the immutable
+ * attempt the resume checks out. Both are read as git blob OIDs, so the answer
+ * does not depend on a working tree that may not be checked out yet. A
+ * non-resumable checkpoint reports every path unproven rather than intact,
+ * because nothing was measured.
+ */
+pub fn recovered_checkpoint_tooling_integrity(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseRepoConfig,
+  original_pin: string,
+  attempt_oid: string,
+  resumable: bool,
+) -> ReleaseCheckpointToolingIntegrity {
+  if !resumable {
+    return release_checkpoint_tooling_integrity({}, {}, original_pin, attempt_oid)
+  }
+  return release_checkpoint_tooling_integrity(
+    gate_tooling_blob_census(harness, cfg, original_pin),
+    gate_tooling_blob_census(harness, cfg, attempt_oid),
+    original_pin,
+    attempt_oid,
   )
 }
 
