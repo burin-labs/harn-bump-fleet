@@ -118,6 +118,18 @@ scripts/dispatch_hosted_release.sh --bump patch --mode ship-pr \
   --at-sha <40-character-origin-main-sha> --expect-pr <number>
 ```
 
+To reuse one earlier candidate archive during recovery, provide the archive run
+and the hosted release run whose `release-run-<id>` artifact contains its
+certification receipt. The launcher requires both IDs and refuses before
+dispatch when either is missing.
+
+```sh
+scripts/dispatch_hosted_release.sh --bump patch --mode ship-pr \
+  --at-sha <40-character-origin-main-sha> \
+  --candidate-archive-run-id <archive-run-id> \
+  --candidate-archive-receipt-run-id <hosted-release-run-id>
+```
+
 If a queued or environment-waiting run must be replaced, replay its receipt.
 The replacement command does not accept release input flags: it dispatches the
 recorded tuple, rechecks the old run, and records both run IDs. If the old run
