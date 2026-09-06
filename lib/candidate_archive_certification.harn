@@ -1,0 +1,510 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import {
+  CandidateArchiveReceipt,
+  candidate_archive_receipt_path,
+  candidate_archive_receipt_read,
+} from "./candidate_archive_receipt"
+import { recorded_step, release_tag_verify_git_args } from "./release_execution"
+import { ReleasePublication } from "./release_publication"
+import {
+  release_git_remote_refs,
+  release_repo_slug,
+  release_run_root,
+  run_git,
+} from "./release_runtime"
+
+pub type CandidateArchiveCertificationRecord = {
+  schema_version: "release_harn.candidate_archive_certification.v1",
+  receipt: CandidateArchiveReceipt,
+}
+
+pub type CandidateArchiveCertificationErrorCode = "missing" \
+  | "conflict" \
+  | "invalid" \
+  | "unsigned" \
+  | "git"
+
+pub type CandidateArchiveCertificationError = {
+  code: CandidateArchiveCertificationErrorCode,
+  message: string,
+}
+
+pub type CandidateArchiveCertificationBindingResult = {
+  success: bool,
+  action: "created" | "reused" | "failed",
+  remote_ref: string,
+  tag_object_oid: string,
+  receipt: CandidateArchiveReceipt?,
+  reason: string,
+}
+
+const CERTIFICATION_MESSAGE_PREFIX = "Harn-Candidate-Archive-Certification: "
+
+fn valid_oid(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", lowercase(trim(value)))) == 1
+}
+
+fn certification_error(
+  code: CandidateArchiveCertificationErrorCode,
+  message: string,
+) -> CandidateArchiveCertificationError {
+  return {code: code, message: message}
+}
+
+/** One immutable remote name owns the certified archive for one candidate. */
+pub fn candidate_archive_certification_ref(source_sha: string) -> string {
+  const source = lowercase(trim(source_sha))
+  if !valid_oid(source) {
+    throw "candidate archive certification ref requires a full Git commit"
+  }
+  return "refs/tags/harn-candidate-archive-certification/${source}"
+}
+
+fn receipt_validation_error(receipt: CandidateArchiveReceipt) -> string {
+  if trim(receipt.slug) == "" || trim(receipt.workflow) == "" {
+    return "candidate archive receipt must name its repository and workflow"
+  }
+  if trim(receipt.event) == "" || trim(receipt.policy_ref) == "" {
+    return "candidate archive receipt must name its event and policy ref"
+  }
+  if !valid_oid(receipt.expected_policy_sha) || !valid_oid(receipt.observed_head_sha) {
+    return "candidate archive receipt policy identities must be full Git commits"
+  }
+  if trim(receipt.source_ref) == "" || !valid_oid(receipt.expected_source_sha) {
+    return "candidate archive receipt must name an immutable source ref and commit"
+  }
+  if receipt.run_id <= 0 || trim(receipt.run_url) == "" {
+    return "candidate archive receipt must name its exact workflow run"
+  }
+  if receipt.observed_event != receipt.event || receipt.observed_head_branch != receipt.policy_ref {
+    return "candidate archive receipt's observed workflow identity disagrees with its request"
+  }
+  return ""
+}
+
+pub fn candidate_archive_certification_record(
+  receipt: CandidateArchiveReceipt,
+) -> CandidateArchiveCertificationRecord {
+  const error = receipt_validation_error(receipt)
+  if error != "" {
+    throw error
+  }
+  return {schema_version: "release_harn.candidate_archive_certification.v1", receipt: receipt}
+}
+
+/** The signed tag message carries the existing operator-compatible receipt unchanged. */
+pub fn candidate_archive_certification_message(receipt: CandidateArchiveReceipt) -> string {
+  return "Harn candidate archive certification\n\n"
+    + CERTIFICATION_MESSAGE_PREFIX
+    + json_stringify(candidate_archive_certification_record(receipt))
+}
+
+/** Decode the single closed record from a signed annotated tag object. */
+pub fn candidate_archive_certification_record_from_tag(
+  contents: string,
+) -> Result<CandidateArchiveCertificationRecord, CandidateArchiveCertificationError> {
+  let payloads: list<string> = []
+  for line in contents.split("\n") {
+    if starts_with(line, CERTIFICATION_MESSAGE_PREFIX) {
+      payloads = payloads + [substring(line, len(CERTIFICATION_MESSAGE_PREFIX), len(line))]
+    }
+  }
+  if len(payloads) != 1 {
+    return Err(
+      certification_error(
+        "invalid",
+        "signed candidate archive certification must contain exactly one closed record; found ${len(payloads)}",
+      ),
+    )
+  }
+  const parsed = try {
+    schema_expect(json_parse(payloads[0]), schema_of(CandidateArchiveCertificationRecord))
+  } catch (error) {
+    return Err(
+      certification_error(
+        "invalid",
+        "signed candidate archive certification is not a valid v1 record: ${to_string(error)}",
+      ),
+    )
+  }
+  const invalid = receipt_validation_error(parsed.receipt)
+  if invalid != "" {
+    return Err(certification_error("invalid", invalid))
+  }
+  return Ok(parsed)
+}
+
+fn archive_digest_identity(digests: dict?) -> list<{name: string, digest: string}> {
+  let identity: list<{name: string, digest: string}> = []
+  const values = digests ?? {}
+  for name in values.keys().sort() {
+    identity = identity + [{name: name, digest: to_string(values[name] ?? "")}]
+  }
+  return identity
+}
+
+/** Compare every field before treating a write-once producer retry as idempotent. */
+fn candidate_archive_certification_matches(
+  left: CandidateArchiveReceipt,
+  right: CandidateArchiveReceipt,
+) -> bool {
+  return left.slug == right.slug
+    && left.workflow == right.workflow
+    && left.event == right.event
+    && left.policy_ref == right.policy_ref
+    && lowercase(left.expected_policy_sha)
+      == lowercase(right.expected_policy_sha)
+    && left.source_ref == right.source_ref
+    && lowercase(left.expected_source_sha)
+      == lowercase(right.expected_source_sha)
+    && left.run_id == right.run_id
+    && left.run_url == right.run_url
+    && left.observed_event == right.observed_event
+    && left.observed_head_branch == right.observed_head_branch
+    && lowercase(left.observed_head_sha)
+      == lowercase(right.observed_head_sha)
+    && left.archive_digests == nil == (right.archive_digests == nil)
+    && archive_digest_identity(left.archive_digests)
+      == archive_digest_identity(right.archive_digests)
+    && left.created_at == right.created_at
+}
+
+fn binding_failure(
+  remote_ref: string,
+  reason: string,
+  tag_object_oid: string = "",
+) -> CandidateArchiveCertificationBindingResult {
+  return {
+    success: false,
+    action: "failed",
+    remote_ref: remote_ref,
+    tag_object_oid: tag_object_oid,
+    receipt: nil,
+    reason: reason,
+  }
+}
+
+fn read_remote_binding(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  remote_ref: string,
+  expected_source_sha: string,
+) -> Result<
+  {receipt: CandidateArchiveReceipt, tag_object_oid: string},
+  CandidateArchiveCertificationError
+> {
+  const observed = release_git_remote_refs(harness.process, cfg, [remote_ref])
+  if !observed.success {
+    return Err(
+      certification_error(
+        "git",
+        "could not read signed candidate archive certification ref: ${trim(observed.stderr)}",
+      ),
+    )
+  }
+  if len(observed.refs) == 0 {
+    return Err(certification_error("missing", "signed candidate archive certification is absent"))
+  }
+  const remote_row = observed.refs[0] ?? {oid: "", ref: "", name: "", peeled: false}
+  if len(observed.refs) != 1 || remote_row.name != remote_ref {
+    return Err(
+      certification_error(
+        "conflict",
+        "candidate archive certification ref lookup returned ${len(observed.refs)} records",
+      ),
+    )
+  }
+  const remote_oid = lowercase(trim(remote_row.oid))
+  if !valid_oid(remote_oid) {
+    return Err(
+      certification_error("invalid", "candidate archive certification ref is not a Git object"),
+    )
+  }
+  const fetched = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["fetch", "--quiet", "origin", remote_ref],
+  )
+  if !fetched.success {
+    return Err(
+      certification_error(
+        "git",
+        "could not fetch signed candidate archive certification: ${trim(fetched.stderr ?? "")}",
+      ),
+    )
+  }
+  const fetched_oid = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["rev-parse", "FETCH_HEAD"],
+  )
+  if !fetched_oid.success || lowercase(trim(fetched_oid.stdout ?? "")) != remote_oid {
+    return Err(
+      certification_error("conflict", "fetched certification object differs from remote read-back"),
+    )
+  }
+  const verified = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    release_tag_verify_git_args(remote_oid),
+  )
+  if !verified.success {
+    return Err(
+      certification_error(
+        "unsigned",
+        "candidate archive certification signature does not verify against Harn's release trust root",
+      ),
+    )
+  }
+  const target = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["rev-parse", "${remote_oid}^{commit}"],
+  )
+  if !target.success
+    || lowercase(trim(target.stdout ?? ""))
+      != lowercase(trim(expected_source_sha)) {
+    return Err(
+      certification_error(
+        "conflict",
+        "signed candidate archive certification targets a different source commit",
+      ),
+    )
+  }
+  const contents = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["cat-file", "tag", remote_oid],
+  )
+  if !contents.success {
+    return Err(
+      certification_error("invalid", "candidate archive certification is not an annotated tag"),
+    )
+  }
+  const parsed = candidate_archive_certification_record_from_tag(contents.stdout ?? "")
+  if is_err(parsed) {
+    return Err(unwrap_err(parsed))
+  }
+  if lowercase(unwrap(parsed).receipt.expected_source_sha)
+    != lowercase(trim(expected_source_sha)) {
+    return Err(
+      certification_error(
+        "conflict",
+        "signed candidate archive certification payload binds a different source commit",
+      ),
+    )
+  }
+  return Ok({receipt: unwrap(parsed).receipt, tag_object_oid: remote_oid})
+}
+
+/** Read and authenticate the write-once remote record. */
+pub fn candidate_archive_certification_read_remote(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_sha: string,
+) -> Result<CandidateArchiveReceipt, CandidateArchiveCertificationError> {
+  const remote_ref = candidate_archive_certification_ref(source_sha)
+  const record = read_remote_binding(harness, cfg, remote_ref, source_sha)
+  if is_err(record) {
+    return Err(unwrap_err(record))
+  }
+  return Ok(unwrap(record).receipt)
+}
+
+/** Create the signed write-once binding, or prove an identical binding already exists. */
+pub fn candidate_archive_certification_ensure(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  receipt: CandidateArchiveReceipt,
+) -> CandidateArchiveCertificationBindingResult {
+  const invalid = receipt_validation_error(receipt)
+  const remote_ref = if valid_oid(receipt.expected_source_sha) {
+    candidate_archive_certification_ref(receipt.expected_source_sha)
+  } else {
+    ""
+  }
+  if invalid != "" {
+    return binding_failure(remote_ref, invalid)
+  }
+  if cfg.mock {
+    return {
+      success: true,
+      action: "created",
+      remote_ref: remote_ref,
+      tag_object_oid: "cccccccccccccccccccccccccccccccccccccccc",
+      receipt: receipt,
+      reason: "mock signed candidate archive certification created",
+    }
+  }
+  const existing = read_remote_binding(
+    {env: harness.env, process: harness.process},
+    cfg,
+    remote_ref,
+    receipt.expected_source_sha,
+  )
+  if is_ok(existing) {
+    if !candidate_archive_certification_matches(unwrap(existing).receipt, receipt) {
+      return binding_failure(
+        remote_ref,
+        "signed candidate archive certification disagrees with the requested binding",
+        unwrap(existing).tag_object_oid,
+      )
+    }
+    return {
+      success: true,
+      action: "reused",
+      remote_ref: remote_ref,
+      tag_object_oid: unwrap(existing).tag_object_oid,
+      receipt: unwrap(existing).receipt,
+      reason: "remote signed candidate archive certification already binds run ${receipt.run_id}",
+    }
+  }
+  if unwrap_err(existing).code != "missing" {
+    return binding_failure(remote_ref, unwrap_err(existing).message)
+  }
+  const local_tag = "harn-candidate-archive-certification/${receipt.expected_source_sha}"
+  let created_oid = ""
+  try {
+    // This module owns the namespaced local tag. A killed prior attempt may
+    // leave it behind, but the remote write-once ref remains the authority.
+    let _ = run_git({env: harness.env, process: harness.process}, cfg, ["tag", "-d", local_tag])
+    const created = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      [
+        "tag",
+        "-s",
+        local_tag,
+        "-m",
+        candidate_archive_certification_message(receipt),
+        receipt.expected_source_sha,
+      ],
+    )
+    if !created.success {
+      return binding_failure(
+        remote_ref,
+        "could not create signed candidate archive certification: ${trim(created.stderr ?? "")}",
+      )
+    }
+    const resolved = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["rev-parse", "refs/tags/${local_tag}"],
+    )
+    created_oid = lowercase(trim(resolved.stdout ?? ""))
+    if !resolved.success || !valid_oid(created_oid) {
+      return binding_failure(
+        remote_ref,
+        "could not resolve signed candidate archive certification object",
+      )
+    }
+    const verified = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      release_tag_verify_git_args(created_oid),
+    )
+    if !verified.success {
+      return binding_failure(
+        remote_ref,
+        "new candidate archive certification signature does not verify against Harn's release trust root",
+        created_oid,
+      )
+    }
+    let _ = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["push", "origin", "${created_oid}:${remote_ref}"],
+    )
+    const read_back = read_remote_binding(
+      {env: harness.env, process: harness.process},
+      cfg,
+      remote_ref,
+      receipt.expected_source_sha,
+    )
+    if is_err(read_back) {
+      return binding_failure(
+        remote_ref,
+        "candidate archive certification push was not durably readable: ${unwrap_err(read_back).message}",
+        created_oid,
+      )
+    }
+    if !candidate_archive_certification_matches(unwrap(read_back).receipt, receipt) {
+      return binding_failure(
+        remote_ref,
+        "remote signed candidate archive certification disagrees with the requested binding",
+        created_oid,
+      )
+    }
+    const remote_oid = unwrap(read_back).tag_object_oid
+    const created_here = remote_oid == created_oid
+    return {
+      success: true,
+      action: if created_here {
+        "created"
+      } else {
+        "reused"
+      },
+      remote_ref: remote_ref,
+      tag_object_oid: remote_oid,
+      receipt: unwrap(read_back).receipt,
+      reason: if created_here {
+        "created signed candidate archive certification for run ${receipt.run_id}"
+      } else {
+        "concurrent signed candidate archive certification already binds run ${receipt.run_id}"
+      },
+    }
+  } finally {
+    let _ = run_git({env: harness.env, process: harness.process}, cfg, ["tag", "-d", local_tag])
+  }
+  return binding_failure(remote_ref, "candidate archive certification did not reach a verdict")
+}
+
+/** Bind the receipt produced by the successful certification join. */
+pub fn bind_certified_candidate_archive(
+  harness: Harness,
+  cfg: dict,
+  publication: ReleasePublication,
+) -> CandidateArchiveCertificationBindingResult {
+  const path = candidate_archive_receipt_path(release_run_root(harness.fs), publication.head_oid)
+  const receipt = candidate_archive_receipt_read(harness.fs, path)
+  const remote_ref = candidate_archive_certification_ref(publication.head_oid)
+  if receipt == nil {
+    return binding_failure(
+      remote_ref,
+      "successful candidate certification produced no readable archive receipt at ${path}",
+    )
+  }
+  const slug = if cfg.mock {
+    "burin-labs/harn"
+  } else {
+    release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  }
+  if slug == "" || receipt.slug != slug
+    || lowercase(receipt.expected_source_sha)
+      != lowercase(publication.head_oid)
+    || receipt.source_ref != publication.remote_ref {
+    return binding_failure(
+      remote_ref,
+      "candidate archive receipt does not bind the certified publication identity",
+    )
+  }
+  return candidate_archive_certification_ensure(
+    {env: harness.env, process: harness.process},
+    cfg,
+    receipt,
+  )
+}
+
+pub fn candidate_archive_certification_step(
+  result: CandidateArchiveCertificationBindingResult,
+) -> dict {
+  return recorded_step(
+    "bind-certified-candidate-archive",
+    "persist exact certified archive run in a signed write-once remote ref",
+    if result.success {
+      command_result_ok("${result.reason}; ${result.remote_ref} -> ${result.tag_object_oid}\n")
+    } else {
+      command_result_fail(2, result.reason)
+    },
+  )
+}
