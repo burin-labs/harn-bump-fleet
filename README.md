@@ -920,14 +920,22 @@ Options:
   The tag selects the prepared and certified commit parented at this pin;
   subsequent main commits cannot change the published version. Honors
   `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
-- `--candidate-archive-run-id N` names the exact candidate archive run whose
-  binaries this release ships, for the one case the harness must not decide:
-  two unexpired archives of the same candidate. Two runs of one commit under
-  byte-identical archive policy still produce different binaries, so choosing
-  by age would be a guess about which bytes ship. The pin only selects; the
-  named run must still be an unexpired archive of this exact candidate built
-  under matching policy, or it is refused. Leave it unset and a single
-  certified archive is adopted automatically.
+- `--candidate-archive-receipt PATH` supplies the certification's
+  `release_harn.candidate_archive.v1` receipt when this workspace did not write
+  one, which is every hosted resume. The certifying release harness run
+  publishes it with its artifacts under
+  `release-harn/candidate-archive/<source commit>.json`. It is the only record
+  that says which archive run the certification used, and it is needed because
+  two archives of one candidate are not interchangeable: two runs of the same
+  commit under byte-identical archive policy still produce different binaries.
+  A receipt that binds another commit, repository or workflow is refused rather
+  than read.
+- `--candidate-archive-run-id N` asserts which archive run ships. It is checked
+  against the receipt, never believed on its own: a pin that disagrees with the
+  certified run is refused, and so is a pin with no receipt to check it
+  against. The named run must also still be an unexpired archive of this exact
+  candidate built under matching policy. Neither flag is needed on the ordinary
+  path, where a candidate has one archive and the receipt names it.
 - `--consumer-proof-runs-json '{"owner/repository":123}'` resumes a consumer
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch

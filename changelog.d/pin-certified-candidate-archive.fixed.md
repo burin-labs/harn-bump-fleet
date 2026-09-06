@@ -1,1 +1,1 @@
-Let an operator name which certified candidate archive ships when a candidate has more than one, because two runs of the same commit under identical archive policy still produce different binaries.
+Select the certified candidate archive from the certification's durable receipt, refusing an operator-pinned archive run that disagrees with it or that has no receipt to check it against, because two archives of one candidate are not interchangeable.
