@@ -19,11 +19,41 @@ pub type FleetDispatchContinuation = {
 }
 
 /**
+ * One prerequisite identity a dependent is still waiting on.
+ *
+ * Spelled out in scalars owned by this module rather than reusing the manifest
+ * type. The receipt is decoded with `schema_of` against this file's shapes, and
+ * the identity that matters downstream is which repository must land and which
+ * pin surface proves it, not the whole manifest row.
+ */
+pub type FleetDeferredPrerequisite = {repository: string, pin_kind: string, pin_path: string}
+
+/**
+ * One dependent withheld at dispatch because a prerequisite had not landed.
+ *
+ * A durable controller records the withholding instead of dispatching, so the
+ * successor round can tell "deliberately deferred, prerequisite still pending"
+ * from "this repository has no bump pull request and nobody knows why". Without
+ * this row the observation phase reads the dependent as
+ * `missing_bump_pull_request` and repair refuses it as not code-repairable,
+ * which ends the round and skips proof.
+ */
+pub type FleetDispatchDeferral = {
+  repository: string,
+  target: string,
+  workflow: string,
+  base_branch: string,
+  branch: string,
+  prerequisites: list<FleetDeferredPrerequisite>,
+  detail: string,
+}
+
+/**
  * Immutable repository census owned by one controller chain.
  * Durable handoff from dispatch into exact-run convergence observation.
  */
 pub type FleetDispatchContinuationReceipt = {
-  schema_version: "harn_bump_fleet.dispatch_continuation.v3",
+  schema_version: "harn_bump_fleet.dispatch_continuation.v4",
   target: string,
   chain_id: string,
   scope: FleetDispatchScope,
@@ -31,6 +61,8 @@ pub type FleetDispatchContinuationReceipt = {
   controller_run_id: int,
   controller_run_attempt: int,
   dispatches: list<FleetDispatchContinuation>,
+  /** Dependents withheld this round, each bound to the prerequisite it awaits. */
+  deferrals: list<FleetDispatchDeferral>,
 }
 
 /** Exact hosted-controller lineage that owns one dispatch handoff. */
@@ -90,7 +122,35 @@ pub fn fleet_dispatch_lineage(
   }
 }
 
-/** Retain only outcomes that prove GitHub accepted a specific workflow run. */
+/** The outcome status a dependent carries when its prerequisite has not landed. */
+pub const FLEET_PREREQUISITE_PENDING_STATUS: string = "prerequisite_updates_pending"
+
+/** Project one repository's manifest prerequisites into durable receipt identities. */
+fn deferred_prerequisites(repo: FleetRepo) -> list<FleetDeferredPrerequisite> {
+  let required: list<FleetDeferredPrerequisite> = []
+  for prerequisite in repo.update.prerequisites {
+    required = required
+      + [
+        {
+          repository: prerequisite.repository,
+          pin_kind: to_string(prerequisite.pin.kind),
+          pin_path: trim(to_string(prerequisite.pin.path ?? "")),
+        },
+      ]
+  }
+  return required
+}
+
+/**
+ * Retain outcomes that prove GitHub accepted a run, plus dependents deliberately
+ * withheld at a prerequisite.
+ *
+ * The two lists answer different questions and neither substitutes for the
+ * other. A dispatch row names an exact accepted run to observe. A deferral row
+ * names a repository that was correctly not dispatched, so its absent pull
+ * request reads as a decision this controller made rather than as an unexplained
+ * gap for repair to refuse.
+ */
 pub fn fleet_dispatch_continuation_receipt(
   lineage: FleetDispatchLineage,
   repos: list<FleetRepo>,
@@ -101,13 +161,32 @@ pub fn fleet_dispatch_continuation_receipt(
     by_slug[repo.slug] = repo
   }
   let dispatches: list<FleetDispatchContinuation> = []
+  let deferrals: list<FleetDispatchDeferral> = []
   for outcome in outcomes {
     const members = fleet_scope_members(lineage.scope)
     if members != nil && !contains(members, outcome.slug) {
       throw "dispatch outside operation scope"
     }
     const repo = by_slug[outcome.slug]
-    if repo == nil || outcome.run_id == nil || trim(outcome.run_url ?? "") == "" {
+    if repo == nil {
+      continue
+    }
+    if outcome.status == FLEET_PREREQUISITE_PENDING_STATUS {
+      deferrals = deferrals
+        + [
+          {
+            repository: outcome.slug,
+            target: lineage.target,
+            workflow: repo.update.workflow_name,
+            base_branch: repo.update.base_branch,
+            branch: repo.update.branch,
+            prerequisites: deferred_prerequisites(repo),
+            detail: outcome.detail,
+          },
+        ]
+      continue
+    }
+    if outcome.run_id == nil || trim(outcome.run_url ?? "") == "" {
       continue
     }
     dispatches = dispatches
@@ -124,7 +203,7 @@ pub fn fleet_dispatch_continuation_receipt(
       ]
   }
   return {
-    schema_version: "harn_bump_fleet.dispatch_continuation.v3",
+    schema_version: "harn_bump_fleet.dispatch_continuation.v4",
     target: lineage.target,
     chain_id: lineage.chain_id,
     scope: lineage.scope,
@@ -132,6 +211,7 @@ pub fn fleet_dispatch_continuation_receipt(
     controller_run_id: lineage.controller_run_id,
     controller_run_attempt: lineage.controller_run_attempt,
     dispatches: dispatches,
+    deferrals: deferrals,
   }
 }
 
@@ -170,7 +250,7 @@ pub fn fleet_dispatch_continuation_entry_write(
     throw "dispatch outside operation scope"
   }
   const receipt: FleetDispatchContinuationReceipt = {
-    schema_version: "harn_bump_fleet.dispatch_continuation.v3",
+    schema_version: "harn_bump_fleet.dispatch_continuation.v4",
     target: lineage.target,
     chain_id: lineage.chain_id,
     scope: lineage.scope,
@@ -188,6 +268,7 @@ pub fn fleet_dispatch_continuation_entry_write(
         branch: repo.update.branch,
       },
     ],
+    deferrals: [],
   }
   return fleet_dispatch_continuation_write(
     harness,
@@ -217,8 +298,45 @@ fn fleet_dispatch_continuation_read_one(
         throw "continuation contains dispatch outside scope"
       }
     }
+    for deferral in receipt.deferrals {
+      if !contains(members, deferral.repository) {
+        throw "continuation contains deferral outside scope"
+      }
+    }
   }
   return receipt
+}
+
+/** Collect the aggregate receipt and every per-repository fragment, in read order. */
+fn continuation_receipt_parts(
+  fs: HarnessFs,
+  path: string,
+) -> list<FleetDispatchContinuationReceipt> {
+  let parts: list<FleetDispatchContinuationReceipt> = []
+  if fs.exists(path) {
+    parts = parts + [fleet_dispatch_continuation_read_one(fs, path)]
+  }
+  const entry_dir = continuation_entry_dir(path)
+  if fs.exists(entry_dir) {
+    for name in fs.list_dir(entry_dir).sort() {
+      if ends_with(name, ".json") {
+        parts = parts + [fleet_dispatch_continuation_read_one(fs, path_join(entry_dir, name))]
+      }
+    }
+  }
+  return parts
+}
+
+/** The controller identity every fragment of one handoff must agree on. */
+fn continuation_lineage_key(receipt: FleetDispatchContinuationReceipt) -> list {
+  return [
+    receipt.target,
+    receipt.chain_id,
+    receipt.scope,
+    receipt.update_round,
+    receipt.controller_run_id,
+    receipt.controller_run_attempt,
+  ]
 }
 
 /** Read one structurally valid continuation receipt; absence is an empty handoff. */
@@ -226,80 +344,61 @@ pub fn fleet_dispatch_continuation_read(
   fs: HarnessFs,
   path: string,
 ) -> FleetDispatchContinuationReceipt? {
-  if trim(path) == "" || !fs.exists(path) {
-    const entry_dir = continuation_entry_dir(path)
-    if trim(path) == "" || !fs.exists(entry_dir) {
-      return nil
-    }
+  if trim(path) == "" {
+    return nil
   }
-  let target = ""
-  let chain_id = ""
-  let scope: FleetDispatchScope? = nil
-  let update_round = 0
-  let controller_run_id = 0
-  let controller_run_attempt = 0
+  if !fs.exists(path) && !fs.exists(continuation_entry_dir(path)) {
+    return nil
+  }
+  const parts = continuation_receipt_parts(fs, path)
   let dispatches = {}
-  if fs.exists(path) {
-    const aggregate = fleet_dispatch_continuation_read_one(fs, path)
-    target = aggregate.target
-    chain_id = aggregate.chain_id
-    scope = aggregate.scope
-    update_round = aggregate.update_round
-    controller_run_id = aggregate.controller_run_id
-    controller_run_attempt = aggregate.controller_run_attempt
-    for dispatch in aggregate.dispatches {
+  let deferrals = {}
+  // Each part is compared against the one before it. Equality is transitive, so
+  // agreeing pairwise is agreeing with the aggregate the first part came from.
+  let lineage: FleetDispatchContinuationReceipt? = nil
+  for part in parts {
+    if lineage != nil
+      && continuation_lineage_key(part)
+        != continuation_lineage_key(unwrap(lineage)) {
+      throw "fleet dispatch continuation fragments disagree on controller lineage"
+    }
+    lineage = part
+    for dispatch in part.dispatches {
       if dispatches[dispatch.repository] != nil && dispatches[dispatch.repository] != dispatch {
         throw "conflicting duplicate dispatch continuation"
       }
       dispatches[dispatch.repository] = dispatch
     }
-  }
-  const entry_dir = continuation_entry_dir(path)
-  if fs.exists(entry_dir) {
-    for name in fs.list_dir(entry_dir).sort() {
-      if !ends_with(name, ".json") {
-        continue
+    for deferral in part.deferrals {
+      if deferrals[deferral.repository] != nil && deferrals[deferral.repository] != deferral {
+        throw "conflicting duplicate deferral continuation"
       }
-      const entry = fleet_dispatch_continuation_read_one(fs, path_join(entry_dir, name))
-      if target != ""
-        && [
-          entry.target,
-          entry.chain_id,
-          entry.scope,
-          entry.update_round,
-          entry.controller_run_id,
-          entry.controller_run_attempt,
-        ]
-          != [target, chain_id, scope, update_round, controller_run_id, controller_run_attempt] {
-        throw "fleet dispatch continuation fragments disagree on controller lineage"
-      }
-      target = entry.target
-      chain_id = entry.chain_id
-      scope = entry.scope
-      update_round = entry.update_round
-      controller_run_id = entry.controller_run_id
-      controller_run_attempt = entry.controller_run_attempt
-      for dispatch in entry.dispatches {
-        if dispatches[dispatch.repository] != nil && dispatches[dispatch.repository] != dispatch {
-          throw "conflicting duplicate dispatch continuation"
-        }
-        dispatches[dispatch.repository] = dispatch
-      }
+      deferrals[deferral.repository] = deferral
     }
   }
   let merged: list<FleetDispatchContinuation> = []
   for entry in dispatches {
     merged = merged + [entry.value]
   }
+  // An accepted run outranks a deferral for the same repository. The two can
+  // only meet when a fragment recorded the dispatch after the aggregate
+  // recorded the withholding, and in that ordering the run is the later fact.
+  let merged_deferrals: list<FleetDispatchDeferral> = []
+  for entry in deferrals {
+    if dispatches[entry.key] == nil {
+      merged_deferrals = merged_deferrals + [entry.value]
+    }
+  }
   return {
-    schema_version: "harn_bump_fleet.dispatch_continuation.v3",
-    target: target,
-    chain_id: chain_id,
-    scope: scope ?? {kind: "fleet"},
-    update_round: update_round,
-    controller_run_id: controller_run_id,
-    controller_run_attempt: controller_run_attempt,
+    schema_version: "harn_bump_fleet.dispatch_continuation.v4",
+    target: lineage?.target ?? "",
+    chain_id: lineage?.chain_id ?? "",
+    scope: lineage?.scope ?? {kind: "fleet"},
+    update_round: lineage?.update_round ?? 0,
+    controller_run_id: lineage?.controller_run_id ?? 0,
+    controller_run_attempt: lineage?.controller_run_attempt ?? 0,
     dispatches: merged,
+    deferrals: merged_deferrals,
   }
 }
 
@@ -357,7 +456,7 @@ pub fn fleet_dispatch_continuation_rebind(
     throw "dispatch continuation must advance by one run attempt or one controller round"
   }
   const rebound: FleetDispatchContinuationReceipt = {
-    schema_version: "harn_bump_fleet.dispatch_continuation.v3",
+    schema_version: "harn_bump_fleet.dispatch_continuation.v4",
     target: lineage.target,
     chain_id: lineage.chain_id,
     scope: lineage.scope,
@@ -365,6 +464,7 @@ pub fn fleet_dispatch_continuation_rebind(
     controller_run_id: lineage.controller_run_id,
     controller_run_attempt: lineage.controller_run_attempt,
     dispatches: receipt.dispatches,
+    deferrals: receipt.deferrals,
   }
   const fragments = continuation_entry_dir(path)
   if harness.fs.exists(fragments) {
