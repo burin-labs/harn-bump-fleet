@@ -920,6 +920,14 @@ Options:
   The tag selects the prepared and certified commit parented at this pin;
   subsequent main commits cannot change the published version. Honors
   `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
+- `--candidate-archive-run-id N` names the exact candidate archive run whose
+  binaries this release ships, for the one case the harness must not decide:
+  two unexpired archives of the same candidate. Two runs of one commit under
+  byte-identical archive policy still produce different binaries, so choosing
+  by age would be a guess about which bytes ship. The pin only selects; the
+  named run must still be an unexpired archive of this exact candidate built
+  under matching policy, or it is refused. Leave it unset and a single
+  certified archive is adopted automatically.
 - `--consumer-proof-runs-json '{"owner/repository":123}'` resumes a consumer
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch
