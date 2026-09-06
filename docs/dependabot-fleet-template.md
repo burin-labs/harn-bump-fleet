@@ -150,6 +150,14 @@ Only two, and both need a comment saying why:
 Large multi-package repos (`burin-code`, `harn`, `harn-cloud`) exercise both.
 Everything else should be a verbatim instance of the template.
 
+Shipping a manifest is not by itself a reason for a block. `tree-sitter-harn-spm`
+has a `Package.swift` with an empty `dependencies` list — the grammar is
+vendored and updated by hand under supply-chain review — so a `swift` block
+there would monitor nothing. Rule 1 says cover every ecosystem the repo *has*;
+an ecosystem with no external dependencies is not one. Its config also drops
+`day`/`time`/`timezone` and adds a `ci` commit prefix; that is grandfathered,
+not a third permitted deviation.
+
 ## Enforcement ownership
 
 This file owns the *written* fleet contract (schedule, cooldown, grouping,
@@ -171,16 +179,11 @@ delivery gate.
 Org package repos still project `templates/dependabot.yml` as a byte-for-byte
 `github-actions` prefix via `harn-repo-policy`.
 
-## Conformance, audited 2026-07-18
+## Audit the fleet
 
-This template was written by reading what the fleet already does, not by
-imposing something new. Audited against `origin/main` for every burin-labs
-repo, **25 repos carry a `.github/dependabot.yml` byte-identical to the
-`github-actions` block above**. The fleet was already uniform; this file just
-writes down the thing it had converged on so new repos have something to copy
-and drift has something to fail against.
-
-Audit the fleet with `origin/main`, never a local checkout:
+Read every repository from `origin/main`, never from a local checkout. A stale
+clone reports gaps that do not exist, and it will report a pin as several
+majors behind when the upstream file is current.
 
 ```sh
 for r in ~/projects/*/; do
@@ -190,22 +193,9 @@ for r in ~/projects/*/; do
 done
 ```
 
-A stale local clone reports gaps that do not exist. A 2026-07-18 sweep was
-opened on the premise that ~18 repos had no config and the two SDKs were the
-worst gaps; every one of those repos already had correct coverage upstream, and
-a `checkout@v4` pin that looked three majors stale was `v7.0.0` on `origin/main`.
-
-The only real gap the audit found was grouping: `harn-sdk-python` and
-`harn-sdk-typescript` had package blocks with no catch-all group, so every
-dependency became its own PR — and therefore its own manual re-sign.
-
-Shipping a manifest is not by itself a reason for a block. `tree-sitter-harn-spm`
-has a `Package.swift` with an empty `dependencies` list — the grammar is
-vendored and updated by hand under supply-chain review — so a `swift` block
-there would monitor nothing. Rule 1 says cover every ecosystem the repo *has*;
-an ecosystem with no external dependencies is not one. Its config also drops
-`day`/`time`/`timezone` and adds a `ci` commit prefix; that is grandfathered,
-not a third permitted deviation.
+The gap worth looking for is grouping, not absence. A package block with no
+catch-all group turns every dependency into its own pull request, and under
+required signatures that means its own manual re-sign.
 
 ## Required signatures caveat
 
