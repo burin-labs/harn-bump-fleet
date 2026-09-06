@@ -78,6 +78,8 @@ Release implementation changes belong in the stage that owns the behavior:
 - `release_ship_pr`: PR publication and watch-receipt handoff
 - `release_candidate_tag`: certified-candidate tagging and write-once receipt binding
 - `release_main_tag`: historical merged-main recovery and bump reversal
+- `release_main_drift`: the drift reading those recoveries decide on, and
+  the union of ruleset-required and repository-declared release contexts
 - `release_preflight`: interactive flags, planner/fleet/sccache checks, and
   build-lock lifecycle
 
