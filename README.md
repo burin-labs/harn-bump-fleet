@@ -898,12 +898,21 @@ The closed hosted/local receipt is immutable at
 records both hosted proofs, the local source lanes, wall-clock timings and
 critical path, and the SHA-256 of the exact-candidate Harn CLI. The joined
 candidate receipt also preserves the independent Linux size-run identity,
-the candidate-archive run identity, and their verdicts. The release PR remains
-impossible until the hosted/local lane, Linux size lane, archive lane, and
-residual audit are all green. The tag-derived workflows build the
-certified candidate source directly; the candidate archive is certification
-evidence, not a publishable substitute. `force_rebuild` remains audited
-recovery only. `--local-audit` remains useful for read-only diagnosis but
+the candidate-archive run identity, and their verdicts. Once every candidate
+lane is green, that archive receipt is also embedded unchanged in a signed,
+write-once tag at
+`harn-candidate-archive-certification/<candidate-oid>`. This durable tag is the
+primary archive-run receipt after the certifying run's receipt artifact expires.
+The archive gate authenticates it before selection, refuses a conflicting
+operator receipt, and still requires the named archive artifact itself to be
+unexpired. A missing record permits the initial archive build; an invalid or
+unsigned record stops the gate. The release PR remains
+impossible until the hosted/local lane, Linux size lane, archive lane, residual
+audit, and durable binding are all green. The version-tag workflows build the
+certified candidate source directly. A signed-selected candidate archive is
+promotable only after the archive gate revalidates the exact source-qualified,
+unexpired artifact and matching archive-policy content. `force_rebuild` remains
+audited recovery only. `--local-audit` remains useful for read-only diagnosis but
 cannot bypass hosted certification for live preparation.
 
 Options:

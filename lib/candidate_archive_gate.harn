@@ -4,9 +4,11 @@ import {
   command_result_fail,
   command_result_ok,
 } from "std/command"
+import { candidate_archive_certification_read_remote } from "./candidate_archive_certification"
 import {
   CandidateArchiveGateConfig,
   CandidateArchiveGateStartedEvent,
+  CandidateArchiveReceipt,
   candidate_archive_receipt_matches,
   candidate_archive_receipt_overwrite_allowed,
   candidate_archive_receipt_path,
@@ -285,7 +287,29 @@ pub fn candidate_archive_receipt_reuse_decision(
   return "dispatch_new"
 }
 
-type CandidateArchiveAdoption = {run_id: int, url: string, head_sha: string}
+pub type CandidateArchiveAdoption = {run_id: int, url: string, head_sha: string}
+
+/** Cross the dispatch boundary only when archive selection found no reusable run. */
+pub fn candidate_archive_dispatch_after_selection(
+  adoption: CandidateArchiveAdoption?,
+  gate: CandidateArchiveGateConfig,
+  dispatch: fn() -> Result<CandidateArchiveGateDispatch, CandidateArchiveGateError>,
+) -> Result<CandidateArchiveGateDispatch, CandidateArchiveGateError> {
+  if adoption != nil {
+    return Ok(
+      {
+        accepted: true,
+        run_id: adoption.run_id,
+        url: adoption.url,
+        event: gate.event,
+        head_branch: gate.policy_ref,
+        head_sha: adoption.head_sha,
+        reused: true,
+      },
+    )
+  }
+  return dispatch()
+}
 
 fn archive_policy_census(
   io: {env: HarnessEnv, process: HarnessProcess},
@@ -320,17 +344,44 @@ fn archive_policy_census(
  */
 /**
  * The certified archive run this candidate's own receipt records, if one is
- * reachable. `local_path` is the receipt this workspace wrote; `supplied_path`
- * is the durable copy an operator recovered from the certifying run's
- * artifacts, which is the only route on a fresh checkout.
+ * reachable. The signed remote record is primary. `local_path` is the receipt
+ * this workspace wrote and `supplied_path` is the exact operator recovery
+ * input. Every present source must name the same run.
  */
+pub fn candidate_archive_certified_run_from_receipts(
+  receipts: list<CandidateArchiveReceipt>,
+  slug: string,
+  gate: CandidateArchiveGateConfig,
+) -> Result<int, string> {
+  let certified = 0
+  for receipt in receipts {
+    const observed = candidate_archive_certified_run(receipt, slug, gate)
+    if is_err(observed) {
+      return Err(unwrap_err(observed))
+    }
+    const run_id = unwrap(observed)
+    if certified > 0 && certified != run_id {
+      return Err(
+        "candidate archive receipts disagree: certified runs ${certified} and ${run_id} cannot both be authority",
+      )
+    }
+    certified = run_id
+  }
+  return Ok(certified)
+}
+
 fn certified_archive_run_from_receipt(
   fs: HarnessFs,
+  durable_receipt: CandidateArchiveReceipt?,
   local_path: string,
   supplied_path: string,
   slug: string,
   gate: CandidateArchiveGateConfig,
 ) -> Result<int, string> {
+  let receipts: list<CandidateArchiveReceipt> = []
+  if durable_receipt != nil {
+    receipts = receipts + [schema_expect(durable_receipt, schema_of(CandidateArchiveReceipt))]
+  }
   for path in [trim(supplied_path), trim(local_path)] {
     if path == "" {
       continue
@@ -344,9 +395,9 @@ fn certified_archive_run_from_receipt(
       }
       continue
     }
-    return candidate_archive_certified_run(receipt ?? {}, slug, gate)
+    receipts = receipts + [receipt ?? {}]
   }
-  return Ok(0)
+  return candidate_archive_certified_run_from_receipts(receipts, slug, gate)
 }
 
 fn remote_certified_archive_run(
@@ -359,8 +410,22 @@ fn remote_certified_archive_run(
   supplied_receipt_path: string,
 ) -> Result<CandidateArchiveAdoption?, CandidateArchiveGateError> {
   const io = {env: harness.env, process: harness.process}
+  const durable = candidate_archive_certification_read_remote(io, cfg, gate.expected_source_sha)
+  let durable_receipt: CandidateArchiveReceipt? = nil
+  if is_ok(durable) {
+    durable_receipt = unwrap(durable)
+  } else if unwrap_err(durable).code != "missing" {
+    return Err(
+      {
+        code: "candidate_archive_receipt",
+        message: "could not authenticate durable candidate archive certification: "
+          + unwrap_err(durable).message,
+      },
+    )
+  }
   const certified = certified_archive_run_from_receipt(
     harness.fs,
+    durable_receipt,
     receipt_path,
     supplied_receipt_path,
     slug,
@@ -649,22 +714,6 @@ pub fn run_release_candidate_archive_gate(
         {
           dispatch: fn(gate) {
             const prior = candidate_archive_receipt_read(harness.fs, receipt_path)
-            const reuse = candidate_archive_receipt_reuse_decision(prior, slug, gate, [])
-            if reuse == "reuse" && prior != nil {
-              return {
-                accepted: true,
-                run_id: prior.run_id,
-                url: prior.run_url,
-                event: prior.observed_event,
-                head_branch: prior.observed_head_branch,
-                head_sha: prior.observed_head_sha,
-                reused: true,
-              }
-            }
-            // The local receipt only survives inside one workspace. A hosted
-            // resume gets a fresh checkout, so the durable evidence that this
-            // exact commit was already archived is the artifact the archive
-            // workflow published under a source-qualified name.
             const remote = remote_certified_archive_run(
               harness,
               cfg,
@@ -678,53 +727,39 @@ pub fn run_release_candidate_archive_gate(
               return remote
             }
             const adopted = unwrap(remote)
-            if adopted != nil {
-              return {
-                accepted: true,
-                run_id: adopted.run_id,
-                url: adopted.url,
-                event: gate.event,
-                head_branch: gate.policy_ref,
-                head_sha: adopted.head_sha,
-                reused: true,
-              }
-            }
-            if reuse == "reject_ambiguous" {
-              return Err(
-                {
-                  code: "ambiguous_active_run",
-                  message:
-                    "multiple or unbound active candidate archive runs for ${gate.expected_source_sha}; refusing to dispatch",
-                },
-              )
-            }
-            if !candidate_archive_receipt_overwrite_allowed(prior) {
-              return Err(
-                {
-                  code: "receipt_exists",
-                  message:
-                    "candidate archive receipt already exists at ${receipt_path} with a different run identity",
-                },
-              )
-            }
-            const dispatched = github_workflow_dispatch(
-              harness,
-              slug,
-              gate.workflow,
-              {
-                candidate_only: gate.candidate_only,
-                candidate_source_ref: gate.source_ref,
-                candidate_source_sha: gate.expected_source_sha,
-                runner_profile: gate.runner_profile,
-                targets: gate.targets,
+            return candidate_archive_dispatch_after_selection(
+              adopted,
+              gate,
+              fn() {
+                if !candidate_archive_receipt_overwrite_allowed(prior) {
+                  return Err(
+                    {
+                      code: "receipt_exists",
+                      message:
+                        "candidate archive receipt already exists at ${receipt_path} with a different run identity",
+                    },
+                  )
+                }
+                const dispatched = github_workflow_dispatch(
+                  harness,
+                  slug,
+                  gate.workflow,
+                  {
+                    candidate_only: gate.candidate_only,
+                    candidate_source_ref: gate.source_ref,
+                    candidate_source_sha: gate.expected_source_sha,
+                    runner_profile: gate.runner_profile,
+                    targets: gate.targets,
+                  },
+                  gate.policy_ref,
+                )
+                return if is_err(dispatched) {
+                  dispatched
+                } else {
+                  Ok(unwrap(dispatched) + {reused: false})
+                }
               },
-              gate.policy_ref,
             )
-            return if is_err(dispatched) {
-              dispatched
-            } else {
-              unwrap(dispatched) + {reused: false}
-            }
           },
           view_run: fn(action_run_id) {
             const run = github_actions_run(harness, slug, action_run_id)
