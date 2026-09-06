@@ -14,6 +14,13 @@ import {
   candidate_archive_receipt_write,
 } from "./candidate_archive_receipt"
 import {
+  CANDIDATE_ARCHIVE_POLICY_PATHS,
+  candidate_archive_artifacts_named,
+  candidate_archive_manifest_artifact_name,
+  candidate_archive_policy_matches,
+  candidate_archive_reuse_decision,
+} from "./candidate_archive_reuse"
+import {
   github_actions_run,
   github_actions_run_jobs,
   github_is_rate_limited_read_error,
@@ -145,16 +152,24 @@ pub fn candidate_archive_gate_event(
   }
 }
 
+/**
+ * `effective_policy_sha` is the policy commit the observed run is required to
+ * carry. For a fresh dispatch that is the release's own policy head. For an
+ * adopted archive it is the head that run was dispatched under, whose archive
+ * policy was already proven byte-identical before adoption; asserting today's
+ * commit instead would refuse every reuse.
+ */
 fn candidate_archive_gate_verdict(
   config: CandidateArchiveGateConfig,
   run: CandidateArchiveGateRun,
   jobs: list<PreTagBinaryGateJob>,
+  effective_policy_sha: string,
 ) -> {action: string, message: string} {
   const size_config: PreTagBinaryGateConfig = {
     workflow: config.workflow,
     event: config.event,
     policy_ref: config.policy_ref,
-    expected_policy_sha: config.expected_policy_sha,
+    expected_policy_sha: lowercase(trim(effective_policy_sha)),
     source_ref: config.source_ref,
     expected_source_sha: config.expected_source_sha,
     target_job: config.target_job,
@@ -175,7 +190,7 @@ fn candidate_archive_gate_verdict(
     return {
       action: "pass",
       message:
-        "run ${run.id} built candidate archives and cleared the Linux size gate for ${config.source_ref} at ${config.expected_source_sha} under policy ${config.policy_ref}@${config.expected_policy_sha}",
+        "run ${run.id} built candidate archives and cleared the Linux size gate for ${config.source_ref} at ${config.expected_source_sha} under policy ${config.policy_ref}@${lowercase(trim(effective_policy_sha))}",
     }
   }
   return verdict
@@ -268,6 +283,98 @@ pub fn candidate_archive_receipt_reuse_decision(
   return "dispatch_new"
 }
 
+type CandidateArchiveAdoption = {run_id: int, url: string, head_sha: string}
+
+fn archive_policy_census(
+  io: {env: HarnessEnv, process: HarnessProcess},
+  cfg: any,
+  commit: string,
+) -> dict<string, string> {
+  let census: dict<string, string> = {}
+  if trim(commit) == "" {
+    return census
+  }
+  for path in CANDIDATE_ARCHIVE_POLICY_PATHS {
+    const shown = run_git(io, cfg, ["rev-parse", "${trim(commit)}:${path}"])
+    if shown.success {
+      const oid = lowercase(trim(shown.stdout ?? ""))
+      if len(regex_captures("^[0-9a-f]{40}$", oid)) == 1 {
+        census[path] = oid
+      }
+    }
+  }
+  return census
+}
+
+/**
+ * Find the already-certified archive run for this exact candidate, if one
+ * exists and its binaries are still retrievable.
+ *
+ * `Ok(nil)` means the name was searched and nothing usable was found, which is
+ * the signal to build. A read failure is an `Err` and stops the gate: an
+ * unreadable artifact census must not be mistaken for "never built", because
+ * that mistake costs the release forty minutes of rebuild every time it
+ * happens silently.
+ */
+fn remote_certified_archive_run(
+  harness: Harness,
+  cfg: any,
+  slug: string,
+  gate: CandidateArchiveGateConfig,
+) -> Result<CandidateArchiveAdoption?, CandidateArchiveGateError> {
+  const io = {env: harness.env, process: harness.process}
+  const expected_policy = archive_policy_census(io, cfg, gate.expected_policy_sha)
+  if len(expected_policy.keys().to_list()) != len(CANDIDATE_ARCHIVE_POLICY_PATHS) {
+    // Nothing to compare against, so nothing can be adopted. Build.
+    return Ok(nil)
+  }
+  const listed = candidate_archive_artifacts_named(
+    harness,
+    slug,
+    candidate_archive_manifest_artifact_name(gate.expected_source_sha),
+  )
+  if is_err(listed) {
+    return Err(
+      {
+        code: "archive_census_unreadable",
+        message: "could not read candidate archive artifacts for ${gate.expected_source_sha}: "
+          + to_string(unwrap_err(listed)),
+      },
+    )
+  }
+  let policy_cache: dict<string, bool> = {}
+  const decision = candidate_archive_reuse_decision(
+    unwrap(listed),
+    gate,
+    { head ->
+      const key = lowercase(trim(head))
+      if policy_cache[key] == nil {
+        policy_cache[key] = candidate_archive_policy_matches(
+          expected_policy,
+          archive_policy_census(io, cfg, key),
+        )
+      }
+      return policy_cache[key] ?? false
+    },
+  )
+  if !cfg.mock {
+    harness.stdio.println("   candidate archive: ${decision.reason}")
+  }
+  if decision.action == "reject_ambiguous" {
+    return Err({code: "ambiguous_certified_archive", message: decision.reason})
+  }
+  if decision.action == "dispatch_new" {
+    return Ok(nil)
+  }
+  return Ok(
+    {
+      run_id: decision.run_id,
+      url: "https://github.com/${slug}/actions/runs/${to_string(decision.run_id)}",
+      head_sha: decision.run_head_sha,
+    },
+  )
+}
+
 pub fn run_candidate_archive_gate(
   config: CandidateArchiveGateConfig,
   adapter: CandidateArchiveGateAdapter,
@@ -283,9 +390,16 @@ pub fn run_candidate_archive_gate(
   }
   const run_id = dispatch.run_id
   const run_url = dispatch.url
-  if dispatch.event != config.event || dispatch.head_branch != config.policy_ref
-    || lowercase(dispatch.head_sha)
-      != lowercase(config.expected_policy_sha) {
+  // A reused run was dispatched under an earlier policy commit, by definition:
+  // it exists because a previous attempt built this candidate. Its policy
+  // identity was already proven by content before it was adopted, so asserting
+  // today's policy commit here would refuse every reuse and rebuild five
+  // platforms whenever main moved.
+  const reused = dispatch.reused ?? false
+  if !reused
+    && (dispatch.event != config.event || dispatch.head_branch != config.policy_ref
+      || lowercase(dispatch.head_sha)
+        != lowercase(config.expected_policy_sha)) {
     return gate_result(
       false,
       "dispatch",
@@ -293,6 +407,20 @@ pub fn run_candidate_archive_gate(
       run_id,
       run_url,
     )
+  }
+  if reused && (dispatch.event != config.event || dispatch.head_branch != config.policy_ref) {
+    return gate_result(
+      false,
+      "dispatch",
+      "reused archive run ${run_id} was ${dispatch.event} on ${dispatch.head_branch}; expected ${config.event} on ${config.policy_ref}",
+      run_id,
+      run_url,
+    )
+  }
+  const effective_policy_sha = if reused {
+    lowercase(trim(dispatch.head_sha))
+  } else {
+    lowercase(trim(config.expected_policy_sha))
   }
   let attempt = 0
   let view_attempts = 0
@@ -328,7 +456,12 @@ pub fn run_candidate_archive_gate(
         transient_view_retries,
       )
     }
-    const verdict = candidate_archive_gate_verdict(config, unwrap(viewed).run, unwrap(viewed).jobs)
+    const verdict = candidate_archive_gate_verdict(
+      config,
+      unwrap(viewed).run,
+      unwrap(viewed).jobs,
+      effective_policy_sha,
+    )
     if verdict.action == "pass" || verdict.action == "fail" {
       const recovery_suffix = if transient_view_retries > 0 {
         " after ${transient_view_retries} transient status-read retries"
@@ -474,6 +607,26 @@ pub fn run_release_candidate_archive_gate(
                 event: prior.observed_event,
                 head_branch: prior.observed_head_branch,
                 head_sha: prior.observed_head_sha,
+                reused: true,
+              }
+            }
+            // The local receipt only survives inside one workspace. A hosted
+            // resume gets a fresh checkout, so the durable evidence that this
+            // exact commit was already archived is the artifact the archive
+            // workflow published under a source-qualified name.
+            const remote = remote_certified_archive_run(harness, cfg, slug, gate)
+            if is_err(remote) {
+              return remote
+            }
+            const adopted = unwrap(remote)
+            if adopted != nil {
+              return {
+                accepted: true,
+                run_id: adopted.run_id,
+                url: adopted.url,
+                event: gate.event,
+                head_branch: gate.policy_ref,
+                head_sha: adopted.head_sha,
                 reused: true,
               }
             }
