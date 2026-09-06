@@ -1,5 +1,5 @@
 import { shell_quote } from "std/runtime"
-import { hosted_release_repository_scope } from "../dispatch_hosted_release"
+import { hosted_release_adapter, hosted_release_repository_scope } from "../dispatch_hosted_release"
 import { harn_bump_repositories, read_fleet_manifest } from "../lib/fleet_manifest"
 import {
   HostedReleaseDispatchAdapter,
@@ -13,6 +13,7 @@ import {
 } from "../lib/hosted_release_dispatch"
 import { ReleaseCertifiedPinResolution } from "../lib/release_certified_pin"
 import { pinned_test_runtime } from "./pinned_runtime"
+import { GithubClientOptions } from "harn-github-connector/default"
 
 const REPO = "burin-labs/harn-bump-fleet"
 
@@ -25,6 +26,56 @@ const REF = "main"
 const POLICY_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 const RELEASE_SHA = "98a2d2b9c046a1a93078c6bcd27b1b2bc8c761dd"
+
+const GITHUB_TEST = "https://github.test"
+
+fn github_test_options() -> GithubClientOptions {
+  return {api_base_url: GITHUB_TEST, installation_token: "certified-pin-test-token"}
+}
+
+fn mock_certified_pin_policy(testing: HarnessTesting) {
+  testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/rulesets",
+    {status: 200, body: json_stringify([{id: 7, enforcement: "active"}])},
+  )
+  testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/rulesets/7",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          id: 7,
+          enforcement: "active",
+          rules: [
+            {
+              type: "required_status_checks",
+              parameters: {required_status_checks: [{context: "CI status"}]},
+            },
+          ],
+        },
+      ),
+    },
+  )
+}
+
+fn check_run(conclusion: string) -> dict {
+  return {__typename: "CheckRun", name: "CI status", status: "COMPLETED", conclusion: conclusion}
+}
+
+fn mock_owning_pull(testing: HarnessTesting, merge_sha: string, head_sha: string, number: int) {
+  testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${merge_sha}/pulls?per_page=100",
+    {
+      status: 200,
+      body: json_stringify(
+        [{number: number, merge_commit_sha: merge_sha, base: {ref: "main"}, head: {sha: head_sha}}],
+      ),
+    },
+  )
+}
 
 fn refused(callback: closure) -> bool {
   try {
@@ -517,6 +568,12 @@ pipeline test_receipt_round_trips_through_typed_atomic_store(harness: Harness, t
 
 const RESOLVED_SHA = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
 
+const RED_TIP_SHA = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+
+const RED_TIP_PR_HEAD = "6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f"
+
+const RESOLVED_PR_HEAD = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
+
 fn unpinned() -> HostedReleaseInputs {
   return inputs() + {at_sha: ""}
 }
@@ -570,6 +627,149 @@ pipeline test_an_unpinned_dispatch_resolves_and_records_one_certified_commit(tas
     RESOLVED_SHA,
     "the durable receipt records the resolved commit, not a blank",
   )
+}
+
+/**
+ * The public dispatcher uses the production GitHub reader, rather than merely
+ * declaring a resolver slot that no concrete adapter fills. A red branch tip
+ * is read and rejected before the next green commit is returned.
+ */
+pipeline test_public_dispatch_adapter_resolves_the_newest_green_branch_commit(
+  harness: Harness,
+  task: any,
+) {
+  harness.testing.http_mock_clear()
+  mock_certified_pin_policy(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits?sha=main&per_page=20",
+    {status: 200, body: json_stringify([{sha: RED_TIP_SHA}, {sha: RESOLVED_SHA}])},
+  )
+  mock_owning_pull(harness.testing, RED_TIP_SHA, RED_TIP_PR_HEAD, 101)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RED_TIP_PR_HEAD}/check-runs?per_page=100",
+    {status: 200, body: json_stringify({check_runs: [check_run("FAILURE")]})},
+  )
+  mock_owning_pull(harness.testing, RESOLVED_SHA, RESOLVED_PR_HEAD, 100)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RESOLVED_PR_HEAD}/check-runs?per_page=100",
+    {status: 200, body: json_stringify({check_runs: [check_run("SUCCESS")]})},
+  )
+  const concrete = hosted_release_adapter(harness, nil, github_test_options())
+  const resolver = concrete.resolve_pin
+  assert(resolver != nil, "the production dispatcher must attach its commit resolver")
+  const result = resolver()
+  assert_eq(result.resolved, true)
+  assert_eq(result.sha, RESOLVED_SHA, "the red branch head must not become the release pin")
+  assert_eq(result.scanned, 2)
+  assert_eq(result.rejected[0]?.sha, RED_TIP_SHA)
+  const calls = harness.testing.http_mock_calls().filter({ call -> call.method == "GET" }).to_list()
+  assert_eq(len(calls), 7, "policy, branch page, and both pull-head rollups were observed")
+  assert(
+    contains(calls[2].url, "/commits?sha=main&per_page=20"),
+    "the concrete resolver reads the default branch page",
+  )
+}
+
+/** A failed commit-rollup read stays distinct from a rollup read as red. */
+pipeline test_public_dispatch_adapter_refuses_an_unread_commit_rollup(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_certified_pin_policy(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits?sha=main&per_page=20",
+    {status: 200, body: json_stringify([{sha: RED_TIP_SHA}])},
+  )
+  mock_owning_pull(harness.testing, RED_TIP_SHA, RED_TIP_PR_HEAD, 101)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RED_TIP_PR_HEAD}/check-runs?per_page=100",
+    {status: 503, body: json_stringify({message: "unavailable"})},
+  )
+  const resolver = hosted_release_adapter(harness, nil, github_test_options()).resolve_pin
+  assert(resolver != nil)
+  const result = resolver()
+  assert_eq(result.resolved, false)
+  assert_eq(result.refusal, "no_green_commit_in_page")
+  assert_eq(result.rejected[0]?.rollup_read, false)
+  assert(
+    contains(result.reason, "no required context reported"),
+    "an unread rollup must not be mislabeled as a red CI status",
+  )
+}
+
+/** Multiple claimed owners are unreadable lineage, not permission to use branch checks. */
+pipeline test_public_dispatch_adapter_refuses_an_ambiguous_owning_pull(
+  harness: Harness,
+  task: any,
+) {
+  harness.testing.http_mock_clear()
+  mock_certified_pin_policy(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits?sha=main&per_page=20",
+    {status: 200, body: json_stringify([{sha: RED_TIP_SHA}])},
+  )
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RED_TIP_SHA}/pulls?per_page=100",
+    {
+      status: 200,
+      body: json_stringify(
+        [
+          {
+            number: 101,
+            merge_commit_sha: RED_TIP_SHA,
+            base: {ref: "main"},
+            head: {sha: RED_TIP_PR_HEAD},
+          },
+          {
+            number: 102,
+            merge_commit_sha: RED_TIP_SHA,
+            base: {ref: "main"},
+            head: {sha: RESOLVED_PR_HEAD},
+          },
+        ],
+      ),
+    },
+  )
+  const resolver = hosted_release_adapter(harness, nil, github_test_options()).resolve_pin
+  assert(resolver != nil)
+  const result = resolver()
+  assert_eq(result.resolved, false)
+  assert_eq(result.rejected[0]?.rollup_read, false)
+  const calls = harness.testing.http_mock_calls().filter({ call -> call.method == "GET" }).to_list()
+  assert_eq(len(calls), 4, "ambiguous lineage must not fall back to branch-commit checks")
+}
+
+/** A commit with no associated pull is certified from its own reported checks. */
+pipeline test_public_dispatch_adapter_certifies_a_direct_push(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_certified_pin_policy(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits?sha=main&per_page=20",
+    {status: 200, body: json_stringify([{sha: RESOLVED_SHA}])},
+  )
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RESOLVED_SHA}/pulls?per_page=100",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    GITHUB_TEST + "/repos/burin-labs/harn/commits/${RESOLVED_SHA}/check-runs?per_page=100",
+    {status: 200, body: json_stringify({check_runs: [check_run("SUCCESS")]})},
+  )
+  const resolver = hosted_release_adapter(harness, nil, github_test_options()).resolve_pin
+  assert(resolver != nil)
+  const result = resolver()
+  assert_eq(result.resolved, true)
+  assert_eq(result.sha, RESOLVED_SHA)
+  const calls = harness.testing.http_mock_calls().filter({ call -> call.method == "GET" }).to_list()
+  assert_eq(len(calls), 5, "the direct-push path must read the branch commit rollup")
 }
 
 /** An operator's explicit pin is never second-guessed, and never re-resolved. */
