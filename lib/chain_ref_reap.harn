@@ -1,0 +1,410 @@
+import { fleet_chain_branch } from "./fleet_chain_ref"
+import { github_actions_run, github_actions_runs, github_release_ref } from "./github"
+import { release_git_remote_refs } from "./release_runtime"
+import { GithubRefRelease } from "harn-github-connector/default"
+
+const FLEET_REPO = "burin-labs/harn-bump-fleet"
+
+const FLEET_WORKFLOW = "bump-fleet.yml"
+
+const FLEET_WORKFLOW_PATH = ".github/workflows/bump-fleet.yml"
+
+const CHAIN_REF_PATTERN = "^refs/heads/harn-update-chain/([1-9][0-9]*)$"
+
+/** How long after a chain's last run moves the lease is still treated as live. */
+pub const DEFAULT_HANDOFF_GRACE_S = 3600
+
+/** One run that could still be using a chain lease. */
+pub type ChainRefRun = {id: int, status: string, conclusion: string, updated_at?: string}
+
+/** A chain ref paired with what could be read about the runs that own it. */
+pub type ChainRefObservation = {
+  ref: string,
+  oid: string,
+  runs?: list<ChainRefRun>,
+  read_error?: string,
+}
+
+/** What the reaper decided about one chain ref, and why. */
+pub type ChainRefReapEntry = {
+  ref: string,
+  chain_id: string,
+  oid: string,
+  action: "clear" | "retain",
+  outcome: "planned" | "cleared" | "retained" | "failed",
+  reason_code: string,
+  message: string,
+  runs_examined: int,
+  runs_unfinished: int,
+}
+
+/**
+ * Everything the reaper examined and everything it left.
+ *
+ * `inventory` is the whole point of the receipt. A reaper that read the remote
+ * and found nothing reports `inventory: "read"` with `examined_count: 0`; a
+ * reaper whose read failed reports `inventory: "unreadable"` and a blocked
+ * state. Collapsing those two into an empty list is how a broken instrument
+ * starts reading as a clean fleet.
+ */
+pub type ChainRefReapReceipt = {
+  schema_version: "harn_bump_fleet.chain_ref_reap.v1",
+  state: "clean" | "blocked",
+  mode: "dry_run" | "apply",
+  inventory: "read" | "unreadable",
+  examined_count: int,
+  planned_count: int,
+  cleared_count: int,
+  retained_count: int,
+  failed_count: int,
+  refs: list<ChainRefReapEntry>,
+  inventory_failure?: string,
+}
+
+/** Remote inventory, per-chain run reads, and the exact-OID delete. Each throws on failure. */
+pub type ChainRefReapAdapter = {
+  refs: fn() -> list<{ref: string, oid: string}>,
+  runs: fn(string) -> list<ChainRefRun>,
+  clear: fn(string, string) -> GithubRefRelease,
+}
+
+fn entry(
+  ref: string,
+  chain_id: string,
+  oid: string,
+  action: "clear" | "retain",
+  outcome: "planned" | "cleared" | "retained" | "failed",
+  reason_code: string,
+  message: string,
+  runs_examined: int = 0,
+  runs_unfinished: int = 0,
+) -> ChainRefReapEntry {
+  return {
+    ref: ref,
+    chain_id: chain_id,
+    oid: oid,
+    action: action,
+    outcome: outcome,
+    reason_code: reason_code,
+    message: message,
+    runs_examined: runs_examined,
+    runs_unfinished: runs_unfinished,
+  }
+}
+
+/** The chain this ref leases, or nil when the name is not a canonical chain ref. */
+pub fn chain_ref_identity(ref: string) -> string? {
+  const matched = regex_captures(CHAIN_REF_PATTERN, trim(ref))
+  return if len(matched) == 1 {
+    matched[0].groups[0]
+  } else {
+    nil
+  }
+}
+
+/**
+ * Decide one chain ref from what was observed about its owning runs.
+ *
+ * Every path that cannot positively prove the chain is finished retains the
+ * ref. An unreadable run list and an empty run list are separate reasons: the
+ * first is a failed instrument, the second is a chain whose runs aged out of
+ * retention, and neither is proof that nothing is using the lease.
+ */
+pub fn classify_chain_ref(
+  observation: ChainRefObservation,
+  now_s: int,
+  grace_s: int,
+) -> ChainRefReapEntry {
+  const ref = trim(observation.ref)
+  const oid = lowercase(trim(observation.oid))
+  const chain_id = chain_ref_identity(ref)
+  if chain_id == nil {
+    return entry(
+      ref,
+      "",
+      oid,
+      "retain",
+      "retained",
+      "malformed_chain_ref",
+      "ref is not a canonical refs/heads/harn-update-chain/<chain id> lease",
+    )
+  }
+  const chain = unwrap(chain_id)
+  if observation.runs == nil {
+    return entry(
+      ref,
+      chain,
+      oid,
+      "retain",
+      "retained",
+      "owning_runs_unreadable",
+      "could not read the runs that own chain ${chain}: "
+        + trim(observation.read_error ?? "unknown"),
+    )
+  }
+  const runs = unwrap(observation.runs)
+  if len(runs) == 0 {
+    return entry(
+      ref,
+      chain,
+      oid,
+      "retain",
+      "retained",
+      "owning_runs_unresolved",
+      "no run of ${FLEET_WORKFLOW} could be resolved for chain ${chain}, so nothing proves the chain is finished",
+    )
+  }
+  const unfinished = runs.filter({ run -> return trim(run.status) != "completed" }).to_list()
+  if len(unfinished) > 0 {
+    return entry(
+      ref,
+      chain,
+      oid,
+      "retain",
+      "retained",
+      "owning_run_in_progress",
+      "chain ${chain} still has ${len(unfinished)} run(s) that have not reached a terminal conclusion",
+      len(runs),
+      len(unfinished),
+    )
+  }
+  // A predecessor dispatches its successor and then completes, so for a few
+  // seconds every run of the chain is terminal and the successor has not been
+  // created yet. Deleting the lease in that window deletes the branch the next
+  // round is about to check out, which is the failure this reaper exists to
+  // clean up rather than cause.
+  let newest_end_s = -1
+  for run in runs {
+    const parsed = try {
+      to_int(date_parse(trim(run.updated_at ?? "")))
+    } catch (_error) {
+      nil
+    }
+    if parsed == nil {
+      return entry(
+        ref,
+        chain,
+        oid,
+        "retain",
+        "retained",
+        "owning_run_time_unreadable",
+        "run ${run.id} of chain ${chain} has no readable end time, so the handoff window cannot be excluded",
+        len(runs),
+        0,
+      )
+    }
+    if unwrap(parsed) > newest_end_s {
+      newest_end_s = unwrap(parsed)
+    }
+  }
+  const settled_s = now_s - newest_end_s
+  if settled_s < grace_s {
+    return entry(
+      ref,
+      chain,
+      oid,
+      "retain",
+      "retained",
+      "chain_recently_terminal",
+      "chain ${chain} last moved ${settled_s}s ago, inside the ${grace_s}s successor-handoff window",
+      len(runs),
+      0,
+    )
+  }
+  return entry(
+    ref,
+    chain,
+    oid,
+    "clear",
+    "planned",
+    "terminal_chain",
+    "every one of the ${len(runs)} run(s) owning chain ${chain} reached a terminal conclusion ${settled_s}s ago",
+    len(runs),
+    0,
+  )
+}
+
+fn observe(
+  adapter: ChainRefReapAdapter,
+  remote: {ref: string, oid: string},
+) -> ChainRefObservation {
+  const chain_id = chain_ref_identity(remote.ref)
+  if chain_id == nil {
+    return {ref: remote.ref, oid: remote.oid}
+  }
+  return try {
+    {ref: remote.ref, oid: remote.oid, runs: adapter.runs(unwrap(chain_id))}
+  } catch (error) {
+    {ref: remote.ref, oid: remote.oid, read_error: to_string(error)}
+  }
+}
+
+fn applied(adapter: ChainRefReapAdapter, planned: ChainRefReapEntry) -> ChainRefReapEntry {
+  const release: GithubRefRelease = try {
+    adapter.clear(planned.ref, planned.oid)
+  } catch (error) {
+    return planned
+      + {
+        action: "retain",
+        outcome: "failed",
+        reason_code: "delete_failed",
+        message: "could not delete ${planned.ref}: " + to_string(error),
+      }
+  }
+  if release.reason == "held_by_another" {
+    return planned
+      + {
+        action: "retain",
+        outcome: "retained",
+        reason_code: "moved_ref",
+        message: "${planned.ref} moved off ${planned.oid} between the inventory and the delete",
+      }
+  }
+  if release.reason == "already_absent" {
+    return planned
+      + {
+        action: "retain",
+        outcome: "retained",
+        reason_code: "already_absent",
+        message: "${planned.ref} was gone before the delete; this reaper cleared nothing",
+      }
+  }
+  return planned
+    + {
+      outcome: "cleared",
+      message: "deleted ${planned.ref} at ${planned.oid}; its chain is terminal",
+    }
+}
+
+/** Inventory every chain lease, refuse every live one, and report both counts. */
+pub fn run_chain_ref_reap_with_adapter(
+  mode: "dry_run" | "apply",
+  adapter: ChainRefReapAdapter,
+  now_s: int,
+  grace_s: int = DEFAULT_HANDOFF_GRACE_S,
+) -> ChainRefReapReceipt {
+  const remotes = try {
+    adapter.refs()
+  } catch (error) {
+    return {
+      schema_version: "harn_bump_fleet.chain_ref_reap.v1",
+      state: "blocked",
+      mode: mode,
+      inventory: "unreadable",
+      examined_count: 0,
+      planned_count: 0,
+      cleared_count: 0,
+      retained_count: 0,
+      failed_count: 0,
+      refs: [],
+      inventory_failure: to_string(error),
+    }
+  }
+  let refs: list<ChainRefReapEntry> = []
+  for remote in remotes {
+    const decided = classify_chain_ref(observe(adapter, remote), now_s, grace_s)
+    refs = refs
+      + [
+        if decided.action == "clear" && mode == "apply" {
+          applied(adapter, decided)
+        } else {
+          decided
+        },
+      ]
+  }
+  const failed = refs.filter({ row -> return row.outcome == "failed" }).count()
+  return {
+    schema_version: "harn_bump_fleet.chain_ref_reap.v1",
+    state: if failed > 0 {
+      "blocked"
+    } else {
+      "clean"
+    },
+    mode: mode,
+    inventory: "read",
+    examined_count: len(refs),
+    planned_count: refs.filter({ row -> return row.outcome == "planned" }).count(),
+    cleared_count: refs.filter({ row -> return row.outcome == "cleared" }).count(),
+    retained_count: refs.filter({ row -> return row.outcome == "retained" }).count(),
+    failed_count: failed,
+    refs: refs,
+  }
+}
+
+fn chain_owning_runs(harness: Harness, chain_id: string) -> list<ChainRefRun> {
+  let runs: list<ChainRefRun> = []
+  const originating = github_actions_run(harness, FLEET_REPO, to_int(chain_id) ?? 0)
+  if is_err(originating) {
+    const failure = unwrap_err(originating)
+    // A run GitHub no longer has is absent, not finished. It contributes
+    // nothing, and a chain with no readable run at all is retained below.
+    if (failure.http_status ?? 0) != 404 {
+      throw "could not read the originating run for chain ${chain_id}: " + to_string(failure)
+    }
+  } else {
+    const run = unwrap(originating)
+    runs = runs
+      + [
+        {
+          id: run.id,
+          status: run.status,
+          conclusion: to_string(run.conclusion ?? ""),
+          updated_at: run.updated_at,
+        },
+      ]
+  }
+  // Rounds two and later are dispatched from the chain branch itself, so the
+  // branch filter enumerates every successor that could still hold the lease.
+  const successors = github_actions_runs(
+    harness,
+    FLEET_REPO,
+    FLEET_WORKFLOW,
+    fleet_chain_branch(chain_id),
+  )
+  if is_err(successors) {
+    throw "could not list the successor runs for chain ${chain_id}: "
+      + to_string(unwrap_err(successors))
+  }
+  for run in unwrap(successors).runs {
+    if run.workflow_path == FLEET_WORKFLOW_PATH && run.id != (to_int(chain_id) ?? 0) {
+      runs = runs
+        + [
+          {
+            id: run.id,
+            status: run.status,
+            conclusion: to_string(run.conclusion ?? ""),
+            updated_at: run.updated_at,
+          },
+        ]
+    }
+  }
+  return runs
+}
+
+/** Production adapter: git for the inventory, the connector for runs and the delete. */
+pub fn chain_ref_reap_adapter(harness: Harness, repo: string) -> ChainRefReapAdapter {
+  return {
+    refs: fn() {
+      const observed = release_git_remote_refs(
+        harness.process,
+        {repo: repo, mock: false},
+        ["refs/heads/harn-update-chain/*"],
+      )
+      if !observed.success {
+        throw "could not inventory remote chain refs: " + trim(observed.stderr)
+      }
+      return observed.refs.map(
+        { remote -> return {ref: trim(remote.ref), oid: lowercase(trim(remote.oid))} },
+      )
+        .to_list()
+    },
+    runs: fn(chain_id) { return chain_owning_runs(harness, chain_id) },
+    clear: fn(ref, oid) {
+      const released = github_release_ref(harness, FLEET_REPO, ref, oid)
+      if is_err(released) {
+        throw to_string(unwrap_err(released))
+      }
+      return unwrap(released)
+    },
+  }
+}

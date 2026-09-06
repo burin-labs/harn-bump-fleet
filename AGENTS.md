@@ -23,6 +23,12 @@ The entry points are:
   for a bump that merged and must not be published.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
+- `reap_chain_refs.harn`: clears `harn-update-chain/<chain id>` leases whose
+  every owning run reached a terminal conclusion, so a round that died before it
+  could release its own lease does not force the next release to start a fresh
+  chain around the dead one. Dry-run-first. It refuses a chain with a live run,
+  an unreadable run list, or no resolvable run, and its receipt distinguishes
+  reading zero refs from failing to read.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
   `release-attempt/vX.Y.Z/` refs by renaming each unclaimed attempt into
   `release-failed/vX.Y.Z/<oid>-abandoned`. Dry-run-first, and it refuses when a

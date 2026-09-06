@@ -843,10 +843,19 @@ pipeline test_false_readiness_blocks_target_setup_and_mints_fresh_mutation_autho
   assert(positive_readiness.success, positive_readiness.combined)
   const lineage = steps.find({ step -> step.name == "Admit initial or validated dispatch lineage" })
   assert(contains(lineage?.if ?? "", "steps.require-release-ready.outcome == 'success'"))
+  // The chain lease release is the one tail step that must NOT inherit this
+  // gate. Readiness failing is a round that already holds the lease its
+  // predecessor claimed, so gating cleanup on readiness held the ref for
+  // exactly the failures the release step exists for.
   const lease_token = steps.find(
     { step -> step.name == "Mint chain lease release GitHub App token" },
   )
-  assert(contains(lease_token?.if ?? "", "steps.require-release-ready.outcome == 'success'"))
+  assert_eq(
+    contains(lease_token?.if ?? "", "steps.require-release-ready.outcome"),
+    false,
+    "the chain lease release must not be gated on target release readiness",
+  )
+  assert(contains(lease_token?.if ?? "", "steps.chain-lease.outcome == 'success'"))
 }
 
 /**
@@ -895,4 +904,118 @@ pipeline test_every_round_ends_with_an_owner_for_the_chain_lease(harness: Harnes
   }
   assert_eq(scheduler_id, "schedule-successor")
   assert(contains(to_string(last.env?.SCHEDULER_OUTCOME ?? ""), "steps.${scheduler_id}.outcome"))
+  // The lease identity has to be resolvable before the first step that can
+  // fail, or the release is gated on the plan step it is supposed to survive.
+  const chain_index = steps.find_index({ step -> step.name == "Resolve the chain lease identity" })
+  const plan_index = steps.find_index(
+    { step -> step.name == "Resolve exact update target and bounded round" },
+  )
+  assert(
+    chain_index >= 0 && plan_index > chain_index,
+    "the chain lease identity must be resolved before the update plan",
+  )
+  assert_eq(to_string(last.env?.CHAIN_ID ?? ""), "$" + "{{ steps.chain-lease.outputs.chain_id }}")
+  assert_eq(
+    contains(condition, "steps.update-plan.outcome"),
+    false,
+    "a round that dies in or before the update plan still holds the lease",
+  )
+  // The negative control: the condition this replaced must fail the same check.
+  assert_eq(
+    contains(
+      "always() && steps.update-plan.outcome == 'success' && steps.lease-token.outcome == 'success'",
+      "steps.update-plan.outcome",
+    ),
+    true,
+    "the old under-gated condition must fail the control",
+  )
+}
+
+/**
+ * A round killed before the plan step must still be able to name its lease.
+ *
+ * The resolver is the second step of the job and reads the same expression as
+ * `run-name` and `concurrency`, so this executes its actual body rather than
+ * asserting on its text.
+ */
+pipeline test_chain_lease_identity_resolves_before_any_fleet_work(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const resolve = steps.find({ step -> step.name == "Resolve the chain lease identity" })
+  const body = to_string(resolve?.run ?? "")
+  assert(body != "", "the chain lease resolver must exist")
+  const inherited = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID=33659789177 GITHUB_RUN_ID=99 bash -c "
+      + shell_quote(body),
+  )
+  assert(inherited.success, inherited.combined)
+  assert(contains(inherited.stdout, "chain_id=33659789177"), inherited.combined)
+  const originating = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID= GITHUB_RUN_ID=33659789177 bash -c "
+      + shell_quote(body),
+  )
+  assert(originating.success, originating.combined)
+  assert(contains(originating.stdout, "chain_id=33659789177"), originating.combined)
+  const malformed = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID=not-a-run-id GITHUB_RUN_ID=99 bash -c "
+      + shell_quote(body),
+  )
+  assert_eq(malformed.success, false, malformed.combined)
+  assert(contains(malformed.combined, "chain id must be a positive integer"))
+}
+
+/**
+ * A round that never installed the runtime still has to clear the lease.
+ *
+ * The step used to warn and exit zero, which named the ref and left it held
+ * with nothing scheduled to clear it. It now bootstraps the pinned runtime, and
+ * when even that is impossible it fails loudly and names the reaper.
+ */
+pipeline test_chain_lease_release_bootstraps_a_missing_runtime(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const release = unwrap(steps[len(steps) - 1])
+  const body = to_string(release.run ?? "")
+  const probe_index = steps.find_index(
+    { step -> step.name == "Probe for a Harn runtime before releasing the chain lease" },
+  )
+  const setup_index = steps.find_index(
+    { step -> step.name == "Install a Harn runtime for the chain lease release" },
+  )
+  const deps_index = steps.find_index(
+    { step -> step.name == "Install locked Harn dependencies for the chain lease release" },
+  )
+  assert(
+    probe_index >= 0 && setup_index > probe_index && deps_index > setup_index
+      && deps_index
+        < len(steps) - 1,
+    "a round with no runtime must acquire one before the lease release runs",
+  )
+  const probe = unwrap(steps[probe_index])
+  assert(contains(to_string(probe.if ?? ""), "always()"))
+  const setup = unwrap(steps[setup_index])
+  assert(
+    contains(to_string(setup.if ?? ""), "steps.lease-runtime-probe.outputs.present == 'false'"),
+    "the runtime install must be reached only when there is no runtime",
+  )
+  assert(starts_with(to_string(setup.uses ?? ""), "burin-labs/harn/.github/actions/setup-harn@"))
+  assert_eq(
+    contains(body, "could not be released and may still be held"),
+    false,
+    "a warn-and-exit-zero release leaves the ref held with nothing scheduled to clear it",
+  )
+  // The probe answers `present=false` on a round whose runtime install never
+  // ran, which is the whole reason the install step above exists.
+  const probed = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout PATH=/usr/bin:/bin bash -c "
+      + shell_quote(to_string(probe.run ?? "")),
+  )
+  assert(probed.success, probed.combined)
+  assert(contains(probed.stdout, "present=false"), probed.combined)
+  // The one case that can still leave residue must be an error naming the ref
+  // and the reaper, not a silent success.
+  const stranded = harness.process.shell(
+    "cd / && PATH=/usr/bin:/bin CHAIN_ID=33659789177 bash -c " + shell_quote(body),
+  )
+  assert_eq(stranded.success, false, stranded.combined)
+  assert(contains(stranded.combined, "harn-update-chain/33659789177"), stranded.combined)
+  assert(contains(stranded.combined, "reap_chain_refs.harn"), stranded.combined)
 }
