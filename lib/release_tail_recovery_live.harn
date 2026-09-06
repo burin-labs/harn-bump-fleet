@@ -1,0 +1,168 @@
+/**
+ * The real remote reads and the one remote effect behind automatic tail
+ * recovery.
+ *
+ * Every read here throws when it cannot answer. That is the whole contract:
+ * the decision owner treats an exception as "unreadable" and escalates, and
+ * treats an empty answer as "nothing is there". A read that swallowed its own
+ * failure and returned empty would convert a network fault into permission to
+ * publish again.
+ */
+import { github_connector_options, github_workflow_dispatch, github_workflow_runs } from "./github"
+import { PublishedTailRequest } from "./release_published_tail"
+import { run_git } from "./release_runtime"
+import {
+  RELEASE_TAIL_RECOVERY_MODE,
+  RELEASE_TAIL_RECOVERY_WORKFLOW,
+  TailRecoveryAdapter,
+  TailRecoveryDispatchInput,
+  TailRecoveryRun,
+  TailRecoveryTagState,
+} from "./release_tail_recovery"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const FLEET = "burin-labs/harn-bump-fleet"
+
+/** The recovery workflow stamps this exact run name, so the census is an equality. */
+pub fn release_recovery_run_name(tag: string) -> string {
+  return "recover ${tag}"
+}
+
+/**
+ * Read the remote tag through the same peel the recovery workflow's own
+ * refusal gate uses, so the two cannot disagree about what the tag points at.
+ */
+pub fn release_recovery_tag_state(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  repo: string,
+  tag: string,
+) -> TailRecoveryTagState {
+  const cfg = {repo: repo, mock: false}
+  const direct = run_git(git, cfg, ["ls-remote", "origin", "refs/tags/${tag}"])
+  if !direct.success {
+    throw "cannot read refs/tags/${tag} from origin"
+  }
+  const direct_oid = lowercase(trim(trim(direct.stdout ?? "").split("\t")[0] ?? ""))
+  if !regex_match("^[0-9a-f]{40}$", direct_oid) {
+    return {present: false, target_oid: ""}
+  }
+  const peeled = run_git(git, cfg, ["ls-remote", "origin", "refs/tags/${tag}^{}"])
+  if !peeled.success {
+    throw "cannot peel refs/tags/${tag} on origin"
+  }
+  const peeled_oid = lowercase(trim(trim(peeled.stdout ?? "").split("\t")[0] ?? ""))
+  const target = if regex_match("^[0-9a-f]{40}$", peeled_oid) {
+    peeled_oid
+  } else {
+    direct_oid
+  }
+  return {present: true, target_oid: target}
+}
+
+/**
+ * Every recovery run that already claims this exact tag.
+ *
+ * The walk is bounded and complete: a page whose identity or shape does not
+ * match the request is a read failure, never an empty page, because "we could
+ * not enumerate" must not become "no run owns this tag".
+ */
+pub fn release_recovery_existing_runs(
+  harness: Harness,
+  tag: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> list<TailRecoveryRun> {
+  const expected = release_recovery_run_name(tag)
+  let matches: list<TailRecoveryRun> = []
+  let observed = 0
+  for page in range(1, 11) {
+    const listed = github_workflow_runs(
+      harness,
+      FLEET,
+      RELEASE_TAIL_RECOVERY_WORKFLOW,
+      {branch: "main", event: "workflow_dispatch", page: page},
+      100,
+      options,
+    )
+    if is_err(listed) {
+      throw "cannot census recovery runs for ${tag}: " + to_string(unwrap_err(listed))
+    }
+    const census = unwrap(listed)
+    if census.repo != FLEET || census.workflow_id != RELEASE_TAIL_RECOVERY_WORKFLOW
+      || census.total_count < 0 {
+      throw "recovery run census returned an unexpected identity or count"
+    }
+    if census.page != page || census.per_page != 100 {
+      throw "recovery run census returned an unexpected page"
+    }
+    observed += len(census.runs)
+    for run in census.runs {
+      if run.display_title == expected && run.id > 0 {
+        matches = matches
+          + [{run_id: run.id, run_url: "https://github.com/${FLEET}/actions/runs/${run.id}"}]
+      }
+    }
+    if observed >= census.total_count || len(census.runs) == 0 {
+      return matches
+    }
+  }
+  throw "recovery run census for ${tag} did not terminate within its page bound"
+}
+
+pub fn release_recovery_dispatch(
+  harness: Harness,
+  input: TailRecoveryDispatchInput,
+) -> TailRecoveryRun {
+  if input.mode != RELEASE_TAIL_RECOVERY_MODE {
+    throw "automatic recovery may only request ${RELEASE_TAIL_RECOVERY_MODE}"
+  }
+  if !regex_match("^[0-9a-f]{40}$", input.merge_oid) {
+    throw "automatic recovery requires the exact 40-character release merge commit"
+  }
+  const accepted = github_workflow_dispatch(
+    harness,
+    FLEET,
+    RELEASE_TAIL_RECOVERY_WORKFLOW,
+    {tag: input.tag, merge_oid: input.merge_oid, hosted_run: input.hosted_run, mode: input.mode},
+    "main",
+  )
+  if is_err(accepted) {
+    throw "recovery dispatch acceptance uncertain: " + to_string(unwrap_err(accepted))
+  }
+  const run = unwrap(accepted)
+  return {run_id: run.run_id, run_url: run.url}
+}
+
+/**
+ * A reconcile-only lane observes; it never publishes anything, so its recovery
+ * adapter refuses the effect outright rather than relying on a caller's flag.
+ */
+pub fn release_tail_recovery_live_adapter(
+  harness: Harness,
+  request: PublishedTailRequest,
+  repo: string,
+  reconcile_only: bool,
+  options: GithubClientOptions = github_connector_options(),
+) -> TailRecoveryAdapter {
+  return {
+    tag_state: fn(tag) { return release_recovery_tag_state(
+      {env: harness.env, process: harness.process},
+      repo,
+      tag,
+    ) },
+    existing_recovery_runs:
+      fn(tag) { return release_recovery_existing_runs(harness, tag, options) },
+    dispatch_recovery: fn(input) {
+      if reconcile_only {
+        throw "read-only reconciliation cannot dispatch release recovery"
+      }
+      if input.tag != request.tag {
+        throw "recovery dispatch tag does not match the tail's own release"
+      }
+      return release_recovery_dispatch(harness, input)
+    },
+    backoff: fn(attempt) {
+      harness.clock.sleep_ms(min(60000, 5000 * attempt))
+      return nil
+    },
+  }
+}

@@ -1,0 +1,529 @@
+/**
+ * Recover the post-tag publication tail without a person.
+ *
+ * Past the tag a release is already irreversible, so a red tail is not a safe
+ * stop: it is an unfinished publication that stays unfinished until somebody
+ * notices. This module owns the decision the tail could not previously make.
+ * It reads the typed cause the tail recorded on its failing stage, classifies
+ * it, and takes exactly one action per attempt: retry a transient cause,
+ * dispatch the recovery workflow for a cause that workflow owns, or escalate.
+ *
+ * An unclassified cause escalates. There is deliberately no default arm that
+ * retries: a cause nobody has classified is a cause nobody has reasoned about,
+ * and retrying it is how an unbounded loop starts.
+ *
+ * ## Why a second publication is structurally impossible on this path
+ *
+ * Automatic recovery is the only new remote effect here, and four independent
+ * conditions must all hold before it fires. Each is asserted, and each failure
+ * escalates rather than proceeding:
+ *
+ * 1. The dispatched mode is the constant `resume-receipt`. The recovery
+ *    workflow's tag-creating modes are unreachable from this path.
+ * 2. The tag must already be observed present on the remote *and* already
+ *    resolve to this release's own merge commit. Resuming publication for a
+ *    tag that already points at the right commit cannot create a second one.
+ * 3. A census of existing recovery runs for the exact tag must return zero. An
+ *    unreadable census is not zero: it escalates.
+ * 4. The durable per-tag recovery receipt records the dispatch before this
+ *    process can reach the decision again, so a resumed journal never
+ *    dispatches a second time even while the first run is still unlisted.
+ *
+ * The recovery workflow also shares the release's `hosted-harn-release`
+ * concurrency group, so a dispatch accepted here cannot run beside the release
+ * that dispatched it.
+ */
+import { read_json_typed_result, write_json } from "std/fs"
+import { is_v_semver } from "std/semver"
+import {
+  ReleaseChainCause,
+  ReleaseChainReceipt,
+  ReleaseChainStage,
+  ReleaseChainStageReceipt,
+  release_chain_latest_stage,
+} from "./release_chain_state"
+import {
+  PublishedTailAdapter,
+  PublishedTailRequest,
+  run_published_release_tail,
+} from "./release_published_tail"
+
+pub const RELEASE_TAIL_RECOVERY_SCHEMA = "harn.release-tail-recovery.v1"
+
+/** Bounded means bounded: attempts are counted per tag across invocations. */
+pub const RELEASE_TAIL_RECOVERY_CEILING: int = 3
+
+/** The one recovery mode this path may ever request. It never creates a tag. */
+pub const RELEASE_TAIL_RECOVERY_MODE = "resume-receipt"
+
+pub const RELEASE_TAIL_RECOVERY_WORKFLOW = "recover-release-publication.yml"
+
+pub type TailRecoveryClass = "transient" | "publication_incomplete" | "policy_stop"
+
+pub type TailRecoveryAction = "complete" | "handoff" | "retry" | "dispatch_recovery" | "escalate"
+
+pub type TailRecoveryRun = {run_id: int, run_url: string}
+
+pub type TailRecoveryTagState = {present: bool, target_oid: string}
+
+pub type TailRecoveryDispatchInput = {
+  tag: string,
+  merge_oid: string,
+  hosted_run: string,
+  mode: string,
+}
+
+/**
+ * Every remote read the decision needs, injected so the decision is testable.
+ *
+ * `tag_state` and `existing_recovery_runs` must throw when they cannot read.
+ * Returning an empty or absent answer for an unreadable remote is the exact
+ * shape that turns "we could not look" into "there is nothing there".
+ */
+pub type TailRecoveryAdapter = {
+  tag_state: fn(string) -> TailRecoveryTagState,
+  existing_recovery_runs: fn(string) -> list<TailRecoveryRun>,
+  dispatch_recovery: fn(TailRecoveryDispatchInput) -> TailRecoveryRun,
+  backoff: fn(int) -> nil,
+}
+
+pub type TailRecoveryLimits = {ceiling: int, hosted_run: string}
+
+pub type TailRecoveryIdentities = {
+  tag: string,
+  chain_id: string,
+  release_commit_oid: string,
+  hosted_run: string,
+  recovery_run_id: int,
+  recovery_run_url: string,
+}
+
+pub type TailRecoveryAttempt = {
+  attempt: int,
+  stage?: ReleaseChainStage,
+  cause: ReleaseChainCause,
+  cause_class?: TailRecoveryClass,
+  action: TailRecoveryAction,
+  reason: string,
+  identities: TailRecoveryIdentities,
+  recorded_at: string,
+}
+
+pub type TailRecoveryReceipt = {
+  schema_version: string,
+  tag: string,
+  chain_id: string,
+  ceiling: int,
+  attempts: list<TailRecoveryAttempt>,
+  terminal_action: TailRecoveryAction,
+  recovery_dispatched: bool,
+}
+
+pub type TailRecoveryOutcome = {receipt: ReleaseChainReceipt?, recovery: TailRecoveryReceipt}
+
+const TAIL_STAGES: list<ReleaseChainStage> = ["prove", "baseline", "promote", "repin", "converge"]
+
+/**
+ * Causes the tail itself can outlast by trying again.
+ *
+ * Every stage behind these is a reconciling read-then-propose that adopts its
+ * own prior effect, so a second attempt observes rather than repeats.
+ */
+const TRANSIENT_CAUSES: list<ReleaseChainCause> = [
+  "credential_unavailable",
+  "lease_unavailable",
+  "baseline_unproven",
+  "anchor_stale",
+  "convergence_proof_missing",
+  "consumer_pin_unreadable",
+  "consumer_pin_stale",
+  "consumer_update_failed",
+]
+
+/**
+ * Exactly the charter of `recover-release-publication.yml`: an existing tag whose publication is incomplete.
+ */
+const PUBLICATION_INCOMPLETE_CAUSES: list<ReleaseChainCause> = [
+  "assets_missing",
+  "packages_missing",
+  "publication_dispatch_missing",
+]
+
+/** Named stops. A person decides these, and the receipt says which one fired. */
+const POLICY_STOP_CAUSES: list<ReleaseChainCause> = [
+  "stopped",
+  "target_superseded",
+  "tag_missing",
+  "tag_moved",
+  "tag_unsigned",
+]
+
+/** Nil is the answer for an unclassified cause, and nil escalates. */
+pub fn tail_recovery_class(cause: ReleaseChainCause) -> TailRecoveryClass? {
+  if contains(TRANSIENT_CAUSES, cause) {
+    return "transient"
+  }
+  if contains(PUBLICATION_INCOMPLETE_CAUSES, cause) {
+    return "publication_incomplete"
+  }
+  if contains(POLICY_STOP_CAUSES, cause) {
+    return "policy_stop"
+  }
+  return nil
+}
+
+/** The first tail stage whose latest row is failed or stopped, in stage order. */
+pub fn published_tail_failure(receipt: ReleaseChainReceipt) -> ReleaseChainStageReceipt? {
+  for stage in TAIL_STAGES {
+    const row = release_chain_latest_stage(receipt, stage)
+    if row != nil && (row.status == "failed" || row.status == "stopped") {
+      return row
+    }
+  }
+  return nil
+}
+
+pub fn release_tail_recovery_path(state_root: string, tag: string) -> string {
+  if !is_v_semver(tag) {
+    throw "release tail recovery requires an exact v-prefixed release tag"
+  }
+  return path_join(state_root, "release-tail-recovery", tag + ".json")
+}
+
+pub fn release_tail_recovery_read(
+  fs: HarnessFs,
+  state_root: string,
+  tag: string,
+) -> TailRecoveryReceipt? {
+  const path = release_tail_recovery_path(state_root, tag)
+  const result = read_json_typed_result<TailRecoveryReceipt>(
+    fs,
+    path,
+    schema_of(TailRecoveryReceipt),
+  )
+  if is_ok(result) {
+    const receipt = unwrap(result)
+    if receipt.schema_version != RELEASE_TAIL_RECOVERY_SCHEMA || receipt.tag != tag {
+      throw "release tail recovery receipt at ${path} names another release"
+    }
+    return receipt
+  }
+  const failure = unwrap_err(result)
+  if failure.kind == "absent" {
+    return nil
+  }
+  throw "invalid release tail recovery receipt at ${path}: ${failure.kind}: ${failure.detail}"
+}
+
+pub fn release_tail_recovery_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  state_root: string,
+  receipt: TailRecoveryReceipt,
+) -> string {
+  const path = release_tail_recovery_path(state_root, receipt.tag)
+  harness.fs.mkdir(dirname(path), true)
+  const temporary = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+  return path
+}
+
+fn identities(
+  request: PublishedTailRequest,
+  hosted_run: string,
+  run: TailRecoveryRun?,
+) -> TailRecoveryIdentities {
+  return {
+    tag: request.tag,
+    chain_id: request.chain_id,
+    release_commit_oid: request.watch.release_commit_oid,
+    hosted_run: hosted_run,
+    recovery_run_id: run?.run_id ?? 0,
+    recovery_run_url: run?.run_url ?? "",
+  }
+}
+
+pub type TailRecoveryDecision = {
+  action: TailRecoveryAction,
+  cause: ReleaseChainCause,
+  cause_class?: TailRecoveryClass,
+  stage?: ReleaseChainStage,
+  reason: string,
+  run?: TailRecoveryRun,
+}
+
+/**
+ * Decide whether the recovery workflow may be dispatched for this tag, and do
+ * it. Every refusal escalates by name; none of them falls through to a retry.
+ */
+fn dispatch_decision(
+  request: PublishedTailRequest,
+  state: TailRecoveryReceipt,
+  recovery: TailRecoveryAdapter,
+  limits: TailRecoveryLimits,
+  base: TailRecoveryDecision,
+) -> TailRecoveryDecision {
+  if state.recovery_dispatched {
+    return base
+      + {
+        action: "escalate",
+        reason: "recovery was already dispatched for ${request.tag}; refusing a second publication",
+      }
+  }
+  if !regex_match("^[1-9][0-9]*$", limits.hosted_run) {
+    return base
+      + {action: "escalate", reason: "no exact hosted run identity to hand the recovery workflow"}
+  }
+  const tag_state: Result<TailRecoveryTagState, unknown> = try {
+    Ok(recovery.tag_state(request.tag))
+  } catch (error) {
+    Err(error)
+  }
+  if is_err(tag_state) {
+    return base
+      + {
+        action: "escalate",
+        reason: "remote tag state for ${request.tag} is unreadable: "
+          + to_string(unwrap_err(tag_state)),
+      }
+  }
+  const observed = unwrap(tag_state)
+  if !observed.present {
+    return base
+      + {
+        action: "escalate",
+        reason: "${request.tag} is not on the remote; automatic recovery never creates a tag",
+      }
+  }
+  if observed.target_oid != request.watch.release_commit_oid {
+    return base
+      + {
+        action: "escalate",
+        reason:
+          "${request.tag} resolves to ${observed.target_oid}, not this release's ${request.watch.release_commit_oid}",
+      }
+  }
+  const census: Result<list<TailRecoveryRun>, unknown> = try {
+    Ok(recovery.existing_recovery_runs(request.tag))
+  } catch (error) {
+    Err(error)
+  }
+  if is_err(census) {
+    return base
+      + {
+        action: "escalate",
+        reason: "recovery run census for ${request.tag} is unreadable: "
+          + to_string(unwrap_err(census)),
+      }
+  }
+  const existing = unwrap(census)
+  if len(existing) > 0 {
+    return base
+      + {
+        action: "escalate",
+        reason: "recovery run ${existing[0]?.run_id ?? 0} already owns ${request.tag}",
+      }
+  }
+  const accepted: Result<TailRecoveryRun, unknown> = try {
+    Ok(
+      recovery.dispatch_recovery(
+        {
+          tag: request.tag,
+          merge_oid: request.watch.release_commit_oid,
+          hosted_run: limits.hosted_run,
+          mode: RELEASE_TAIL_RECOVERY_MODE,
+        },
+      ),
+    )
+  } catch (error) {
+    Err(error)
+  }
+  if is_err(accepted) {
+    return base
+      + {
+        action: "escalate",
+        reason: "recovery dispatch was not accepted: " + to_string(unwrap_err(accepted)),
+      }
+  }
+  const run = unwrap(accepted)
+  if run.run_id < 1 || trim(run.run_url) == "" {
+    return base
+      + {action: "escalate", reason: "recovery dispatch returned no exact accepted run identity"}
+  }
+  return base
+    + {
+      action: "dispatch_recovery",
+      reason:
+        "dispatched ${RELEASE_TAIL_RECOVERY_WORKFLOW} mode=${RELEASE_TAIL_RECOVERY_MODE} for ${request.tag}",
+      run: run,
+    }
+}
+
+/** Read one tail outcome into exactly one action. */
+pub fn tail_recovery_decide(
+  request: PublishedTailRequest,
+  state: TailRecoveryReceipt,
+  outcome: Result<ReleaseChainReceipt, unknown>,
+  recovery: TailRecoveryAdapter,
+  limits: TailRecoveryLimits,
+) -> TailRecoveryDecision {
+  if is_err(outcome) {
+    return {
+      action: "escalate",
+      cause: "unknown",
+      reason: "the published tail threw before recording a cause: "
+        + to_string(unwrap_err(outcome)),
+    }
+  }
+  const receipt = unwrap(outcome)
+  if receipt.status == "complete" {
+    return {action: "complete", cause: "unknown", reason: "published tail is complete"}
+  }
+  const failure = published_tail_failure(receipt)
+  if failure == nil {
+    return {
+      action: "handoff",
+      cause: "unknown",
+      reason: "no published tail stage is failed or stopped",
+    }
+  }
+  const cause: ReleaseChainCause = failure.cause ?? "unknown"
+  const cause_class = tail_recovery_class(cause)
+  const base: TailRecoveryDecision = {
+    action: "escalate",
+    cause: cause,
+    stage: failure.stage,
+    reason:
+      "cause '${cause}' at stage '${failure.stage}' is not classified; escalating rather than retrying",
+  }
+  if cause_class == nil {
+    return base
+  }
+  const classified = base + {cause_class: cause_class}
+  if cause_class == "policy_stop" {
+    return classified
+      + {reason: "'${cause}' at stage '${failure.stage}' is a policy stop; a person decides it"}
+  }
+  if cause_class == "transient" {
+    return classified
+      + {action: "retry", reason: "'${cause}' at stage '${failure.stage}' is transient; retrying"}
+  }
+  return dispatch_decision(request, state, recovery, limits, classified)
+}
+
+fn fresh_state(request: PublishedTailRequest, ceiling: int) -> TailRecoveryReceipt {
+  return {
+    schema_version: RELEASE_TAIL_RECOVERY_SCHEMA,
+    tag: request.tag,
+    chain_id: request.chain_id,
+    ceiling: ceiling,
+    attempts: [],
+    terminal_action: "escalate",
+    recovery_dispatched: false,
+  }
+}
+
+fn append_attempt(
+  harness: Harness,
+  request: PublishedTailRequest,
+  state: TailRecoveryReceipt,
+  decision: TailRecoveryDecision,
+  limits: TailRecoveryLimits,
+) -> TailRecoveryReceipt {
+  let attempt: TailRecoveryAttempt = {
+    attempt: len(state.attempts) + 1,
+    cause: decision.cause,
+    action: decision.action,
+    reason: decision.reason,
+    identities: identities(request, limits.hosted_run, decision.run),
+    recorded_at: harness.clock.date_iso(),
+  }
+  if decision.stage != nil {
+    attempt = attempt + {stage: decision.stage}
+  }
+  if decision.cause_class != nil {
+    attempt = attempt + {cause_class: decision.cause_class}
+  }
+  const next = state
+    + {
+      attempts: state.attempts + [attempt],
+      terminal_action: decision.action,
+      recovery_dispatched: state.recovery_dispatched || decision.action == "dispatch_recovery",
+    }
+  release_tail_recovery_write({fs: harness.fs, random: harness.random}, request.state_root, next)
+  return next
+}
+
+/** The ceiling row is itself an attempt, so the receipt says why it stopped. */
+fn exhausted(
+  harness: Harness,
+  request: PublishedTailRequest,
+  state: TailRecoveryReceipt,
+  limits: TailRecoveryLimits,
+) -> TailRecoveryReceipt {
+  return append_attempt(
+    harness,
+    request,
+    state,
+    {
+      action: "escalate",
+      cause: "unknown",
+      reason:
+        "per-tag attempt ceiling ${limits.ceiling} reached for ${request.tag}; refusing another attempt",
+    },
+    limits,
+  )
+}
+
+/**
+ * Run the published tail under bounded, cause-driven recovery.
+ *
+ * The receipt is written after every attempt, before the next one starts, so
+ * the ceiling and the dispatch marker survive a process that dies mid-loop.
+ */
+pub fn run_published_tail_with_recovery(
+  harness: Harness,
+  request: PublishedTailRequest,
+  tail: PublishedTailAdapter,
+  recovery: TailRecoveryAdapter,
+  limits: TailRecoveryLimits,
+) -> TailRecoveryOutcome {
+  if limits.ceiling < 1 {
+    throw "published tail recovery ceiling must be at least one attempt"
+  }
+  let state = release_tail_recovery_read(harness.fs, request.state_root, request.tag)
+    ?? fresh_state(request, limits.ceiling)
+  state = state + {ceiling: limits.ceiling, chain_id: request.chain_id}
+  let last: ReleaseChainReceipt? = nil
+  while true {
+    if len(state.attempts) >= limits.ceiling {
+      return {receipt: last, recovery: exhausted(harness, request, state, limits)}
+    }
+    const outcome: Result<ReleaseChainReceipt, unknown> = try {
+      Ok(run_published_release_tail(harness, request, tail))
+    } catch (error) {
+      Err(error)
+    }
+    if is_ok(outcome) {
+      last = unwrap(outcome)
+    }
+    const decision = tail_recovery_decide(request, state, outcome, recovery, limits)
+    state = append_attempt(harness, request, state, decision, limits)
+    if decision.action != "retry" {
+      return {receipt: last, recovery: state}
+    }
+    // The ceiling is read before the wait, so an exhausted budget never pays
+    // for a backoff it will not use.
+    if len(state.attempts) >= limits.ceiling {
+      return {receipt: last, recovery: exhausted(harness, request, state, limits)}
+    }
+    recovery.backoff(len(state.attempts))
+  }
+}
+
+/** A tail that finished, handed off, or handed itself to recovery is not a red job. */
+pub fn tail_recovery_settled(receipt: TailRecoveryReceipt) -> bool {
+  return len(receipt.attempts) > 0
+    && (receipt.terminal_action == "complete" || receipt.terminal_action == "handoff"
+      || receipt.terminal_action == "dispatch_recovery")
+}

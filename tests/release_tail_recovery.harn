@@ -1,0 +1,575 @@
+import { ReleaseChainCause, release_chain_latest_stage } from "../lib/release_chain_state"
+import { ReleasePublicationEvidence } from "../lib/release_publication_proof"
+import {
+  PublishedTailAdapter,
+  PublishedTailRead,
+  PublishedTailRequest,
+} from "../lib/release_published_tail"
+import { published_tail_publication_cause } from "../lib/release_published_tail_live"
+import { ReleaseTagIdentityVerification } from "../lib/release_tag_identity"
+import {
+  RELEASE_TAIL_RECOVERY_MODE,
+  TailRecoveryAdapter,
+  TailRecoveryRun,
+  TailRecoveryTagState,
+  release_tail_recovery_read,
+  run_published_tail_with_recovery,
+  tail_recovery_class,
+} from "../lib/release_tail_recovery"
+import { release_recovery_run_name } from "../lib/release_tail_recovery_live"
+import {
+  release_watch_receipt,
+  release_watch_receipt_bind_main_commit,
+} from "../lib/release_watch_state"
+
+const SHA = "1111111111111111111111111111111111111111"
+
+const OTHER_SHA = "2222222222222222222222222222222222222222"
+
+const NOW = "2026-09-05T00:00:00Z"
+
+const TAG = "v0.10.125"
+
+const HOSTED_RUN = "4242"
+
+fn request(fs: HarnessFs) -> PublishedTailRequest {
+  const root = fs.mkdtemp_in_workspace("tail-recovery")
+  const watch = release_watch_receipt(
+    {
+      tag: TAG,
+      slug: "burin-labs/harn",
+      pin_sha: SHA,
+      publication: {
+        version: "0.10.125",
+        local_branch: "release/${TAG}",
+        remote_ref: "release-attempt/${TAG}/${SHA}",
+        head_oid: SHA,
+      },
+      pr_url: "https://github.com/burin-labs/harn/pull/125",
+      created_at: NOW,
+    },
+  )
+  return {
+    tag: watch.tag,
+    watch: release_watch_receipt_bind_main_commit(watch, SHA, NOW),
+    chain_id: "125",
+    state_root: root,
+  }
+}
+
+fn proven(subject: string) -> PublishedTailRead {
+  return {
+    state: "proven",
+    detail: "",
+    evidence: [
+      {
+        subject: subject,
+        kind: "fixture",
+        status: "observed",
+        expected: TAG,
+        observed: TAG,
+        source: "fixture",
+        ref: TAG,
+        identity: SHA,
+        observed_at: NOW,
+      },
+    ],
+  }
+}
+
+fn broken(subject: string, cause: ReleaseChainCause) -> PublishedTailRead {
+  const base = proven(subject)
+  return base
+    + {
+      state: "failed",
+      cause: cause,
+      detail: "${subject} is not observable",
+      evidence: base.evidence.map({ item -> item + {status: "broken", observed: ""} }).to_list(),
+    }
+}
+
+fn successful_adapter() -> PublishedTailAdapter {
+  return {
+    publication: fn(_request) { return proven("publication") },
+    current_targets: fn() { return [{subject: "consumer", version: "v0.10.124"}] },
+    baseline: fn(_request, _apply) { return proven("baseline") },
+    promote: fn(_request, _apply) { return proven("promotion") },
+    find_dispatch: fn(_request) { return [] },
+    dispatch: fn(_request) { return {
+      run_id: 125,
+      run_url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/125",
+    } },
+    converge: fn(_request, _run) { return proven("consumer") },
+  }
+}
+
+pub type RecoveryProbe = {adapter: TailRecoveryAdapter, dispatches: any, backoffs: any, log: any}
+
+/**
+ * A recovery adapter that records exactly what it was asked to do.
+ *
+ * The cells are keyed per probe, never on a shared name, so a parallel suite
+ * cannot leak one test's dispatch count into another's assertion.
+ */
+fn recovery_probe(
+  harness: {random: HarnessRandom, runtime: HarnessRuntime},
+  tag_state: fn(string) -> TailRecoveryTagState,
+  existing: fn(string) -> list<TailRecoveryRun>,
+) -> RecoveryProbe {
+  const key = harness.random.uuid_v7()
+  const dispatches = harness.runtime.atomic(0)
+  const backoffs = harness.runtime.atomic(0)
+  const log = harness.runtime.shared_cell(
+    {scope: "process", key: "tail-recovery-dispatch-${key}", initial: ""},
+  )
+  return {
+    dispatches: dispatches,
+    backoffs: backoffs,
+    log: log,
+    adapter: {
+      tag_state: tag_state,
+      existing_recovery_runs: existing,
+      dispatch_recovery: fn(input) {
+        harness.runtime.atomic_add(dispatches, 1)
+        harness.runtime.shared_set(
+          log,
+          "${input.tag}|${input.merge_oid}|${input.hosted_run}|${input.mode}",
+        )
+        return {
+          run_id: 999,
+          run_url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/999",
+        }
+      },
+      backoff: fn(_attempt) {
+        harness.runtime.atomic_add(backoffs, 1)
+        return nil
+      },
+    },
+  }
+}
+
+fn present_at(oid: string) -> fn(string) -> TailRecoveryTagState {
+  const state: TailRecoveryTagState = {present: true, target_oid: oid}
+  return fn(_tag) { return state }
+}
+
+fn no_existing_runs() -> fn(string) -> list<TailRecoveryRun> {
+  return fn(_tag) { return [] }
+}
+
+/**
+ * FALSIFIER 1: a failure the recovery workflow does not own escalates.
+ *
+ * `tag_unsigned` is a named policy stop; `certification_failed` is a cause this
+ * tail has never classified. Neither may retry and neither may dispatch. Add a
+ * default arm that retries an unclassified cause, or fold the policy stops into
+ * the transient list, and this fails on `terminal_action` and on the count of
+ * observations the tail made.
+ */
+pipeline test_unowned_failure_escalates_instead_of_retrying(harness: Harness) {
+  const causes: list<ReleaseChainCause> = ["tag_unsigned", "certification_failed"]
+  for cause in causes {
+    const input = request(harness.fs)
+    const observations = harness.runtime.atomic(0)
+    const adapter: PublishedTailAdapter = successful_adapter()
+      + {
+        publication: fn(_actual) {
+          harness.runtime.atomic_add(observations, 1)
+          return broken("publication", cause)
+        },
+      }
+    const probe = recovery_probe(
+      {random: harness.random, runtime: harness.runtime},
+      present_at(SHA),
+      no_existing_runs(),
+    )
+    const outcome = run_published_tail_with_recovery(
+      harness,
+      input,
+      adapter,
+      probe.adapter,
+      {ceiling: 3, hosted_run: HOSTED_RUN},
+    )
+    assert_eq(outcome.recovery.terminal_action, "escalate", cause)
+    assert_eq(len(outcome.recovery.attempts), 1, cause)
+    assert_eq(outcome.recovery.attempts[0]?.cause, cause)
+    assert_eq(outcome.recovery.attempts[0]?.action, "escalate")
+    assert_eq(outcome.recovery.attempts[0]?.stage, "prove")
+    assert_eq(outcome.recovery.recovery_dispatched, false)
+    // Observed once: it escalated rather than trying again.
+    assert_eq(harness.runtime.atomic_get(observations), 1, cause)
+    assert_eq(harness.runtime.atomic_get(probe.dispatches), 0, cause)
+    assert_eq(harness.runtime.atomic_get(probe.backoffs), 0, cause)
+  }
+}
+
+/** An unclassified cause carries no class at all, so nothing can read it as transient. */
+pipeline test_unclassified_cause_has_no_class() {
+  assert_eq(tail_recovery_class("certification_failed"), nil)
+  assert_eq(tail_recovery_class("unknown"), nil)
+  assert_eq(tail_recovery_class("release_pr_missing"), nil)
+  assert_eq(tail_recovery_class("tag_unsigned"), "policy_stop")
+  assert_eq(tail_recovery_class("tag_moved"), "policy_stop")
+  assert_eq(tail_recovery_class("stopped"), "policy_stop")
+  assert_eq(tail_recovery_class("lease_unavailable"), "transient")
+  assert_eq(tail_recovery_class("assets_missing"), "publication_incomplete")
+  assert_eq(tail_recovery_class("publication_dispatch_missing"), "publication_incomplete")
+}
+
+/**
+ * FALSIFIER 2: a transient failure recovers with no dispatch by hand.
+ *
+ * The baseline proposal is unavailable once and observable afterwards. Remove
+ * the retry arm and the tail stops at attempt one with a failed baseline stage
+ * — exactly the state somebody had to finish by hand on the observed cut.
+ */
+pipeline test_transient_failure_recovers_without_a_person(harness: Harness) {
+  const input = request(harness.fs)
+  const observations = harness.runtime.atomic(0)
+  const adapter: PublishedTailAdapter = successful_adapter()
+    + {
+      baseline: fn(_actual, _apply) {
+        const seen = harness.runtime.atomic_get(observations)
+        harness.runtime.atomic_add(observations, 1)
+        return if seen == 0 {
+          broken("baseline", "lease_unavailable")
+        } else {
+          proven("baseline")
+        }
+      },
+    }
+  const probe = recovery_probe(
+    {random: harness.random, runtime: harness.runtime},
+    present_at(SHA),
+    no_existing_runs(),
+  )
+  const outcome = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(outcome.recovery.terminal_action, "complete")
+  assert_eq(len(outcome.recovery.attempts), 2)
+  assert_eq(outcome.recovery.attempts[0]?.action, "retry")
+  assert_eq(outcome.recovery.attempts[0]?.cause, "lease_unavailable")
+  assert_eq(outcome.recovery.attempts[0]?.cause_class, "transient")
+  assert_eq(outcome.recovery.attempts[0]?.stage, "baseline")
+  assert_eq(outcome.recovery.attempts[1]?.action, "complete")
+  const receipt = outcome.receipt
+  assert(receipt != nil)
+  assert_eq(receipt.status, "complete")
+  assert_eq(release_chain_latest_stage(receipt, "baseline")?.status, "proven")
+  // Nothing was dispatched and nobody was asked.
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 0)
+  assert_eq(harness.runtime.atomic_get(probe.backoffs), 1)
+}
+
+/**
+ * FALSIFIER 3: the ceiling is read, not merely written.
+ *
+ * A permanently unavailable proposal lease is the retry loop's worst case. The
+ * tail is observed exactly `ceiling` times, the ceiling row names itself, and a
+ * second invocation against the same durable receipt observes zero more times.
+ * Ignore the stored attempt count and the second invocation runs it again.
+ */
+pipeline test_attempt_ceiling_stops_the_retry_loop(harness: Harness) {
+  const input = request(harness.fs)
+  const observations = harness.runtime.atomic(0)
+  const adapter: PublishedTailAdapter = successful_adapter()
+    + {
+      baseline: fn(_actual, _apply) {
+        harness.runtime.atomic_add(observations, 1)
+        return broken("baseline", "lease_unavailable")
+      },
+    }
+  const probe = recovery_probe(
+    {random: harness.random, runtime: harness.runtime},
+    present_at(SHA),
+    no_existing_runs(),
+  )
+  const first = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(harness.runtime.atomic_get(observations), 3)
+  assert_eq(len(first.recovery.attempts), 4)
+  assert_eq(first.recovery.terminal_action, "escalate")
+  assert_eq(first.recovery.attempts[3]?.action, "escalate")
+  assert_eq(first.recovery.attempts[3]?.attempt, 4)
+  assert_eq(first.recovery.attempts[3]?.cause_class, nil)
+  assert_eq(first.recovery.ceiling, 3)
+  assert_eq(harness.runtime.atomic_get(probe.backoffs), 2)
+  // The bound is durable, not per process.
+  const second = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(harness.runtime.atomic_get(observations), 3)
+  assert_eq(second.recovery.terminal_action, "escalate")
+  assert_eq(second.receipt, nil)
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 0)
+}
+
+/**
+ * A publication that is incomplete against an exact, correct tag is the
+ * recovery workflow's charter, so the tail hands it over with the exact tag,
+ * merge commit and hosted run, in the one mode that cannot create a tag — and
+ * then never hands the same tag over twice.
+ */
+pipeline test_incomplete_publication_dispatches_recovery_exactly_once(harness: Harness) {
+  const input = request(harness.fs)
+  const adapter: PublishedTailAdapter = successful_adapter()
+    + {publication: fn(_actual) { return broken("publication", "assets_missing") }}
+  const probe = recovery_probe(
+    {random: harness.random, runtime: harness.runtime},
+    present_at(SHA),
+    no_existing_runs(),
+  )
+  const outcome = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(outcome.recovery.terminal_action, "dispatch_recovery")
+  assert_eq(outcome.recovery.recovery_dispatched, true)
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 1)
+  assert_eq(
+    harness.runtime.shared_get(probe.log),
+    "${TAG}|${SHA}|${HOSTED_RUN}|${RELEASE_TAIL_RECOVERY_MODE}",
+  )
+  assert_eq(RELEASE_TAIL_RECOVERY_MODE, "resume-receipt")
+  const attempt = outcome.recovery.attempts[0]
+  assert_eq(attempt?.identities?.recovery_run_id, 999)
+  assert_eq(attempt?.identities?.release_commit_oid, SHA)
+  assert_eq(attempt?.identities?.chain_id, "125")
+  assert_eq(attempt?.identities?.hosted_run, HOSTED_RUN)
+  // The durable receipt, not this process's memory, is what refuses the second.
+  const stored = release_tail_recovery_read(harness.fs, input.state_root, TAG)
+  assert_eq(stored?.recovery_dispatched, true)
+  const again = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(again.recovery.terminal_action, "escalate")
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 1)
+}
+
+fn refuses_to_dispatch(
+  harness: Harness,
+  name: string,
+  tag_state: fn(string) -> TailRecoveryTagState,
+  existing: fn(string) -> list<TailRecoveryRun>,
+  hosted_run: string,
+) -> nil {
+  const input = request(harness.fs)
+  const adapter: PublishedTailAdapter = successful_adapter()
+    + {publication: fn(_actual) { return broken("publication", "packages_missing") }}
+  const probe = recovery_probe(
+    {random: harness.random, runtime: harness.runtime},
+    tag_state,
+    existing,
+  )
+  const outcome = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: hosted_run},
+  )
+  assert_eq(outcome.recovery.terminal_action, "escalate", name)
+  assert_eq(outcome.recovery.recovery_dispatched, false, name)
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 0, name)
+  return nil
+}
+
+/**
+ * Every guard on the one remote effect, one at a time.
+ *
+ * Each of these is a state in which a second publication of the same tag would
+ * be conceivable. None may dispatch, and an unreadable remote is never read as
+ * an absent one.
+ */
+pipeline test_no_guard_failure_can_start_a_second_publication(harness: Harness) {
+  refuses_to_dispatch(
+    harness,
+    "tag absent",
+    fn(_tag) { return {present: false, target_oid: ""} },
+    no_existing_runs(),
+    HOSTED_RUN,
+  )
+  refuses_to_dispatch(
+    harness,
+    "tag points at another commit",
+    present_at(OTHER_SHA),
+    no_existing_runs(),
+    HOSTED_RUN,
+  )
+  refuses_to_dispatch(
+    harness,
+    "tag state unreadable",
+    fn(_tag) {
+      throw "origin is unreachable"
+    },
+    no_existing_runs(),
+    HOSTED_RUN,
+  )
+  refuses_to_dispatch(
+    harness,
+    "a recovery run already owns the tag",
+    present_at(SHA),
+    fn(_tag) { return [{run_id: 7, run_url: "https://example.invalid/7"}] },
+    HOSTED_RUN,
+  )
+  refuses_to_dispatch(
+    harness,
+    "recovery census unreadable",
+    present_at(SHA),
+    fn(_tag) {
+      throw "the runs API refused"
+    },
+    HOSTED_RUN,
+  )
+  refuses_to_dispatch(harness, "no hosted run identity", present_at(SHA), no_existing_runs(), "")
+}
+
+/** A tail that throws recorded no cause, so it escalates rather than retrying blind. */
+pipeline test_a_thrown_tail_escalates(harness: Harness) {
+  const input = request(harness.fs)
+  const adapter: PublishedTailAdapter = successful_adapter()
+    + {
+      publication: fn(_actual) {
+        throw "the publication owner crashed"
+      },
+    }
+  const probe = recovery_probe(
+    {random: harness.random, runtime: harness.runtime},
+    present_at(SHA),
+    no_existing_runs(),
+  )
+  const outcome = run_published_tail_with_recovery(
+    harness,
+    input,
+    adapter,
+    probe.adapter,
+    {ceiling: 3, hosted_run: HOSTED_RUN},
+  )
+  assert_eq(outcome.recovery.terminal_action, "escalate")
+  assert_eq(outcome.recovery.attempts[0]?.cause, "unknown")
+  assert_eq(outcome.receipt, nil)
+  assert_eq(harness.runtime.atomic_get(probe.dispatches), 0)
+}
+
+type EvidenceOverrides = {
+  tag_present?: bool,
+  tag_signature_verified?: bool,
+  release_draft?: bool,
+  missing_assets?: list<string>,
+  packages_published?: bool,
+}
+
+fn publication_evidence(overrides: EvidenceOverrides = {}) -> ReleasePublicationEvidence {
+  return {
+    tag: TAG,
+    tag_present: overrides.tag_present ?? true,
+    tag_signature_verified: overrides.tag_signature_verified ?? true,
+    release_found: true,
+    release_draft: overrides.release_draft ?? false,
+    release_prerelease: false,
+    expected_prerelease: false,
+    required_assets: ["SHA256SUMS"],
+    missing_assets: overrides.missing_assets ?? [],
+    packages_published: overrides.packages_published ?? true,
+  }
+}
+
+fn tag_identity(success: bool) -> ReleaseTagIdentityVerification {
+  return {
+    success: success,
+    object_oid: SHA,
+    embedded_tag: TAG,
+    object_type: "commit",
+    direct_target_oid: SHA,
+    peeled_target_oid: SHA,
+    signature_verified: true,
+    reason: "fixture",
+  }
+}
+
+/**
+ * The publication owner names its own cause, so a signing failure is never
+ * labelled a missing asset and therefore never reaches the recovery workflow.
+ */
+pipeline test_publication_cause_is_read_from_the_release_state() {
+  assert_eq(
+    published_tail_publication_cause(
+      publication_evidence({tag_present: false}),
+      tag_identity(true),
+      "",
+    ),
+    "tag_missing",
+  )
+  assert_eq(
+    published_tail_publication_cause(publication_evidence(), tag_identity(false), SHA),
+    "tag_moved",
+  )
+  assert_eq(
+    published_tail_publication_cause(
+      publication_evidence({tag_signature_verified: false}),
+      tag_identity(true),
+      SHA,
+    ),
+    "tag_unsigned",
+  )
+  assert_eq(
+    published_tail_publication_cause(
+      publication_evidence({release_draft: true}),
+      tag_identity(true),
+      SHA,
+    ),
+    "publication_dispatch_missing",
+  )
+  assert_eq(
+    published_tail_publication_cause(
+      publication_evidence({missing_assets: ["SHA256SUMS"]}),
+      tag_identity(true),
+      SHA,
+    ),
+    "assets_missing",
+  )
+  assert_eq(
+    published_tail_publication_cause(
+      publication_evidence({packages_published: false}),
+      tag_identity(true),
+      SHA,
+    ),
+    "packages_missing",
+  )
+}
+
+/**
+ * The census that makes a second dispatch impossible is an equality on the
+ * recovery workflow's run name, so the workflow has to stamp exactly that.
+ */
+pipeline test_recovery_workflow_stamps_the_run_name_the_census_matches(harness: Harness) {
+  const source = harness.fs.read_text(
+    path_join(dirname(harness.fs.cwd()), ".github", "workflows", "recover-release-publication.yml"),
+  )
+  assert(contains(source, "run-name: recover $" + "{{ inputs.tag }}"))
+  assert_eq(release_recovery_run_name(TAG), "recover ${TAG}")
+  // The same concurrency group as the release: a dispatched recovery can never
+  // run beside the release that dispatched it.
+  assert(contains(source, "group: hosted-harn-release"))
+}
