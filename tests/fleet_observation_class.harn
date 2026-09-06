@@ -1,0 +1,212 @@
+import { convergence_snapshot_from_rows } from "../lib/fleet_convergence"
+import {
+  fleet_default_branch_observation,
+  fleet_default_branch_refusal,
+} from "../lib/fleet_default_branch_proof"
+import {
+  fleet_observation_class,
+  fleet_observation_set_class,
+} from "../lib/fleet_observation_class"
+
+// The record the connector actually returned on the round that cost fifty
+// minutes, reproduced field for field.
+const PERMISSION_REFUSAL: dict = {
+  category: "permission",
+  code: "missing_scopes",
+  http_status: 403,
+  message: "github API request failed with status 403",
+}
+
+const RATE_LIMIT: dict = {
+  category: "rate_limit",
+  code: "rate_limited",
+  http_status: 403,
+  message: "github API rate limit exceeded",
+}
+
+const TRANSPORT: dict = {category: "network", code: "network", message: "connection reset"}
+
+const SHA: string = "1111111111111111111111111111111111111111"
+
+/**
+ * The headline case. This exact record was rendered as "pending" for a whole
+ * day, and every round that met it polled its full window for an answer that
+ * was already final in the first response.
+ */
+pipeline test_a_permission_refusal_is_not_something_to_wait_for(task: any) {
+  const classified = fleet_observation_class(PERMISSION_REFUSAL)
+  assert_eq(classified.disposition, "refuse")
+  assert_eq(classified.code, "missing_scopes")
+  assert_eq(classified.category, "permission")
+  // The action is the cheap half. A refusal that does not name its remedy
+  // still leaves someone to work it out, which is what made a three-minute
+  // fix wait four and a half hours.
+  assert(contains(classified.action, "grant"))
+  assert(contains(classified.action, "re-dispatch"))
+}
+
+/** Negative control: the failures a later attempt genuinely can find satisfied. */
+pipeline test_transport_and_pacing_failures_still_wait(task: any) {
+  for retryable in [RATE_LIMIT, TRANSPORT] {
+    const classified = fleet_observation_class(retryable)
+    assert_eq(classified.disposition, "retry")
+    // Nothing to tell a person to do, because nobody has to do anything.
+    assert_eq(classified.action, "")
+  }
+}
+
+/**
+ * An unrecognized failure refuses rather than waits.
+ *
+ * The asymmetry is deliberate and it is the whole design. Guessing "retry" on
+ * an unknown failure costs a full polling window per round and produces
+ * nothing. Guessing "refuse" costs one re-dispatch, and it makes a new failure
+ * shape visible the first time it happens instead of hiding it inside a wait
+ * that looks like ordinary patience.
+ */
+pipeline test_an_unrecognized_failure_refuses_rather_than_waits(task: any) {
+  const classified = fleet_observation_class({category: "something_new", code: "never_seen"})
+  assert_eq(classified.disposition, "refuse")
+  assert(contains(classified.action, "no round of this chain can clear it"))
+}
+
+/** A missing or empty error record is still a refusal, never a silent wait. */
+pipeline test_an_absent_error_record_is_not_read_as_retryable(task: any) {
+  assert_eq(fleet_observation_class(nil).disposition, "refuse")
+  assert_eq(fleet_observation_class({}).disposition, "refuse")
+}
+
+/** Classification reads the structured fields, never the human-facing message. */
+pipeline test_classification_ignores_message_text(task: any) {
+  // A transport failure whose message says "permission" is still a retry, and a
+  // permission refusal whose message says "timeout" is still a refusal. Message
+  // text is written for people and a substring match on it is a guess.
+  assert_eq(
+    fleet_observation_class(TRANSPORT + {message: "permission denied while connecting"})
+      .disposition,
+    "retry",
+  )
+  assert_eq(
+    fleet_observation_class(PERMISSION_REFUSAL + {message: "timeout"}).disposition,
+    "refuse",
+  )
+}
+
+/** One refusal ends the wait even when every other failure is retryable. */
+pipeline test_one_refusal_in_a_set_ends_the_wait(task: any) {
+  assert_eq(fleet_observation_set_class([TRANSPORT, RATE_LIMIT]).disposition, "retry")
+  assert_eq(
+    fleet_observation_set_class([TRANSPORT, PERMISSION_REFUSAL, RATE_LIMIT]).disposition,
+    "refuse",
+  )
+  assert_eq(fleet_observation_set_class([]).disposition, "retry")
+}
+
+/**
+ * The observation now carries the structured records, not only their text.
+ *
+ * Without this the classifier upstream has nothing to read but prose, which is
+ * the thing this design refuses to depend on.
+ */
+pipeline test_the_observation_carries_the_records_it_refused_on(task: any) {
+  const observed = fleet_default_branch_observation(nil, PERMISSION_REFUSAL, nil)
+  assert_eq(observed.refused, true)
+  assert_eq(len(observed.errors), 1)
+  assert_eq(observed.errors[0]?.code, "missing_scopes")
+  assert_eq(len(observed.unproven), 1)
+  assert(contains(observed.unproven[0] ?? "", "exact-head check census read failed"))
+  const clean = fleet_default_branch_observation(nil, nil, nil)
+  assert_eq(clean.refused, false)
+  assert_eq(len(clean.errors), 0)
+}
+
+/**
+ * The fifty-minute shape, end to end, counted in polls.
+ *
+ * The wait loop runs while a snapshot is neither complete nor terminal, and a
+ * snapshot is terminal as soon as one repository has failed. So the number of
+ * polls a round spends on a condition is decided entirely by which state that
+ * condition produces.
+ *
+ * Under the old rendering a permission refusal produced "pending", the row read
+ * as waiting, the snapshot was neither complete nor terminal, and the loop went
+ * around again until its window ran out. Measured, that was fifty minutes on
+ * one round and twenty-six rounds across the day, none of which proved.
+ *
+ * Under the classification it produces "failed", the snapshot is terminal on
+ * the first reading, and the loop condition is false before a second poll.
+ */
+pipeline test_the_refusal_ends_the_round_in_one_poll(task: any) {
+  const refused = convergence_snapshot_from_rows(
+    "v0.10.131",
+    [
+      {repo: "owner/proved", state: "proven", reason: "exact_green_update_merged"},
+      {
+        repo: "owner/refused",
+        state: "failed",
+        reason: "default_branch_checks_unproven: missing_scopes",
+      },
+    ],
+  )
+  assert_eq(refused.terminal, true)
+  assert_eq(refused.complete, false)
+  // The loop's own condition, evaluated on this snapshot.
+  assert_eq(!refused.complete && !refused.terminal, false)
+  assert_eq(refused.failing_count, 1)
+  assert_eq(refused.unproven_repositories, ["owner/refused"])
+  // Negative control on the same shape: the state the old rendering produced
+  // keeps the loop running, which is exactly the cost being removed. If this
+  // ever stops being true, the poll-count claim above is measuring nothing.
+  const waiting = convergence_snapshot_from_rows(
+    "v0.10.131",
+    [
+      {repo: "owner/proved", state: "proven", reason: "exact_green_update_merged"},
+      {
+        repo: "owner/refused",
+        state: "waiting",
+        reason: "default_branch_checks_unproven: missing_scopes",
+      },
+    ],
+  )
+  assert_eq(waiting.terminal, false)
+  assert_eq(waiting.complete, false)
+  assert_eq(!waiting.complete && !waiting.terminal, true)
+}
+
+/**
+ * The decision itself, at the seam that makes it.
+ *
+ * This is the line that governs how long a round runs. A permission refusal
+ * must report failed, so the snapshot is terminal and the loop stops; a
+ * transport failure must still report pending, so a round that could yet
+ * succeed keeps its window. Both directions are asserted here because
+ * asserting only one leaves the other free to regress silently.
+ */
+pipeline test_the_refusal_state_is_decided_by_the_class(task: any) {
+  const refused = fleet_default_branch_refusal(
+    fleet_default_branch_observation(nil, PERMISSION_REFUSAL, nil),
+    SHA,
+  )
+  assert_eq(refused.state, "failed")
+  assert_eq(refused.ok, false)
+  assert_eq(refused.head_sha, SHA)
+  // The remedy reaches the receipt, not just the classifier.
+  assert_eq(len(refused.unproven), 2)
+  assert(contains(refused.unproven[1] ?? "", "action: "))
+  assert(contains(refused.unproven[1] ?? "", "grant"))
+  // The other direction, on the same seam.
+  const waiting = fleet_default_branch_refusal(
+    fleet_default_branch_observation(nil, TRANSPORT, nil),
+    SHA,
+  )
+  assert_eq(waiting.state, "pending")
+  assert_eq(waiting.ok, false)
+  // A retryable failure gets no action line, because nobody has to act.
+  assert_eq(len(waiting.unproven), 1)
+  // A rate limit is the case most easily mistaken for the permission refusal:
+  // same HTTP status, opposite disposition.
+  assert_eq(
+    fleet_default_branch_refusal(fleet_default_branch_observation(nil, RATE_LIMIT, nil), SHA).state,
+    "pending",
+  )
+}
