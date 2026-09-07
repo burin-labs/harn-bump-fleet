@@ -1,0 +1,370 @@
+import {
+  GithubConnectorError,
+  GithubPullReference,
+  github_claim_ref,
+  github_connector_options,
+  github_enable_auto_merge,
+  github_pr_view,
+  github_ref_snapshot,
+  github_release_ref,
+} from "./github"
+import {
+  GithubAutoMergeReceipt,
+  GithubClientOptions,
+  GithubConnectorResult,
+} from "harn-github-connector/default"
+
+/** One cross-process owner for merge mutations while a release candidate exists. */
+pub type ReleaseMergeLease = {
+  repo: string,
+  base_branch: string,
+  base_oid: string,
+  candidate_pr: int,
+  candidate_head: string,
+  generation: string,
+  tag: string,
+}
+
+pub type ReleaseMergeLeaseState = "clear" | "active" | "invalid" | "unreadable"
+
+pub type ReleaseMergeLeaseObservation = {
+  state: ReleaseMergeLeaseState,
+  ref: string,
+  oid: string,
+  identity: string,
+  lease: ReleaseMergeLease?,
+  reason: string,
+}
+
+pub type ReleaseMergeLeaseAdmission = {allowed: bool, reason: string, observed_identity: string}
+
+pub type ReleaseMergeLeaseClaim = {
+  acquired: bool,
+  idempotent: bool,
+  ref: string,
+  oid: string,
+  lease: ReleaseMergeLease,
+  reason: string,
+}
+
+pub type ReleaseMergeLeaseFinish = {released: bool, reason: string, ref: string, oid: string}
+
+fn exact_oid(value: any) -> bool {
+  return regex_match("^[0-9a-fA-F]{40}$", trim(to_string(value ?? ""))) != nil
+}
+
+fn valid_atom(value: any) -> bool {
+  return regex_match("^[A-Za-z0-9._:/-]+$", trim(to_string(value ?? ""))) != nil
+}
+
+/** One discoverable ref per protected base. Its creation is GitHub-atomic. */
+pub fn release_merge_lease_ref(base_branch: string) -> string {
+  const base = trim(base_branch)
+  if regex_match("^[A-Za-z0-9._-]+$", base) == nil {
+    throw "release merge lease requires a single-segment base branch"
+  }
+  return "refs/release-merge-lease/" + base
+}
+
+/** Machine-readable payload stored in the lease ref's parentless commit. */
+pub fn release_merge_lease_headline(lease: ReleaseMergeLease) -> string {
+  if !valid_atom(lease.repo) || !valid_atom(lease.base_branch)
+    || !exact_oid(lease.base_oid)
+    || !exact_oid(lease.candidate_head)
+    || lease.candidate_pr <= 0
+    || !valid_atom(lease.generation)
+    || !valid_atom(lease.tag) {
+    throw "release merge lease identity is incomplete"
+  }
+  return "release-merge-lease v1"
+    + " repo=${lease.repo}"
+    + " base=${lease.base_branch}"
+    + " base_oid=${lowercase(lease.base_oid)}"
+    + " candidate_pr=${to_string(lease.candidate_pr)}"
+    + " candidate_head=${lowercase(lease.candidate_head)}"
+    + " generation=${lease.generation}"
+    + " tag=${lease.tag}"
+}
+
+/** Parse only the exact schema this controller writes. */
+pub fn parse_release_merge_lease_headline(headline: string) -> ReleaseMergeLease? {
+  const rows = regex_captures(
+    "^release-merge-lease v1 repo=([^ ]+) base=([^ ]+) base_oid=([0-9a-fA-F]{40}) candidate_pr=([1-9][0-9]*) candidate_head=([0-9a-fA-F]{40}) generation=([^ ]+) tag=([^ ]+)$",
+    trim(headline),
+  )
+  if len(rows) != 1 {
+    return nil
+  }
+  const groups = rows[0].groups
+  const lease = {
+    repo: groups[0],
+    base_branch: groups[1],
+    base_oid: lowercase(groups[2]),
+    candidate_pr: to_int(groups[3]) ?? 0,
+    candidate_head: lowercase(groups[4]),
+    generation: groups[5],
+    tag: groups[6],
+  }
+  return if valid_atom(lease.repo) && valid_atom(lease.base_branch)
+    && valid_atom(lease.generation)
+    && valid_atom(lease.tag) {
+    lease
+  } else {
+    nil
+  }
+}
+
+/** Convert one exact ref snapshot into fail-closed policy state. */
+pub fn release_merge_lease_observation(
+  repo: string,
+  base_branch: string,
+  snapshot: any,
+) -> ReleaseMergeLeaseObservation {
+  const ref = release_merge_lease_ref(base_branch)
+  if snapshot == nil {
+    return {
+      state: "unreadable",
+      ref: ref,
+      oid: "",
+      identity: "unreadable",
+      lease: nil,
+      reason: "release merge lease could not be read",
+    }
+  }
+  if snapshot.state == "absent" {
+    return {
+      state: "clear",
+      ref: ref,
+      oid: "",
+      identity: "clear",
+      lease: nil,
+      reason: "no release merge lease is active",
+    }
+  }
+  const oid = lowercase(trim(to_string(snapshot.oid ?? "")))
+  const lease = parse_release_merge_lease_headline(snapshot.holder_headline ?? "")
+  if !exact_oid(oid) || lease == nil || lease.repo != repo || lease.base_branch != base_branch {
+    return {
+      state: "invalid",
+      ref: ref,
+      oid: oid,
+      identity: "invalid:${oid}",
+      lease: nil,
+      reason: "release merge lease exists but its typed identity is invalid",
+    }
+  }
+  return {
+    state: "active",
+    ref: ref,
+    oid: oid,
+    identity: "${oid}:${lease.generation}",
+    lease: lease,
+    reason:
+      "release merge lease permits only ${repo}#${to_string(lease.candidate_pr)} at ${lease.candidate_head}",
+  }
+}
+
+/** Decide from exact repository, base, PR, head, and lease generation. */
+pub fn release_merge_lease_admission(
+  observation: ReleaseMergeLeaseObservation,
+  target: {repo: string, base_branch: string, pr: int, head: string},
+) -> ReleaseMergeLeaseAdmission {
+  if observation.state == "clear" {
+    return {allowed: true, reason: observation.reason, observed_identity: observation.identity}
+  }
+  const lease = observation.lease
+  const allowed = observation.state == "active" && lease != nil
+    && lease.repo == target.repo
+    && lease.base_branch == target.base_branch
+    && lease.candidate_pr == target.pr
+    && lowercase(lease.candidate_head) == lowercase(trim(target.head))
+  return {
+    allowed: allowed,
+    reason: if allowed {
+      "exact release candidate matches lease generation ${lease.generation}"
+    } else {
+      observation.reason
+    },
+    observed_identity: observation.identity,
+  }
+}
+
+/** Read the fixed lease ref. Any connector failure is an unreadable, blocking state. */
+pub fn observe_release_merge_lease(
+  harness: Harness,
+  repo: string,
+  base_branch: string = "main",
+  options: GithubClientOptions = github_connector_options(),
+) -> ReleaseMergeLeaseObservation {
+  const snapshot = github_ref_snapshot(harness, repo, release_merge_lease_ref(base_branch), options)
+  return release_merge_lease_observation(
+    repo,
+    base_branch,
+    if is_err(snapshot) {
+      nil
+    } else {
+      unwrap(snapshot)
+    },
+  )
+}
+
+/** Atomically claim the base's lease, or identify the exact existing owner. */
+pub fn claim_release_merge_lease(
+  harness: Harness,
+  lease: ReleaseMergeLease,
+  options: GithubClientOptions = github_connector_options(),
+) -> Result<ReleaseMergeLeaseClaim, GithubConnectorError> {
+  const ref = release_merge_lease_ref(lease.base_branch)
+  const claimed = github_claim_ref(
+    harness,
+    lease.repo,
+    ref,
+    {
+      payload: {
+        message: release_merge_lease_headline(lease),
+        base_ref: "refs/heads/" + lease.base_branch,
+      },
+    },
+    options,
+  )
+  if is_err(claimed) {
+    return Err(unwrap_err(claimed))
+  }
+  const result = unwrap(claimed)
+  const incumbent = parse_release_merge_lease_headline(result.holder_headline ?? "")
+  const idempotent = !result.claimed && incumbent == lease
+  if !result.claimed && !idempotent {
+    return Err(
+      {
+        code: "release_merge_lease_held",
+        category: "conflict",
+        message: "release merge lease is held by another candidate",
+      },
+    )
+  }
+  return Ok(
+    {
+      acquired: result.claimed || idempotent,
+      idempotent: idempotent,
+      ref: ref,
+      oid: result.oid,
+      lease: lease,
+      reason: if result.claimed {
+        "claimed release merge lease"
+      } else if idempotent {
+        "reused identical release merge lease"
+      } else {
+        "release merge lease is held by another candidate"
+      },
+    },
+  )
+}
+
+/** Finish a lease when the terminal watcher did not retain its generation locally. */
+pub fn finish_release_merge_lease_for_candidate(
+  harness: Harness,
+  candidate: {
+    repo: string,
+    base_branch: string,
+    base_oid: string,
+    candidate_pr: int,
+    candidate_head: string,
+    tag: string,
+  },
+  options: GithubClientOptions = github_connector_options(),
+) -> ReleaseMergeLeaseFinish {
+  const observed = observe_release_merge_lease(
+    harness,
+    candidate.repo,
+    candidate.base_branch,
+    options,
+  )
+  if observed.state == "clear" {
+    return {released: true, reason: "already_absent", ref: observed.ref, oid: ""}
+  }
+  const lease = observed.lease
+  const owned = observed.state == "active" && lease != nil
+    && lease.repo == candidate.repo
+    && lease.base_branch == candidate.base_branch
+    && lowercase(lease.base_oid) == lowercase(candidate.base_oid)
+    && lease.candidate_pr == candidate.candidate_pr
+    && lowercase(lease.candidate_head) == lowercase(candidate.candidate_head)
+    && lease.tag == candidate.tag
+  if !owned {
+    return {released: false, reason: "not_owned", ref: observed.ref, oid: observed.oid}
+  }
+  return finish_release_merge_lease(harness, lease, options)
+}
+
+/** Release only the exact typed candidate and exact ref object observed now. */
+pub fn finish_release_merge_lease(
+  harness: Harness,
+  expected: ReleaseMergeLease,
+  options: GithubClientOptions = github_connector_options(),
+) -> ReleaseMergeLeaseFinish {
+  const observed = observe_release_merge_lease(
+    harness,
+    expected.repo,
+    expected.base_branch,
+    options,
+  )
+  if observed.state == "clear" {
+    return {released: true, reason: "already_absent", ref: observed.ref, oid: ""}
+  }
+  if observed.state != "active" || observed.lease != expected {
+    return {released: false, reason: "not_owned", ref: observed.ref, oid: observed.oid}
+  }
+  const released = github_release_ref(harness, expected.repo, observed.ref, observed.oid, options)
+  if is_err(released) {
+    return {released: false, reason: "release_failed", ref: observed.ref, oid: observed.oid}
+  }
+  const result = unwrap(released)
+  return {
+    released: result.released || result.reason == "already_absent",
+    reason: result.reason,
+    ref: observed.ref,
+    oid: observed.oid,
+  }
+}
+
+/**
+ * Lease-aware auto-merge boundary. It re-reads the lease after the PR view and
+ * immediately before the connector mutation, so a release hold cannot be
+ * crossed by a stale polling decision.
+ */
+pub fn github_enable_auto_merge_with_release_lease(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  expected_head_oid: string,
+  merge_method: string = "squash",
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubAutoMergeReceipt> {
+  const pr = github_pr_view(harness, slug, pr_ref, options)
+  if is_err(pr) {
+    return Err(unwrap_err(pr))
+  }
+  const observed_pr = unwrap(pr)
+  const number = to_int(observed_pr?.number ?? 0) ?? 0
+  const head = trim(to_string(observed_pr?.head?.sha ?? ""))
+  const base = trim(to_string(observed_pr?.base?.ref ?? "main"))
+  if lowercase(head) != lowercase(trim(expected_head_oid)) {
+    return Err(
+      {
+        code: "head_mismatch",
+        category: "conflict",
+        message: "pull request head moved before release-lease reconciliation",
+      },
+    )
+  }
+  const admission = release_merge_lease_admission(
+    observe_release_merge_lease(harness, slug, base, options),
+    {repo: slug, base_branch: base, pr: number, head: head},
+  )
+  if !admission.allowed {
+    return Err(
+      {code: "release_merge_lease_refused", category: "conflict", message: admission.reason},
+    )
+  }
+  return github_enable_auto_merge(harness, slug, pr_ref, expected_head_oid, merge_method, options)
+}
