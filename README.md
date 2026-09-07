@@ -86,6 +86,8 @@ Start with the job you need to do.
 
 - [How a bump run works](docs/explanation/how-a-bump-run-works.md). The order a
   run executes in, why a rerun is safe, and what it leaves behind.
+- [Candidate record](docs/explanation/candidate-record.md). How one signed
+  certification identity selects the exact archives used after certification.
 - [Fleet convergence](docs/fleet-convergence.md). What convergence means, and
   what it does not.
 - [Update benchmark](docs/harn-update-benchmark.md). How repair performance is

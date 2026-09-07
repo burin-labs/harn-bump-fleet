@@ -120,10 +120,9 @@ lane is green, that archive receipt is also embedded unchanged in a signed,
 write-once tag at
 `harn-candidate-archive-certification/<candidate-oid>`. This durable tag is the
 primary archive-run receipt after the certifying run's receipt artifact expires.
-The archive gate authenticates it before selection, refuses a conflicting
-operator receipt, and still requires the named archive artifact itself to be
-unexpired. A missing record permits the initial archive build; an invalid or
-unsigned record stops the gate. The release PR remains
+The archive gate authenticates it before selection and still requires the named
+archive artifact itself to be unexpired. A missing record permits the initial
+archive build; an invalid or unsigned record stops the gate. The release PR remains
 impossible until the hosted/local lane, Linux size lane, archive lane, residual
 audit, and durable binding are all green. The version-tag workflows build the
 certified candidate source directly. A signed-selected candidate archive is
@@ -146,27 +145,13 @@ Options:
   The tag selects the prepared and certified commit parented at this pin;
   subsequent main commits cannot change the published version. Honors
   `HARN_EXT_RELEASE_PIN_SHA` env var as a fallback.
-- `--candidate-archive-receipt PATH` supplies the certification's
-  `release_harn.candidate_archive.v1` receipt when this workspace did not write
-  one, which is every hosted resume. The certifying release harness run
-  publishes it with its artifacts under
-  `release-harn/candidate-archive/<source commit>.json`. It is the only record
-  that says which archive run the certification used, and it is needed because
-  two archives of one candidate are not interchangeable: two runs of the same
-  commit under byte-identical archive policy still produce different binaries.
-  A receipt that binds another commit, repository or workflow is refused rather
-  than read.
-- `--candidate-archive-run-id N` asserts which archive run ships. It is checked
-  against the receipt, never believed on its own: a pin that disagrees with the
-  certified run is refused, and so is a pin with no receipt to check it
-  against. The named run must also still be an unexpired archive of this exact
-  candidate built under matching policy. Neither flag is needed on the ordinary
-  path, where a candidate has one archive and the receipt names it.
-- Hosted recovery requires `--candidate-archive-run-id N` together with
-  `--candidate-archive-receipt-run-id M`, where `M` names the earlier hosted
-  release run whose `release-run-M` artifact contains the typed receipt. The
-  workflow restores the receipt, verifies that it names archive run `N`, and
-  supplies its local path to `--candidate-archive-receipt`.
+- Candidate archive recovery has no operator archive selector. It reads the
+  signed candidate record at
+  `harn-candidate-archive-certification/<candidate-oid>`, then requires the
+  record's exact archive run to remain unexpired and policy-compatible. Two
+  builds of one candidate are not interchangeable, even under byte-identical
+  archive policy, so a missing or unauthenticated record cannot be replaced by
+  naming a workflow run manually.
 - `--consumer-proof-runs-json '{"owner/repository":123}'` resumes a consumer
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch
