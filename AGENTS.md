@@ -49,6 +49,14 @@ The entry points are:
   read from the step's position relative to `Run release harness`, and a failure
   on the far side of that boundary is routed to recovery rather than to any
   dispatch of the release workflow.
+- `lib/release_chain_driver.harn`: the one thing that moves a release chain and
+  the only thing that applies an effect. Every side effect goes through its
+  adapter's `apply_effect`, called from the planned-repair arm alone, and
+  control events are read before a stage is observed so a stand-down abandons
+  the remaining stages instead of only stopping the reporting. Its run receipt
+  names the proven, pending, and abandoned stages rather than reporting a
+  count. `release_chain.harn --plan` drives a journal read-only: its effect door
+  refuses, so a chain needing a repair says so instead of taking it.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that
