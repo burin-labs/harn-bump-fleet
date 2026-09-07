@@ -1,0 +1,453 @@
+//
+// `regex_captures` returns a list of match objects, each holding its captures
+// under `groups`. A caller that indexes the outer list expecting capture
+// strings reads something that is never a capture, and a genuine no-match is
+// also an empty list, so the two are indistinguishable at the call site. The
+// type checker cannot see the difference, and a test that stubs the function
+// cannot either, because the stub is written from the same wrong model of the
+// shape.
+//
+// The only thing that falsifies a misreading is a test whose call graph
+// reaches the enclosing function and runs it against the real builtin. This
+// module turns that sentence into a census: parse every module, find every
+// `regex_captures` call site, and decide per site whether a test pipeline can
+// reach the function that holds it.
+/** One `regex_captures` call site, named by where a reader would go to fix it. */
+pub type CaptureCallSite = {module: string, function: string, line: int}
+
+/** A function or pipeline declaration, reduced to what reachability needs. */
+pub type FunctionSummary = {
+  name: string,
+  is_test_root: bool,
+  calls: list<string>,
+  capture_lines: list<int>,
+}
+
+/** One module's imports and declarations, plus what the whole file contains. */
+pub type ModuleSummary = {
+  path: string,
+  imports: list<{path: string, names: list<string>}>,
+  functions: list<FunctionSummary>,
+  file_capture_total: int,
+}
+
+/** A site excused from coverage, recorded by name with the reason it is excused. */
+pub type CaptureCoverageExemption = {module: string, function: string, reason: string}
+
+pub type CaptureCoverageCensus = {
+  module_count: int,
+  site_count: int,
+  covered_count: int,
+  uncovered: list<CaptureCallSite>,
+  unowned: list<string>,
+}
+
+const TEST_ROOT_PREFIXES = ["tests/", "tests-risky/"]
+
+fn is_dict(value: any) -> bool {
+  return type_of(value) == "dict"
+}
+
+fn is_list(value: any) -> bool {
+  return type_of(value) == "list"
+}
+
+/** Unwrap `@test`-style attributes so an annotated pipeline is still a declaration. */
+fn declaration_of(item: any) -> any {
+  if is_dict(item) && item.kind == "AttributedDecl" {
+    return item.fields.inner
+  }
+  return item
+}
+
+fn is_capture_call(node: any) -> bool {
+  return is_dict(node)
+    && node.kind == "FunctionCall"
+    && is_dict(node.fields)
+    && node.fields.name == "regex_captures"
+}
+
+/** Count `regex_captures` calls anywhere beneath a node, declarations included. */
+pub fn capture_call_total(node: any) -> int {
+  if is_dict(node) {
+    let total = if is_capture_call(node) {
+      1
+    } else {
+      0
+    }
+    for key in keys(node) {
+      total = total + capture_call_total(node[key])
+    }
+    return total
+  }
+  if is_list(node) {
+    let total = 0
+    for child in node {
+      total = total + capture_call_total(child)
+    }
+    return total
+  }
+  return 0
+}
+
+fn collect_calls(
+  node: any,
+  calls: list<string>,
+  lines: list<int>,
+) -> {calls: list<string>, lines: list<int>} {
+  let found_calls = calls
+  let found_lines = lines
+  if is_dict(node) {
+    if node.kind == "FunctionCall" && is_dict(node.fields)
+      && type_of(node.fields.name)
+        == "string" {
+      found_calls = found_calls + [node.fields.name]
+      if node.fields.name == "regex_captures" && is_dict(node.span) {
+        found_lines = found_lines + [node.span.line]
+      }
+    }
+    for key in keys(node) {
+      const nested = collect_calls(node[key], found_calls, found_lines)
+      found_calls = nested.calls
+      found_lines = nested.lines
+    }
+    return {calls: found_calls, lines: found_lines}
+  }
+  if is_list(node) {
+    for child in node {
+      const nested = collect_calls(child, found_calls, found_lines)
+      found_calls = nested.calls
+      found_lines = nested.lines
+    }
+    return {calls: found_calls, lines: found_lines}
+  }
+  return {calls: found_calls, lines: found_lines}
+}
+
+fn unique_strings(values: list<string>) -> list<string> {
+  let seen: list<string> = []
+  for value in values {
+    if !contains(seen, value) {
+      seen = seen + [value]
+    }
+  }
+  return seen.sort()
+}
+
+pub fn is_test_module(path: string) -> bool {
+  for prefix in TEST_ROOT_PREFIXES {
+    if starts_with(path, prefix) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Reduce one parsed program to the imports, declarations, and call sites the
+ * census reads. `file_capture_total` is measured over the whole program rather
+ * than summed from the declarations, so a call site the declaration walk fails
+ * to own is visible as a discrepancy instead of vanishing from the count.
+ */
+pub fn summarize_module(path: string, program: any) -> ModuleSummary {
+  let imports: list<{path: string, names: list<string>}> = []
+  let functions: list<FunctionSummary> = []
+  const test_module = is_test_module(path)
+  const body = if is_dict(program) && is_list(program.body) {
+    program.body
+  } else {
+    []
+  }
+  for item in body {
+    const decl = declaration_of(item)
+    if !is_dict(decl) {
+      continue
+    }
+    if decl.kind == "SelectiveImport" {
+      const names = if is_list(decl.fields.names) {
+        decl.fields.names
+      } else {
+        []
+      }
+      imports = imports + [{path: to_string(decl.fields.path), names: names}]
+      continue
+    }
+    if decl.kind != "FnDecl" && decl.kind != "Pipeline" {
+      continue
+    }
+    const collected = collect_calls(decl, [], [])
+    const name = to_string(decl.fields.name)
+    functions = functions
+      + [
+        {
+          name: name,
+          is_test_root: test_module && decl.kind == "Pipeline" && starts_with(name, "test_"),
+          calls: unique_strings(collected.calls),
+          capture_lines: collected.lines,
+        },
+      ]
+  }
+  return {
+    path: path,
+    imports: imports,
+    functions: functions,
+    file_capture_total: capture_call_total(program),
+  }
+}
+
+fn normalize_segments(path: string) -> string {
+  let parts: list<string> = []
+  for segment in split(path, "/") {
+    if segment == "" || segment == "." {
+      continue
+    }
+    if segment == ".." && len(parts) > 0 && parts[len(parts) - 1] != ".." {
+      parts = parts.slice(0, len(parts) - 1)
+      continue
+    }
+    parts = parts + [segment]
+  }
+  return join(parts, "/")
+}
+
+fn directory_of(path: string) -> string {
+  const parts = split(path, "/")
+  if len(parts) <= 1 {
+    return ""
+  }
+  return join(parts.slice(0, len(parts) - 1), "/")
+}
+
+fn with_harn_suffix(path: string) -> string {
+  return if ends_with(path, ".harn") {
+    path
+  } else {
+    path + ".harn"
+  }
+}
+
+/**
+ * Resolve an import path to a module in this repository, or nil when it names
+ * something outside it. `std/...` is the runtime library and a bare path can be
+ * either sibling-relative or repository-root-relative, so a bare path resolves
+ * against the importer's own directory first and only then against the root.
+ */
+pub fn resolve_import_target(
+  importer: string,
+  import_path: string,
+  known_modules: list<string>,
+) -> string? {
+  if import_path == "" || starts_with(import_path, "std/") {
+    return nil
+  }
+  const suffixed = with_harn_suffix(import_path)
+  if starts_with(import_path, "./") || starts_with(import_path, "../") {
+    const relative = normalize_segments(directory_of(importer) + "/" + suffixed)
+    return if contains(known_modules, relative) {
+      relative
+    } else {
+      nil
+    }
+  }
+  const sibling = normalize_segments(directory_of(importer) + "/" + suffixed)
+  if contains(known_modules, sibling) {
+    return sibling
+  }
+  const rooted = normalize_segments(suffixed)
+  return if contains(known_modules, rooted) {
+    rooted
+  } else {
+    nil
+  }
+}
+
+pub fn function_key(module: string, function: string) -> string {
+  return module + "::" + function
+}
+
+fn module_function_names(module: ModuleSummary) -> list<string> {
+  return module.functions.map({ entry -> return entry.name }).to_list()
+}
+
+/**
+ * Build the call graph and walk it from every test pipeline. A callee name
+ * resolves to a declaration in the same module first, then to the module it was
+ * imported from; anything else is a runtime builtin and has no edge.
+ */
+pub fn reachable_function_keys(modules: list<ModuleSummary>) -> list<string> {
+  const paths = modules.map({ entry -> return entry.path }).to_list()
+  let edges: dict<string, list<string>> = {}
+  let frontier: list<string> = []
+  let by_path: dict<string, ModuleSummary> = {}
+  for module in modules {
+    by_path[module.path] = module
+  }
+  for module in modules {
+    let imported: dict<string, string> = {}
+    for entry in module.imports {
+      const target = resolve_import_target(module.path, entry.path, paths)
+      if target == nil {
+        continue
+      }
+      for name in entry.names {
+        imported[name] = target
+      }
+    }
+    const local_names = module_function_names(module)
+    for declaration in module.functions {
+      const source = function_key(module.path, declaration.name)
+      if declaration.is_test_root && !contains(frontier, source) {
+        frontier = frontier + [source]
+      }
+      let targets: list<string> = []
+      for callee in declaration.calls {
+        if contains(local_names, callee) {
+          targets = targets + [function_key(module.path, callee)]
+          continue
+        }
+        const owner = imported[callee]
+        if owner == nil {
+          continue
+        }
+        const owning_module = by_path[owner]
+        if owning_module != nil && contains(module_function_names(owning_module), callee) {
+          targets = targets + [function_key(owner, callee)]
+        }
+      }
+      edges[source] = targets
+    }
+  }
+  let reached = frontier
+  let pending = frontier
+  while len(pending) > 0 {
+    const current = pending[len(pending) - 1]
+    pending = pending.slice(0, len(pending) - 1)
+    for next in edges[current] ?? [] {
+      if !contains(reached, next) {
+        reached = reached + [next]
+        pending = pending + [next]
+      }
+    }
+  }
+  return reached
+}
+
+/**
+ * Decide every call site against the reachable set. `unowned` names a module
+ * whose file-wide call total exceeds what its declarations account for, so a
+ * site the walk cannot attribute is reported rather than dropped.
+ */
+pub fn coverage_census(modules: list<ModuleSummary>) -> CaptureCoverageCensus {
+  const reached = reachable_function_keys(modules)
+  let sites = 0
+  let covered = 0
+  let uncovered: list<CaptureCallSite> = []
+  let unowned: list<string> = []
+  for module in modules {
+    let owned = 0
+    for declaration in module.functions {
+      const reachable = contains(reached, function_key(module.path, declaration.name))
+      for line in declaration.capture_lines {
+        owned = owned + 1
+        sites = sites + 1
+        if reachable {
+          covered = covered + 1
+        } else {
+          uncovered = uncovered
+            + [{module: module.path, function: declaration.name, line: line}]
+        }
+      }
+    }
+    if owned != module.file_capture_total {
+      unowned = unowned
+        + [
+          "${module.path}: ${module.file_capture_total} call sites in the file, "
+            + "${owned} inside a declaration",
+        ]
+    }
+  }
+  return {
+    module_count: len(modules),
+    site_count: sites,
+    covered_count: covered,
+    uncovered: uncovered.sort_by({ site -> return "${site.module}:${site.line}" }),
+    unowned: unowned.sort(),
+  }
+}
+
+fn exemption_key(module: string, function: string) -> string {
+  return function_key(module, function)
+}
+
+fn uncovered_keys(census: CaptureCoverageCensus) -> list<string> {
+  return unique_strings(
+    census.uncovered.map({ site -> return exemption_key(site.module, site.function) }).to_list(),
+  )
+}
+
+/**
+ * Compare the census against the recorded baseline in both directions. A new
+ * uncovered site is a regression; a baseline entry that is now covered or gone
+ * is a baseline that no longer describes the repository. A ratchet is wrong on
+ * a baseline that is too loose as surely as on one that is too tight, so both
+ * are named failures.
+ */
+pub fn ratchet_findings(
+  census: CaptureCoverageCensus,
+  baseline: list<CaptureCoverageExemption>,
+) -> list<string> {
+  const recorded = unique_strings(
+    baseline.map({ entry -> return exemption_key(entry.module, entry.function) }).to_list(),
+  )
+  const observed = uncovered_keys(census)
+  let findings: list<string> = []
+  for site in census.uncovered {
+    const key = exemption_key(site.module, site.function)
+    if !contains(recorded, key) {
+      findings = findings
+        + [
+          "${site.module}:${site.line} in `${site.function}` is not reached by any test "
+            + "and is not in the recorded baseline",
+        ]
+    }
+  }
+  for key in recorded {
+    if !contains(observed, key) {
+      findings = findings
+        + [
+          "${key} is recorded as uncovered but the census now reaches it; "
+            + "remove it from the baseline",
+        ]
+    }
+  }
+  for entry in census.unowned {
+    findings = findings + ["unattributed call site: ${entry}"]
+  }
+  return findings.sort()
+}
+
+/**
+ * Refuse a census that measured nothing. An empty or unreadable inventory is
+ * indistinguishable from a clean one once it collapses to a verdict, so the
+ * two are separated here and reported apart.
+ */
+pub fn census_refusals(
+  census: CaptureCoverageCensus,
+  parse_failures: list<string>,
+) -> list<string> {
+  let refusals: list<string> = []
+  for failure in parse_failures {
+    refusals = refusals + ["could not parse ${failure}"]
+  }
+  if census.module_count == 0 {
+    refusals = refusals + ["no modules were inventoried, so the census measured nothing"]
+  }
+  if census.site_count == 0 {
+    refusals = refusals
+      + [
+        "no `regex_captures` call site was found in any module, which is a broken "
+          + "census rather than a clean one",
+      ]
+  }
+  return refusals
+}
