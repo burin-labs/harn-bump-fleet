@@ -1,8 +1,11 @@
 import {
+  CONSUMER_PRETAG_DISPATCH_ATTEMPTS,
   CONSUMER_PRETAG_GATE_POLICY,
   ConsumerPretagGateAdapter,
   ConsumerPretagGatePolicy,
   ConsumerPretagRunRow,
+  consumer_pretag_dispatch_backoff_ms,
+  consumer_pretag_dispatch_is_retryable,
   consumer_pretag_gate_policy,
   derive_consumer_pretag_exclusions,
   parse_consumer_pretag_proof_runs_json,
@@ -1329,4 +1332,132 @@ pipeline test_gate_without_a_main_history_keeps_the_red() {
   )
   assert_eq(len(receipts), 1)
   assert_eq(receipts[0]?.status, "failed")
+}
+
+// The retry spends the gate's own deadline, so a fixture that exercises it
+// needs a window wide enough to hold the backoff. Production allows three
+// hours, against a bound of about two minutes.
+const RETRY_WINDOW: ConsumerPretagGatePolicy = {poll_interval_ms: 1, deadline_ms: 600000}
+
+const NETWORK_ERROR: dict = {
+  message: {
+    category: "network",
+    code: "network",
+    message: "http: request failed: error sending request for url (…/dispatches)",
+  },
+}
+
+const NOT_FOUND_ERROR: dict = {
+  message: {category: "not_found", code: "not_found", message: "workflow does not exist"},
+}
+
+/**
+ * A gate whose dispatch drops the first `failures` sends and then succeeds.
+ *
+ * `sends` counts every send, so a test can tell a retry that ran from one that
+ * was merely configured.
+ */
+fn flaky_dispatch_adapter(failures: int, error: dict) -> ConsumerPretagGateAdapter {
+  let sends = 0
+  let clock = 0
+  return {
+    consumer_revision: fn(_target) { return Ok(REVISION) },
+    dispatch: fn(_target) {
+      sends = sends + 1
+      if sends <= failures {
+        return Err(error)
+      }
+      return Ok({run_id: 11, head_sha: REVISION})
+    },
+    runs: fn(_target) { return Ok(
+      if sends > failures {
+        [row(11, "queued", "")]
+      } else {
+        []
+      },
+    ) },
+    run: fn(_target, _run_id) { return Ok(row(11, "completed", "success")) },
+    wait: fn(ms) { clock = clock + ms },
+    now_ms: fn() {
+      clock = clock + 1
+      return clock
+    },
+  }
+}
+
+/**
+ * The release that was lost: one dropped request failed a candidate that had
+ * already been built and certified. Four dropped sends must now be survivable,
+ * and the receipt must be able to prove the retry happened.
+ */
+pipeline test_a_dropped_dispatch_is_retried_and_the_gate_still_proves() {
+  for failures in [1, 2, 4] {
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      flaky_dispatch_adapter(failures, NETWORK_ERROR),
+      RETRY_WINDOW,
+    )
+    assert_eq(receipts[0]?.status, "passed")
+    // The recorded attempts are the proof the retry ran. A gate reporting one
+    // attempt while the bound is five is a gate whose retry never fired.
+    assert_eq(len(receipts[0]?.dispatch_attempts ?? []), failures)
+  }
+}
+
+/**
+ * When every send fails the run still stops, but it stops naming the bound and
+ * the transport, not a bare "unreadable" a release owner has to decode.
+ */
+pipeline test_an_unreachable_dispatch_names_the_bound_and_the_cause() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    flaky_dispatch_adapter(99, NETWORK_ERROR),
+    RETRY_WINDOW,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert_eq(receipts[0]?.cause, "consumer_dispatch_unreachable")
+  assert_eq(len(receipts[0]?.dispatch_attempts ?? []), CONSUMER_PRETAG_DISPATCH_ATTEMPTS)
+  assert(contains(receipts[0]?.detail ?? "", "unreachable after"))
+  assert(contains(receipts[0]?.detail ?? "", "error sending request"))
+}
+
+/**
+ * The negative control on the retry. A refusal the remote actually answered is
+ * a fact about this request, so it must be reported on the first send. Retrying
+ * it would delay a real answer behind two minutes of waiting for nothing.
+ */
+pipeline test_a_refusal_the_remote_answered_is_not_retried() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    flaky_dispatch_adapter(99, NOT_FOUND_ERROR),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert_eq(receipts[0]?.cause, "consumer_dispatch_rejected")
+  assert_eq(len(receipts[0]?.dispatch_attempts ?? []), 1)
+  assert(!contains(receipts[0]?.detail ?? "", "unreachable after"))
+}
+
+/** The classifier decides on structured fields, never on message prose. */
+pipeline test_only_transport_failures_are_retryable() {
+  assert(consumer_pretag_dispatch_is_retryable(NETWORK_ERROR))
+  assert(consumer_pretag_dispatch_is_retryable({message: {category: "network", code: "timeout"}}))
+  assert(consumer_pretag_dispatch_is_retryable({category: "network", code: "network"}))
+  assert(!consumer_pretag_dispatch_is_retryable(NOT_FOUND_ERROR))
+  assert(
+    !consumer_pretag_dispatch_is_retryable({message: {category: "permission", code: "forbidden"}}),
+  )
+  // Prose alone must not make a failure retryable, or the first reword of the
+  // message silently changes which class gets retried.
+  assert(!consumer_pretag_dispatch_is_retryable({message: {message: "network error"}}))
+}
+
+/** The bound is real: five sends spread over roughly two minutes. */
+pipeline test_the_retry_bound_is_five_sends_over_about_two_minutes() {
+  assert_eq(CONSUMER_PRETAG_DISPATCH_ATTEMPTS, 5)
+  let total = 0
+  for attempt in [1, 2, 3, 4] {
+    total = total + consumer_pretag_dispatch_backoff_ms(attempt)
+  }
+  assert_eq(total, 120000)
 }

@@ -251,6 +251,18 @@ the immutable tag; no candidate archive is promoted as the release artifact.
 If the release PR conflicts with main, the watcher stops with a conflict result
 and preserves its receipt and refs. Post-publish fixup owns that repair.
 
+A consumer pre-tag gate retries a dispatch the network dropped. Transport
+failures and 5xx responses are sent again with bounded backoff, five sends over
+about two minutes, because a request that was dropped in transit may never have
+arrived and sending it again is the only way to find out. A refusal the remote
+actually answered is not retried: it is a fact about that request and repeating
+it only delays a real answer. Every send is recorded on the gate receipt, so a
+retry that ran can be told from one that did not, and an exhausted bound reports
+`consumer_dispatch_unreachable` naming the last error rather than a bare
+unreadable. Whether a failure is transient is decided by
+`fleet_observation_class`, which owns that question for every connector error
+here, so the two answers cannot drift apart.
+
 A release whose bump merged without a tag is recovered by
 `recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
 cut the release preflight refuses. That mode tags the stranded merge commit only
