@@ -44,7 +44,11 @@ The entry points are:
   registry that decides what each failure means and whether a re-dispatch is a
   sane repair at all; a step the registry does not name escalates rather than
   defaulting to a retry, and `check_hosted_release_failure_coverage.harn` keeps
-  the registry and the workflow in step in both directions.
+  the registry and the workflow in step in both directions. Whether a step runs
+  before or after the release is irreversible is never registered by hand: it is
+  read from the step's position relative to `Run release harness`, and a failure
+  on the far side of that boundary is routed to recovery rather than to any
+  dispatch of the release workflow.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that
