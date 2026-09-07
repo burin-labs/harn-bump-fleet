@@ -93,6 +93,15 @@ Do not put stage policy back in the entrypoint or add a second implementation
 behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line
 ceiling for every maintained handwritten source file.
 
+`check_regex_captures_coverage.harn` parses every tracked module, finds every
+`regex_captures` call site, and refuses one that no test pipeline reaches.
+`regex_captures` returns match objects rather than capture strings, and a
+caller that misreads that shape behaves exactly like a no-match, which neither
+the type checker nor a test that stubs the function can catch. Cover a new call
+site by putting it in a function a test calls, or record it by name with a
+reason in `regex-captures-coverage-baseline.json`; the baseline is exact in
+both directions, so a site it lists that is now covered is also a failure.
+
 Every pull request this repository opens gets its title from
 `lib/pr_title_convention.harn`, never from a literal at the call site.
 `burin-labs/harn` runs a required title gate that refuses a subject without a
