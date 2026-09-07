@@ -78,6 +78,14 @@ runtime-bump commands as named fields. Private consumers instead own those
 details in `.harn/fleet-projections.toml`, so the public manifest carries no
 private path or command inventory.
 
+For a consumer-owned contract, the generated `bump-harn.yml` also owns a
+`Consumer contract projection` job. Pull requests and pushes that change either
+`.harn/fleet-projections.toml` or the generated adapter run that job. It compares
+the manifest bytes with the SHA-256 identity projected into the adapter, so a
+manifest-only change stays red until the same pull request regenerates the
+adapter. A manual runtime bump runs only the reusable `bump` job; repository
+events cannot dispatch a bump accidentally.
+
 A consumer pre-tag contract may name the exact workflow job and step that
 prove the candidate:
 
