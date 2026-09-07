@@ -1,4 +1,8 @@
-import { github_connector_options, github_pr_list } from "./github"
+import {
+  github_commit_reachable_from_branch,
+  github_connector_options,
+  github_pr_list,
+} from "./github"
 import { GithubClientOptions, api_call } from "harn-github-connector/default"
 
 const PAGE_SIZE = 100
@@ -15,6 +19,20 @@ pub type BranchAuditState = "clean" | "findings" | "measurement_failed"
 
 pub type RepositoryBranch = {name: string, head_oid: string, protected: bool}
 
+/**
+ * Whether a branch with no open pull request still holds work.
+ *
+ * `merged` means the tip is reachable from the default branch, so deleting the
+ * branch loses nothing. `unmerged` means it is not, so the branch is the only
+ * copy of whatever is on it. `unknown` means the audit could not establish
+ * either, and is deliberately its own value: an unreadable answer must not
+ * collapse into the one that reads as safe to delete.
+ */
+pub type PrlessBranchDisposition = "merged" | "unmerged" | "unknown"
+
+pub type PrlessBranchFinding = RepositoryBranch \
+  & {disposition: PrlessBranchDisposition, disposition_detail: string}
+
 pub type RepositoryBranchAudit = {
   slug: string,
   default_branch: string,
@@ -23,6 +41,10 @@ pub type RepositoryBranchAudit = {
   open_pr_head_count: int?,
   prless_branch_count: int?,
   prless_branches: list<RepositoryBranch>,
+  prless_findings: list<PrlessBranchFinding>,
+  merged_branch_count: int?,
+  unmerged_branch_count: int?,
+  undetermined_branch_count: int?,
   error_code?: string,
   detail: string,
 }
@@ -160,9 +182,85 @@ fn measurement_failure(
     open_pr_head_count: nil,
     prless_branch_count: nil,
     prless_branches: [],
+    prless_findings: [],
+    merged_branch_count: nil,
+    unmerged_branch_count: nil,
+    undetermined_branch_count: nil,
     error_code: trim(pieces[0]),
     detail: detail,
   }
+}
+
+/**
+ * Classify one PR-less branch from a compare read that either succeeded or did
+ * not.
+ *
+ * The read is passed in rather than performed here so the decision is testable
+ * on its own, and so the failure case is a value instead of an exception. A
+ * `nil` read is `unknown`: the audit reports what it established, and a branch
+ * it could not compare is not evidence that the branch is disposable.
+ */
+pub fn prless_branch_disposition(
+  branch: RepositoryBranch,
+  default_branch: string,
+  reachable: bool?,
+) -> PrlessBranchFinding {
+  if reachable == nil {
+    return branch
+      + {
+        disposition: "unknown",
+        disposition_detail:
+          "the audit could not compare this tip against ${default_branch}, so it makes no claim about it",
+      }
+  }
+  if reachable ?? false {
+    return branch
+      + {
+        disposition: "merged",
+        disposition_detail:
+          "the tip is reachable from ${default_branch}, so deleting the branch loses nothing",
+      }
+  }
+  return branch
+    + {
+      disposition: "unmerged",
+      disposition_detail:
+        "the tip is not reachable from ${default_branch}, so this branch is the only copy of the work on it",
+    }
+}
+
+/** How many findings fall into one disposition. */
+pub fn prless_disposition_count(
+  findings: list<PrlessBranchFinding>,
+  disposition: PrlessBranchDisposition,
+) -> int {
+  return len(findings.filter({ finding -> finding.disposition == disposition }).to_list())
+}
+
+fn classify_findings(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  findings: list<RepositoryBranch>,
+  client: GithubClientOptions,
+) -> list<PrlessBranchFinding> {
+  let rows: list<PrlessBranchFinding> = []
+  for branch in findings {
+    const read = github_commit_reachable_from_branch(
+      harness,
+      slug,
+      branch.head_oid,
+      default_branch,
+      client,
+    )
+    const reachable = if is_err(read) {
+      nil
+    } else {
+      unwrap(read).reachable
+    }
+    rows = rows + [prless_branch_disposition(branch, default_branch, reachable)]
+  }
+  return rows
 }
 
 /**
@@ -214,6 +312,7 @@ pub fn survey_repository_branches(
     } else {
       "findings"
     }
+    const classified = classify_findings(harness, slug, default_branch, findings, client)
     const row: RepositoryBranchAudit = {
       slug: slug,
       default_branch: default_branch,
@@ -222,6 +321,10 @@ pub fn survey_repository_branches(
       open_pr_head_count: len(open_heads),
       prless_branch_count: len(findings),
       prless_branches: findings,
+      prless_findings: classified,
+      merged_branch_count: prless_disposition_count(classified, "merged"),
+      unmerged_branch_count: prless_disposition_count(classified, "unmerged"),
+      undetermined_branch_count: prless_disposition_count(classified, "unknown"),
       error_code: nil,
       detail: if len(findings) == 0 {
         "every non-default branch is the head of an open pull request"
@@ -312,8 +415,8 @@ pub fn prless_branch_issue_title(row: RepositoryBranchAudit) -> string {
   }
 }
 
-fn finding_preview(rows: list<RepositoryBranch>) -> list<RepositoryBranch> {
-  let preview: list<RepositoryBranch> = []
+fn finding_preview(rows: list<PrlessBranchFinding>) -> list<PrlessBranchFinding> {
+  let preview: list<PrlessBranchFinding> = []
   for row in rows {
     if len(preview) >= ISSUE_PREVIEW_LIMIT {
       break
@@ -337,8 +440,8 @@ pub fn prless_branch_issue_body(row: RepositoryBranchAudit, run_url: string?) ->
       + "\n\nThis issue refreshes until a complete read succeeds. The audit never deletes branches."
       + trailer
   }
-  const preview = finding_preview(row.prless_branches)
-  const omitted = len(row.prless_branches) - len(preview)
+  const preview = finding_preview(row.prless_findings)
+  const omitted = len(row.prless_findings) - len(preview)
   const omitted_text = if omitted == 0 {
     ""
   } else {
@@ -353,6 +456,12 @@ pub fn prless_branch_issue_body(row: RepositoryBranchAudit, run_url: string?) ->
     + json_stringify_pretty(preview)
     + "\n```"
     + omitted_text
+    + "\n\nOf those, **${to_string(row.merged_branch_count ?? 0)}** have a tip already reachable "
+    + "from `${row.default_branch}` and can be deleted without losing anything, "
+    + "**${to_string(row.unmerged_branch_count ?? 0)}** hold work that exists nowhere else, and "
+    + "**${to_string(row.undetermined_branch_count ?? 0)}** could not be compared at all. Each "
+    + "branch above carries its own `disposition`. Delete only the merged ones. A branch the "
+    + "audit could not compare is not a branch it found safe."
     + "\n\nReview, finish, or archive the work deliberately. This audit never deletes branches."
     + " It refreshes this issue while findings remain and closes it when none remain."
     + trailer
