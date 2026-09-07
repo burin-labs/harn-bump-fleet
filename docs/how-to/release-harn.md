@@ -40,6 +40,28 @@ is refused with the reason rather than adopted. A branch or tag name is not a
 commit prefix and is refused: `--at-sha main` would pin whatever main happened
 to be at that instant, which is the binding the input exists to remove.
 
+## What has to be true before anything is tagged
+
+Four assertions read the tree the release will act on rather than a workflow
+run's conclusion. A conclusion says a job finished; these say what the system
+decided.
+
+- the default branch carries the exact next `X.Y.Z-dev` version, which only the
+  post-release cutover produces
+- the release contract's own verdict is green on that commit
+- the tree that will carry the tag holds no unfolded `changelog.d/` fragment
+- every consumer's current pin is known by value, with any pin that could not
+  be read named rather than dropped from the count
+
+The fragment count is asked about the commit being tagged, not the base. At
+launch the fold has not run yet, so the base legitimately holds fragments and
+the question is reported not asked until a commit is named:
+
+```sh
+scripts/preflight_release_launch.sh --mode ship-pr --bump patch \
+  --checkpoint-commit <commit>
+```
+
 Ask the same questions without starting a release:
 
 ```sh

@@ -22,8 +22,29 @@
 import { ParserSpec } from "std/cli/argparse"
 import { env_str } from "std/config"
 import { cli_options } from "lib/cli_options"
-import { github_is_transient_read_error } from "lib/github"
-import { github_resolve_commit } from "lib/github_commits"
+import { remote_pin_probe } from "lib/fleet_convergence"
+import {
+  harn_pin_watch_repositories,
+  read_fleet_manifest,
+  resolve_harn_update_spec,
+} from "lib/fleet_manifest"
+import {
+  github_file_text_at_ref,
+  github_is_transient_read_error,
+  github_latest_release_tag,
+} from "lib/github"
+import {
+  github_directory_entry_names,
+  github_large_file_text_at_ref,
+  github_resolve_commit,
+} from "lib/github_commits"
+import { harn_release_contract_from_text } from "lib/harn_release_contract"
+import {
+  ConsumerPinReading,
+  ReleaseCheckpointEvidence,
+  release_checkpoint_preconditions,
+  release_checkpoint_unavailable,
+} from "lib/release_checkpoint"
 import {
   AtShaResolution,
   PreflightPrecondition,
@@ -58,6 +79,8 @@ type Options = {
   consumer_proof_runs_json: string,
   token_profile: string,
   release_repo: string,
+  base: string,
+  checkpoint_commit: string,
   offline: bool,
   resolve_only: bool,
   receipt: string,
@@ -80,6 +103,8 @@ const ARG_SPEC: ParserSpec = {
     },
     {kind: "flag", name: "token_profile", long: "--token-profile", default: "harn-release"},
     {kind: "flag", name: "release_repo", long: "--release-repo", default: "burin-labs/harn"},
+    {kind: "flag", name: "base", long: "--base", default: "main"},
+    {kind: "flag", name: "checkpoint_commit", long: "--checkpoint-commit", default: ""},
     {kind: "switch", name: "offline", long: "--offline"},
     {kind: "switch", name: "resolve_only", long: "--resolve-only"},
     {kind: "flag", name: "receipt", long: "--receipt", default: ""},
@@ -201,6 +226,141 @@ fn resolve_at_sha(
     }
   }
   return {requested: pinned, resolved: unwrap(resolved).sha, asked: true, reason: ""}
+}
+
+/** The checkpoint's evidence, or the reason it could not be read. */
+type CheckpointEvidenceRead = {evidence: ReleaseCheckpointEvidence?, reason: string}
+
+/**
+ * Read, once, everything the pre-irreversible checkpoint decides on.
+ *
+ * The reads are deliberately all here and the decisions all in
+ * `lib/release_checkpoint.harn`. Nine releases in a row were damaged by stages
+ * that inferred a decision from something adjacent to it, and the cheapest way
+ * to keep that from recurring is for the code that fetches evidence to have no
+ * opinion about what it means.
+ *
+ * `commit` is the tree these facts are read at. At launch that is the base the
+ * cut will start from; the same gathering serves a pre-tag call given the
+ * commit about to be tagged.
+ */
+fn gather_checkpoint_evidence(
+  harness: Harness,
+  slug: string,
+  base: string,
+  commit: string,
+) -> CheckpointEvidenceRead {
+  const contract_text = try {
+    github_file_text_at_ref(harness, slug, "scripts/release_contract.json", base)
+  } catch (error) {
+    return {
+      evidence: nil,
+      reason: "scripts/release_contract.json could not be read at ${slug}@${base}: "
+        + to_string(error),
+    }
+  }
+  if contract_text == nil {
+    return {evidence: nil, reason: "${slug}@${base} has no scripts/release_contract.json"}
+  }
+  const contract = harn_release_contract_from_text(contract_text ?? "")
+  if contract == nil {
+    // Without the contract there is nothing to decide against, and guessing a
+    // default would answer a question this checkpoint was asked to read.
+    return {
+      evidence: nil,
+      reason: "scripts/release_contract.json at ${slug}@${base} did not parse as a release "
+        + "contract",
+    }
+  }
+  // The fragment count is a fact about the tree that will carry the tag, and at
+  // launch that tree does not exist yet: the cut folds the fragments and then
+  // tags. Asking the base would refuse every cut for fragments the cut itself
+  // is about to consume, so with no commit named the question is reported
+  // unasked rather than answered against the wrong tree.
+  const fragments = if trim(commit) == "" {
+    Ok(nil)
+  } else {
+    github_directory_entry_names(harness, slug, "changelog.d", commit)
+  }
+  const pins = read_consumer_pins(harness)
+  const evidence: ReleaseCheckpointEvidence = {
+    commit: commit,
+    base_ref: "${slug}@${base}",
+    latest_tag: github_latest_release_tag(harness, slug),
+    cargo_toml: github_file_text_at_ref(harness, slug, "Cargo.toml", base) ?? "",
+    changelog: read_release_changelog(harness, slug, base),
+    contract: contract ?? {},
+    fragment_entries: if trim(commit) == "" || is_err(fragments) {
+      nil
+    } else {
+      unwrap(fragments) ?? []
+    },
+    fragment_unread_reason: if trim(commit) == "" {
+      "no commit was named, and the tree that will be tagged does not exist until the fold "
+        + "lands; pass --checkpoint-commit at the pre-tag checkpoint"
+    } else if is_err(fragments) {
+      to_string(unwrap_err(fragments).message ?? unwrap_err(fragments))
+    } else {
+      ""
+    },
+    consumer_pins: pins.rows,
+    consumer_pins_unread_reason: pins.reason,
+  }
+  return {evidence: evidence, reason: ""}
+}
+
+/**
+ * The release changelog, whichever route can return a file of its size.
+ *
+ * The typed connector is asked first because it is the owner of every other
+ * read here. It cannot answer for this one file: the changelog passed both the
+ * contents API's inline ceiling and the connector's response cap, and the
+ * failure it raises names a schema, not a size. Falling through to the raw
+ * route keeps the fold assertion answerable instead of permanently unasked,
+ * which is the reading that would let an unfolded release through unremarked.
+ */
+fn read_release_changelog(harness: Harness, slug: string, base: string) -> string {
+  const typed = try {
+    github_file_text_at_ref(harness, slug, "CHANGELOG.md", base)
+  } catch (error) {
+    nil
+  }
+  if trim(typed ?? "") != "" {
+    return typed ?? ""
+  }
+  const raw = github_large_file_text_at_ref(harness.process, slug, "CHANGELOG.md", base)
+  if is_err(raw) {
+    return ""
+  }
+  return unwrap(raw)
+}
+
+/**
+ * Every manifest-watched consumer's pin, read from its own default branch.
+ *
+ * A repository whose pin cannot be read is kept as a row with no value rather
+ * than dropped, so the checkpoint can report it by name. Dropping it would make
+ * an unreadable consumer indistinguishable from a converged one, which is the
+ * failure this assertion exists to remove.
+ */
+fn read_consumer_pins(harness: Harness) -> {rows: list<ConsumerPinReading>?, reason: string} {
+  const manifest = try {
+    read_fleet_manifest(harness.fs)
+  } catch (error) {
+    return {rows: nil, reason: "the fleet manifest could not be read: " + to_string(error)}
+  }
+  let rows: list<ConsumerPinReading> = []
+  for repo in harn_pin_watch_repositories(manifest) {
+    const reading = try {
+      const spec = resolve_harn_update_spec(manifest, repo, "")
+      const probe = remote_pin_probe(harness, spec)
+      {slug: repo.slug, pin: probe.pin, evidence: probe.evidence}
+    } catch (error) {
+      {slug: repo.slug, pin: nil, evidence: to_string(error)}
+    }
+    rows = rows + [reading]
+  }
+  return {rows: rows, reason: ""}
 }
 
 pipeline main(harness: Harness) {
@@ -345,6 +505,13 @@ pipeline main(harness: Harness) {
   // Credentialed: the mint itself, through the production mint path.
   const has_credentials = (env_str(harness.env, "RELEASE_APP_CLIENT_ID") ?? "") != ""
     && (env_str(harness.env, "RELEASE_APP_PRIVATE_KEY") ?? "") != ""
+  // The consumer contract gate reads public consumer branches, so it is gated
+  // on its own reachability rather than on the release App. Tying it to the
+  // App made it report itself unasked in every context that could in fact have
+  // asked it, which is the loudest way to answer a question with nothing.
+  const has_github_read = !options.offline
+    && ((env_str(harness.env, "GH_TOKEN") ?? "") != ""
+      || (env_str(harness.env, "GITHUB_TOKEN") ?? "") != "")
   if options.offline || !has_credentials {
     const reason = if options.offline {
       "not asked: --offline"
@@ -365,7 +532,7 @@ pipeline main(harness: Harness) {
           root,
           inputs.mode,
           options.repositories_json,
-          false,
+          has_github_read,
         ),
       ]
   } else {
@@ -407,9 +574,30 @@ pipeline main(harness: Harness) {
           root,
           inputs.mode,
           options.repositories_json,
-          true,
+          has_github_read,
         ),
       ]
+  }
+  // The pre-irreversible checkpoint: what has to be true of the tree before
+  // anything is tagged, decided from evidence rather than from a workflow's
+  // conclusion.
+  if options.offline {
+    checks = checks + release_checkpoint_unavailable("--offline")
+  } else {
+    const at = trim(options.checkpoint_commit)
+    // A failed read reports its own reason. A checkpoint that cannot say why it
+    // did not ask is the absence-reads-as-success shape this receipt refuses.
+    const read: CheckpointEvidenceRead = try {
+      gather_checkpoint_evidence(harness, trim(options.release_repo), trim(options.base), at)
+    } catch (error) {
+      {evidence: nil, reason: "the checkpoint evidence read threw: " + to_string(error)}
+    }
+    checks = checks
+      + if read.evidence == nil {
+        release_checkpoint_unavailable(read.reason)
+      } else {
+        release_checkpoint_preconditions(read.evidence ?? {})
+      }
   }
   const receipt = release_launch_preflight_receipt(
     inputs,
