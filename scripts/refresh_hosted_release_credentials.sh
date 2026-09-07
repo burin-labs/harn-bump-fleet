@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remint the GitHub App installation token and rewrite every push/API path.
 #
-# App installation tokens expire after one hour. Hosted ship-pr regularly runs
+# App installation tokens expire after one hour. Hosted prepare and ship-pr regularly run
 # longer (candidate certification alone is ~40m), so a token minted at job
 # start is dead by the tag push. This script refreshes:
 #   1. $RUNNER_TEMP/git-credentials — credential.helper store used by git push
