@@ -270,6 +270,17 @@ retry that ran can be told from one that did not, and an exhausted bound reports
 unreadable. Whether a failure is transient is decided by
 `fleet_observation_class`, which owns that question for every connector error
 here, so the two answers cannot drift apart.
+A failed stage repairs itself only through `lib/release_chain_effect_door.harn`,
+the single place where a planned effect becomes an action. Its allowlist names
+every effect a repair may perform, and no entry dispatches the release workflow,
+so a repair can never produce a second cut of a published version. A repair runs
+at most once: the caller supplies the idempotency keys the chain has already
+spent and a repeat is refused, so a replayed chain refuses for the same reason a
+live one does. An effect counts as done only on evidence it read back; an empty,
+missing, or unattributed read-back escalates, because a door that accepted
+silence would report every unreachable dispatch as a successful repair. An
+unmapped cause, an unmapped effect kind, and an exhausted bound all stop with a
+typed reason rather than falling through to a retry.
 
 A release whose bump merged without a tag is recovered by
 `recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh

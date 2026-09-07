@@ -1,0 +1,271 @@
+import { ReleaseChainPlannedEffect } from "./release_chain_effect"
+import { ReleaseChainRepairDecision, release_chain_repair_decision } from "./release_chain_repair"
+import {
+  ReleaseChainCause,
+  ReleaseChainEffectKind,
+  ReleaseChainEffectReceipt,
+  ReleaseChainEvidenceRead,
+  ReleaseChainStage,
+  ReleaseChainUnprovenSubject,
+} from "./release_chain_state"
+
+/**
+ * The door a planned repair passes through to become an effect.
+ *
+ * `release_chain_repair_decision` decides what a typed cause deserves and
+ * `release_chain_planned_effect` describes it, but neither can do anything: the
+ * planning module is deliberately data-only. This module is the one place where
+ * a decision becomes an action, so the bound on repair lives here rather than
+ * being restated at every caller.
+ *
+ * Four properties hold structurally, not by convention:
+ *
+ * 1. Only a kind named in `RELEASE_CHAIN_EFFECT_DOOR` can be performed. The
+ *    allowlist is what makes "the repair loop never re-cuts a release" true:
+ *    no entry dispatches the release workflow, so no repair can produce a
+ *    second cut of a version that is already out.
+ * 2. An effect runs at most once. The caller hands in the idempotency keys it
+ *    has already applied and a repeat is refused rather than retried.
+ * 3. A repair is accepted only on evidence it actually read back. An empty
+ *    read-back is refused, because a door that accepted silence would report
+ *    every unreachable dispatch as a successful repair.
+ * 4. Anything else escalates. An unmapped cause, an unmapped kind, an exhausted
+ *    bound, and a broken read-back all stop with a typed reason instead of
+ *    falling through to a retry.
+ */
+pub type ReleaseChainDoorEntry = {kind: ReleaseChainEffectKind, mechanism: string, proves: string}
+
+/**
+ * The closed set of effects this loop may perform, and what each one must read
+ * back before it counts as done.
+ *
+ * `refresh_size_baseline` is deliberately absent. It is a declared effect kind
+ * that no policy plans today, and adding a door for an unplanned kind would be
+ * a mechanism with no caller: reachable only by a future edit that would not
+ * know the bound it was crossing.
+ */
+pub const RELEASE_CHAIN_EFFECT_DOOR: list<ReleaseChainDoorEntry> = [
+  {
+    kind: "dispatch_development_cutover",
+    mechanism: "workflow_dispatch",
+    proves: "the dispatched run exists and names the chain's own idempotency key",
+  },
+  {
+    kind: "open_fragment_fold_pr",
+    mechanism: "pull_request",
+    proves: "the opened pull request exists and folds the fragments the stage named",
+  },
+  {
+    kind: "recover_binary_assets",
+    mechanism: "workflow_dispatch",
+    proves: "the dispatched run exists and names the chain's own idempotency key",
+  },
+  {
+    kind: "promote_anchor",
+    mechanism: "workflow_dispatch",
+    proves: "the dispatched run exists and names the chain's own idempotency key",
+  },
+  {
+    kind: "dispatch_consumer_repin",
+    mechanism: "workflow_dispatch",
+    proves: "the dispatched run exists and names the repository the stage named",
+  },
+  {
+    kind: "dispatch_convergence_proof",
+    mechanism: "workflow_dispatch",
+    proves: "the dispatched run exists and names the chain's own idempotency key",
+  },
+]
+
+pub fn release_chain_effect_door_entry(kind: ReleaseChainEffectKind) -> ReleaseChainDoorEntry? {
+  for entry in RELEASE_CHAIN_EFFECT_DOOR {
+    if entry.kind == kind {
+      return entry
+    }
+  }
+  return nil
+}
+
+/**
+ * The one call that leaves this process.
+ *
+ * It is a field rather than a direct call so a test can pass a door that throws
+ * on contact. A repair loop proven only against a recording adapter proves that
+ * something was recorded; one proven against a tripwire proves the loop did not
+ * reach the outside world when it was not supposed to.
+ */
+pub type ReleaseChainEffectGateway = {
+  perform: fn(ReleaseChainPlannedEffect, ReleaseChainDoorEntry) -> list<ReleaseChainEvidenceRead>,
+  now: fn() -> string,
+}
+
+pub type ReleaseChainRepairOutcome = "repaired" | "waiting" | "escalated" | "refused"
+
+pub type ReleaseChainRepairReceipt = {
+  schema_version: "harn.release-chain.repair.v1",
+  outcome: ReleaseChainRepairOutcome,
+  stage: ReleaseChainStage,
+  cause: ReleaseChainCause,
+  subject: string,
+  reason: string,
+  effect?: ReleaseChainEffectReceipt,
+}
+
+fn stopped(
+  outcome: ReleaseChainRepairOutcome,
+  stage: ReleaseChainStage,
+  cause: ReleaseChainCause,
+  subject: string,
+  reason: string,
+) -> ReleaseChainRepairReceipt {
+  return {
+    schema_version: "harn.release-chain.repair.v1",
+    outcome: outcome,
+    stage: stage,
+    cause: cause,
+    subject: subject,
+    reason: reason,
+  }
+}
+
+/**
+ * Refuse a read-back that proves nothing.
+ *
+ * A dispatch that was accepted and then never happened returns an empty list,
+ * which is exactly what a dispatch that was never attempted returns. Treating
+ * either as a repair would let the loop report progress it did not make, and
+ * the chain would then wait forever on a stage nothing was fixing.
+ */
+pub fn release_chain_read_back_refusals(read_back: list<ReleaseChainEvidenceRead>) -> list<string> {
+  let refusals: list<string> = []
+  if len(read_back) == 0 {
+    refusals = refusals + ["the effect read nothing back, so nothing proves it happened"]
+  }
+  for read in read_back {
+    if read.status == "missing" {
+      refusals = refusals + ["`${read.subject}` was not there when the effect read it back"]
+    }
+    if read.status == "broken" {
+      refusals = refusals + ["`${read.subject}` read back broken: ${read.observed}"]
+    }
+    if trim(read.identity) == "" {
+      refusals = refusals + ["`${read.subject}` read back without an identity to attribute it to"]
+    }
+  }
+  return refusals
+}
+
+/**
+ * Perform, at most once, exactly the repair the typed cause named.
+ *
+ * `applied_keys` is every idempotency key this chain has already spent. It is
+ * an argument rather than state inside the door so that a replayed chain
+ * refuses a repeat for the same reason a live one does, instead of the bound
+ * living only in a process that can be restarted.
+ */
+pub fn release_chain_repair_once(
+  chain_id: string,
+  revision: int,
+  stage: ReleaseChainStage,
+  unproven: ReleaseChainUnprovenSubject,
+  attempt: int,
+  target: string,
+  applied_keys: list<string>,
+  gateway: ReleaseChainEffectGateway,
+) -> ReleaseChainRepairReceipt {
+  let decision: ReleaseChainRepairDecision = {action: "escalate", cause: unproven.cause, reason: ""}
+  // An out-of-bounds attempt throws out of the planner rather than returning,
+  // and an exhausted bound is a stop, not a crash.
+  try {
+    decision = release_chain_repair_decision(
+      chain_id,
+      revision,
+      stage,
+      unproven.cause,
+      unproven.subject,
+      attempt,
+      target,
+    )
+  } catch (error) {
+    return stopped(
+      "escalated",
+      stage,
+      unproven.cause,
+      unproven.subject,
+      "the bounded repair policy refused to plan this attempt: ${error}",
+    )
+  }
+  if decision.action == "wait" {
+    return stopped("waiting", stage, unproven.cause, unproven.subject, decision.reason)
+  }
+  if decision.action == "escalate" || decision.effect == nil {
+    return stopped("escalated", stage, unproven.cause, unproven.subject, decision.reason)
+  }
+  const planned = unwrap(decision.effect)
+  if contains(applied_keys, planned.idempotency_key) {
+    return stopped(
+      "refused",
+      stage,
+      unproven.cause,
+      unproven.subject,
+      "this exact repair was already applied once; a second attempt is not a repair",
+    )
+  }
+  const entry = release_chain_effect_door_entry(planned.kind)
+  if entry == nil {
+    return stopped(
+      "escalated",
+      stage,
+      unproven.cause,
+      unproven.subject,
+      "`${planned.kind}` has no door, so nothing may perform it",
+    )
+  }
+  let read_back: list<ReleaseChainEvidenceRead> = []
+  try {
+    read_back = gateway.perform(planned, unwrap(entry))
+  } catch (error) {
+    return stopped(
+      "escalated",
+      stage,
+      unproven.cause,
+      unproven.subject,
+      "the effect could not be performed: ${error}",
+    )
+  }
+  const refusals = release_chain_read_back_refusals(read_back)
+  if len(refusals) > 0 {
+    return stopped(
+      "escalated",
+      stage,
+      unproven.cause,
+      unproven.subject,
+      "the effect was attempted but did not prove itself: " + join(refusals, "; "),
+    )
+  }
+  return {
+    schema_version: "harn.release-chain.repair.v1",
+    outcome: "repaired",
+    stage: stage,
+    cause: unproven.cause,
+    subject: unproven.subject,
+    reason: "${decision.reason}; ${unwrap(entry).proves}",
+    effect: {
+      kind: planned.kind,
+      idempotency_key: planned.idempotency_key,
+      target: planned.target,
+      accepted_identity: read_back[0]?.identity ?? "",
+      read_back: read_back,
+      accepted_at: gateway.now(),
+    },
+  }
+}
+
+/** One line a release owner can read without opening the receipt. */
+pub fn release_chain_repair_summary(receipt: ReleaseChainRepairReceipt) -> string {
+  const head = "${receipt.outcome} ${receipt.stage} `${receipt.subject}` (${receipt.cause})"
+  if receipt.effect == nil {
+    return "${head}: ${receipt.reason}"
+  }
+  return "${head}: ${unwrap(receipt.effect).kind}; ${receipt.reason}"
+}
