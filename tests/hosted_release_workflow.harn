@@ -1,6 +1,7 @@
 import { shell_quote } from "std/runtime"
 import { with_temp_dir } from "std/testing"
 import { decode_github_workflow } from "../lib/github_workflow"
+import { undeclared_job_variables } from "../lib/workflow_step_environment"
 
 fn hosted_release_workflow(fs: HarnessFs) -> string {
   return fs.read_text(path_join(dirname(fs.cwd()), ".github", "workflows", "hosted-release.yml"))
@@ -329,11 +330,7 @@ pipeline test_consumer_projection_drift_blocks_publication_before_release_work(h
   const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
   const steps = workflow.jobs.get("release")?.steps ?? []
   const token_index = steps.find_index({ step -> step.name == "Mint fleet policy read token" })
-  const policy_index = steps.find_index(
-    { step ->
-      step.name == "Verify consumer contracts match generated adapters before publication"
-    },
-  )
+  const policy_index = steps.find_index({ step -> step.name == "Run the release launch preflight" })
   const release_index = steps.find_index({ step -> step.name == "Run release harness" })
   const rust_index = steps.find_index({ step -> contains(step.uses ?? "", "/rust-toolchain@") })
   const cache_index = steps.find_index({ step -> contains(step.uses ?? "", "/rust-cache@") })
@@ -350,12 +347,24 @@ pipeline test_consumer_projection_drift_blocks_publication_before_release_work(h
   assert_eq(token.with?.get("permission-actions"), nil)
   assert_eq(token.with?.get("permission-pull-requests"), nil)
   const policy = steps[policy_index]
-  assert_eq(policy?.if, "inputs.mode == 'ship-pr'")
+  // The preflight runs in every mode. The consumer contract it carries still
+  // gates publication only, and says so in its own receipt rather than by
+  // being skipped -- a step that did not run and a step that ran and liked the
+  // answer must not read the same.
+  assert_eq(policy?.if, nil)
   const token_ref = "$" + "{{ steps.fleet-policy-token.outputs.token }}"
   assert_eq(policy?.env?.get("GH_TOKEN"), token_ref)
   assert_eq(policy?.env?.get("GITHUB_TOKEN"), token_ref)
-  assert(contains(policy?.run ?? "", "check_fleet_policy.harn"))
-  assert(contains(policy?.run ?? "", "prepublication-fleet-policy.json"))
+  assert(contains(policy?.run ?? "", "scripts/preflight_release_launch.sh"))
+  assert(contains(policy?.run ?? "", "release-launch-preflight.json"))
+  // The gate's own document survives the step it moved out of; the preflight
+  // writes it, so the forensic detail behind a refusal is still uploaded.
+  assert(
+    contains(
+      harness.fs.read_text(path_join(dirname(harness.fs.cwd()), "preflight_release_launch.harn")),
+      "prepublication-fleet-policy.json",
+    ),
+  )
 }
 
 /**
@@ -591,11 +600,7 @@ pipeline test_hosted_release_forwards_one_repository_scope_only_after_publicatio
   const preflight = release_steps.find(
     { step -> step.name == "Validate and normalize the post-publication consumer scope" },
   )
-  const policy = release_steps.find(
-    { step ->
-      step.name == "Verify consumer contracts match generated adapters before publication"
-    },
-  )
+  const policy = release_steps.find({ step -> step.name == "Run the release launch preflight" })
   const release = release_steps.find({ step -> step.name == "Run release harness" })
   const tail = release_steps.find(
     { step -> step.name == "Reconcile published release and hand off fleet update" },
@@ -874,4 +879,49 @@ pipeline test_every_hosted_release_input_is_reachable_from_the_dispatcher(
   )
     .to_list()
   assert_eq(unreachable, [], "every declared hosted release input is sent by the dispatcher")
+}
+
+pipeline test_input_validation_widens_a_short_pin_and_exports_the_exact_commit(harness: Harness) {
+  // Operators type seven characters; the dispatch receipt, the certification
+  // branch, and the tag all require forty, and a live cut was refused for that
+  // mismatch. The widening happens once, in the first step that reads the
+  // input, and every later step reads the exported result.
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const validate = steps.find({ step -> step.name == "Validate release inputs" })
+  assert(validate != nil)
+  const run = validate?.run ?? ""
+  assert(contains(run, "--resolve-only"), run)
+  assert(contains(run, "RELEASE_AT_SHA=" + "\${RELEASE_AT_SHA}"), run)
+  assert(contains(run, ">> \"$GITHUB_ENV\""), run)
+  // An empty or malformed resolution must not be exported as the pin.
+  assert(contains(run, "not a full commit SHA"), run)
+  assert_eq(validate?.env?.get("RELEASE_AT_SHA"), "$" + "{{ inputs.at_sha }}")
+  // Every later consumer reads the exported commit, never the raw input, or
+  // the widening would be undone by whichever step re-read the abbreviation.
+  for later in ["Run the release launch preflight", "Run release harness"] {
+    const step = steps.find({ entry -> entry.name == later })
+    assert(step != nil, later)
+    assert(contains(step?.run ?? "", "RELEASE_AT_SHA"), later)
+    assert_eq(step?.env?.get("RELEASE_AT_SHA"), nil, later)
+  }
+}
+
+pipeline test_every_variable_the_hosted_release_reads_is_declared_before_it(harness: Harness) {
+  /**
+   * Every shell step in this workflow runs under `set -u`, so a read of a name
+   * nothing declared aborts the step. One edit dropped `RELEASE_MODE` from the
+   * release step's `env:` block while leaving two reads of it in the body, and
+   * every hosted cut would have died about ten minutes in, past the checkout,
+   * the mint, and the harness build. Nothing else in this repository would have
+   * noticed: the workflow parses and the expression syntax is valid.
+   */
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  let findings: list<string> = []
+  for named in workflow.jobs.entries() {
+    for finding in undeclared_job_variables(named.value) {
+      findings = findings + ["${named.key}: ${finding.step} reads ${finding.variable}"]
+    }
+  }
+  assert_eq(findings, [])
 }

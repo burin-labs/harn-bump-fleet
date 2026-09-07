@@ -16,6 +16,43 @@ verifies its signature locally before pushing. A merge-identity, ancestry,
 signing, or verification failure stops publication before the tag reaches the
 remote. Existing tags are never moved.
 
+## Preconditions are asked first
+
+Every mode runs `preflight_release_launch.harn` before anything is leased,
+dispatched, or built. It validates the dispatch inputs through the release's
+own validator, mints an installation token through the reviewed profile and
+asserts the grants the cut will exercise, compares that mint's lifetime against
+the declared phase wall budgets, and, for `ship-pr`, runs the consumer contract
+gate against live consumer mains. It takes under two minutes and writes
+nothing.
+
+Each precondition reports `pass`, `fail`, or `not asked`. A context without
+release App credentials -- an operator laptop, a fork pull request -- reports
+the credentialed half as not asked rather than as passing, so a partial read
+never looks like a clean one. On consumer drift the receipt names
+`fleet-projection-convergence.yml` as the repair to dispatch.
+
+`at_sha` takes seven to forty hex digits. A short one is resolved against the
+release repository and widened before the dispatch, so what reaches the receipt,
+the certification branch, and the tag is always one exact commit. A prefix that
+names no commit, or that GitHub resolves to something which does not extend it,
+is refused with the reason rather than adopted. A branch or tag name is not a
+commit prefix and is refused: `--at-sha main` would pin whatever main happened
+to be at that instant, which is the binding the input exists to remove.
+
+Ask the same questions without starting a release:
+
+```sh
+scripts/preflight_release_launch.sh --mode ship-pr --bump patch
+```
+
+To widen a commit prefix without asking anything else, `--resolve-only` prints
+the exact commit on stdout and everything a person reads on stderr.
+
+The same job runs on every pull request to this repository and hourly on main,
+so a change to a renderer, the fleet manifest, or the token profiles fails its
+own pull request instead of a release attempt.
+
 Default mode dispatches a read-only audit through the hosted release workflow:
 
 ```sh

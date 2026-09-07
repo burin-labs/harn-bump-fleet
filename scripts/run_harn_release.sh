@@ -24,6 +24,8 @@ case "${HARN_EXT_RELEASE_LOCAL_AUDIT:-}" in
   1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy]) local_audit=1 ;;
 esac
 at_sha=""
+bump="patch"
+preid=""
 args=("$@")
 index=0
 while [ "$index" -lt "${#args[@]}" ]; do
@@ -43,6 +45,20 @@ while [ "$index" -lt "${#args[@]}" ]; do
       fi
       ;;
     --at-sha=*) at_sha="${arg#--at-sha=}" ;;
+    --bump)
+      index=$((index + 1))
+      if [ "$index" -lt "${#args[@]}" ]; then
+        bump="${args[$index]}"
+      fi
+      ;;
+    --bump=*) bump="${arg#--bump=}" ;;
+    --preid)
+      index=$((index + 1))
+      if [ "$index" -lt "${#args[@]}" ]; then
+        preid="${args[$index]}"
+      fi
+      ;;
+    --preid=*) preid="${arg#--preid=}" ;;
     --yes-live-release) live_release=1 ;;
     --mock) mock_run=1 ;;
     --local-audit) local_audit=1 ;;
@@ -131,6 +147,91 @@ preflight_development_workspace() {
   fi
   printf 'release-preflight workspace_version=%s ref=origin/main status=ready\n' "$version" >&2
 }
+
+# Ask every release precondition before anything is leased, dispatched, or
+# built. Five hosted attempts were lost in one day, each at a gate first
+# exercised between thirty seconds and sixty-five minutes into a cut that could
+# not be taken back: a token minted without `workflows`, a mint that expired
+# mid-certification, a consumer contract the daily convergence had not
+# re-rendered, a consumer whose own guard could not pass on that render, and a
+# short `at_sha`. Every one was answerable in under two minutes.
+#
+# This runs in every mode, including `audit`, because the gates it asks about
+# are not mode-specific -- what was mode-specific was the guess about which
+# ones mattered, and that guess is what cost the 401.
+preflight_release_launch() {
+  local preflight="${script_dir}/preflight_release_launch.sh"
+  if [ ! -x "$preflight" ]; then
+    # Deliberately fatal. A missing preflight that let the release through
+    # would be the failure mode the preflight exists to remove: an absent
+    # answer reading as a satisfied one.
+    printf 'error: release preflight %s is missing or not executable; nothing was dispatched\n' \
+      "$preflight" >&2
+    exit 2
+  fi
+  local preflight_args=(--mode "$mode" --bump "$bump" --at-sha "$at_sha")
+  if [ -n "$preid" ]; then
+    preflight_args+=(--preid "$preid")
+  fi
+  # A mocked run has no credentials and no live fleet to read; the structural
+  # half is still asked, and the credentialed half reports itself unasked.
+  if [ "$mock_run" -eq 1 ]; then
+    preflight_args+=(--offline)
+  fi
+  if ! "$preflight" "${preflight_args[@]}"; then
+    printf 'error: release preflight refused; nothing was dispatched\n' >&2
+    exit 2
+  fi
+}
+
+# Widen a short `--at-sha` to the exact commit before anything downstream sees
+# it. Operators type seven characters; the dispatch receipt, the certification
+# branch, and the tag all require forty, and a live cut was refused for that
+# mismatch. Resolution happens once, here, and every later step keeps its
+# forty-character invariant without knowing an abbreviation was ever typed.
+resolve_at_sha() {
+  if [ -z "$at_sha" ] || [ ${#at_sha} -eq 40 ] || [ "$mock_run" -eq 1 ]; then
+    return 0
+  fi
+  local resolved
+  if ! resolved="$("${script_dir}/preflight_release_launch.sh" --at-sha "$at_sha" --resolve-only)"; then
+    printf 'error: could not resolve --at-sha %s to an exact commit; nothing was dispatched\n' \
+      "$at_sha" >&2
+    exit 2
+  fi
+  resolved="$(printf '%s' "$resolved" | tr -d '[:space:]')"
+  if [ ${#resolved} -ne 40 ]; then
+    # An empty or short answer here would otherwise be passed on as the pin.
+    printf 'error: commit resolution returned %s, which is not a full commit; nothing was dispatched\n' \
+      "${resolved:-<empty>}" >&2
+    exit 2
+  fi
+  printf 'release-preflight at_sha=%s resolved=%s\n' "$at_sha" "$resolved" >&2
+  local rewritten=()
+  local i=0
+  while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+      --at-sha)
+        rewritten+=(--at-sha "$resolved")
+        i=$((i + 1))
+        ;;
+      --at-sha=*) rewritten+=("--at-sha=${resolved}") ;;
+      *) rewritten+=("${args[$i]}") ;;
+    esac
+    i=$((i + 1))
+  done
+  args=("${rewritten[@]}")
+  at_sha="$resolved"
+}
+
+resolve_at_sha
+# Bash 3.2 treats an empty array under `set -u` as unbound, and a bare
+# `run_harn_release.sh` with no arguments is a supported invocation.
+if [ "${#args[@]}" -gt 0 ]; then
+  set -- "${args[@]}"
+fi
+
+preflight_release_launch
 
 preflight_development_workspace
 
