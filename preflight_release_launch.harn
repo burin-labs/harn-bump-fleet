@@ -22,9 +22,13 @@
 import { ParserSpec } from "std/cli/argparse"
 import { env_str } from "std/config"
 import { cli_options } from "lib/cli_options"
+import { github_is_transient_read_error } from "lib/github"
+import { github_resolve_commit } from "lib/github_commits"
 import {
+  AtShaResolution,
   PreflightPrecondition,
   ReleaseLaunchInputs,
+  at_sha_preconditions,
   consumer_contract_precondition,
   credential_refresh_precondition,
   preflight_fail,
@@ -52,7 +56,9 @@ type Options = {
   skip_consumers: string,
   consumer_proof_runs_json: string,
   token_profile: string,
+  release_repo: string,
   offline: bool,
+  resolve_only: bool,
   receipt: string,
 }
 
@@ -72,7 +78,9 @@ const ARG_SPEC: ParserSpec = {
       default: "",
     },
     {kind: "flag", name: "token_profile", long: "--token-profile", default: "harn-release"},
+    {kind: "flag", name: "release_repo", long: "--release-repo", default: "burin-labs/harn"},
     {kind: "switch", name: "offline", long: "--offline"},
+    {kind: "switch", name: "resolve_only", long: "--resolve-only"},
     {kind: "flag", name: "receipt", long: "--receipt", default: ""},
   ],
 }
@@ -159,6 +167,54 @@ fn credential_refresh_interval_s(document: any) -> int? {
   return to_int(matched[0].groups[0] ?? "")
 }
 
+/**
+ * Turn a commit prefix into the exact commit, or say why it was not asked.
+ *
+ * A transient read is reported as unasked rather than as a bad pin. The
+ * difference matters: one is an operator's typo and the other is GitHub having
+ * a bad minute, and a preflight that called them the same thing would send
+ * somebody looking for a commit that is there.
+ */
+fn resolve_at_sha(
+  harness: Harness,
+  slug: string,
+  requested: string,
+  offline: bool,
+) -> AtShaResolution {
+  const pinned = lowercase(trim(requested))
+  if pinned == "" || len(pinned) == 40 || offline {
+    return {
+      requested: pinned,
+      resolved: "",
+      asked: false,
+      reason: if offline {
+        "--offline"
+      } else {
+        "nothing to resolve"
+      },
+    }
+  }
+  const resolved = github_resolve_commit(harness, slug, pinned)
+  if is_err(resolved) {
+    const failure = unwrap_err(resolved)
+    if github_is_transient_read_error(failure) {
+      return {
+        requested: pinned,
+        resolved: "",
+        asked: false,
+        reason: "${slug} could not be read: " + to_string(failure.message ?? failure),
+      }
+    }
+    return {
+      requested: pinned,
+      resolved: "",
+      asked: true,
+      reason: to_string(failure.message ?? failure),
+    }
+  }
+  return {requested: pinned, resolved: unwrap(resolved).sha, asked: true, reason: ""}
+}
+
 pipeline main(harness: Harness) {
   const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
   const inputs: ReleaseLaunchInputs = {
@@ -170,7 +226,51 @@ pipeline main(harness: Harness) {
     skip_consumers: options.skip_consumers,
     consumer_proof_runs_json: options.consumer_proof_runs_json,
   }
-  let checks: list<PreflightPrecondition> = release_input_preconditions(inputs)
+  // Resolve the pin first. Everything downstream of this preflight requires a
+  // full forty-character commit, so this is the one place a short one is
+  // widened, and the receipt records both what was asked for and what it means.
+  const pin = resolve_at_sha(harness, trim(options.release_repo), options.at_sha, options.offline)
+  const resolved_at_sha = if trim(pin.resolved) != "" {
+    trim(pin.resolved)
+  } else if len(lowercase(trim(options.at_sha))) == 40 {
+    lowercase(trim(options.at_sha))
+  } else {
+    ""
+  }
+  let checks: list<PreflightPrecondition> = at_sha_preconditions(pin)
+  if options.resolve_only {
+    // The one stdout line is the resolved commit, so a shell step can capture
+    // it without parsing prose. Everything a person reads goes to stderr.
+    const partial = release_launch_preflight_receipt(
+      inputs,
+      options.token_profile,
+      checks,
+      resolved_at_sha,
+    )
+    for line in release_launch_preflight_lines(partial) {
+      harness.stdio.eprintln(line)
+    }
+    if trim(options.receipt) != "" {
+      harness.fs.write_text(trim(options.receipt), json_stringify_pretty(partial) + "\n")
+    }
+    if !partial.ok {
+      return 1
+    }
+    harness.stdio.println(resolved_at_sha)
+    return 0
+  }
+  checks = checks
+    + release_input_preconditions(
+      {
+        mode: inputs.mode,
+        bump: inputs.bump,
+        prerelease_identifier: inputs.prerelease_identifier,
+        at_sha: resolved_at_sha,
+        repositories_json: inputs.repositories_json,
+        skip_consumers: inputs.skip_consumers,
+        consumer_proof_runs_json: inputs.consumer_proof_runs_json,
+      },
+    )
   const root = release_harness_root(harness.fs)
   const registry = read_profile_registry(harness.fs, root)
   const profile = registry.profiles.get(options.token_profile)
@@ -321,7 +421,12 @@ pipeline main(harness: Harness) {
         ),
       ]
   }
-  const receipt = release_launch_preflight_receipt(inputs, options.token_profile, checks)
+  const receipt = release_launch_preflight_receipt(
+    inputs,
+    options.token_profile,
+    checks,
+    resolved_at_sha,
+  )
   for line in release_launch_preflight_lines(receipt) {
     harness.stdio.println(line)
   }

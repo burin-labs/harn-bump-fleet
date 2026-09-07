@@ -184,6 +184,53 @@ preflight_release_launch() {
   fi
 }
 
+# Widen a short `--at-sha` to the exact commit before anything downstream sees
+# it. Operators type seven characters; the dispatch receipt, the certification
+# branch, and the tag all require forty, and a live cut was refused for that
+# mismatch. Resolution happens once, here, and every later step keeps its
+# forty-character invariant without knowing an abbreviation was ever typed.
+resolve_at_sha() {
+  if [ -z "$at_sha" ] || [ ${#at_sha} -eq 40 ] || [ "$mock_run" -eq 1 ]; then
+    return 0
+  fi
+  local resolved
+  if ! resolved="$("${script_dir}/preflight_release_launch.sh" --at-sha "$at_sha" --resolve-only)"; then
+    printf 'error: could not resolve --at-sha %s to an exact commit; nothing was dispatched\n' \
+      "$at_sha" >&2
+    exit 2
+  fi
+  resolved="$(printf '%s' "$resolved" | tr -d '[:space:]')"
+  if [ ${#resolved} -ne 40 ]; then
+    # An empty or short answer here would otherwise be passed on as the pin.
+    printf 'error: commit resolution returned %s, which is not a full commit; nothing was dispatched\n' \
+      "${resolved:-<empty>}" >&2
+    exit 2
+  fi
+  printf 'release-preflight at_sha=%s resolved=%s\n' "$at_sha" "$resolved" >&2
+  local rewritten=()
+  local i=0
+  while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+      --at-sha)
+        rewritten+=(--at-sha "$resolved")
+        i=$((i + 1))
+        ;;
+      --at-sha=*) rewritten+=("--at-sha=${resolved}") ;;
+      *) rewritten+=("${args[$i]}") ;;
+    esac
+    i=$((i + 1))
+  done
+  args=("${rewritten[@]}")
+  at_sha="$resolved"
+}
+
+resolve_at_sha
+# Bash 3.2 treats an empty array under `set -u` as unbound, and a bare
+# `run_harn_release.sh` with no arguments is a supported invocation.
+if [ "${#args[@]}" -gt 0 ]; then
+  set -- "${args[@]}"
+fi
+
 preflight_release_launch
 
 preflight_development_workspace
