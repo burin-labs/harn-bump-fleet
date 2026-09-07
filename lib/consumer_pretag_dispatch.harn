@@ -1,8 +1,10 @@
 import {
   ConsumerPretagAttestationReceipt,
+  ConsumerPretagDispatchAttempt,
   ConsumerPretagGateReceipt,
   ConsumerPretagGateTarget,
 } from "./consumer_pretag_gate"
+import { fleet_observation_class } from "./fleet_observation_class"
 
 pub type ConsumerPretagJobRow = {
   id: int,
@@ -214,6 +216,21 @@ type PendingGate = {
   dispatched?: bool,
   visibility_error?: string,
   visibility_stop_ms?: int,
+  // Carried so a gate that survived a dropped dispatch can still prove it did.
+  // A retry whose evidence is dropped the moment the gate passes cannot be
+  // told apart from a retry that never ran.
+  dispatch_attempts?: list<ConsumerPretagDispatchAttempt>,
+}
+
+/** Attach the gate's dispatch history to whatever verdict it reached. */
+fn with_attempts(
+  receipt: ConsumerPretagGateReceipt,
+  gate: PendingGate,
+) -> ConsumerPretagGateReceipt {
+  if len(gate.dispatch_attempts ?? []) == 0 {
+    return receipt
+  }
+  return receipt + {dispatch_attempts: gate.dispatch_attempts ?? []}
 }
 
 type CandidateResolution = {
@@ -232,6 +249,49 @@ pub fn consumer_pretag_gate_policy(pre_tag_resume: bool) -> ConsumerPretagGatePo
         0
       },
     }
+}
+
+/**
+ * How many times a dispatch may be sent, and how long the waits between sends
+ * are.
+ *
+ * A release that has already built and certified a candidate must not be thrown
+ * away because one HTTP request was dropped in transit. Five sends spread over
+ * roughly two minutes covers the transient failures actually seen without
+ * turning an outage into a two-minute stall on every consumer: a rejection the
+ * remote actually answered is not retried at all.
+ */
+pub const CONSUMER_PRETAG_DISPATCH_ATTEMPTS = 5
+
+pub const CONSUMER_PRETAG_DISPATCH_BACKOFF_MS: list<int> = [5000, 15000, 40000, 60000]
+
+/**
+ * Whether a failed dispatch is worth sending again.
+ *
+ * The judgement is not made here. `fleet_observation_class` already owns the
+ * question "can a later attempt find this satisfied?" for every connector error
+ * in this repository, and it decides from the structured `code` and `category`
+ * rather than from message text. A second classifier living at this seam would
+ * drift from that one, and the direction it would drift is the dangerous one:
+ * two answers to whether a failure is transient, disagreeing silently.
+ *
+ * The one thing this adds is unwrapping the envelope. A dispatch error arrives
+ * as `{message: {code, category, message}}`, so the classified record is one
+ * level in; a record without a category at the top is unwrapped before it is
+ * classified, and anything else is passed through unchanged.
+ */
+pub fn consumer_pretag_dispatch_is_retryable(error: any) -> bool {
+  const inner = if error?.category == nil && error?.message != nil {
+    error?.message
+  } else {
+    error
+  }
+  return fleet_observation_class(inner).disposition == "retry"
+}
+
+/** How long to wait before send number `attempt` + 1. */
+pub fn consumer_pretag_dispatch_backoff_ms(attempt: int) -> int {
+  return CONSUMER_PRETAG_DISPATCH_BACKOFF_MS[attempt - 1] ?? 60000
 }
 
 /**
@@ -924,6 +984,57 @@ fn resolve_candidate_rows(
   return {receipts: [], pending: [{target: target, run_id: row.id}], unseen: []}
 }
 
+/** One dispatch outcome plus every send it took to get there. */
+pub type ConsumerPretagDispatchOutcome = {
+  receipt?: ConsumerPretagDispatchReceipt,
+  attempts: list<ConsumerPretagDispatchAttempt>,
+  last_error: string,
+  retryable: bool,
+}
+
+/**
+ * Send the dispatch, retrying only what a retry can fix.
+ *
+ * A dropped request is indistinguishable from one that never arrived, so the
+ * only way to learn anything is to send it again. This is bounded rather than
+ * patient: a release that has already built and certified a candidate is worth
+ * two minutes of retrying and is not worth stalling behind an outage.
+ *
+ * Every send is recorded, including the ones that failed, so "it retried" is a
+ * claim the receipt can prove rather than one a reader has to take on faith.
+ */
+pub fn consumer_pretag_dispatch_with_retry(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+  max_attempts: int = CONSUMER_PRETAG_DISPATCH_ATTEMPTS,
+) -> ConsumerPretagDispatchOutcome {
+  let attempts: list<ConsumerPretagDispatchAttempt> = []
+  let last_error = ""
+  let retryable = false
+  let attempt = 0
+  while attempt < max_attempts {
+    attempt = attempt + 1
+    const sent = adapter.dispatch(target)
+    if !is_err(sent) {
+      return {receipt: unwrap(sent), attempts: attempts, last_error: "", retryable: false}
+    }
+    const error = unwrap_err(sent)
+    last_error = to_string(error)
+    retryable = consumer_pretag_dispatch_is_retryable(error)
+    attempts = attempts
+      + [{attempt: attempt, at_ms: adapter.now_ms(), error: last_error}]
+    // A refusal the remote actually answered is a fact about this request. It
+    // will read the same on every send, so repeating it only delays the report.
+    if !retryable {
+      return {attempts: attempts, last_error: last_error, retryable: false}
+    }
+    if attempt < max_attempts {
+      adapter.wait(consumer_pretag_dispatch_backoff_ms(attempt))
+    }
+  }
+  return {attempts: attempts, last_error: last_error, retryable: true}
+}
+
 fn dispatch_unseen_candidates(
   gates: list<PendingGate>,
   adapter: ConsumerPretagGateAdapter,
@@ -946,13 +1057,30 @@ fn dispatch_unseen_candidates(
         ]
       continue
     }
-    const dispatched = adapter.dispatch(target)
-    if is_err(dispatched) {
+    const outcome = consumer_pretag_dispatch_with_retry(target, adapter)
+    if outcome.receipt == nil {
+      const sends = len(outcome.attempts)
+      const summary = if outcome.retryable {
+        "dispatch unreachable after ${to_string(sends)} attempts; last error: ${outcome.last_error}"
+      } else {
+        "dispatch failed: ${outcome.last_error}"
+      }
       receipts = receipts
-        + [unreadable(target, "dispatch failed: " + to_string(unwrap_err(dispatched)))]
+        + [
+          unreadable(target, summary)
+            + {
+              cause: if outcome.retryable {
+                "consumer_dispatch_unreachable"
+              } else {
+                "consumer_dispatch_rejected"
+              },
+              dispatch_attempts: outcome.attempts,
+            },
+        ]
       continue
     }
-    const run_id = unwrap(dispatched).run_id
+    const dispatched = unwrap(outcome.receipt)
+    const run_id = dispatched.run_id
     if run_id <= 0 {
       receipts = receipts + [unreadable(target, "dispatch returned no valid run identity")]
       continue
@@ -963,7 +1091,7 @@ fn dispatch_unseen_candidates(
     if recorder != nil {
       (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
     }
-    if unwrap(dispatched).head_sha != target.consumer_revision {
+    if dispatched.head_sha != target.consumer_revision {
       receipts = receipts
         + [
           unreadable(
@@ -980,6 +1108,7 @@ fn dispatch_unseen_candidates(
             run_id: run_id,
             dispatched: true,
             visibility_stop_ms: adapter.now_ms() + dispatch_visibility_ms,
+            dispatch_attempts: outcome.attempts,
           },
       ]
   }
@@ -1058,7 +1187,7 @@ fn poll_pending_gates(
       const detail = "exact run lookup failed: " + to_string(unwrap_err(row))
       if (gate.dispatched ?? false)
         && adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
-        receipts = receipts + [unreadable(gate.target, detail)]
+        receipts = receipts + [with_attempts(unreadable(gate.target, detail), gate)]
       } else {
         still_pending = still_pending + [gate + {visibility_error: detail}]
       }
@@ -1070,7 +1199,7 @@ fn poll_pending_gates(
       && (observed.id != gate.run_id || trim(observed.display_title) != expected_title) {
       const detail = "run lookup returned a different run or candidate identity"
       if adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
-        receipts = receipts + [unreadable(gate.target, detail)]
+        receipts = receipts + [with_attempts(unreadable(gate.target, detail), gate)]
       } else {
         still_pending = still_pending + [gate + {visibility_error: detail}]
       }
@@ -1081,7 +1210,7 @@ fn poll_pending_gates(
       still_pending = still_pending + [gate + {visibility_error: nil}]
       continue
     }
-    receipts = receipts + [settled ?? unreadable(gate.target, "unreachable")]
+    receipts = receipts + [with_attempts(settled ?? unreadable(gate.target, "unreachable"), gate)]
   }
   return {receipts: receipts, pending: still_pending, unseen: []}
 }
