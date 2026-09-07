@@ -36,6 +36,19 @@ The entry points are:
   hold the `release-owner` lease and refuse while a live release owns it.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
+- `report_failed_hosted_release.harn`: the terminal finalizer for a failed
+  hosted release. It reads the run's failing step and the inputs the run
+  recorded when it started, then writes one typed receipt naming the
+  precondition that failed and the exact re-dispatch that would retry it. It
+  never dispatches anything. `lib/hosted_release_failure.harn` owns the step
+  registry that decides what each failure means and whether a re-dispatch is a
+  sane repair at all; a step the registry does not name escalates rather than
+  defaulting to a retry, and `check_hosted_release_failure_coverage.harn` keeps
+  the registry and the workflow in step in both directions. Whether a step runs
+  before or after the release is irreversible is never registered by hand: it is
+  read from the step's position relative to `Run release harness`, and a failure
+  on the far side of that boundary is routed to recovery rather than to any
+  dispatch of the release workflow.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that

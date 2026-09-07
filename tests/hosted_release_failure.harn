@@ -1,0 +1,694 @@
+import { decode_github_workflow } from "../lib/github_workflow"
+import {
+  HOSTED_RELEASE_FAILURE_REGISTRY,
+  HOSTED_RELEASE_TAG_BOUNDARY_STEP,
+  HostedReleaseRecordedInputs,
+  HostedReleaseRunStep,
+  HostedReleaseWorkflowJob,
+  hosted_release_failure_receipt,
+  hosted_release_failure_row,
+  hosted_release_failure_summary,
+  hosted_release_job_key,
+  hosted_release_order_refusals,
+  hosted_release_registry_findings,
+  hosted_release_registry_refusals,
+  hosted_release_repair_line,
+  hosted_release_repair_map_findings,
+  hosted_release_repairs_for,
+  hosted_release_run_steps,
+  hosted_release_step_is_post_tag,
+  hosted_release_step_order,
+  job_name_literals,
+} from "../lib/hosted_release_failure"
+
+fn workflow_jobs_from(path: string, fs: HarnessFs) -> list<HostedReleaseWorkflowJob> {
+  const workflow = decode_github_workflow(fs.read_text(path))
+  let jobs: list<HostedReleaseWorkflowJob> = []
+  for job in workflow.jobs {
+    const declared = job.value.needs
+    const needs: list<string> = if declared == nil {
+      []
+    } else if type_of(declared) == "string" {
+      [to_string(declared)]
+    } else {
+      declared
+    }
+    jobs = jobs
+      + [
+        {
+          job: job.key,
+          needs: needs,
+          steps: (job.value.steps ?? []).map({ step -> return step.name }).to_list(),
+        },
+      ]
+  }
+  return jobs
+}
+
+const FIXTURE_JOBS: list<HostedReleaseWorkflowJob> = [
+  {
+    job: "release",
+    needs: [],
+    steps: [
+      "Check out release harness",
+      "Mint scoped release token",
+      "Install cargo-nextest",
+      "Validate release inputs",
+      "Validate and normalize the post-publication consumer scope",
+      "Verify consumer contracts match generated adapters before publication",
+      HOSTED_RELEASE_TAG_BOUNDARY_STEP,
+      "Persist exact release runtime cost receipt",
+      "Prove hosted release publication",
+      "Upload release run artifacts",
+    ],
+  },
+  {job: "fleet", needs: ["release"], steps: ["Prove exact fleet convergence run"]},
+]
+
+const ORDER = hosted_release_step_order(FIXTURE_JOBS)
+
+const RUN = {
+  repo: "burin-labs/harn-bump-fleet",
+  workflow: "hosted-release.yml",
+  ref: "main",
+  run_id: 32739738413,
+  run_url: "https://github.test/run/32739738413",
+  run_attempt: 1,
+}
+
+const INPUTS: HostedReleaseRecordedInputs = {
+  mode: "ship-pr",
+  bump: "patch",
+  prerelease_identifier: "",
+  at_sha: "",
+  expected_prs: "",
+  resume_tagged_release: false,
+  converge_fleet: true,
+  repositories_json: "",
+  skip_consumers: "",
+  consumer_proof_runs_json: "",
+}
+
+fn step(job: string, name: string, conclusion: string, number: int = 1) -> HostedReleaseRunStep {
+  return {job: job, name: name, conclusion: conclusion, number: number}
+}
+
+pipeline test_a_mechanical_failure_names_its_exact_redispatch(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [
+      step("release", "Check out release harness", "success", 1),
+      step("release", "Mint scoped release token", "failure", 2),
+      step("release", "Upload release run artifacts", "success", 3),
+    ],
+    INPUTS,
+  )
+  assert_eq(receipt.state, "classified")
+  assert_eq(receipt.cause, "credential")
+  assert_eq(receipt.failed_precondition, "the scoped release token mint")
+  assert_eq(len(receipt.failed_steps), 1)
+  assert_eq(receipt.unmapped_steps, [])
+  const plan = unwrap(receipt.redispatch)
+  assert_eq(plan.repo, "burin-labs/harn-bump-fleet")
+  assert_eq(plan.workflow, "hosted-release.yml")
+  assert_eq(plan.ref, "main")
+  assert_eq(plan.inputs.mode, "ship-pr")
+  assert_eq(plan.inputs.bump, "patch")
+  assert_eq(plan.inputs.converge_fleet, true)
+  assert_eq(plan.inputs.resume_tagged_release, false)
+}
+
+/**
+ * A step that runs only after the tag exists cannot be retried at all. The
+ * earlier model here re-dispatched it with the resume flag set, which is still
+ * a dispatch of a workflow that cuts releases; the failing step is bookkeeping
+ * after a release that already shipped, and the repair is recovery.
+ */
+pipeline test_a_failure_after_the_tag_is_recovered_not_redispatched(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Prove hosted release publication", "failure", 9)],
+    INPUTS,
+  )
+  assert_eq(receipt.state, "escalated")
+  assert_eq(receipt.cause, "publication")
+  assert_eq(receipt.redispatch, nil)
+  assert(contains(unwrap(receipt.escalation_reason), "recover-release-publication.yml"))
+  const before_tag = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Install cargo-nextest", "failure", 5)],
+    INPUTS,
+  )
+  assert_eq(before_tag.state, "classified")
+  assert_eq(unwrap(before_tag.redispatch).inputs.resume_tagged_release, false)
+}
+
+/**
+ * The negative control the repair loop turns on: an unrecognised cause has to
+ * escalate. Defaulting to a retry is how a repair loop turns one failure into
+ * a queue of identical failures.
+ */
+pipeline test_an_unregistered_step_escalates_rather_than_retrying(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Do something nobody registered", "failure", 4)],
+    INPUTS,
+  )
+  assert_eq(receipt.state, "escalated")
+  assert_eq(receipt.cause, "unclassified")
+  assert_eq(receipt.redispatch, nil)
+  assert_eq(receipt.unmapped_steps, ["release: Do something nobody registered"])
+  assert(contains(unwrap(receipt.escalation_reason), "escalates rather than defaulting"))
+}
+
+/** A failure the same inputs would reproduce is escalated, not re-dispatched. */
+pipeline test_a_failure_the_same_inputs_would_repeat_is_escalated(task: any) {
+  for name in [
+    "Validate release inputs",
+    "Validate and normalize the post-publication consumer scope",
+    "Verify consumer contracts match generated adapters before publication",
+    "Run release harness",
+  ] {
+    const receipt = hosted_release_failure_receipt(
+      RUN,
+      ORDER,
+      [step("release", name, "failure")],
+      INPUTS,
+    )
+    assert_eq(receipt.state, "escalated")
+    assert_eq(receipt.redispatch, nil)
+    assert(contains(unwrap(receipt.escalation_reason), "would repeat this failure"))
+    assert(receipt.cause != "unclassified")
+  }
+}
+
+/**
+ * A failure that has a mechanical repair which is not a re-dispatch says what
+ * that repair is. Consumer contract drift is repaired by the convergence
+ * workflow, and a reader told only "this needs a change" would have to go
+ * looking for that themselves.
+ */
+pipeline test_an_escalation_names_a_repair_when_one_exists(task: any) {
+  const drift = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [
+      step(
+        "release",
+        "Verify consumer contracts match generated adapters before publication",
+        "failure",
+      ),
+    ],
+    INPUTS,
+  )
+  assert_eq(drift.state, "escalated")
+  assert(contains(unwrap(drift.escalation_reason), "fleet-projection-convergence.yml"))
+  assert(contains(unwrap(drift.escalation_reason), "re-dispatch this release unchanged"))
+  const no_named_repair = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Run release harness", "failure")],
+    INPUTS,
+  )
+  assert(contains(unwrap(no_named_repair.escalation_reason), "needs a change, not a retry"))
+}
+
+/**
+ * A failed run with no failed step in hand is a failed reading. Reporting it as
+ * clean would turn every unreadable run into a silent success, which is the one
+ * outcome a failure finalizer must never produce.
+ */
+pipeline test_a_run_with_no_readable_failure_is_unreadable_not_clean(task: any) {
+  const no_steps = hosted_release_failure_receipt(RUN, ORDER, [], INPUTS)
+  assert_eq(no_steps.state, "unreadable")
+  assert_eq(no_steps.redispatch, nil)
+  assert(contains(no_steps.failed_precondition, "no steps at all"))
+  const nothing_failed = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Check out release harness", "success")],
+    INPUTS,
+  )
+  assert_eq(nothing_failed.state, "unreadable")
+  assert_eq(nothing_failed.redispatch, nil)
+  assert(contains(unwrap(nothing_failed.escalation_reason), "failed reading"))
+}
+
+/** Without the recorded inputs there is no exact re-dispatch to name. */
+pipeline test_a_run_that_recorded_no_inputs_escalates(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Mint scoped release token", "failure")],
+    nil,
+  )
+  assert_eq(receipt.state, "escalated")
+  assert_eq(receipt.cause, "credential")
+  assert_eq(receipt.redispatch, nil)
+  assert(contains(unwrap(receipt.escalation_reason), "did not record the inputs"))
+}
+
+/**
+ * One step name in two jobs is two rows, and the workflow places them on
+ * opposite sides of the tag. The registry separates them by job; the order
+ * separates them by position, and neither is derived from the other.
+ */
+pipeline test_the_registry_separates_the_two_jobs(harness: Harness, task: any) {
+  const release_row = unwrap(hosted_release_failure_row("release", "Check out release harness"))
+  const fleet_row = unwrap(hosted_release_failure_row("fleet", "Check out release harness"))
+  assert(release_row.precondition != fleet_row.precondition)
+  assert_eq(hosted_release_failure_row("nobody", "Check out release harness"), nil)
+  const order = hosted_release_step_order(
+    workflow_jobs_from("../.github/workflows/hosted-release.yml", harness.fs),
+  )
+  assert_eq(hosted_release_step_is_post_tag(order, "release", "Check out release harness"), false)
+  assert_eq(hosted_release_step_is_post_tag(order, "fleet", "Check out release harness"), true)
+}
+
+pipeline test_a_rendered_job_name_resolves_to_its_declared_key(task: any) {
+  const templates = [
+    {key: "release", name: "\${{ inputs.mode }} v-next (\${{ inputs.bump }})"},
+    {key: "fleet", name: "Prove Harn repository updates"},
+  ]
+  assert_eq(job_name_literals("Prove Harn repository updates"), ["Prove Harn repository updates"])
+  assert_eq(
+    job_name_literals("\${{ inputs.mode }} v-next (\${{ inputs.bump }})"),
+    ["", " v-next (", ")"],
+  )
+  assert_eq(hosted_release_job_key(templates, "ship-pr v-next (patch)"), "release")
+  assert_eq(hosted_release_job_key(templates, "Prove Harn repository updates"), "fleet")
+  assert_eq(hosted_release_job_key(templates, "something else entirely"), nil)
+  assert_eq(hosted_release_job_key([], "ship-pr v-next (patch)"), nil)
+}
+
+pipeline test_run_steps_keep_an_unresolved_job_under_its_own_name(task: any) {
+  const templates = [{key: "fleet", name: "Prove Harn repository updates"}]
+  const steps = hosted_release_run_steps(
+    templates,
+    [
+      {
+        name: "Prove Harn repository updates",
+        steps: [{number: 1, name: "Prove exact fleet convergence run", conclusion: "failure"}],
+      },
+      {
+        name: "ship-pr v-next (patch)",
+        steps: [{number: 1, name: "Mint scoped release token", conclusion: "failure"}],
+      },
+    ],
+  )
+  assert_eq(len(steps), 2)
+  assert_eq(steps[0]?.job, "fleet")
+  assert_eq(steps[1]?.job, "ship-pr v-next (patch)")
+  const receipt = hosted_release_failure_receipt(RUN, ORDER, steps, INPUTS)
+  assert_eq(receipt.cause, "fleet_convergence")
+  assert_eq(receipt.unmapped_steps, ["ship-pr v-next (patch): Mint scoped release token"])
+}
+
+pipeline test_the_registry_census_names_both_directions(task: any) {
+  const matching = [
+    {job: "release", steps: ["Check out release harness", "Mint scoped release token"]},
+  ]
+  const findings = hosted_release_registry_findings(matching)
+  // Every registry row the fixture does not mention is a stale row, which is
+  // the census working, so assert on the shape of one instead of the count.
+  assert(len(findings) > 0)
+  assert_eq(findings.filter({ f -> return f.kind == "unregistered_step" }).to_list(), [])
+  const renamed = [{job: "release", steps: ["Mint a scoped release token"]}]
+  const unregistered = hosted_release_registry_findings(renamed).filter(
+    { f -> return f.kind == "unregistered_step" },
+  )
+    .to_list()
+  assert_eq(len(unregistered), 1)
+  assert_eq(unwrap(unregistered[0]).step, "Mint a scoped release token")
+  const unnamed = hosted_release_registry_findings([{job: "release", steps: [nil]}]).filter(
+    { f -> return f.kind == "unnamed_step" },
+  )
+    .to_list()
+  assert_eq(len(unnamed), 1)
+  assert(contains(unwrap(unnamed[0]).detail, "give the step a name"))
+}
+
+pipeline test_the_registry_census_refuses_a_reading_of_nothing(task: any) {
+  assert_eq(len(hosted_release_registry_refusals([])), 1)
+  assert(contains(unwrap(hosted_release_registry_refusals([])[0]), "no jobs at all"))
+  const empty_job = hosted_release_registry_refusals([{job: "release", steps: []}])
+  assert_eq(len(empty_job), 1)
+  assert(contains(unwrap(empty_job[0]), "no steps"))
+  assert_eq(
+    hosted_release_registry_refusals([{job: "release", steps: ["Check out release harness"]}]),
+    [],
+  )
+}
+
+pipeline test_the_summary_leads_with_the_decision(task: any) {
+  const classified = hosted_release_failure_summary(
+    hosted_release_failure_receipt(
+      RUN,
+      ORDER,
+      [step("release", "Mint scoped release token", "failure")],
+      INPUTS,
+    ),
+  )
+  assert(contains(classified, "State: `classified`"))
+  assert(contains(classified, "the scoped release token mint"))
+  assert(contains(classified, "### Exact re-dispatch"))
+  assert(contains(classified, "ship-pr"))
+  const escalated = hosted_release_failure_summary(
+    hosted_release_failure_receipt(
+      RUN,
+      ORDER,
+      [step("release", "Run release harness", "failure")],
+      INPUTS,
+    ),
+  )
+  assert(contains(escalated, "State: `escalated`"))
+  assert(!contains(escalated, "### Exact re-dispatch"))
+}
+
+/**
+ * The finding this test exists for: four `always()` steps that sit after the
+ * release harness were hand-registered as running before it, so a failure in
+ * any of them handed a release owner a re-dispatch that would re-cut a version
+ * already published. The side of the boundary is now read from the workflow.
+ *
+ * The same step name is used twice on purpose, once after the harness and once
+ * before it, so the assertion is about position and not about the name.
+ */
+pipeline test_a_post_tag_failure_is_never_offered_a_redispatch(task: any) {
+  for name in [
+    "Persist exact release runtime cost receipt",
+    "Prove hosted release publication",
+    "Upload release run artifacts",
+  ] {
+    const receipt = hosted_release_failure_receipt(
+      RUN,
+      ORDER,
+      [step("release", name, "failure")],
+      INPUTS,
+    )
+    assert_eq(receipt.state, "escalated")
+    assert_eq(receipt.redispatch, nil)
+    assert(contains(unwrap(receipt.escalation_reason), "may already be published"))
+    assert(contains(unwrap(receipt.escalation_reason), "recover-release-publication.yml"))
+  }
+  const in_the_fleet_job = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("fleet", "Prove exact fleet convergence run", "failure")],
+    INPUTS,
+  )
+  assert_eq(in_the_fleet_job.state, "escalated")
+  assert_eq(in_the_fleet_job.redispatch, nil)
+}
+
+/** The positive control: the same reader, on a step before the harness. */
+pipeline test_a_pre_tag_failure_still_names_its_redispatch(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    ORDER,
+    [step("release", "Mint scoped release token", "failure")],
+    INPUTS,
+  )
+  assert_eq(receipt.state, "classified")
+  assert_eq(unwrap(receipt.redispatch).inputs.mode, "ship-pr")
+  assert_eq(unwrap(receipt.redispatch).inputs.resume_tagged_release, false)
+}
+
+/**
+ * Moving one step across the harness flips its answer with nothing else
+ * changed, which is what proves the derivation is positional rather than a
+ * table that happens to agree with the file today.
+ */
+pipeline test_moving_a_step_across_the_harness_flips_its_side(task: any) {
+  const before: list<HostedReleaseWorkflowJob> = [
+    {
+      job: "release",
+      needs: [],
+      steps: ["Upload release run artifacts", HOSTED_RELEASE_TAG_BOUNDARY_STEP],
+    },
+  ]
+  const after: list<HostedReleaseWorkflowJob> = [
+    {
+      job: "release",
+      needs: [],
+      steps: [HOSTED_RELEASE_TAG_BOUNDARY_STEP, "Upload release run artifacts"],
+    },
+  ]
+  assert_eq(
+    hosted_release_step_is_post_tag(
+      hosted_release_step_order(before),
+      "release",
+      "Upload release run artifacts",
+    ),
+    false,
+  )
+  assert_eq(
+    hosted_release_step_is_post_tag(
+      hosted_release_step_order(after),
+      "release",
+      "Upload release run artifacts",
+    ),
+    true,
+  )
+  assert_eq(
+    hosted_release_failure_receipt(
+      RUN,
+      hosted_release_step_order(before),
+      [step("release", "Upload release run artifacts", "failure")],
+      INPUTS,
+    ).state,
+    "classified",
+  )
+  assert_eq(
+    hosted_release_failure_receipt(
+      RUN,
+      hosted_release_step_order(after),
+      [step("release", "Upload release run artifacts", "failure")],
+      INPUTS,
+    ).state,
+    "escalated",
+  )
+}
+
+/** A step the order cannot place escalates; absence is not the safe reading. */
+pipeline test_an_unplaceable_step_escalates_rather_than_assuming_pre_tag(task: any) {
+  const receipt = hosted_release_failure_receipt(
+    RUN,
+    hosted_release_step_order(
+      [{job: "release", needs: [], steps: [HOSTED_RELEASE_TAG_BOUNDARY_STEP]}],
+    ),
+    [step("release", "Mint scoped release token", "failure")],
+    INPUTS,
+  )
+  assert_eq(receipt.state, "escalated")
+  assert_eq(receipt.redispatch, nil)
+  assert(contains(unwrap(receipt.escalation_reason), "is unknown"))
+}
+
+/** A workflow with no readable boundary is refused, not guessed at. */
+pipeline test_an_unreadable_tag_boundary_is_refused(task: any) {
+  const missing = hosted_release_order_refusals(
+    [{job: "release", needs: [], steps: ["Check out release harness"]}],
+  )
+  assert_eq(len(missing), 1)
+  assert(contains(unwrap(missing[0]), "nothing marks where"))
+  const twice = hosted_release_order_refusals(
+    [
+      {
+        job: "release",
+        needs: [],
+        steps: [HOSTED_RELEASE_TAG_BOUNDARY_STEP, HOSTED_RELEASE_TAG_BOUNDARY_STEP],
+      },
+    ],
+  )
+  assert_eq(len(twice), 1)
+  assert(contains(unwrap(twice[0]), "ambiguous"))
+  const detached = hosted_release_order_refusals(
+    FIXTURE_JOBS + [{job: "stray", needs: [], steps: ["Do something"]}],
+  )
+  assert_eq(len(detached), 1)
+  assert(contains(unwrap(detached[0]), "no side of the tag boundary"))
+  assert_eq(hosted_release_order_refusals(FIXTURE_JOBS), [])
+}
+
+/**
+ * The real workflow, not a fixture of it. Every step after the harness is
+ * post-tag and every step before it is not, so a row that drifts from the file
+ * is caught here as well as by the census.
+ */
+pipeline test_the_real_workflow_places_every_step(harness: Harness, task: any) {
+  const jobs = workflow_jobs_from("../.github/workflows/hosted-release.yml", harness.fs)
+  const order = hosted_release_step_order(jobs)
+  assert_eq(order.refusals, [])
+  assert_eq(order.boundary_job, "release")
+  assert_eq(hosted_release_step_is_post_tag(order, "release", "Mint scoped release token"), false)
+  assert_eq(
+    hosted_release_step_is_post_tag(order, "release", "Persist exact release runtime cost receipt"),
+    true,
+  )
+  assert_eq(hosted_release_step_is_post_tag(order, "release", "Publish run summary"), true)
+  assert_eq(
+    hosted_release_step_is_post_tag(order, "release", "Upload exact release lane claim"),
+    true,
+  )
+  assert_eq(hosted_release_step_is_post_tag(order, "release", "Upload release run artifacts"), true)
+  assert_eq(
+    hosted_release_step_is_post_tag(order, "fleet", "Upload fleet convergence receipt"),
+    true,
+  )
+  assert_eq(hosted_release_step_is_post_tag(order, "release", "Check out release harness"), false)
+}
+
+/**
+ * A release that ran out of its five-hour ceiling asks the same question as one
+ * that failed, and it used to leave no receipt at all because the finalizer
+ * fired only on a failure conclusion.
+ */
+pipeline test_the_finalizer_fires_on_every_terminal_conclusion(harness: Harness, task: any) {
+  const source = harness.fs.read_text("../.github/workflows/report-failed-hosted-release.yml")
+  for conclusion in ["failure", "cancelled", "timed_out"] {
+    assert(contains(source, "workflow_run.conclusion == '${conclusion}'"))
+  }
+  const workflow = decode_github_workflow(source)
+  assert(contains(workflow.triggers, "workflow_run"))
+}
+
+/**
+ * The step that owns several preconditions must answer each of them with its
+ * own repair, and a receipt naming several causes must get several repairs in
+ * the order it named them. Picking one would mean ranking them, and a ranking
+ * nothing tests becomes list order, which tells an owner to fix the cheapest
+ * failure while the expensive one stays invisible.
+ */
+pipeline test_every_reported_cause_gets_its_own_repair(harness: Harness, task: any) {
+  const row = {
+    job: "release",
+    step: "Run the release launch preflight",
+    cause: "release_harness",
+    redispatchable: false,
+    precondition: "every release precondition",
+    repair: "read the preflight receipt and fix what it names",
+    repairs: [
+      {cause: "consumers.contracts", repair: "dispatch the convergence workflow"},
+      {cause: "checkpoint.consumer_pins", repair: "a person has to make the repository readable"},
+      {cause: "checkpoint.development_version", repair: "re-dispatch the bump job"},
+    ],
+  }
+  // The real shape: one run refusing on two preconditions at once.
+  assert_eq(
+    hosted_release_repairs_for(row, ["consumers.contracts", "checkpoint.consumer_pins"]),
+    ["dispatch the convergence workflow", "a person has to make the repository readable"],
+  )
+  // The order is the receipt's, not the registry's.
+  assert_eq(
+    hosted_release_repairs_for(row, ["checkpoint.consumer_pins", "consumers.contracts"]),
+    ["a person has to make the repository readable", "dispatch the convergence workflow"],
+  )
+  // Three at once, which happened earlier today, loses none of them.
+  assert_eq(
+    len(
+      hosted_release_repairs_for(
+        row,
+        ["consumers.contracts", "checkpoint.consumer_pins", "checkpoint.development_version"],
+      ),
+    ),
+    3,
+  )
+  // An unmapped cause appends the row-level repair rather than replacing the
+  // mapped one, so naming a cause the map does not know cannot hide a repair
+  // the map does know.
+  assert_eq(
+    hosted_release_repairs_for(row, ["consumers.contracts", "token.lifetime"]),
+    ["dispatch the convergence workflow", "read the preflight receipt and fix what it names"],
+  )
+  // No cause at all, and a blank one, both take the row-level repair.
+  assert_eq(
+    hosted_release_repairs_for(row, []),
+    ["read the preflight receipt and fix what it names"],
+  )
+  assert_eq(
+    hosted_release_repairs_for(row, ["   "]),
+    ["read the preflight receipt and fix what it names"],
+  )
+  // Two causes wanting the same repair is one piece of work, not two.
+  const shared = row
+    + {
+      repairs: [
+        {cause: "token.permissions", repair: "remint the release credential"},
+        {cause: "token.lifetime", repair: "remint the release credential"},
+      ],
+    }
+  assert_eq(
+    hosted_release_repairs_for(shared, ["token.permissions", "token.lifetime"]),
+    ["remint the release credential"],
+  )
+  // A row with no map and no repair answers nothing, so the caller supplies the
+  // generic line rather than printing an empty one.
+  const bare = {
+    job: "release",
+    step: "Mint fleet policy read token",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the fleet policy read token",
+  }
+  assert_eq(hosted_release_repairs_for(bare, ["token.lifetime"]), [])
+  assert_eq(hosted_release_repair_line(bare, ["token.lifetime"]), nil)
+  assert(
+    contains(
+      hosted_release_repair_line(row, ["consumers.contracts", "checkpoint.consumer_pins"]) ?? "",
+      "; then ",
+    ),
+  )
+}
+
+pipeline test_the_census_refuses_a_map_that_answers_nothing(harness: Harness, task: any) {
+  const duplicated = {
+    job: "release",
+    step: "Run the release launch preflight",
+    cause: "release_harness",
+    redispatchable: false,
+    precondition: "every release precondition",
+    repairs: [
+      {cause: "consumers.contracts", repair: "first"},
+      {cause: "consumers.contracts", repair: "second, never read"},
+    ],
+  }
+  assert_eq(hosted_release_repairs_for(duplicated, ["consumers.contracts"]), ["first"])
+  const empty = {
+    job: "release",
+    step: "Run the release launch preflight",
+    cause: "release_harness",
+    redispatchable: false,
+    precondition: "every release precondition",
+    repairs: [{cause: "consumers.contracts", repair: "   "}],
+  }
+  // The selector hands back the empty string it was given. The census is what
+  // stops such a row reaching a release, so assert the census, not the selector.
+  assert_eq(hosted_release_repairs_for(empty, ["consumers.contracts"]), ["   "])
+  const findings = hosted_release_repair_map_findings([duplicated, empty])
+  const kinds = findings.map({ finding -> return finding.kind })
+  assert(contains(kinds, "duplicate_cause_repair"))
+  assert(contains(kinds, "empty_cause_repair"))
+  assert_eq(len(findings), 2)
+  // The negative control: the same census over well-formed rows must be silent,
+  // or a finding list that is never empty proves nothing when it is non-empty.
+  const sound = {
+    job: "release",
+    step: "Run the release launch preflight",
+    cause: "release_harness",
+    redispatchable: false,
+    precondition: "every release precondition",
+    repairs: [
+      {cause: "consumers.contracts", repair: "dispatch fleet-projection-convergence.yml"},
+      {cause: "token.lifetime", repair: "re-dispatch; the token expired mid-run"},
+    ],
+  }
+  assert_eq(len(hosted_release_repair_map_findings([sound])), 0)
+  // And a registry with no maps at all is silent rather than unmeasured: the
+  // real registry ships that way today, so a green census must mean agreement.
+  assert_eq(len(hosted_release_repair_map_findings(HOSTED_RELEASE_FAILURE_REGISTRY)), 0)
+}
