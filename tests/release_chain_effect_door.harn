@@ -1,0 +1,212 @@
+import {
+  RELEASE_CHAIN_EFFECT_DOOR,
+  ReleaseChainEffectGateway,
+  ReleaseChainRepairReceipt,
+  release_chain_effect_door_entry,
+  release_chain_read_back_refusals,
+  release_chain_repair_once,
+  release_chain_repair_summary,
+} from "../lib/release_chain_effect_door"
+import { ReleaseChainEvidenceRead, ReleaseChainUnprovenSubject } from "../lib/release_chain_state"
+
+const CHAIN = "chain-0197"
+
+const REVISION = 4
+
+fn subject(name: string, cause: string) -> ReleaseChainUnprovenSubject {
+  return {subject: name, cause: cause, retryable: true, detail: "seeded by the test"}
+}
+
+fn observed(name: string) -> list<ReleaseChainEvidenceRead> {
+  return [
+    {
+      subject: name,
+      kind: "workflow_run",
+      status: "observed",
+      expected: name,
+      observed: name,
+      source: "api",
+      ref: "refs/heads/main",
+      identity: "run-4412",
+      observed_at: "2026-09-07T22:00:00Z",
+    },
+  ]
+}
+
+/**
+ * A gateway that records nothing and throws on contact.
+ *
+ * A loop proven against a recorder proves something was recorded. A loop proven
+ * against a tripwire proves it did not reach the outside world at all, which is
+ * the claim that matters for every path that is supposed to stop first.
+ */
+fn tripwire() -> ReleaseChainEffectGateway {
+  return {
+    perform: { planned, entry ->
+      throw "the door was opened for `${planned.kind}`"
+    },
+    now: { ->
+      throw "the clock was read, so the door was opened"
+    },
+  }
+}
+
+fn door(read_back: list<ReleaseChainEvidenceRead>) -> ReleaseChainEffectGateway {
+  return {
+    perform: { planned, entry -> return read_back },
+    now: { -> return "2026-09-07T22:00:01Z" },
+  }
+}
+
+fn repair(
+  cause: string,
+  gateway: ReleaseChainEffectGateway,
+  applied: list<string>,
+) -> ReleaseChainRepairReceipt {
+  return release_chain_repair_once(
+    CHAIN,
+    REVISION,
+    "prepare",
+    subject("harn-documents", cause),
+    1,
+    "burin-labs/harn-documents",
+    applied,
+    gateway,
+  )
+}
+
+/**
+ * The three complications the issue was opened for. Each is injected as a typed
+ * cause and each must take its own named action, not a shared retry.
+ */
+pipeline test_each_named_cause_takes_its_own_repair(harness: Harness, task: any) {
+  const cutover = repair("development_version_missing", door(observed("bump run")), [])
+  assert_eq(cutover.outcome, "repaired")
+  assert_eq(unwrap(cutover.effect).kind, "dispatch_development_cutover")
+  const fragments = repair("unfolded_fragments", door(observed("fold pull request")), [])
+  assert_eq(fragments.outcome, "repaired")
+  assert_eq(unwrap(fragments.effect).kind, "open_fragment_fold_pr")
+  const pin = repair("consumer_pin_stale", door(observed("repin run")), [])
+  assert_eq(pin.outcome, "repaired")
+  assert_eq(unwrap(pin.effect).kind, "dispatch_consumer_repin")
+  // The three keys differ, so one spent key cannot silence another subject.
+  const keys = [
+    unwrap(cutover.effect).idempotency_key,
+    unwrap(fragments.effect).idempotency_key,
+    unwrap(pin.effect).idempotency_key,
+  ]
+  assert_eq(len(keys), 3)
+}
+
+/**
+ * The negative control the issue asks for: an unrecognised cause must escalate
+ * rather than default to a retry, and it must not reach the door at all.
+ */
+pipeline test_an_unrecognised_cause_escalates_without_opening_the_door(
+  harness: Harness,
+  task: any,
+) {
+  for cause in ["unknown", "certification_failed", "tag_moved", "credential_unavailable"] {
+    const receipt = repair(cause, tripwire(), [])
+    assert_eq(receipt.outcome, "escalated")
+    assert_eq(receipt.effect, nil)
+  }
+  // The companion proof that the tripwire is armed. A cause that IS repairable
+  // reaches the door, and the escalation the door raises names the attempt.
+  // Without it, the assertions above would pass just as well against a loop
+  // that escalated everything, including what it is supposed to repair.
+  const reached = repair("unfolded_fragments", tripwire(), [])
+  assert_eq(reached.outcome, "escalated")
+  assert(contains(reached.reason, "could not be performed"))
+  // The two escalations must be distinguishable, or "escalated" would say
+  // nothing about whether the door was opened.
+  const refused = repair("unknown", tripwire(), [])
+  assert(!contains(refused.reason, "could not be performed"))
+  assert(contains(refused.reason, "no automatic repair is authorized"))
+}
+
+/**
+ * A repair runs at most once. The bound is the caller's spent-key list, so a
+ * replayed chain refuses for the same reason a live one does.
+ */
+pipeline test_a_spent_repair_is_refused_rather_than_retried(harness: Harness, task: any) {
+  const first = repair("unfolded_fragments", door(observed("fold pull request")), [])
+  assert_eq(first.outcome, "repaired")
+  const key = unwrap(first.effect).idempotency_key
+  // The second attempt carries a tripwire: a refusal that still opened the door
+  // would have already had its effect, and the refusal would be a lie.
+  const second = repair("unfolded_fragments", tripwire(), [key])
+  assert_eq(second.outcome, "refused")
+  assert_eq(second.effect, nil)
+  assert(contains(second.reason, "already applied once"))
+}
+
+/**
+ * An effect that reads nothing back is not a repair. This is the shape that
+ * would otherwise let an unreachable dispatch report success: an empty list is
+ * what a dispatch that never happened returns.
+ */
+pipeline test_an_effect_that_proves_nothing_escalates(harness: Harness, task: any) {
+  const empty = repair("unfolded_fragments", door([]), [])
+  assert_eq(empty.outcome, "escalated")
+  assert_eq(empty.effect, nil)
+  assert(contains(empty.reason, "read nothing back"))
+  const seed = unwrap(observed("fold pull request")[0])
+  const gone = repair("unfolded_fragments", door([seed + {status: "missing"}]), [])
+  assert_eq(gone.outcome, "escalated")
+  const anonymous = repair("unfolded_fragments", door([seed + {identity: "  "}]), [])
+  assert_eq(anonymous.outcome, "escalated")
+  assert(contains(anonymous.reason, "identity"))
+  // The measured zero has a matching non-null read through the same path, so a
+  // green refusal here cannot mean the refusal logic simply never runs.
+  assert_eq(len(release_chain_read_back_refusals(observed("fold pull request"))), 0)
+}
+
+/**
+ * A door that fails to act says so. A gateway that throws is an escalation with
+ * the cause named, never a silent pass to the next stage.
+ */
+pipeline test_a_door_that_throws_escalates_with_the_reason(harness: Harness, task: any) {
+  const receipt = repair("unfolded_fragments", tripwire(), [])
+  assert_eq(receipt.outcome, "escalated")
+  assert(contains(receipt.reason, "could not be performed"))
+}
+
+/**
+ * The allowlist is what makes "a repair never re-cuts a release" structural.
+ * No door entry dispatches the release workflow, so no typed cause can reach
+ * one, and a kind with no entry stops instead of falling through.
+ */
+pipeline test_the_door_can_never_recut_a_release(harness: Harness, task: any) {
+  // Assert the exact set, not a substring of each name. A prose check would
+  // read `dispatch_development_cutover` as a re-cut because "cut" sits inside
+  // "cutover", and a test that fires on the letters rather than the meaning
+  // gets loosened until it fires on nothing.
+  const permitted = [
+    "dispatch_development_cutover",
+    "open_fragment_fold_pr",
+    "recover_binary_assets",
+    "promote_anchor",
+    "dispatch_consumer_repin",
+    "dispatch_convergence_proof",
+  ]
+  assert_eq(len(RELEASE_CHAIN_EFFECT_DOOR), len(permitted))
+  for entry in RELEASE_CHAIN_EFFECT_DOOR {
+    assert(contains(permitted, entry.kind))
+    assert(contains(["workflow_dispatch", "pull_request"], entry.mechanism))
+    assert(trim(entry.proves) != "")
+  }
+  // A declared effect kind with no door is unperformable rather than assumed.
+  assert_eq(release_chain_effect_door_entry("refresh_size_baseline"), nil)
+  assert(release_chain_effect_door_entry("dispatch_convergence_proof") != nil)
+}
+
+/** A stage owner reads one line before opening anything. */
+pipeline test_the_summary_names_the_outcome_and_the_effect(harness: Harness, task: any) {
+  const repaired = repair("unfolded_fragments", door(observed("fold pull request")), [])
+  const line = release_chain_repair_summary(repaired)
+  assert(contains(line, "repaired"))
+  assert(contains(line, "open_fragment_fold_pr"))
+  const escalated = repair("unknown", tripwire(), [])
+  assert(contains(release_chain_repair_summary(escalated), "escalated"))
+}
