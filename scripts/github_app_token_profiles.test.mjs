@@ -6,7 +6,12 @@ import { installationTokenRequest } from "./github_app_token_profiles.mjs";
 test("release profile is confined to Harn", () => {
   assert.deepEqual(installationTokenRequest("harn-release"), {
     repository_names: ["harn"],
-    permissions: { actions: "write", contents: "write", pull_requests: "write" },
+    permissions: {
+      actions: "write",
+      contents: "write",
+      pull_requests: "write",
+      workflows: "write",
+    },
   });
 });
 
