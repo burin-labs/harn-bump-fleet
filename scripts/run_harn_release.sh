@@ -24,6 +24,8 @@ case "${HARN_EXT_RELEASE_LOCAL_AUDIT:-}" in
   1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy]) local_audit=1 ;;
 esac
 at_sha=""
+bump="patch"
+preid=""
 args=("$@")
 index=0
 while [ "$index" -lt "${#args[@]}" ]; do
@@ -43,6 +45,20 @@ while [ "$index" -lt "${#args[@]}" ]; do
       fi
       ;;
     --at-sha=*) at_sha="${arg#--at-sha=}" ;;
+    --bump)
+      index=$((index + 1))
+      if [ "$index" -lt "${#args[@]}" ]; then
+        bump="${args[$index]}"
+      fi
+      ;;
+    --bump=*) bump="${arg#--bump=}" ;;
+    --preid)
+      index=$((index + 1))
+      if [ "$index" -lt "${#args[@]}" ]; then
+        preid="${args[$index]}"
+      fi
+      ;;
+    --preid=*) preid="${arg#--preid=}" ;;
     --yes-live-release) live_release=1 ;;
     --mock) mock_run=1 ;;
     --local-audit) local_audit=1 ;;
@@ -131,6 +147,44 @@ preflight_development_workspace() {
   fi
   printf 'release-preflight workspace_version=%s ref=origin/main status=ready\n' "$version" >&2
 }
+
+# Ask every release precondition before anything is leased, dispatched, or
+# built. Five hosted attempts were lost in one day, each at a gate first
+# exercised between thirty seconds and sixty-five minutes into a cut that could
+# not be taken back: a token minted without `workflows`, a mint that expired
+# mid-certification, a consumer contract the daily convergence had not
+# re-rendered, a consumer whose own guard could not pass on that render, and a
+# short `at_sha`. Every one was answerable in under two minutes.
+#
+# This runs in every mode, including `audit`, because the gates it asks about
+# are not mode-specific -- what was mode-specific was the guess about which
+# ones mattered, and that guess is what cost the 401.
+preflight_release_launch() {
+  local preflight="${script_dir}/preflight_release_launch.sh"
+  if [ ! -x "$preflight" ]; then
+    # Deliberately fatal. A missing preflight that let the release through
+    # would be the failure mode the preflight exists to remove: an absent
+    # answer reading as a satisfied one.
+    printf 'error: release preflight %s is missing or not executable; nothing was dispatched\n' \
+      "$preflight" >&2
+    exit 2
+  fi
+  local preflight_args=(--mode "$mode" --bump "$bump" --at-sha "$at_sha")
+  if [ -n "$preid" ]; then
+    preflight_args+=(--preid "$preid")
+  fi
+  # A mocked run has no credentials and no live fleet to read; the structural
+  # half is still asked, and the credentialed half reports itself unasked.
+  if [ "$mock_run" -eq 1 ]; then
+    preflight_args+=(--offline)
+  fi
+  if ! "$preflight" "${preflight_args[@]}"; then
+    printf 'error: release preflight refused; nothing was dispatched\n' >&2
+    exit 2
+  fi
+}
+
+preflight_release_launch
 
 preflight_development_workspace
 

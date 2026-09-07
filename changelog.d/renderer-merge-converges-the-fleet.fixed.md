@@ -1,0 +1,1 @@
+Converge fleet projections on the merge that changes a renderer, the fleet manifest, or the token profiles, instead of waiting for the daily sweep. A release cut in the hours between a renderer change and that sweep refused at its publication gate on consumer contracts nothing had re-rendered yet.

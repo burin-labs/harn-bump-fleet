@@ -13,6 +13,13 @@
 //   RELEASE_APP_TOKEN_PROFILE — reviewed repository/permission profile (default harn-release)
 //
 // Prints the token on stdout and nothing else.
+//
+// `--describe` mints through the same profile and the same endpoint and prints
+// what was granted instead of the token: the permissions, the repository
+// selection, and the expiry. That is what lets a preflight assert the grants
+// the cut will exercise without ever putting a credential where it can be
+// logged. It is the production call shape deliberately -- a probe that asked
+// GitHub a different question would prove a different token.
 
 import crypto from "node:crypto";
 import process from "node:process";
@@ -112,4 +119,32 @@ if (typeof token !== "string" || token.trim() === "") {
   console.error("installation token response omitted token");
   process.exit(1);
 }
+
+if (process.argv.includes("--describe")) {
+  const expiresAt = typeof access.expires_at === "string" ? access.expires_at : null;
+  const lifetimeSeconds =
+    expiresAt == null
+      ? null
+      : Math.round((Date.parse(expiresAt) - Date.now()) / 1000);
+  process.stdout.write(
+    `${JSON.stringify(
+      {
+        schema_version: "harn_bump_fleet.installation_token_description.v1",
+        profile,
+        owner,
+        repo,
+        requested_permissions: installationTokenRequest(profile).permissions,
+        granted_permissions: access.permissions ?? {},
+        repository_selection: access.repository_selection ?? null,
+        repositories: (access.repositories ?? []).map((entry) => entry?.name).filter(Boolean),
+        expires_at: expiresAt,
+        lifetime_s: lifetimeSeconds,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  process.exit(0);
+}
+
 process.stdout.write(token.trim());
