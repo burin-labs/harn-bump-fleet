@@ -1,26 +1,47 @@
+import { FleetRepository } from "./fleet_manifest"
+import { github_claim_ref } from "./github"
+
 /**
- * Whether a fresh, green consumer rehearsal stands behind a release.
+ * Whether a consumer rehearsal stands behind a release, and what it proved.
  *
  * The consumer pre-tag gate is the last thing a release runs and the first
- * thing that fails, because it is the only step that asks a question about
- * repositories nobody in this one has touched since the previous cut. By the
- * time it asks, the release has already certified a candidate and is minutes
- * from a tag, so a drifted consumer turns into a failed release rather than a
- * pull request.
+ * thing that fails, because it is the only step that asks about repositories
+ * nobody in this one has touched since the previous cut. By the time it asks,
+ * a candidate is certified and a tag is minutes away, so a consumer that
+ * drifted three weeks ago surfaces as a failed release instead of as a pull
+ * request. The rehearsal moves that question earlier and repeats it.
  *
- * The rehearsal moves that question earlier and repeats it: a scheduled run
- * puts the same consumer gates against the Harn default branch, on a cadence,
- * and its run record is the evidence. This module owns the one decision the
- * release makes about that evidence -- is there a recent successful rehearsal
- * -- and nothing else.
+ * The record is what was proved, not when. A clock would be the wrong
+ * instrument twice over: each consumer gate is a full runtime build on that
+ * consumer's largest runner class, so an hourly tick that re-proves an
+ * unchanged fleet spends thirty-two builds an hour to learn nothing, and any
+ * age bound has to stay loose enough to cover a whole schedule interval, which
+ * is the wrong direction for a gate. So the evidence is one ref per consumer
+ * per Harn revision:
  *
- * The shape of this module is set by what it must not do. A release refusing
- * for want of a rehearsal is annoying; a release proceeding because the
- * rehearsal record was empty, unparseable, or still running is the failure
- * this is here to prevent. So every answer other than "a completed, successful
- * run inside the age bound" is a refusal with a name, and the verdict carries
- * how many runs it examined so a decision made over nothing is visible as one
- * rather than reading like a decision made over evidence.
+ *   refs/heads/rehearsal-proved/<harn tip>/<owner>__<repo>.<contract digest>
+ *
+ * Existence is the proof. A tick reads the tip, lists the refs under it, and
+ * dispatches gates only for the consumers missing one; when none are missing
+ * it no-ops with a receipt naming the revision it was already proved at, and
+ * the whole tick costs one listing. A release asks the same question the same
+ * way, against the revision it is actually cutting, so its answer is about
+ * that candidate rather than about how recently something ran.
+ *
+ * Revision-scoped refs claimed once are the idiom this repository already uses
+ * for `release-certify/<sha>`: the existing reaper understands the shape, and
+ * a claim is atomic, so two overlapping ticks cannot leave two proofs
+ * disagreeing about the same fact.
+ *
+ * The consumer's own contract is folded into the ref name rather than tracked
+ * beside it. A consumer that rewrote its gate has a different digest, which
+ * is a different ref, which reads as unproved -- one fact in one place instead
+ * of two that can disagree.
+ *
+ * The shape of the whole module is set by what it must not do. A release
+ * refusing for want of a rehearsal is annoying; a release proceeding because
+ * the proof listing was empty, unread, or over no consumers at all is the
+ * failure this exists to prevent. Every one of those refuses by name.
  */
 /** The workflow whose runs are the rehearsal record. */
 pub const CONSUMER_REHEARSAL_WORKFLOW = "consumer-rehearsal.yml"
@@ -34,261 +55,338 @@ pub const CONSUMER_REHEARSAL_WORKFLOW = "consumer-rehearsal.yml"
  */
 pub const CONSUMER_REHEARSAL_REPO = "burin-labs/harn-bump-fleet"
 
+/** Where a proof for one consumer at one revision lives. */
+pub const REHEARSAL_PROOF_PREFIX = "refs/heads/rehearsal-proved"
+
+/** A consumer slug reduced to something a ref path can carry. */
+pub fn rehearsal_proof_slug(slug: string) -> string {
+  const clean = lowercase(trim(slug))
+  if len(regex_captures("^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$", clean)) == 0 {
+    throw "rehearsal proof slug must be owner/name, got: " + slug
+  }
+  return replace(clean, "/", "__")
+}
+
 /**
- * How old a rehearsal may be and still speak for a release, in seconds.
+ * The ref that proves one consumer was gated against one Harn revision under
+ * one contract.
  *
- * Ninety minutes: the hourly schedule plus most of a run. Tightening this
- * below the schedule interval would refuse every release that asked between
- * two ticks, which trains an operator to override the gate.
+ * The contract digest is part of the name rather than part of the payload
+ * because a ref carries no payload this can read cheaply. A consumer whose gate
+ * contract changed therefore looks unproved, which is the correct answer.
  */
-pub const CONSUMER_REHEARSAL_MAX_AGE_S = 5400
-
-/** Why no rehearsal stands behind this release. Each name is a different repair. */
-pub type ConsumerRehearsalRefusal = "no_rehearsal_recorded" \
-  | "rehearsal_still_running" \
-  | "rehearsal_failed" \
-  | "rehearsal_stale" \
-  | "rehearsal_clock_unreadable"
-
-/** The fields the verdict reads. Extra workflow-run keys stay out. */
-pub type ConsumerRehearsalRun = {
-  id: int,
-  status: string,
-  conclusion: string?,
-  head_sha: string,
-  created_at: string?,
-  updated_at: string?,
-  url: string,
+pub fn rehearsal_proof_ref(harn_tip: string, slug: string, contract_digest: string) -> string {
+  const tip = lowercase(trim(harn_tip))
+  if len(regex_captures("^[0-9a-f]{40}$", tip)) == 0 {
+    throw "rehearsal proof requires a full 40-hex Harn revision, got: " + harn_tip
+  }
+  const digest = lowercase(trim(contract_digest))
+  if len(regex_captures("^[0-9a-f]{8,64}$", digest)) == 0 {
+    throw "rehearsal proof requires a hex contract digest, got: " + contract_digest
+  }
+  return "${REHEARSAL_PROOF_PREFIX}/${tip}/${rehearsal_proof_slug(slug)}.${digest.substring(0, 12)}"
 }
 
-/** The rehearsal a release is standing on, once one has been found. */
-pub type ConsumerRehearsalRecord = {
-  run_id: int,
-  url: string,
-  /** The Harn default-branch commit the gates actually ran against. */
-  head_sha: string,
-  observed_at: string,
-  age_s: int,
-}
+/** One consumer the rehearsal is responsible for at this revision. */
+pub type RehearsalSubject = {slug: string, contract_digest: string}
 
-pub type ConsumerRehearsalVerdict = {
-  fresh: bool,
-  record: ConsumerRehearsalRecord?,
-  refusal: ConsumerRehearsalRefusal?,
-  /** One sentence naming what was found, for the preflight receipt's detail. */
+/** What a tick has to do, and what it may skip. */
+pub type RehearsalWorkPlan = {
+  /** Consumers with no proof at this revision and contract. */
+  unproved: list<RehearsalSubject>,
+  /** Consumers already proved, skipped by this tick. */
+  proved: list<RehearsalSubject>,
+  /** True only when every subject was already proved. */
+  no_op: bool,
+  /** One sentence for the receipt, naming the revision either way. */
   detail: string,
-  /** How many runs were examined, so a verdict over nothing is visible as one. */
-  examined_count: int,
-  /** How many of those GitHub had recorded as finished. */
-  completed_count: int,
-}
-
-fn unix_seconds(iso: string) -> int? {
-  return try {
-    to_int(date_parse(trim(iso)))
-  } catch (_e) {
-    nil
-  }
+  /** How many subjects were considered, so a plan over nothing is visible. */
+  considered: int,
 }
 
 /**
- * When the run finished, preferring the last update over the start.
+ * Split the fleet into what still needs gating and what does not.
  *
- * A rehearsal's age is the age of its answer, not the age of the question. A
- * long run started inside the bound can finish outside it, and reading
- * `created_at` would let that run vouch for a consumer state it stopped
- * observing an hour ago.
+ * `existing_refs` is the listing of `refs/heads/rehearsal-proved/<tip>/`. An
+ * empty listing means nothing is proved, never that everything is: a tick whose
+ * listing failed must be given `nil` instead, which this refuses outright,
+ * because "the remote did not answer" and "nothing is proved" lead to opposite
+ * amounts of work and only one of them is safe to guess.
  */
-pub fn consumer_rehearsal_observed_at(run: ConsumerRehearsalRun) -> string? {
-  const updated = trim(run.updated_at ?? "")
-  if updated != "" {
-    return updated
+pub fn rehearsal_work_plan(
+  harn_tip: string,
+  subjects: list<RehearsalSubject>,
+  existing_refs: list<string>?,
+) -> RehearsalWorkPlan {
+  if existing_refs == nil {
+    throw "rehearsal work plan requires a readable proof listing; an unreadable remote is not an empty one"
   }
-  const created = trim(run.created_at ?? "")
-  if created != "" {
-    return created
-  }
-  return nil
-}
-
-/** True once GitHub recorded the run finished, whatever it concluded. */
-pub fn consumer_rehearsal_is_completed(run: ConsumerRehearsalRun) -> bool {
-  return lowercase(trim(run.status)) == "completed"
-}
-
-/** True only for a finished run GitHub recorded as successful. */
-pub fn consumer_rehearsal_is_successful(run: ConsumerRehearsalRun) -> bool {
-  return consumer_rehearsal_is_completed(run)
-    && lowercase(trim(run.conclusion ?? "")) == "success"
-}
-
-/**
- * The newest finished run, whatever it concluded.
- *
- * Asked separately from the newest success on purpose. An older success must
- * never speak for a newer failure: that is how a gate reports a healthy fleet
- * while the thing it gates is red, and it is the exact defect the pin-staleness
- * heartbeat was rewritten to avoid.
- */
-pub fn newest_completed_rehearsal(runs: list<ConsumerRehearsalRun>) -> ConsumerRehearsalRun? {
-  let best: ConsumerRehearsalRun? = nil
-  let best_at = ""
-  for run in runs {
-    if !consumer_rehearsal_is_completed(run) {
-      continue
-    }
-    const observed = consumer_rehearsal_observed_at(run)
-    if observed == nil || unix_seconds(to_string(observed)) == nil {
-      continue
-    }
-    if best == nil || to_string(observed) > best_at {
-      best = run
-      best_at = to_string(observed)
+  const present = to_list(existing_refs).map({ ref -> return trim(ref) }).to_list()
+  let unproved: list<RehearsalSubject> = []
+  let proved: list<RehearsalSubject> = []
+  for subject in subjects {
+    const wanted = rehearsal_proof_ref(harn_tip, subject.slug, subject.contract_digest)
+    if present.contains(wanted) {
+      proved = proved + [subject]
+    } else {
+      unproved = unproved + [subject]
     }
   }
-  return best
-}
-
-fn refusal(
-  name: ConsumerRehearsalRefusal,
-  detail: string,
-  examined: int,
-  completed: int,
-) -> ConsumerRehearsalVerdict {
-  return {
-    fresh: false,
-    record: nil,
-    refusal: name,
-    detail: detail,
-    examined_count: examined,
-    completed_count: completed,
-  }
-}
-
-/**
- * Does a fresh, green rehearsal stand behind a release cut at `now_iso`?
- *
- * `runs` is a page of this workflow's runs on the default branch, newest-first
- * or not; the order is not trusted. Every path other than a completed,
- * successful run inside `max_age_s` returns `fresh: false` with a named
- * refusal, including the paths where there is nothing to read at all.
- */
-pub fn consumer_rehearsal_verdict(
-  runs: list<ConsumerRehearsalRun>,
-  now_iso: string,
-  max_age_s: int = CONSUMER_REHEARSAL_MAX_AGE_S,
-) -> ConsumerRehearsalVerdict {
-  const examined = len(runs)
-  const completed = len(
-    runs.filter({ run -> return consumer_rehearsal_is_completed(run) }).to_list(),
-  )
-  if examined == 0 {
-    return refusal(
-      "no_rehearsal_recorded",
-      "no consumer rehearsal run was found; the rehearsal workflow has never reported",
-      examined,
-      completed,
-    )
-  }
-  const newest = newest_completed_rehearsal(runs)
-  if newest == nil {
-    // Two different states reach here and they are not the same repair.
-    // Nothing has finished yet, which resolves on its own; or things have
-    // finished but none of them carries a timestamp this can read, which does
-    // not. Reporting the second as "still in flight" would tell an operator to
-    // wait for a run that already ended.
-    if completed > 0 {
-      return refusal(
-        "rehearsal_clock_unreadable",
-        "all ${completed} finished consumer rehearsal runs carry timestamps that cannot be read, "
-          + "so none of their ages can be established",
-        examined,
-        completed,
-      )
+  const tip = lowercase(trim(harn_tip))
+  const considered = len(subjects)
+  if considered == 0 {
+    // Not a no-op. A rehearsal with no subjects proves nothing about the fleet
+    // and must not leave a record saying otherwise.
+    return {
+      unproved: [],
+      proved: [],
+      no_op: false,
+      detail: "no consumers were in scope, so this tick proved nothing at ${tip}",
+      considered: 0,
     }
-    return refusal(
-      "rehearsal_still_running",
-      "all ${examined} consumer rehearsal runs are still in flight; none has reported a verdict",
-      examined,
-      completed,
-    )
   }
-  const run = to_string(newest.id)
-  if !consumer_rehearsal_is_successful(newest) {
-    return refusal(
-      "rehearsal_failed",
-      "the newest finished consumer rehearsal (run ${run}) concluded "
-        + trim(newest.conclusion ?? "without a conclusion"),
-      examined,
-      completed,
-    )
-  }
-  const observed = consumer_rehearsal_observed_at(newest)
-  if observed == nil {
-    return refusal(
-      "rehearsal_clock_unreadable",
-      "the newest successful consumer rehearsal (run ${run}) carries no timestamp, "
-        + "so its age cannot be established",
-      examined,
-      completed,
-    )
-  }
-  const then_s = unix_seconds(to_string(observed))
-  const now_s = unix_seconds(now_iso)
-  if then_s == nil || now_s == nil {
-    // An unreadable stamp is not "recent enough". Treating a parse failure as
-    // zero age would make a corrupt row look like a live rehearsal.
-    return refusal(
-      "rehearsal_clock_unreadable",
-      "consumer rehearsal run ${run} or the current time could not be read as a timestamp",
-      examined,
-      completed,
-    )
-  }
-  const age = to_int(now_s) - to_int(then_s)
-  if age > max_age_s {
-    return refusal(
-      "rehearsal_stale",
-      "the newest successful consumer rehearsal (run ${run}) finished ${to_string(age)}s ago, "
-        + "past the ${to_string(max_age_s)}s bound",
-      examined,
-      completed,
-    )
+  if len(unproved) == 0 {
+    return {
+      unproved: [],
+      proved: proved,
+      no_op: true,
+      detail: "unchanged since ${tip}: all ${to_string(considered)} consumers are already proved "
+        + "at this revision and contract",
+      considered: considered,
+    }
   }
   return {
-    fresh: true,
-    record: {
-      run_id: newest.id,
-      url: newest.url,
-      head_sha: newest.head_sha,
-      observed_at: to_string(observed),
-      age_s: age,
-    },
-    refusal: nil,
-    detail: "consumer rehearsal run ${run} passed ${to_string(age)}s ago against "
-      + trim(newest.head_sha),
-    examined_count: examined,
-    completed_count: completed,
+    unproved: unproved,
+    proved: proved,
+    no_op: false,
+    detail:
+      "${to_string(len(unproved))} of ${to_string(considered)} consumers need gating at ${tip}",
+    considered: considered,
   }
 }
 
 /**
- * What to do about each refusal, keyed by name.
+ * Is every consumer a release is about to cut proved at that release's revision?
  *
- * The release receipt names a cause; the repair loop needs the cause to map to
- * exactly one action. A stale or missing rehearsal is repaired by running one,
- * which is a dispatch. A failed one is not: something in a consumer actually
- * broke, and re-dispatching the rehearsal would only fail again, so that one
- * escalates to a person instead.
+ * This is the release-side half, and it asks about the revision being cut
+ * rather than about a clock. A rehearsal that passed an hour ago against a
+ * different tip says nothing about this candidate, and a rehearsal that passed
+ * a week ago against this exact tip and these exact contracts says everything.
  */
-pub fn consumer_rehearsal_repair(refused: ConsumerRehearsalRefusal) -> string {
-  return if refused == "rehearsal_failed" {
-    "read the failing consumer in the rehearsal run and repair that consumer; "
-      + "re-running the rehearsal will not change the answer"
-  } else if refused == "rehearsal_clock_unreadable" {
-    "the rehearsal record is unreadable rather than absent; inspect the run before dispatching another"
+pub type RehearsalCoverage = {covered: bool, missing: list<string>, detail: string, considered: int}
+
+pub fn rehearsal_coverage(
+  harn_tip: string,
+  subjects: list<RehearsalSubject>,
+  existing_refs: list<string>?,
+) -> RehearsalCoverage {
+  if existing_refs == nil {
+    return {
+      covered: false,
+      missing: [],
+      detail: "the rehearsal proof listing could not be read, so no consumer can be shown proved",
+      considered: len(subjects),
+    }
+  }
+  if len(subjects) == 0 {
+    return {
+      covered: false,
+      missing: [],
+      detail: "no consumers were resolved, so a covered verdict would be a verdict over nothing",
+      considered: 0,
+    }
+  }
+  const plan = rehearsal_work_plan(harn_tip, subjects, existing_refs)
+  const missing = plan.unproved.map({ subject -> return subject.slug }).to_list()
+  if len(missing) > 0 {
+    return {
+      covered: false,
+      missing: missing,
+      detail: "${to_string(len(missing))} of ${to_string(plan.considered)} consumers have no "
+        + "rehearsal proof at ${lowercase(trim(harn_tip))}: "
+        + join(missing, ", "),
+      considered: plan.considered,
+    }
+  }
+  return {
+    covered: true,
+    missing: [],
+    detail: "all ${to_string(plan.considered)} consumers are rehearsed at "
+      + lowercase(trim(harn_tip)),
+    considered: plan.considered,
+  }
+}
+
+/**
+ * The digest that stands for one consumer's gate contract.
+ *
+ * Two things can change a consumer's answer while Harn stands still: the gate
+ * it declares (which workflow, which input template, which job is the proof)
+ * and the checked-in contract those come from. Both are folded in, so a
+ * consumer that rewrote its gate reads as unproved even at a revision it was
+ * proved at an hour ago.
+ *
+ * The unresolved input template is hashed, never the substituted values. A
+ * digest built from resolved inputs would carry the candidate version and
+ * revision, and would therefore differ between the rehearsal that recorded a
+ * proof and the release that reads it back -- which would make every proof
+ * unreadable by the only party that needs it.
+ *
+ * `consumer_contract_sha256` is computed by the manifest reader from bytes it
+ * actually fetched. A row without one says so in the digest input rather than
+ * hashing an empty string, so "nobody read this contract" and "this contract
+ * is empty" are not the same proof identity.
+ */
+pub fn rehearsal_contract_digest(repo: FleetRepository) -> string {
+  const inputs = repo.pretag_gate_inputs ?? {}
+  let rendered = ""
+  for key in inputs.keys().sorted() {
+    rendered = rendered + "${key}=${to_string(inputs[key] ?? "")}\n"
+  }
+  const job = repo.pretag_gate_proof_job
+  const proof = if job == nil {
+    "(none)"
   } else {
-    "dispatch ${CONSUMER_REHEARSAL_WORKFLOW} in burin-labs/harn-bump-fleet and wait for it to conclude, "
-      + "then re-run this preflight"
+    "${job.name}/${job.step}"
+  }
+  const sha = trim(repo.consumer_contract_sha256 ?? "")
+  const contract = if sha == "" {
+    "(unresolved)"
+  } else {
+    lowercase(sha)
+  }
+  return sha256(
+    "consumer-rehearsal-contract.v1\n"
+      + "workflow=${trim(repo.pretag_gate_workflow ?? "")}\n"
+      + "proof=${proof}\n"
+      + "contract=${contract}\n"
+      + rendered,
+  )
+}
+
+/**
+ * Every consumer the rehearsal is responsible for, with its contract digest.
+ *
+ * Only rows that declare a pre-tag gate are subjects, because only those are
+ * ever dispatched. A row without one is not skipped work; there is no work.
+ */
+pub fn rehearsal_subjects(repositories: list<FleetRepository>) -> list<RehearsalSubject> {
+  let subjects: list<RehearsalSubject> = []
+  for repo in repositories {
+    if trim(repo.pretag_gate_workflow ?? "") == "" {
+      continue
+    }
+    subjects = subjects + [{slug: repo.slug, contract_digest: rehearsal_contract_digest(repo)}]
+  }
+  return subjects
+}
+
+/**
+ * The proofs that already exist at one Harn revision.
+ *
+ * Read with `git ls-remote` rather than the API because the fleet repository
+ * is public, so this costs one unauthenticated request and works in a checkout
+ * that persisted no credential. `nil` means the remote did not answer, which
+ * the plan refuses rather than reading as "nothing is proved".
+ */
+pub fn rehearsal_proof_listing(
+  process: any,
+  harn_tip: string,
+  remote: string = "origin",
+) -> list<string>? {
+  const tip = lowercase(trim(harn_tip))
+  if len(regex_captures("^[0-9a-f]{40}$", tip)) == 0 {
+    throw "rehearsal proof listing requires a full 40-hex Harn revision, got: " + harn_tip
+  }
+  const result = process.run(
+    {
+      program: "git",
+      args: ["ls-remote", remote, "${REHEARSAL_PROOF_PREFIX}/${tip}/*"],
+      timeout_ms: 60000,
+    },
+  )
+  if is_err(result) {
+    return nil
+  }
+  const done = unwrap(result)
+  if (done.exit_code ?? 1) != 0 {
+    return nil
+  }
+  return rehearsal_proof_refs_from_ls_remote(to_string(done.stdout ?? ""))
+}
+
+/**
+ * The ref names in `git ls-remote` output.
+ *
+ * Each line is an object id, a tab, and a ref. A line that does not have both
+ * is dropped rather than half-read: a truncated ref name would compare unequal
+ * to every wanted proof and quietly re-gate a consumer that was already proved.
+ */
+pub fn rehearsal_proof_refs_from_ls_remote(output: string) -> list<string> {
+  let refs: list<string> = []
+  for line in split(output, "\n") {
+    const parts = split(trim(line), "\t")
+    if len(parts) < 2 {
+      continue
+    }
+    const ref = trim(to_string(parts[1] ?? ""))
+    if starts_with(ref, "${REHEARSAL_PROOF_PREFIX}/") {
+      refs = refs + [ref]
+    }
+  }
+  return refs
+}
+
+/** What one attempt to record a proof did. */
+pub type RehearsalProofRecord = {ref: string, recorded: bool, detail: string}
+
+/**
+ * Record that one consumer was gated green at one Harn revision.
+ *
+ * A ref claim rather than a plain write, because two ticks of the same
+ * schedule can overlap a cancelled predecessor and both try to record the same
+ * proof. The claim is atomic: the loser learns it lost and to whom, and either
+ * way the fact the proof stands for is now recorded exactly once.
+ *
+ * A ref that already exists is therefore a success, not a conflict. The proof
+ * is existence, and the second writer was asserting the same thing.
+ */
+pub fn record_rehearsal_proof(
+  harness: Harness,
+  harn_tip: string,
+  subject: RehearsalSubject,
+  evidence: string,
+  repo: string = CONSUMER_REHEARSAL_REPO,
+) -> RehearsalProofRecord {
+  const ref = rehearsal_proof_ref(harn_tip, subject.slug, subject.contract_digest)
+  const claim = github_claim_ref(
+    harness,
+    repo,
+    ref,
+    {
+      payload: {
+        message: "Consumer rehearsal proof for ${subject.slug}\n\n"
+          + "harn-revision: ${lowercase(trim(harn_tip))}\n"
+          + "contract-digest: ${lowercase(trim(subject.contract_digest))}\n"
+          + "evidence: ${trim(evidence)}\n",
+        base_ref: "refs/heads/main",
+      },
+    },
+  )
+  if is_err(claim) {
+    return {
+      ref: ref,
+      recorded: false,
+      detail: "could not record the proof for ${subject.slug}: ${to_string(unwrap_err(claim))}",
+    }
+  }
+  const outcome = unwrap(claim)
+  if outcome.claimed {
+    return {ref: ref, recorded: true, detail: "recorded ${ref}"}
+  }
+  return {
+    ref: ref,
+    recorded: true,
+    detail: "${ref} was already recorded by ${trim(outcome.holder_headline)}",
   }
 }

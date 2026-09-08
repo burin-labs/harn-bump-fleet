@@ -22,13 +22,15 @@
 import { ParserSpec } from "std/cli/argparse"
 import { env_str } from "std/config"
 import { cli_options } from "lib/cli_options"
-import { hydrate_remote_consumer_manifest } from "lib/consumer_projection_manifest"
 import {
-  CONSUMER_REHEARSAL_REPO,
+  hydrate_remote_consumer_manifest,
+  hydrate_remote_consumer_repositories,
+} from "lib/consumer_projection_manifest"
+import {
   CONSUMER_REHEARSAL_WORKFLOW,
-  ConsumerRehearsalRun,
-  consumer_rehearsal_repair,
-  consumer_rehearsal_verdict,
+  rehearsal_coverage,
+  rehearsal_proof_listing,
+  rehearsal_subjects,
 } from "lib/consumer_rehearsal"
 import { remote_pin_probe } from "lib/fleet_convergence"
 import {
@@ -37,10 +39,10 @@ import {
   resolve_harn_update_spec,
 } from "lib/fleet_manifest"
 import {
+  github_branch_head,
   github_file_text_at_ref,
   github_is_transient_read_error,
   github_latest_release_tag,
-  github_workflow_runs,
 } from "lib/github"
 import {
   github_directory_entry_names,
@@ -547,7 +549,13 @@ pipeline main(harness: Harness) {
           options.repositories_json,
           has_github_read,
         ),
-        consumer_rehearsal_check(harness, inputs.mode, has_github_read, harness.clock.date_iso()),
+        consumer_rehearsal_check(
+          harness,
+          inputs.mode,
+          has_github_read,
+          options.release_repo,
+          options.base,
+        ),
       ]
   } else {
     const described = harness.process.run(
@@ -590,7 +598,13 @@ pipeline main(harness: Harness) {
           options.repositories_json,
           has_github_read,
         ),
-        consumer_rehearsal_check(harness, inputs.mode, has_github_read, harness.clock.date_iso()),
+        consumer_rehearsal_check(
+          harness,
+          inputs.mode,
+          has_github_read,
+          options.release_repo,
+          options.base,
+        ),
       ]
   }
   // The pre-irreversible checkpoint: what has to be true of the tree before
@@ -658,30 +672,35 @@ pipeline main(harness: Harness) {
 }
 
 /**
- * Is there a fresh, green consumer rehearsal standing behind this cut?
+ * Has the consumer gate suite already passed against the revision being cut?
  *
  * The consumer contract gate above asks whether consumer projections have
  * drifted right now, from this runner, in the seconds before a tag. This asks
- * something the release cannot ask about itself: has the full consumer gate
- * suite actually passed against the Harn default branch recently. The two are
- * not the same question -- a projection can be byte-identical while the
- * consumer's build against that runtime is broken -- and only the second one
- * is what the pre-tag gate will eventually run.
+ * something the release cannot ask about itself: whether every consumer that
+ * declares a gate has actually built against this exact Harn revision. The two
+ * are not the same question, because a projection can be byte-identical while
+ * the consumer's build against that runtime is broken.
  *
- * Every path that is not a completed, successful, recent run refuses. A
- * release admitted because the rehearsal record was empty, still running, or
- * unreadable would be a gate that reports on its own silence.
+ * It asks about the revision rather than about a clock. A rehearsal that
+ * passed an hour ago against a different tip says nothing about this
+ * candidate; one that passed last week against this exact tip and these exact
+ * consumer contracts says everything.
+ *
+ * Every path that is not full coverage refuses. A release admitted because the
+ * proof listing was unreadable, or because no consumer declared a gate at all,
+ * would be a gate reporting on its own silence.
  */
 fn consumer_rehearsal_check(
   harness: Harness,
   mode: string,
   reachable: bool,
-  now_iso: string,
+  release_repo: string,
+  base: string,
 ) -> PreflightPrecondition {
   if !reachable {
     return preflight_unavailable(
       "consumers.rehearsal",
-      "not asked: this context holds no credential for reading workflow runs",
+      "not asked: this context holds no credential for reading the fleet manifest",
     )
   }
   if mode != "ship-pr" {
@@ -690,46 +709,36 @@ fn consumer_rehearsal_check(
       "not asked: the consumer gates gate publication, which ${mode} does not reach",
     )
   }
-  const page = github_workflow_runs(
-    harness,
-    CONSUMER_REHEARSAL_REPO,
-    CONSUMER_REHEARSAL_WORKFLOW,
-    {branch: "main"},
-    50,
-  )
-  if is_err(page) {
-    // A read that failed is not a rehearsal that is missing, and it is not one
-    // that is fresh either. Saying which it was keeps an operator from
-    // dispatching a rehearsal to fix a credential.
+  const head = github_branch_head(harness, trim(release_repo), trim(base))
+  if is_err(head) {
     return preflight_fail(
       "consumers.rehearsal",
-      "could not read ${CONSUMER_REHEARSAL_WORKFLOW} runs: ${to_string(unwrap_err(page))}",
-      "check the token's actions: read scope, then re-run this preflight",
+      "could not read the revision this release would cut: ${to_string(unwrap_err(head))}",
+      "check the token's contents: read scope, then re-run this preflight",
     )
   }
-  const rows: list<ConsumerRehearsalRun> = unwrap(page).runs.map(
-    { run ->
-      return {
-        id: run.id,
-        status: run.status,
-        conclusion: run.conclusion,
-        head_sha: run.head_sha,
-        created_at: run.created_at,
-        updated_at: run.updated_at,
-        url: run.url,
-      }
-    },
+  const revision = trim(unwrap(head).sha)
+  const manifest = read_fleet_manifest(harness.fs)
+  const subjects = rehearsal_subjects(
+    hydrate_remote_consumer_repositories(harness, manifest, manifest.repositories, "main"),
   )
-    .to_list()
-  const verdict = consumer_rehearsal_verdict(rows, now_iso)
-  if verdict.fresh {
-    return preflight_pass("consumers.rehearsal", verdict.detail)
+  // A read that failed is not a fleet with no proofs. Saying which it was keeps
+  // an operator from dispatching a rehearsal to fix a credential, and keeps a
+  // silent remote from admitting a release.
+  const coverage = rehearsal_coverage(
+    revision,
+    subjects,
+    rehearsal_proof_listing(harness.process, revision),
+  )
+  if coverage.covered {
+    return preflight_pass("consumers.rehearsal", coverage.detail)
   }
   return preflight_fail(
     "consumers.rehearsal",
-    verdict.detail + " (examined ${to_string(verdict.examined_count)} runs, "
-      + "${to_string(verdict.completed_count)} finished)",
-    consumer_rehearsal_repair(verdict.refusal ?? "no_rehearsal_recorded"),
+    coverage.detail + " (${to_string(coverage.considered)} consumers declare a gate)",
+    "dispatch ${CONSUMER_REHEARSAL_WORKFLOW} and let it conclude, then re-run this "
+      + "preflight; if the rehearsal itself is red, repair the consumer it names first, "
+      + "because another rehearsal will only fail again",
   )
 }
 

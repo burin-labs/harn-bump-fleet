@@ -24,6 +24,12 @@ import { cli_options } from "lib/cli_options"
 import { run_consumer_pretag_certification } from "lib/consumer_pretag_certification"
 import { ConsumerPretagCandidate, consumer_pretag_gate_targets } from "lib/consumer_pretag_gate"
 import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
+import {
+  record_rehearsal_proof,
+  rehearsal_proof_listing,
+  rehearsal_subjects,
+  rehearsal_work_plan,
+} from "lib/consumer_rehearsal"
 import { read_fleet_manifest } from "lib/fleet_manifest"
 import { github_branch_head, github_file_text_at_ref } from "lib/github"
 import { workspace_version_from_manifest } from "lib/release_analysis"
@@ -51,6 +57,28 @@ pub fn rehearsal_version_from_workspace(cargo_toml: string) -> string? {
   } else {
     "v" + stable
   }
+}
+
+/**
+ * The consumers this run actually proved.
+ *
+ * Read from the gate verdict rather than inferred from overall success, so a
+ * rehearsal where one consumer drifted still records the thirty-one that
+ * passed instead of throwing their builds away. An empty list is the honest
+ * answer for a mock run, which dispatches nothing and must record nothing.
+ */
+pub fn certified_consumer_slugs(steps: list<dict>) -> list<string> {
+  let passed: list<string> = []
+  for step in steps {
+    const verdict = step.get("consumer_pretag_verdict")
+    if verdict == nil {
+      continue
+    }
+    for slug in to_list(verdict?.passed ?? []) {
+      passed = passed + [trim(to_string(slug))]
+    }
+  }
+  return passed
 }
 
 pub type RehearsalOptions = {only?: string, mock: bool}
@@ -133,14 +161,61 @@ pipeline main(harness: Harness) {
     )
     return 1
   }
+  // The change gate. Each consumer gate is a full runtime build on that
+  // consumer's largest runner class, so a tick that re-proves an unchanged
+  // fleet spends thirty-two builds to learn what a single ref listing already
+  // says. What is skipped is decided by evidence -- a recorded proof at this
+  // exact revision and contract -- not by a clock.
+  const subjects = rehearsal_subjects(scoped)
+  const listing = rehearsal_proof_listing(harness.process, revision)
+  if listing == nil {
+    // Not "nothing is proved". A listing that failed and a fleet with no proofs
+    // want opposite amounts of work, and only one of them is safe to guess.
+    harness.stdio.eprintln(
+      "error: could not list the recorded rehearsal proofs at ${revision}; "
+        + "refusing to treat an unreadable remote as an unproved fleet",
+    )
+    return 1
+  }
+  const plan = rehearsal_work_plan(revision, subjects, listing)
+  harness.stdio.println(plan.detail)
+  if plan.no_op {
+    return 0
+  }
+  const needed = plan.unproved.map({ subject -> return subject.slug }).to_list()
+  const pending = targets.filter({ target -> return needed.contains(target.slug) }).to_list()
+  harness.stdio.println("consumers to gate this tick: ${to_string(len(pending))}")
   const certification = run_consumer_pretag_certification(
     harness,
     {mock: options.mock},
     candidate,
-    targets,
+    pending,
   )
   for step in certification.steps {
     harness.stdio.println(to_string(step.get("summary") ?? step.get("name") ?? ""))
+  }
+  // Record before reporting the verdict. A consumer that passed is proved at
+  // this revision whether or not a sibling failed, and discarding that would
+  // make the next tick rebuild it for nothing.
+  const proved_now = certified_consumer_slugs(certification.steps)
+  for subject in plan.unproved {
+    if !proved_now.contains(subject.slug) {
+      continue
+    }
+    const record = record_rehearsal_proof(
+      harness,
+      revision,
+      subject,
+      "${HARN_REPO}@${revision} rehearsed as ${candidate.version}",
+    )
+    harness.stdio.println(record.detail)
+    if !record.recorded {
+      // A proof that was not written is not a proof. Saying so keeps the next
+      // tick from being blamed for re-gating a consumer that did pass.
+      harness.stdio.eprintln(
+        "warning: ${subject.slug} passed but its proof was not recorded, so it will be gated again",
+      )
+    }
   }
   if !certification.success {
     harness.stdio.eprintln(
