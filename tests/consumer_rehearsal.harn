@@ -1,0 +1,207 @@
+import {
+  CONSUMER_REHEARSAL_MAX_AGE_S,
+  CONSUMER_REHEARSAL_WORKFLOW,
+  ConsumerRehearsalRun,
+  consumer_rehearsal_observed_at,
+  consumer_rehearsal_repair,
+  consumer_rehearsal_verdict,
+  newest_completed_rehearsal,
+} from "../lib/consumer_rehearsal"
+
+const NOW = "2026-09-08T02:00:00Z"
+
+const HARN_MAIN = "c591312c7aa0b1ee9a7c50f5b0d0f5a8e2a4b6d1"
+
+fn run(id: int, status: string, conclusion: string?, updated_at: string?) -> ConsumerRehearsalRun {
+  return {
+    id: id,
+    status: status,
+    conclusion: conclusion,
+    head_sha: HARN_MAIN,
+    created_at: updated_at,
+    updated_at: updated_at,
+    url: "https://github.test/burin-labs/harn-bump-fleet/actions/runs/${to_string(id)}",
+  }
+}
+
+fn green(id: int, updated_at: string) -> ConsumerRehearsalRun {
+  return run(id, "completed", "success", updated_at)
+}
+
+/**
+ * The negative control for the whole module.
+ *
+ * Every other test here hands the verdict some evidence. This one hands it
+ * none, which is the state the gate is actually in the first time it runs and
+ * the state it falls back to whenever the connector returns an empty page. If
+ * this ever passes as fresh, the gate is decoration: a release would sail past
+ * a consumer rehearsal that has never happened.
+ */
+pipeline test_a_release_with_no_rehearsal_on_record_is_refused_not_admitted() {
+  const verdict = consumer_rehearsal_verdict([], NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "no_rehearsal_recorded")
+  assert_eq(verdict.examined_count, 0)
+  assert_eq(verdict.completed_count, 0)
+  assert_eq(verdict.record, nil)
+}
+
+/**
+ * A measured zero and measuring nothing must not read alike.
+ *
+ * The counts are the only thing separating "we looked at eleven runs and none
+ * qualified" from "we looked at nothing", and an operator reading the receipt
+ * needs the difference to decide whether to dispatch a rehearsal or go find
+ * out why the query came back empty.
+ */
+pipeline test_the_verdict_reports_how_much_evidence_it_actually_saw() {
+  const runs = [
+    run(1, "in_progress", nil, "2026-09-08T01:58:00Z"),
+    run(2, "queued", nil, "2026-09-08T01:59:00Z"),
+  ]
+  const verdict = consumer_rehearsal_verdict(runs, NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_still_running")
+  assert_eq(verdict.examined_count, 2)
+  assert_eq(verdict.completed_count, 0)
+}
+
+pipeline test_a_recent_successful_rehearsal_admits_the_release() {
+  const verdict = consumer_rehearsal_verdict([green(7, "2026-09-08T01:30:00Z")], NOW)
+  assert_eq(verdict.fresh, true)
+  assert_eq(verdict.refusal, nil)
+  const record = verdict.record
+  assert(record != nil)
+  assert_eq(record?.run_id, 7)
+  assert_eq(record?.age_s, 1800)
+  assert_eq(record?.head_sha, HARN_MAIN)
+}
+
+pipeline test_a_rehearsal_older_than_the_bound_is_refused_as_stale() {
+  // One second past 90 minutes.
+  const verdict = consumer_rehearsal_verdict([green(7, "2026-09-08T00:29:59Z")], NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_stale")
+  assert_eq(verdict.record, nil)
+}
+
+pipeline test_the_bound_admits_a_rehearsal_exactly_at_its_edge() {
+  const verdict = consumer_rehearsal_verdict([green(7, "2026-09-08T00:30:00Z")], NOW)
+  assert_eq(verdict.fresh, true)
+  assert_eq(verdict.record?.age_s, CONSUMER_REHEARSAL_MAX_AGE_S)
+}
+
+/**
+ * The defect this module exists to not repeat.
+ *
+ * The pin-staleness heartbeat reported a healthy fleet on the strength of an
+ * older success while the run it watched was red. Here the successful run is
+ * inside the age bound and would satisfy a naive "is there a recent green"
+ * search; the newer failure is the answer.
+ */
+pipeline test_a_newer_failure_outranks_an_older_success_inside_the_bound() {
+  const runs = [
+    green(7, "2026-09-08T01:10:00Z"),
+    run(8, "completed", "failure", "2026-09-08T01:45:00Z"),
+  ]
+  const verdict = consumer_rehearsal_verdict(runs, NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_failed")
+  assert_eq(verdict.completed_count, 2)
+  assert(contains(verdict.detail, "8"))
+}
+
+/** Page order is not a promise the connector makes, so the verdict must not read it as one. */
+pipeline test_the_newest_run_is_found_regardless_of_page_order() {
+  const ascending = [green(1, "2026-09-08T00:40:00Z"), green(2, "2026-09-08T01:50:00Z")]
+  const descending = [green(2, "2026-09-08T01:50:00Z"), green(1, "2026-09-08T00:40:00Z")]
+  assert_eq(newest_completed_rehearsal(ascending)?.id, 2)
+  assert_eq(newest_completed_rehearsal(descending)?.id, 2)
+  assert_eq(consumer_rehearsal_verdict(ascending, NOW).record?.run_id, 2)
+  assert_eq(consumer_rehearsal_verdict(descending, NOW).record?.run_id, 2)
+}
+
+/**
+ * An unreadable clock is not a young one.
+ *
+ * Reading a parse failure as zero age is the shape that makes a corrupt row
+ * look like the freshest evidence in the set, so it gets its own refusal.
+ */
+pipeline test_an_unreadable_timestamp_refuses_rather_than_counting_as_zero_age() {
+  const verdict = consumer_rehearsal_verdict([green(7, "not a timestamp")], NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_clock_unreadable")
+}
+
+pipeline test_a_successful_run_with_no_timestamp_at_all_is_refused() {
+  const verdict = consumer_rehearsal_verdict([run(7, "completed", "success", nil)], NOW)
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_clock_unreadable")
+}
+
+/**
+ * Age is the age of the answer, not of the question.
+ *
+ * A run that started inside the bound and finished outside it has been wrong
+ * about the fleet for as long as it took to finish, so the finish time is what
+ * the age is measured from.
+ */
+pipeline test_the_finish_time_decides_the_age_not_the_start_time() {
+  const long_run: ConsumerRehearsalRun = {
+    id: 9,
+    status: "completed",
+    conclusion: "success",
+    head_sha: HARN_MAIN,
+    created_at: "2026-09-08T01:55:00Z",
+    updated_at: "2026-09-08T00:10:00Z",
+    url: "https://github.test/run/9",
+  }
+  assert_eq(consumer_rehearsal_observed_at(long_run), "2026-09-08T00:10:00Z")
+  assert_eq(consumer_rehearsal_verdict([long_run], NOW).refusal, "rehearsal_stale")
+}
+
+pipeline test_the_start_time_is_used_only_when_the_finish_time_is_missing() {
+  const no_update: ConsumerRehearsalRun = {
+    id: 9,
+    status: "completed",
+    conclusion: "success",
+    head_sha: HARN_MAIN,
+    created_at: "2026-09-08T01:40:00Z",
+    updated_at: nil,
+    url: "https://github.test/run/9",
+  }
+  assert_eq(consumer_rehearsal_observed_at(no_update), "2026-09-08T01:40:00Z")
+  assert_eq(consumer_rehearsal_verdict([no_update], NOW).fresh, true)
+}
+
+/**
+ * A cancelled rehearsal is not a passing one.
+ *
+ * GitHub records cancellation as a completed run, so a check written against
+ * `status` alone admits it.
+ */
+pipeline test_a_cancelled_rehearsal_does_not_admit_the_release() {
+  const verdict = consumer_rehearsal_verdict(
+    [run(7, "completed", "cancelled", "2026-09-08T01:50:00Z")],
+    NOW,
+  )
+  assert_eq(verdict.fresh, false)
+  assert_eq(verdict.refusal, "rehearsal_failed")
+}
+
+/**
+ * The repair for a failure is not the repair for an absence.
+ *
+ * A repair loop that answers every rehearsal refusal by dispatching another
+ * rehearsal would spin against a genuinely broken consumer, so the two must
+ * not collapse to one string.
+ */
+pipeline test_a_broken_consumer_and_a_missing_rehearsal_get_different_repairs() {
+  const missing = consumer_rehearsal_repair("no_rehearsal_recorded")
+  const stale = consumer_rehearsal_repair("rehearsal_stale")
+  const broken = consumer_rehearsal_repair("rehearsal_failed")
+  assert(contains(missing, CONSUMER_REHEARSAL_WORKFLOW))
+  assert_eq(stale, missing)
+  assert(!contains(broken, CONSUMER_REHEARSAL_WORKFLOW))
+  assert(contains(broken, "repair that consumer"))
+}

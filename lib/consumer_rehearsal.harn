@@ -1,0 +1,285 @@
+/**
+ * Whether a fresh, green consumer rehearsal stands behind a release.
+ *
+ * The consumer pre-tag gate is the last thing a release runs and the first
+ * thing that fails, because it is the only step that asks a question about
+ * repositories nobody in this one has touched since the previous cut. By the
+ * time it asks, the release has already certified a candidate and is minutes
+ * from a tag, so a drifted consumer turns into a failed release rather than a
+ * pull request.
+ *
+ * The rehearsal moves that question earlier and repeats it: a scheduled run
+ * puts the same consumer gates against the Harn default branch, on a cadence,
+ * and its run record is the evidence. This module owns the one decision the
+ * release makes about that evidence -- is there a recent successful rehearsal
+ * -- and nothing else.
+ *
+ * The shape of this module is set by what it must not do. A release refusing
+ * for want of a rehearsal is annoying; a release proceeding because the
+ * rehearsal record was empty, unparseable, or still running is the failure
+ * this is here to prevent. So every answer other than "a completed, successful
+ * run inside the age bound" is a refusal with a name, and the verdict carries
+ * how many runs it examined so a decision made over nothing is visible as one
+ * rather than reading like a decision made over evidence.
+ */
+/** The workflow whose runs are the rehearsal record. */
+pub const CONSUMER_REHEARSAL_WORKFLOW = "consumer-rehearsal.yml"
+
+/**
+ * How old a rehearsal may be and still speak for a release, in seconds.
+ *
+ * Ninety minutes: the hourly schedule plus most of a run. Tightening this
+ * below the schedule interval would refuse every release that asked between
+ * two ticks, which trains an operator to override the gate.
+ */
+pub const CONSUMER_REHEARSAL_MAX_AGE_S = 5400
+
+/** Why no rehearsal stands behind this release. Each name is a different repair. */
+pub type ConsumerRehearsalRefusal = "no_rehearsal_recorded" \
+  | "rehearsal_still_running" \
+  | "rehearsal_failed" \
+  | "rehearsal_stale" \
+  | "rehearsal_clock_unreadable"
+
+/** The fields the verdict reads. Extra workflow-run keys stay out. */
+pub type ConsumerRehearsalRun = {
+  id: int,
+  status: string,
+  conclusion: string?,
+  head_sha: string,
+  created_at: string?,
+  updated_at: string?,
+  url: string,
+}
+
+/** The rehearsal a release is standing on, once one has been found. */
+pub type ConsumerRehearsalRecord = {
+  run_id: int,
+  url: string,
+  /** The Harn default-branch commit the gates actually ran against. */
+  head_sha: string,
+  observed_at: string,
+  age_s: int,
+}
+
+pub type ConsumerRehearsalVerdict = {
+  fresh: bool,
+  record: ConsumerRehearsalRecord?,
+  refusal: ConsumerRehearsalRefusal?,
+  /** One sentence naming what was found, for the preflight receipt's detail. */
+  detail: string,
+  /** How many runs were examined, so a verdict over nothing is visible as one. */
+  examined_count: int,
+  /** How many of those GitHub had recorded as finished. */
+  completed_count: int,
+}
+
+fn unix_seconds(iso: string) -> int? {
+  return try {
+    to_int(date_parse(trim(iso)))
+  } catch (_e) {
+    nil
+  }
+}
+
+/**
+ * When the run finished, preferring the last update over the start.
+ *
+ * A rehearsal's age is the age of its answer, not the age of the question. A
+ * long run started inside the bound can finish outside it, and reading
+ * `created_at` would let that run vouch for a consumer state it stopped
+ * observing an hour ago.
+ */
+pub fn consumer_rehearsal_observed_at(run: ConsumerRehearsalRun) -> string? {
+  const updated = trim(run.updated_at ?? "")
+  if updated != "" {
+    return updated
+  }
+  const created = trim(run.created_at ?? "")
+  if created != "" {
+    return created
+  }
+  return nil
+}
+
+/** True once GitHub recorded the run finished, whatever it concluded. */
+pub fn consumer_rehearsal_is_completed(run: ConsumerRehearsalRun) -> bool {
+  return lowercase(trim(run.status)) == "completed"
+}
+
+/** True only for a finished run GitHub recorded as successful. */
+pub fn consumer_rehearsal_is_successful(run: ConsumerRehearsalRun) -> bool {
+  return consumer_rehearsal_is_completed(run)
+    && lowercase(trim(run.conclusion ?? "")) == "success"
+}
+
+/**
+ * The newest finished run, whatever it concluded.
+ *
+ * Asked separately from the newest success on purpose. An older success must
+ * never speak for a newer failure: that is how a gate reports a healthy fleet
+ * while the thing it gates is red, and it is the exact defect the pin-staleness
+ * heartbeat was rewritten to avoid.
+ */
+pub fn newest_completed_rehearsal(runs: list<ConsumerRehearsalRun>) -> ConsumerRehearsalRun? {
+  let best: ConsumerRehearsalRun? = nil
+  let best_at = ""
+  for run in runs {
+    if !consumer_rehearsal_is_completed(run) {
+      continue
+    }
+    const observed = consumer_rehearsal_observed_at(run)
+    if observed == nil || unix_seconds(to_string(observed)) == nil {
+      continue
+    }
+    if best == nil || to_string(observed) > best_at {
+      best = run
+      best_at = to_string(observed)
+    }
+  }
+  return best
+}
+
+fn refusal(
+  name: ConsumerRehearsalRefusal,
+  detail: string,
+  examined: int,
+  completed: int,
+) -> ConsumerRehearsalVerdict {
+  return {
+    fresh: false,
+    record: nil,
+    refusal: name,
+    detail: detail,
+    examined_count: examined,
+    completed_count: completed,
+  }
+}
+
+/**
+ * Does a fresh, green rehearsal stand behind a release cut at `now_iso`?
+ *
+ * `runs` is a page of this workflow's runs on the default branch, newest-first
+ * or not; the order is not trusted. Every path other than a completed,
+ * successful run inside `max_age_s` returns `fresh: false` with a named
+ * refusal, including the paths where there is nothing to read at all.
+ */
+pub fn consumer_rehearsal_verdict(
+  runs: list<ConsumerRehearsalRun>,
+  now_iso: string,
+  max_age_s: int = CONSUMER_REHEARSAL_MAX_AGE_S,
+) -> ConsumerRehearsalVerdict {
+  const examined = len(runs)
+  const completed = len(
+    runs.filter({ run -> return consumer_rehearsal_is_completed(run) }).to_list(),
+  )
+  if examined == 0 {
+    return refusal(
+      "no_rehearsal_recorded",
+      "no consumer rehearsal run was found; the rehearsal workflow has never reported",
+      examined,
+      completed,
+    )
+  }
+  const newest = newest_completed_rehearsal(runs)
+  if newest == nil {
+    // Two different states reach here and they are not the same repair.
+    // Nothing has finished yet, which resolves on its own; or things have
+    // finished but none of them carries a timestamp this can read, which does
+    // not. Reporting the second as "still in flight" would tell an operator to
+    // wait for a run that already ended.
+    if completed > 0 {
+      return refusal(
+        "rehearsal_clock_unreadable",
+        "all ${completed} finished consumer rehearsal runs carry timestamps that cannot be read, "
+          + "so none of their ages can be established",
+        examined,
+        completed,
+      )
+    }
+    return refusal(
+      "rehearsal_still_running",
+      "all ${examined} consumer rehearsal runs are still in flight; none has reported a verdict",
+      examined,
+      completed,
+    )
+  }
+  const run = to_string(newest.id)
+  if !consumer_rehearsal_is_successful(newest) {
+    return refusal(
+      "rehearsal_failed",
+      "the newest finished consumer rehearsal (run ${run}) concluded "
+        + trim(newest.conclusion ?? "without a conclusion"),
+      examined,
+      completed,
+    )
+  }
+  const observed = consumer_rehearsal_observed_at(newest)
+  if observed == nil {
+    return refusal(
+      "rehearsal_clock_unreadable",
+      "the newest successful consumer rehearsal (run ${run}) carries no timestamp, "
+        + "so its age cannot be established",
+      examined,
+      completed,
+    )
+  }
+  const then_s = unix_seconds(to_string(observed))
+  const now_s = unix_seconds(now_iso)
+  if then_s == nil || now_s == nil {
+    // An unreadable stamp is not "recent enough". Treating a parse failure as
+    // zero age would make a corrupt row look like a live rehearsal.
+    return refusal(
+      "rehearsal_clock_unreadable",
+      "consumer rehearsal run ${run} or the current time could not be read as a timestamp",
+      examined,
+      completed,
+    )
+  }
+  const age = to_int(now_s) - to_int(then_s)
+  if age > max_age_s {
+    return refusal(
+      "rehearsal_stale",
+      "the newest successful consumer rehearsal (run ${run}) finished ${to_string(age)}s ago, "
+        + "past the ${to_string(max_age_s)}s bound",
+      examined,
+      completed,
+    )
+  }
+  return {
+    fresh: true,
+    record: {
+      run_id: newest.id,
+      url: newest.url,
+      head_sha: newest.head_sha,
+      observed_at: to_string(observed),
+      age_s: age,
+    },
+    refusal: nil,
+    detail: "consumer rehearsal run ${run} passed ${to_string(age)}s ago against "
+      + trim(newest.head_sha),
+    examined_count: examined,
+    completed_count: completed,
+  }
+}
+
+/**
+ * What to do about each refusal, keyed by name.
+ *
+ * The release receipt names a cause; the repair loop needs the cause to map to
+ * exactly one action. A stale or missing rehearsal is repaired by running one,
+ * which is a dispatch. A failed one is not: something in a consumer actually
+ * broke, and re-dispatching the rehearsal would only fail again, so that one
+ * escalates to a person instead.
+ */
+pub fn consumer_rehearsal_repair(refused: ConsumerRehearsalRefusal) -> string {
+  return if refused == "rehearsal_failed" {
+    "read the failing consumer in the rehearsal run and repair that consumer; "
+      + "re-running the rehearsal will not change the answer"
+  } else if refused == "rehearsal_clock_unreadable" {
+    "the rehearsal record is unreadable rather than absent; inspect the run before dispatching another"
+  } else {
+    "dispatch ${CONSUMER_REHEARSAL_WORKFLOW} in burin-labs/harn-bump-fleet and wait for it to conclude, "
+      + "then re-run this preflight"
+  }
+}
