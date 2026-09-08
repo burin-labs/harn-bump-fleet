@@ -1,0 +1,266 @@
+import { git_run } from "std/git"
+
+/**
+ * Admit a hand-tagged release for resume without an ancestry proof.
+ *
+ * The resume path proves a candidate belongs to this release by asking whether
+ * it is an ancestor of the refreshed default branch. That question is the right
+ * one for a candidate the harness tagged itself, and it is the wrong one for a
+ * tag applied by hand: release tags here are never ancestors of the default
+ * branch, because the certified candidate lives on its own
+ * `release-certify/<sha>` branch and the default branch receives the fold as a
+ * separate commit. v0.10.133 was tagged that way, and every attempt to resume
+ * its tail died on the ancestry check with no input able to override it.
+ *
+ * Ancestry is a proxy. What it is standing in for is "this commit is the
+ * candidate this release certified", and a hand-applied tag can answer that
+ * question directly and more strongly:
+ *
+ *   1. the tag is annotated, so it carries a message at all;
+ *   2. its signature verifies, so the message was not authored by whoever could
+ *      write a ref;
+ *   3. its message names a candidate in a `Harn-Release-Candidate` trailer;
+ *   4. the tag points at that same candidate;
+ *   5. `release-certify/<candidate>` exists and points at that candidate, which
+ *      only the certification step creates.
+ *
+ * Every one of those is required. Dropping any single one turns the override
+ * into "trust a tag", which is exactly the authority the ancestry check exists
+ * to withhold: anyone who can push a tag could otherwise resume a release
+ * against an arbitrary tree.
+ *
+ * Gathering and deciding both live here, but they are separate functions and
+ * the decision is pure. That split is what makes the refusals testable: the
+ * evidence a real repository would be needed to produce can be written down
+ * instead, so each refusal is exercised on its own rather than only through a
+ * repository that happens to be in the right state.
+ */
+/** The tag-message trailer naming the certified candidate. */
+pub const HAND_TAG_CANDIDATE_TRAILER = "Harn-Release-Candidate"
+
+/** Why a hand-applied tag is not admissible. Each name is a different repair. */
+pub type HandTagRefusal = "resume_not_requested" \
+  | "tag_not_annotated" \
+  | "tag_signature_unverified" \
+  | "tag_missing_candidate_trailer" \
+  | "tag_points_elsewhere" \
+  | "candidate_not_certified"
+
+/**
+ * What a caller must read from git before this can decide.
+ *
+ * Deliberately flat and already-resolved. A verdict that took a git handle
+ * could reach for a fact it forgot to require, and the missing read would show
+ * up as an admission rather than as a refusal.
+ */
+pub type HandTagEvidence = {
+  tag: string,
+  /** `tag` for an annotated object, `commit` for a lightweight tag. */
+  object_type: string,
+  /** Whether git verified the tag's signature. A missing signature is false. */
+  signature_verified: bool,
+  /** The annotated tag's full message, signature block included. */
+  message: string,
+  /** The commit the tag resolves to. */
+  tagged_commit: string,
+  /**
+   * The head of `release-certify/<trailer candidate>`, or "" when that branch
+   * does not exist. Empty is a refusal, never a pass: a candidate whose
+   * certification branch cannot be read has not been shown to be certified.
+   */
+  certify_branch_head: string,
+}
+
+pub type HandTagVerdict = {
+  admitted: bool,
+  /** The candidate this tag proves, only when admitted. */
+  candidate: string?,
+  refusal: HandTagRefusal?,
+  detail: string,
+}
+
+fn normalized(value: string) -> string {
+  return lowercase(trim(value))
+}
+
+fn is_full_oid(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", normalized(value))) == 1
+}
+
+/**
+ * The candidate named by the tag message's trailer.
+ *
+ * Only the part of the message above the signature block is searched. A signed
+ * tag carries base64 after `-----BEGIN SSH SIGNATURE-----`, and reading a
+ * trailer out of signature bytes would let the signature decide what it is
+ * signing.
+ */
+pub fn hand_tag_candidate_trailer(message: string) -> string? {
+  const marker = "-----BEGIN SSH SIGNATURE-----"
+  const idx = index_of(message, marker)
+  const body = if idx >= 0 {
+    message.substring(0, idx)
+  } else {
+    message
+  }
+  let found: string? = nil
+  for line in split(body, "\n") {
+    const trimmed = trim(line)
+    const prefix = HAND_TAG_CANDIDATE_TRAILER + ":"
+    if !starts_with(trimmed, prefix) {
+      continue
+    }
+    const value = normalized(trimmed.substring(len(prefix), len(trimmed)))
+    if !is_full_oid(value) {
+      // A trailer that is present but unreadable is not an absent trailer. Say
+      // nothing here and let the caller refuse on the missing candidate rather
+      // than silently accepting a later, well-formed duplicate.
+      return nil
+    }
+    if found != nil && to_string(found) != value {
+      // Two trailers naming different candidates cannot both be the answer.
+      return nil
+    }
+    found = value
+  }
+  return found
+}
+
+fn refuse(name: HandTagRefusal, detail: string) -> HandTagVerdict {
+  return {admitted: false, candidate: nil, refusal: name, detail: detail}
+}
+
+/**
+ * May this hand-applied tag stand in for an ancestry proof?
+ *
+ * `false` from `resume_requested` refuses immediately: this override exists
+ * only for resuming an already-published release, and a fresh release has no
+ * business skipping ancestry.
+ */
+pub fn hand_tagged_candidate_verdict(
+  evidence: HandTagEvidence,
+  resume_requested: bool,
+) -> HandTagVerdict {
+  if !resume_requested {
+    return refuse(
+      "resume_not_requested",
+      "ancestry is required unless the release is resuming an already-published tag",
+    )
+  }
+  if normalized(evidence.object_type) != "tag" {
+    return refuse(
+      "tag_not_annotated",
+      "${evidence.tag} is a lightweight tag; only an annotated tag can name its candidate",
+    )
+  }
+  if !evidence.signature_verified {
+    return refuse(
+      "tag_signature_unverified",
+      "${evidence.tag} carries no verifiable signature, so its message proves nothing about "
+        + "who chose the candidate",
+    )
+  }
+  const candidate = hand_tag_candidate_trailer(evidence.message)
+  if candidate == nil {
+    return refuse(
+      "tag_missing_candidate_trailer",
+      "${evidence.tag} carries no single well-formed ${HAND_TAG_CANDIDATE_TRAILER} trailer",
+    )
+  }
+  const named = to_string(candidate)
+  if normalized(evidence.tagged_commit) != named {
+    return refuse(
+      "tag_points_elsewhere",
+      "${evidence.tag} names candidate ${named} but points at "
+        + normalized(evidence.tagged_commit),
+    )
+  }
+  if normalized(evidence.certify_branch_head) != named {
+    // Covers both an absent branch and one that has moved. Either way the
+    // certification the trailer claims cannot be read, and an unread
+    // certification is not a passed one.
+    const observed = if trim(evidence.certify_branch_head) == "" {
+      "no such branch"
+    } else {
+      normalized(evidence.certify_branch_head)
+    }
+    return refuse(
+      "candidate_not_certified",
+      "release-certify/${named} does not point at ${named} (${observed}), so this candidate "
+        + "was not certified by the release harness",
+    )
+  }
+  return {
+    admitted: true,
+    candidate: named,
+    refusal: nil,
+    detail: "${evidence.tag} is a signed annotated tag naming certified candidate ${named}",
+  }
+}
+
+/**
+ * Read everything the hand-tag decision needs, in one place.
+ *
+ * Each read resolves to a value the verdict treats as a refusal when it is
+ * empty, so a git call that fails produces a named refusal rather than an
+ * absent field that some later check forgets to look at.
+ */
+pub fn hand_tag_evidence_from_git(
+  process: HarnessProcess,
+  repo: string,
+  pin_sha: string,
+) -> HandTagEvidence {
+  const tag = release_tag_naming_commit(process, repo, pin_sha)
+  if tag == "" {
+    return {
+      tag: "(none)",
+      object_type: "",
+      signature_verified: false,
+      message: "",
+      tagged_commit: pin_sha,
+      certify_branch_head: "",
+    }
+  }
+  const kind = git_run(process, ["cat-file", "-t", tag], {repo: repo})
+  const message = git_run(process, ["cat-file", "tag", tag], {repo: repo})
+  // `--raw` keeps this readable without a locale-dependent prose match; the
+  // exit status is the verdict and the output is only for the receipt.
+  const verified = git_run(process, ["verify-tag", "--raw", tag], {repo: repo})
+  const certify = git_run(
+    process,
+    [
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "refs/remotes/origin/release-certify/${lowercase(trim(pin_sha))}",
+    ],
+    {repo: repo},
+  )
+  return {
+    tag: tag,
+    object_type: trim(kind.stdout ?? ""),
+    signature_verified: verified.success,
+    message: message.stdout ?? "",
+    tagged_commit: pin_sha,
+    certify_branch_head: if certify.success {
+      trim(certify.stdout ?? "")
+    } else {
+      ""
+    },
+  }
+}
+
+/** The tag pointing at `sha`, or "" when none does. */
+fn release_tag_naming_commit(process: HarnessProcess, repo: string, sha: string) -> string {
+  const found = git_run(process, ["tag", "--points-at", sha], {repo: repo})
+  if !found.success {
+    return ""
+  }
+  for line in split(trim(found.stdout ?? ""), "\n") {
+    const name = trim(line)
+    if name != "" {
+      return name
+    }
+  }
+  return ""
+}
