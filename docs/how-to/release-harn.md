@@ -71,6 +71,15 @@ scripts/preflight_release_launch.sh --mode ship-pr --bump patch
 To widen a commit prefix without asking anything else, `--resolve-only` prints
 the exact commit on stdout and everything a person reads on stderr.
 
+Two of these preconditions are facts about another repository: whether the
+release repository's default branch carries the last release's fold, and
+whether the consumers' adapters match what the renderer produces. No commit
+here repairs either. A pull request is therefore asked with a narrower scope:
+every precondition is still asked and still appears in the receipt, and a
+release-state refusal is announced as a warning instead of failing the check. A
+push to the default branch, the hourly run, and the release itself keep
+refusing on all of them.
+
 The same job runs on every pull request to this repository and hourly on main,
 so a change to a renderer, the fleet manifest, or the token profiles fails its
 own pull request instead of a release attempt.
