@@ -259,6 +259,18 @@ the immutable tag; no candidate archive is promoted as the release artifact.
 If the release PR conflicts with main, the watcher stops with a conflict result
 and preserves its receipt and refs. Post-publish fixup owns that repair.
 
+`preflight_package_test_compatibility.harn` runs package test discovery for
+every managed package under the candidate runtime before a cut, without
+mutating any repository. A package whose test files discover no tests is a named
+compatibility failure carrying the files and the migration, never a green count:
+that is the shape this gate exists for, because package verification used to
+pass while running nothing. A receipt that is absent, malformed, or missing its
+counts is recorded as unmeasured rather than as a pass, and a run whose
+inventory mutated the checkout fails outright. The fleet's pinned runtime in
+`.harn-version` must be a release whose `harn package test-inventory` can
+perform the inventory; an older pin makes every row unmeasured, which the gate
+reports rather than hides.
+
 A consumer pre-tag gate retries a dispatch the network dropped. Transport
 failures and 5xx responses are sent again with bounded backoff, five sends over
 about two minutes, because a request that was dropped in transit may never have
