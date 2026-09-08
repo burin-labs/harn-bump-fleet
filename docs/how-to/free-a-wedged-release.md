@@ -162,6 +162,13 @@ Options:
   against. The named run must also still be an unexpired archive of this exact
   candidate built under matching policy. Neither flag is needed on the ordinary
   path, where a candidate has one archive and the receipt names it.
+- Hosted recovery represents those two local release inputs as a required pair:
+  `--candidate-archive-run-id N` selects the archive and
+  `--candidate-archive-receipt-run-id M` selects the earlier hosted release
+  run whose `release-run-M` artifact contains the typed receipt. The hosted
+  workflow restores the receipt before minting release credentials, validates
+  that it names archive run `N`, and then supplies the local
+  `--candidate-archive-receipt` path itself.
 - `--consumer-proof-runs-json '{"owner/repository":123}'` resumes a consumer
   pre-tag gate from operator-selected exact GitHub Actions run IDs. The run
   must name the declared workflow, candidate version and SHA, workflow-dispatch

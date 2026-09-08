@@ -1,0 +1,165 @@
+import { write_json } from "std/fs"
+import {
+  CandidateArchiveReceipt,
+  candidate_archive_receipt_read,
+} from "./candidate_archive_receipt"
+import { release_redact_secrets } from "./release_step_output"
+
+pub type HostedCandidateArchiveReceiptDownload = {success: bool, message: string}
+
+pub type HostedCandidateArchiveReceiptAdapter = {
+  download: fn(int, string) -> HostedCandidateArchiveReceiptDownload,
+}
+
+pub type HostedCandidateArchiveReceiptImport = {
+  repo_root: string,
+  hosted_run_id: int,
+  candidate_archive_run_id: int,
+  destination: string,
+}
+
+const DOWNLOAD_ATTEMPTS = 3
+
+fn safe_download_detail(message: string) -> string {
+  const without_queries = regex_replace(
+    "(https://[^ ?\\n]+)[?][^ \\n]+",
+    "$1?[redacted-query]",
+    message ?? "",
+  )
+  return release_redact_secrets(without_queries)
+}
+
+fn production_adapter(
+  process: HarnessProcess,
+  cwd: string,
+) -> HostedCandidateArchiveReceiptAdapter {
+  return {
+    download: fn(run_id, destination) {
+      const result = process.run(
+        {
+          program: path_join(cwd, "scripts", "download_github_artifact.sh"),
+          args: [to_string(run_id), "release-run-${run_id}", destination],
+          cwd: cwd,
+        },
+      )
+      const message = if trim(result.stderr) != "" {
+        trim(result.stderr)
+      } else {
+        trim(result.stdout)
+      }
+      return {success: result.success, message: message}
+    },
+  }
+}
+
+fn receipt_paths(fs: HarnessFs, staging_root: string) -> list<string> {
+  let paths: list<string> = []
+  for root in [
+    path_join(staging_root, "release-harn", "candidate-archive"),
+    path_join(staging_root, ".harn-runs", "release-harn", "candidate-archive"),
+  ] {
+    if !fs.exists(root) {
+      continue
+    }
+    for name in fs.list_dir(root).sort() {
+      if ends_with(name, ".json") {
+        paths = paths + [path_join(root, name)]
+      }
+    }
+  }
+  return paths
+}
+
+fn validate_receipt(receipt: CandidateArchiveReceipt, candidate_archive_run_id: int) -> string {
+  if receipt.slug != "burin-labs/harn" || receipt.workflow != "build-release-binaries.yml" {
+    return "candidate archive receipt names ${receipt.slug} ${receipt.workflow}, not the canonical Harn archive workflow"
+  }
+  if receipt.run_id != candidate_archive_run_id {
+    return "candidate archive receipt names archive run ${receipt.run_id}, not selected run ${candidate_archive_run_id}"
+  }
+  return ""
+}
+
+fn persist_receipt(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  receipt: CandidateArchiveReceipt,
+) {
+  harness.fs.mkdir(dirname(path), true)
+  const temporary = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+}
+
+/** Restore one exact prior hosted run's candidate archive certification receipt. */
+pub fn import_hosted_candidate_archive_receipt(
+  harness: Harness,
+  input: HostedCandidateArchiveReceiptImport,
+  adapter: HostedCandidateArchiveReceiptAdapter? = nil,
+) -> CandidateArchiveReceipt {
+  if input.hosted_run_id < 1 {
+    throw "candidate archive receipt hosted run ID must be positive"
+  }
+  if input.candidate_archive_run_id < 1 {
+    throw "candidate archive run ID must be positive"
+  }
+  const existing = candidate_archive_receipt_read(harness.fs, input.destination)
+  if existing != nil {
+    const invalid = validate_receipt(existing ?? {}, input.candidate_archive_run_id)
+    if invalid != "" {
+      throw "existing candidate archive receipt is invalid: " + invalid
+    }
+    return existing ?? {}
+  }
+  if harness.fs.exists(input.destination) {
+    throw "existing candidate archive receipt is unreadable: " + input.destination
+  }
+  const downloader = adapter ?? production_adapter(harness.process, input.repo_root)
+  let staging_root = ""
+  let last_download_error = ""
+  let attempt = 0
+  while attempt < DOWNLOAD_ATTEMPTS && staging_root == "" {
+    attempt = attempt + 1
+    const candidate = harness.fs.mkdtemp_in_workspace("hosted-candidate-archive-receipt-")
+    const downloaded = downloader.download(input.hosted_run_id, candidate)
+    if downloaded.success {
+      staging_root = candidate
+    } else {
+      last_download_error = safe_download_detail(downloaded.message)
+      harness.fs.delete(candidate)
+    }
+  }
+  if staging_root == "" {
+    throw "could not download release-run-${input.hosted_run_id} after ${attempt} attempts: "
+      + last_download_error
+  }
+  return try {
+    const paths = receipt_paths(harness.fs, staging_root)
+    if len(paths) == 0 {
+      throw "hosted release run ${input.hosted_run_id} contained no candidate archive receipt"
+    }
+    let receipt: CandidateArchiveReceipt? = nil
+    for path in paths {
+      const candidate = candidate_archive_receipt_read(harness.fs, path)
+      if candidate == nil {
+        throw "hosted release run ${input.hosted_run_id} contained an unreadable candidate archive receipt at ${path}"
+      }
+      if receipt != nil && receipt != candidate {
+        throw "hosted release run ${input.hosted_run_id} contained conflicting candidate archive receipts"
+      }
+      receipt = candidate
+    }
+    if receipt == nil {
+      throw "hosted release run ${input.hosted_run_id} contained no readable candidate archive receipt"
+    }
+    const restored = unwrap(receipt)
+    const invalid = validate_receipt(restored, input.candidate_archive_run_id)
+    if invalid != "" {
+      throw invalid
+    }
+    persist_receipt({fs: harness.fs, random: harness.random}, input.destination, restored)
+    restored
+  } finally {
+    harness.fs.delete(staging_root)
+  }
+}
