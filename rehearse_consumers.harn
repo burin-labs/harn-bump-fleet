@@ -1,0 +1,265 @@
+#!/usr/bin/env harn
+//
+// Ask the consumer question early, and keep asking it.
+//
+// The consumer pre-tag gate is the last step a release runs and the first one
+// that fails, because it is the only step that asks about repositories nobody
+// touched since the previous cut. By the time it asks, a candidate has been
+// certified and a tag is minutes away, so a consumer that drifted three weeks
+// ago surfaces as a failed release instead of as a pull request. That is what
+// happened to the v0.10.133 tail: it ran for eight minutes and died on one
+// consumer's workflow bytes.
+//
+// This runs the same gates against the Harn default branch on a cadence, so
+// the drift shows up as a red rehearsal on the day it lands. A revision- and
+// contract-bound proof ref is the evidence: `lib/consumer_rehearsal.harn` owns
+// both its write and the release launch preflight read.
+//
+// Rehearsing against `main` rather than a tag is the point. There is no tag to
+// rehearse -- the whole purpose is to know the answer before one is cut -- so
+// the candidate is main's head paired with the stable version main is
+// developing toward, which is the version the next release will actually carry.
+import { ParserSpec } from "std/cli/argparse"
+import { cli_options } from "lib/cli_options"
+import { run_consumer_pretag_certification } from "lib/consumer_pretag_certification"
+import { ConsumerPretagCandidate, consumer_pretag_gate_targets } from "lib/consumer_pretag_gate"
+import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
+import {
+  record_rehearsal_proof,
+  rehearsal_proof_listing,
+  rehearsal_recording_failures,
+  rehearsal_subjects,
+  rehearsal_work_plan,
+} from "lib/consumer_rehearsal"
+import { read_fleet_manifest } from "lib/fleet_manifest"
+import { github_branch_head, github_file_text_at_ref } from "lib/github"
+import { workspace_version_from_manifest } from "lib/release_analysis"
+
+const HARN_REPO = "burin-labs/harn"
+
+/**
+ * The stable version a development workspace is working toward.
+ *
+ * `0.10.134-dev` on main means the next cut is `v0.10.134`, which is the
+ * version the consumer gates will be handed for real. Rehearsing under any
+ * other label would exercise a dispatch input no release will ever send.
+ */
+pub fn rehearsal_version_from_workspace(cargo_toml: string) -> string? {
+  const workspace = trim(workspace_version_from_manifest(cargo_toml))
+  if !ends_with(workspace, "-dev") {
+    // A default branch whose version carries no `-dev` is mid-release: the fold
+    // has not landed yet, so there is no next version to rehearse and the
+    // consumers would be asked about an identity that is already tagged.
+    return nil
+  }
+  const stable = workspace.substring(0, len(workspace) - len("-dev"))
+  return if len(regex_captures("^[0-9]+\\.[0-9]+\\.[0-9]+$", stable)) == 0 {
+    nil
+  } else {
+    "v" + stable
+  }
+}
+
+/**
+ * The consumers this run actually proved.
+ *
+ * Read from the gate verdict rather than inferred from overall success, so a
+ * rehearsal where one consumer drifted still records the thirty-one that
+ * passed instead of throwing their builds away. An empty list is the honest
+ * answer for a mock run, which dispatches nothing and must record nothing.
+ *
+ * The verdict names each consumer as `slug:workflow`, because a slug alone
+ * would not say which gate answered. A proof is per consumer, so the slug is
+ * taken back off the front rather than compared whole -- comparing whole is
+ * the version of this that matches nothing and records nothing, forever, while
+ * every test that invented its own fixture still passes.
+ */
+pub fn certified_consumer_slugs(steps: list<dict>) -> list<string> {
+  let passed: list<string> = []
+  for step in steps {
+    const verdict = step.get("consumer_pretag_verdict")
+    if verdict == nil {
+      continue
+    }
+    for entry in to_list(verdict?.passed ?? []) {
+      const named = trim(to_string(entry))
+      const cut = index_of(named, ":")
+      passed = passed
+        + [
+          if cut < 0 {
+            named
+          } else {
+            trim(named.substring(0, cut))
+          },
+        ]
+    }
+  }
+  return passed
+}
+
+pub type RehearsalOptions = {only?: string, mock: bool}
+
+const ARG_SPEC: ParserSpec = {
+  name: "rehearse-consumers",
+  args: [
+    {kind: "flag", name: "only", long: "--only"},
+    {kind: "switch", name: "mock", long: "--mock"},
+  ],
+}
+
+pub fn parse_rehearsal_args(args: list<string>) -> RehearsalOptions {
+  return cli_options<RehearsalOptions>(ARG_SPEC, args, schema_of(RehearsalOptions))
+}
+
+pipeline main(harness: Harness) {
+  const options = parse_rehearsal_args(argv)
+  const head = github_branch_head(harness, HARN_REPO, "main")
+  if is_err(head) {
+    harness.stdio.eprintln(
+      "error: could not read the Harn default branch head: ${to_string(unwrap_err(head))}",
+    )
+    return 1
+  }
+  const revision = trim(unwrap(head).sha)
+  const cargo_manifest = github_file_text_at_ref(harness, HARN_REPO, "Cargo.toml", revision) ?? ""
+  const version = rehearsal_version_from_workspace(cargo_manifest)
+  if version == nil {
+    // Refusing here rather than guessing a version. A rehearsal that invented
+    // one would dispatch consumer gates under an input no release sends, and
+    // its green would say nothing about the release it is standing in for.
+    harness.stdio.eprintln(
+      "error: ${HARN_REPO}@${revision} does not carry an X.Y.Z-dev workspace version, "
+        + "so there is no release identity to rehearse",
+    )
+    return 1
+  }
+  const candidate: ConsumerPretagCandidate = {version: to_string(version), revision: revision}
+  harness.stdio.println(
+    "rehearsing consumer gates for ${candidate.version} at ${HARN_REPO}@${revision}",
+  )
+  const manifest = read_fleet_manifest(harness.fs)
+  const repositories = hydrate_remote_consumer_repositories(
+    harness,
+    manifest,
+    manifest.repositories,
+    "main",
+  )
+  const only = trim(options.only ?? "")
+  const scoped = if only == "" {
+    repositories
+  } else {
+    repositories.filter({ repo -> return repo.slug == only }).to_list()
+  }
+  if only != "" && len(scoped) == 0 {
+    harness.stdio.eprintln("error: no consumer in the fleet manifest is named ${only}")
+    return 2
+  }
+  // Report the count before the verdict. A rehearsal that gated zero consumers
+  // and a rehearsal that gated all of them both conclude "success", and only
+  // this line separates them.
+  harness.stdio.println("consumers in scope: ${to_string(len(scoped))}")
+  if len(scoped) == 0 {
+    harness.stdio.eprintln(
+      "error: the fleet manifest resolved no consumers, so this rehearsal would prove nothing",
+    )
+    return 1
+  }
+  // The targets are built here and handed in rather than left for the
+  // certification to resolve. Resolving them there would ignore `--only`
+  // entirely and rehearse the whole fleet whatever was asked for, which is a
+  // flag that looks like a lever and is not one.
+  const targets = consumer_pretag_gate_targets(scoped, candidate)
+  harness.stdio.println("consumers with a pre-tag gate: ${to_string(len(targets))}")
+  if len(targets) == 0 {
+    harness.stdio.eprintln(
+      "error: no consumer in scope declares a pre-tag gate workflow, so this rehearsal "
+        + "would report success without asking anything",
+    )
+    return 1
+  }
+  // The change gate. Each consumer gate is a full runtime build on that
+  // consumer's largest runner class, so a tick that re-proves an unchanged
+  // fleet spends thirty-two builds to learn what a single ref listing already
+  // says. What is skipped is decided by evidence -- a recorded proof at this
+  // exact revision and contract -- not by a clock.
+  const subjects = rehearsal_subjects(scoped)
+  const listing = rehearsal_proof_listing(harness.process, revision)
+  if is_err(listing) {
+    // Not "nothing is proved". A listing that failed and a fleet with no proofs
+    // want opposite amounts of work, and only one of them is safe to guess.
+    harness.stdio.eprintln(
+      "error: could not list the recorded rehearsal proofs at ${revision}; "
+        + "refusing to treat an unreadable remote as an unproved fleet",
+    )
+    return 1
+  }
+  const plan = rehearsal_work_plan(revision, subjects, unwrap(listing))
+  harness.stdio.println(plan.detail)
+  if plan.no_op {
+    return 0
+  }
+  const needed = plan.unproved.map({ subject -> return subject.slug }).to_list()
+  const pending = targets.filter({ target -> return needed.contains(target.slug) }).to_list()
+  harness.stdio.println("consumers to gate this tick: ${to_string(len(pending))}")
+  if len(pending) != len(needed) {
+    // A subject with no dispatchable target can never be proved, so the fleet
+    // would sit permanently one consumer short of coverage while every tick
+    // reported success. Name it instead of losing it.
+    harness.stdio.eprintln(
+      "error: ${to_string(len(needed))} consumers need gating but only "
+        + "${to_string(len(pending))} resolved to a dispatch",
+    )
+    return 1
+  }
+  const certification = run_consumer_pretag_certification(
+    harness,
+    {mock: options.mock},
+    candidate,
+    pending,
+  )
+  for step in certification.steps {
+    harness.stdio.println(to_string(step.get("summary") ?? step.get("name") ?? ""))
+  }
+  // Record before reporting the verdict. A consumer that passed is proved at
+  // this revision whether or not a sibling failed, and discarding that would
+  // make the next tick rebuild it for nothing.
+  const proved_now = certified_consumer_slugs(certification.steps)
+  let records = []
+  for subject in plan.unproved {
+    if !proved_now.contains(subject.slug) {
+      continue
+    }
+    const record = record_rehearsal_proof(
+      harness,
+      revision,
+      subject,
+      "${HARN_REPO}@${revision} rehearsed as ${candidate.version}",
+    )
+    records = records + [record]
+    harness.stdio.println(record.detail)
+    if !record.recorded {
+      // A proof that was not written is not a proof. Saying so keeps the next
+      // tick from being blamed for re-gating a consumer that did pass.
+      harness.stdio.eprintln(
+        "warning: ${subject.slug} passed but its proof was not recorded, so it will be gated again",
+      )
+    }
+  }
+  const recording_failures = rehearsal_recording_failures(records)
+  if len(recording_failures) > 0 {
+    harness.stdio.eprintln(
+      "consumer rehearsal could not record ${to_string(len(recording_failures))} passing proof(s); "
+        + "refusing a green run because those consumers remain unproved",
+    )
+    return 1
+  }
+  if !certification.success {
+    harness.stdio.eprintln(
+      "consumer rehearsal failed for ${candidate.version} at ${revision}; "
+        + "the release launch preflight will refuse a cut until a rehearsal passes",
+    )
+    return 1
+  }
+  harness.stdio.println("consumer rehearsal passed for ${candidate.version} at ${revision}")
+  return 0
+}
