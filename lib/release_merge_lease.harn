@@ -1,3 +1,4 @@
+import { git_run } from "std/git"
 import {
   GithubConnectorError,
   GithubPullReference,
@@ -23,7 +24,23 @@ pub type ReleaseMergeLease = {
   candidate_head: string,
   generation: string,
   tag: string,
+  merge_method: ReleaseMergeMethod,
 }
+
+pub type ReleaseMergeMethod = "merge" | "rebase" | "squash"
+
+/** The durable fact every post-merge release reader consumes. */
+pub type ReleaseLandingReceipt = {
+  schema_version: "harn_bump_fleet.release_landing.v1",
+  tag_oid: string,
+  release_pr: int,
+  merge_method: ReleaseMergeMethod,
+  merge_commit_oid: string,
+  merged_tree_oid: string,
+  candidate_tree_oid: string,
+}
+
+pub type ReleaseLandingAdmission = {valid: bool, reason: string}
 
 pub type ReleaseMergeLeaseState = "clear" | "active" | "invalid" | "unreadable"
 
@@ -57,6 +74,161 @@ fn valid_atom(value: any) -> bool {
   return regex_match("^[A-Za-z0-9._:/-]+$", trim(to_string(value ?? ""))) != nil
 }
 
+pub fn release_merge_method(value: any) -> ReleaseMergeMethod? {
+  const method = lowercase(trim(to_string(value ?? "")))
+  return if method == "merge" || method == "rebase" || method == "squash" {
+    method
+  } else {
+    nil
+  }
+}
+
+/** Construct the one landing receipt from the lease and exact merged PR view. */
+pub fn release_landing_receipt(
+  lease: ReleaseMergeLease,
+  pull_request: dict,
+  candidate_tree_oid: string,
+  merged_tree_oid: string,
+) -> ReleaseLandingReceipt? {
+  const merged_oid = lowercase(
+    trim(to_string(pull_request?.merge_commit_oid ?? pull_request?.merge_commit_sha ?? "")),
+  )
+  const head_oid = lowercase(trim(to_string(pull_request?.head?.sha ?? "")))
+  const number = to_int(pull_request?.number ?? 0) ?? 0
+  const merged = (pull_request?.merged ?? false)
+    || lowercase(trim(to_string(pull_request?.github_state ?? pull_request?.state ?? "")))
+      == "merged"
+    || (lowercase(trim(to_string(pull_request?.state ?? ""))) == "closed"
+      && trim(to_string(pull_request?.merged_at ?? "")) != "")
+  const candidate_tree = lowercase(trim(candidate_tree_oid))
+  const merged_tree = lowercase(trim(merged_tree_oid))
+  if number != lease.candidate_pr
+    || head_oid != lowercase(lease.candidate_head)
+    || to_string(pull_request?.base?.ref ?? "") != lease.base_branch
+    || !merged
+    || !exact_oid(merged_oid)
+    || !exact_oid(candidate_tree)
+    || !exact_oid(merged_tree) {
+    return nil
+  }
+  return {
+    schema_version: "harn_bump_fleet.release_landing.v1",
+    tag_oid: lowercase(lease.candidate_head),
+    release_pr: lease.candidate_pr,
+    merge_method: lease.merge_method,
+    merge_commit_oid: merged_oid,
+    merged_tree_oid: merged_tree,
+    candidate_tree_oid: candidate_tree,
+  }
+}
+
+/**
+ * State the complete landing policy once.
+ *
+ * Every landing must preserve the certified tree and reach main. Squash is
+ * the sole method allowed to rewrite ancestry; merge and rebase landings must
+ * retain the tagged candidate in main's ancestry.
+ */
+pub fn release_landing_admission(
+  receipt: ReleaseLandingReceipt?,
+  on_main: fn(string) -> bool,
+) -> ReleaseLandingAdmission {
+  if receipt == nil {
+    return {valid: false, reason: "release landing receipt is absent"}
+  }
+  const landing = unwrap(receipt)
+  if !exact_oid(landing.tag_oid)
+    || !exact_oid(landing.merge_commit_oid)
+    || !exact_oid(landing.merged_tree_oid)
+    || !exact_oid(landing.candidate_tree_oid)
+    || landing.release_pr <= 0
+    || release_merge_method(landing.merge_method) == nil {
+    return {valid: false, reason: "release landing receipt identity is invalid"}
+  }
+  if !on_main(landing.merge_commit_oid) {
+    return {valid: false, reason: "release merge commit is not on main"}
+  }
+  if landing.merged_tree_oid != landing.candidate_tree_oid {
+    return {valid: false, reason: "release merge commit tree differs from certified candidate"}
+  }
+  if landing.merge_method != "squash" && !on_main(landing.tag_oid) {
+    return {
+      valid: false,
+      reason: "non-squash release landing does not retain the tagged candidate on main",
+    }
+  }
+  return {
+    valid: true,
+    reason: if landing.merge_method == "squash" {
+      "squash landing preserves the certified candidate tree"
+    } else {
+      "${landing.merge_method} landing preserves the certified candidate tree and ancestry"
+    },
+  }
+}
+
+/** Bind the lease-owned fact once without permitting consumer-specific retargeting. */
+pub fn record_release_landing(receipt: any, landing: ReleaseLandingReceipt, observed_at: string) {
+  if landing.tag_oid != receipt.publication.head_oid
+    || landing.release_pr != receipt.merge_lease_candidate_pr
+    || landing.merge_method != receipt.merge_lease_method {
+    throw "release landing does not match the watch receipt's merge lease"
+  }
+  if receipt.landing != nil && receipt.landing != landing {
+    throw "release watch receipt is already bound to another landing"
+  }
+  return receipt + {landing: landing, updated_at: observed_at}
+}
+
+fn commit_tree(process: HarnessProcess, repo: string, oid: string) -> string {
+  const result = git_run(process, ["rev-parse", "--verify", "${oid}^{tree}"], {repo: repo})
+  return if result.success {
+    lowercase(trim(result.stdout))
+  } else {
+    ""
+  }
+}
+
+fn fetch_landing_objects(process: HarnessProcess, repo: string, lease: ReleaseMergeLease) {
+  if commit_tree(process, repo, lease.candidate_head) == "" {
+    git_run(
+      process,
+      ["fetch", "--quiet", "origin", "refs/tags/${lease.tag}:refs/tags/${lease.tag}"],
+      {repo: repo},
+    )
+  }
+  git_run(
+    process,
+    [
+      "fetch",
+      "--no-tags",
+      "--quiet",
+      "origin",
+      "+refs/heads/${lease.base_branch}:refs/remotes/origin/${lease.base_branch}",
+    ],
+    {repo: repo},
+  )
+}
+
+/** Read the two trees once, at the lease-owned merged-PR observation. */
+pub fn observe_release_landing(
+  process: HarnessProcess,
+  repo: string,
+  lease: ReleaseMergeLease,
+  pull_request: dict,
+) -> ReleaseLandingReceipt? {
+  fetch_landing_objects(process, repo, lease)
+  const merged_oid = lowercase(
+    trim(to_string(pull_request?.merge_commit_oid ?? pull_request?.merge_commit_sha ?? "")),
+  )
+  return release_landing_receipt(
+    lease,
+    pull_request,
+    commit_tree(process, repo, lease.candidate_head),
+    commit_tree(process, repo, merged_oid),
+  )
+}
+
 /** One discoverable ref per protected base. Its creation is GitHub-atomic. */
 pub fn release_merge_lease_ref(base_branch: string) -> string {
   const base = trim(base_branch)
@@ -73,10 +245,11 @@ pub fn release_merge_lease_headline(lease: ReleaseMergeLease) -> string {
     || !exact_oid(lease.candidate_head)
     || lease.candidate_pr <= 0
     || !valid_atom(lease.generation)
-    || !valid_atom(lease.tag) {
+    || !valid_atom(lease.tag)
+    || release_merge_method(lease.merge_method) == nil {
     throw "release merge lease identity is incomplete"
   }
-  return "release-merge-lease v1"
+  return "release-merge-lease v2"
     + " repo=${lease.repo}"
     + " base=${lease.base_branch}"
     + " base_oid=${lowercase(lease.base_oid)}"
@@ -84,19 +257,24 @@ pub fn release_merge_lease_headline(lease: ReleaseMergeLease) -> string {
     + " candidate_head=${lowercase(lease.candidate_head)}"
     + " generation=${lease.generation}"
     + " tag=${lease.tag}"
+    + " merge_method=${lease.merge_method}"
 }
 
 /** Parse only the exact schema this controller writes. */
 pub fn parse_release_merge_lease_headline(headline: string) -> ReleaseMergeLease? {
   const rows = regex_captures(
-    "^release-merge-lease v1 repo=([^ ]+) base=([^ ]+) base_oid=([0-9a-fA-F]{40}) candidate_pr=([1-9][0-9]*) candidate_head=([0-9a-fA-F]{40}) generation=([^ ]+) tag=([^ ]+)$",
+    "^release-merge-lease v2 repo=([^ ]+) base=([^ ]+) base_oid=([0-9a-fA-F]{40}) candidate_pr=([1-9][0-9]*) candidate_head=([0-9a-fA-F]{40}) generation=([^ ]+) tag=([^ ]+) merge_method=(merge|rebase|squash)$",
     trim(headline),
   )
   if len(rows) != 1 {
     return nil
   }
   const groups = rows[0].groups
-  const lease = {
+  const merge_method = release_merge_method(groups[7])
+  if merge_method == nil {
+    return nil
+  }
+  const lease: ReleaseMergeLease = {
     repo: groups[0],
     base_branch: groups[1],
     base_oid: lowercase(groups[2]),
@@ -104,10 +282,12 @@ pub fn parse_release_merge_lease_headline(headline: string) -> ReleaseMergeLease
     candidate_head: lowercase(groups[4]),
     generation: groups[5],
     tag: groups[6],
+    merge_method: merge_method,
   }
   return if valid_atom(lease.repo) && valid_atom(lease.base_branch)
     && valid_atom(lease.generation)
-    && valid_atom(lease.tag) {
+    && valid_atom(lease.tag)
+    && release_merge_method(lease.merge_method) != nil {
     lease
   } else {
     nil
@@ -270,6 +450,7 @@ pub fn finish_release_merge_lease_for_candidate(
     candidate_pr: int,
     candidate_head: string,
     tag: string,
+    merge_method: ReleaseMergeMethod,
   },
   options: GithubClientOptions = github_connector_options(),
 ) -> ReleaseMergeLeaseFinish {
@@ -290,6 +471,7 @@ pub fn finish_release_merge_lease_for_candidate(
     && lease.candidate_pr == candidate.candidate_pr
     && lowercase(lease.candidate_head) == lowercase(candidate.candidate_head)
     && lease.tag == candidate.tag
+    && lease.merge_method == candidate.merge_method
   if !owned {
     return {released: false, reason: "not_owned", ref: observed.ref, oid: observed.oid}
   }
@@ -357,13 +539,26 @@ pub fn github_enable_auto_merge_with_release_lease(
       },
     )
   }
+  const observation = observe_release_merge_lease(harness, slug, base, options)
   const admission = release_merge_lease_admission(
-    observe_release_merge_lease(harness, slug, base, options),
+    observation,
     {repo: slug, base_branch: base, pr: number, head: head},
   )
   if !admission.allowed {
     return Err(
       {code: "release_merge_lease_refused", category: "conflict", message: admission.reason},
+    )
+  }
+  const requested_method = release_merge_method(merge_method)
+  if requested_method == nil
+    || (observation.state == "active"
+      && observation.lease?.merge_method != requested_method) {
+    return Err(
+      {
+        code: "release_merge_method_mismatch",
+        category: "conflict",
+        message: "auto-merge method does not match the release merge lease",
+      },
     )
   }
   return github_enable_auto_merge(harness, slug, pr_ref, expected_head_oid, merge_method, options)

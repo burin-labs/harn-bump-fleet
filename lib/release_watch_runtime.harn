@@ -1,4 +1,5 @@
 import { env_bool } from "std/config"
+import { git_run } from "std/git"
 import {
   GithubConnectorError,
   github_actions_run,
@@ -10,6 +11,14 @@ import {
 } from "./github"
 import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
 import { newest_run_for_workflow } from "./release_health"
+import {
+  ReleaseLandingReceipt,
+  ReleaseMergeLease,
+  observe_release_landing,
+  record_release_landing,
+  release_landing_admission,
+  release_merge_method,
+} from "./release_merge_lease"
 import { release_pr_watchdog_decision } from "./release_pr_watchdog"
 import { harn_release_readiness, required_harn_release_assets } from "./release_readiness"
 import {
@@ -68,6 +77,8 @@ pub type ReleaseWatchRuntimeAdapter = {
   replacement_prs?: fn(string, string, int) -> ReleaseWatchConnectorResult,
   verify_replacement?: fn(ReleaseWatchReceipt, dict) -> bool,
   enable_auto_merge?: fn(string, dict) -> ReleaseWatchConnectorResult,
+  landing?: fn(ReleaseWatchReceipt, dict) -> ReleaseLandingReceipt?,
+  landing_on_main?: fn(string) -> bool,
 }
 
 pub type ReleaseWatchRuntimeResult = {
@@ -202,6 +213,40 @@ fn default_watch_adapter(harness: Harness, repo: string) -> ReleaseWatchRuntimeA
       }
       return is_ok(verified)
     },
+    landing: fn(receipt, pr) {
+      const merge_method = release_merge_method(receipt.merge_lease_method)
+      if repo == "" || merge_method == nil {
+        return nil
+      }
+      const lease: ReleaseMergeLease = {
+        repo: receipt.slug,
+        base_branch: "main",
+        base_oid: receipt.pin_sha,
+        candidate_pr: receipt.merge_lease_candidate_pr,
+        candidate_head: receipt.publication.head_oid,
+        generation: receipt.merge_lease_generation,
+        tag: receipt.tag,
+        merge_method: merge_method,
+      }
+      return observe_release_landing(harness.process, repo, lease, pr)
+    },
+    landing_on_main: fn(oid) {
+      if repo == "" {
+        return false
+      }
+      const fetched = git_run(
+        harness.process,
+        ["fetch", "--no-tags", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+        {repo: repo},
+      )
+      return fetched.success
+        && git_run(
+          harness.process,
+          ["merge-base", "--is-ancestor", oid, "origin/main"],
+          {repo: repo},
+        ).exit_code
+          == 0
+    },
   }
 }
 
@@ -261,20 +306,60 @@ fn collect_runs(adapter: any, receipt: ReleaseWatchReceipt, poll: int) -> list<d
 
 fn observe_release_pr_authority(adapter: any, receipt: ReleaseWatchReceipt) {
   if receipt.pr_url == "" {
-    return {action: "skip", reason: "missing_pull_request"}
+    return {watchdog: {action: "skip", reason: "missing_pull_request"}, landing: receipt.landing}
   }
   const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
   if is_err(probe) {
-    return {action: "skip", reason: "pull_request_probe_failed", error: unwrap_err(probe)}
+    return {
+      watchdog: {action: "skip", reason: "pull_request_probe_failed", error: unwrap_err(probe)},
+      landing: receipt.landing,
+    }
   }
-  const decision = release_pr_watchdog_decision(probe)
+  let landing = receipt.landing
+  const merged = (probe?.merged ?? false)
+    || lowercase(trim(to_string(probe?.github_state ?? ""))) == "merged"
+  if merged && receipt.merge_lease_generation != "" && landing == nil && adapter.landing != nil {
+    landing = adapter.landing(receipt, probe)
+  }
+  const landing_admission = if merged && receipt.merge_lease_generation == "" {
+    {valid: true, reason: "legacy watch receipt predates release merge leasing"}
+  } else if merged && adapter.landing_on_main != nil {
+    release_landing_admission(landing, adapter.landing_on_main)
+  } else {
+    nil
+  }
+  const decision = release_pr_watchdog_decision(probe, landing_admission)
   if decision.action != "skip" && receipt.release_commit_oid != ""
     && probe?.head?.sha != receipt.publication.head_oid {
     if adapter.verify_replacement == nil || !adapter.verify_replacement(receipt, probe) {
-      return {action: "blocked", reason: "replacement_release_pr_unverified"}
+      return {
+        watchdog: {action: "blocked", reason: "replacement_release_pr_unverified"},
+        landing: landing,
+      }
     }
   }
-  return decision
+  return {watchdog: decision, landing: landing}
+}
+
+fn persist_release_pr_authority(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  observed_at: string,
+  enabled: bool,
+) -> dict {
+  const authority = if enabled {
+    observe_release_pr_authority(adapter, receipt)
+  } else {
+    {watchdog: {action: "skip", reason: "pull_request_watchdog_disabled"}, landing: receipt.landing}
+  }
+  if authority.landing == nil || authority.landing == receipt.landing {
+    return {receipt: receipt, watchdog: authority.watchdog}
+  }
+  const persisted = record_release_landing(receipt, authority.landing, observed_at)
+  release_watch_receipt_write(harness, receipt_path, persisted)
+  return {receipt: persisted, watchdog: authority.watchdog}
 }
 
 /** Select one exact-version immutable replacement without trusting connector-side filtering. */
@@ -379,8 +464,14 @@ fn reconcile_replacement_release_pr(
     replacement.pull_request.url,
     observed_at,
   )
-  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, retargeted)
-  return {receipt: retargeted, watchdog: observe_release_pr_authority(adapter, retargeted)}
+  const authority = observe_release_pr_authority(adapter, retargeted)
+  const persisted = if authority.landing != nil && authority.landing != retargeted.landing {
+    record_release_landing(retargeted, authority.landing, observed_at)
+  } else {
+    retargeted
+  }
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, persisted)
+  return {receipt: persisted, watchdog: authority.watchdog}
 }
 
 fn readiness_observation(readiness: any, runs: any, observed_at: any) -> ReleaseWatchObservation {
@@ -640,11 +731,16 @@ pub fn run_release_watch(
   )
   while poll < max_polls {
     const observed_at = adapter.now(poll)
-    last_watchdog = if keep_pr_armed {
-      observe_release_pr_authority(adapter, receipt)
-    } else {
-      {action: "skip", reason: "pull_request_watchdog_disabled"}
-    }
+    const authority = persist_release_pr_authority(
+      {fs: harness.fs, random: harness.random},
+      adapter,
+      receipt,
+      receipt_path,
+      observed_at,
+      keep_pr_armed,
+    )
+    receipt = authority.receipt
+    last_watchdog = authority.watchdog
     const reconciliation = reconcile_replacement_release_pr(
       {fs: harness.fs, random: harness.random},
       adapter,
@@ -951,7 +1047,26 @@ pub fn mock_release_watch_adapter(receipt: ReleaseWatchReceipt) -> ReleaseWatchR
       auto_merge_armed: false,
       mergeable_state: "unknown",
       head: {sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      base: {ref: "main"},
     } },
+    landing: fn(current, pr) {
+      const merge_method = release_merge_method(current.merge_lease_method) ?? "squash"
+      const landing: ReleaseLandingReceipt = {
+        schema_version: "harn_bump_fleet.release_landing.v1",
+        tag_oid: current.publication.head_oid,
+        release_pr: current.merge_lease_candidate_pr,
+        merge_method: merge_method,
+        merge_commit_oid: if current.release_commit_oid == "" {
+          pr.merge_commit_oid
+        } else {
+          current.release_commit_oid
+        },
+        merged_tree_oid: "cccccccccccccccccccccccccccccccccccccccc",
+        candidate_tree_oid: "cccccccccccccccccccccccccccccccccccccccc",
+      }
+      return landing
+    },
+    landing_on_main: fn(_oid) { return true },
     enable_auto_merge: fn(_slug, _pr) { return {state: "enabled"} },
   }
 }

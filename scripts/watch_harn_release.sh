@@ -12,6 +12,7 @@ repo_root="$(cd -- "${script_dir}/.." && pwd)"
 target_repo="${HARN_EXT_RELEASE_REPO:-${HOME}/projects/harn}"
 
 hosted_run=0
+import_only=0
 import_args=()
 skip_import_value=0
 for arg in "$@"; do
@@ -21,6 +22,7 @@ for arg in "$@"; do
   fi
   case "$arg" in
     --hosted-run|--hosted-run=*) hosted_run=1 ;;
+    --import-hosted-receipt-only) import_only=1 ;;
     # The import process can only read and persist one hosted receipt. Do not
     # give it recovery modes or acknowledgements used by the later mutation
     # process. A separate-value recovery option owns its following commit.
@@ -46,6 +48,9 @@ if [ "$hosted_run" -eq 1 ]; then
     -- \
     --import-hosted-receipt-only \
     "${import_args[@]}"
+  if [ "$import_only" -eq 1 ]; then
+    exit 0
+  fi
 fi
 
 exec "${script_dir}/harn_confined.sh" \
