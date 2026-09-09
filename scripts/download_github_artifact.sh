@@ -25,7 +25,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if gh run download "$run_id" --name "$artifact" --dir "$destination" \
+selector=(--name "$artifact")
+if [[ "$artifact" == *'*'* || "$artifact" == *'?'* ]]; then
+  selector=(--pattern "$artifact")
+fi
+if gh run download "$run_id" "${selector[@]}" --dir "$destination" \
   >"$stdout_file" 2>"$stderr_file"; then
   exit 0
 else
