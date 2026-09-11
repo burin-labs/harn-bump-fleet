@@ -1,0 +1,284 @@
+#!/usr/bin/env harn
+//
+// The alarm for a bump pipeline that stops landing.
+//
+// Every other signal in this repository reports on a run that happened: a red
+// workflow, a receipt, a closed pull request. None of them fire when the
+// pipeline simply stops producing anything, which is how a consumer sat four
+// releases behind with two failed bump runs and nobody paged. This check asks
+// the only question that catches every one of those shapes at once — is each
+// consumer actually on the newest release — and files one issue per repository
+// that is not, closing it again when the pin catches up.
+import { ParserSpec } from "std/cli/argparse"
+import { GithubClientOptions } from "harn-github-connector/default"
+import { cli_options, is_exact_harn_release_tag } from "lib/cli_options"
+import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
+import { remote_pin } from "lib/fleet_convergence"
+import {
+  read_fleet_manifest,
+  resolve_harn_update_spec,
+  scoped_harn_pin_watch_repositories,
+  unwatched_repositories,
+} from "lib/fleet_manifest"
+import {
+  FleetStalenessSnapshot,
+  PinStalenessRow,
+  pin_staleness_verdict,
+  releases_behind,
+  stale_rows,
+  staleness_issue_body,
+  staleness_issue_marker,
+  staleness_issue_title,
+  undeclared_pin_rows,
+} from "lib/fleet_staleness"
+import {
+  github_connector_options,
+  github_file_text_at_ref,
+  github_issue_create,
+  github_issue_update,
+  github_latest_release_tag,
+  github_open_issues_with_label,
+  github_pr_list,
+  github_published_release_tags,
+} from "lib/github"
+import { development_cutover_verdict, workspace_version_from_manifest } from "lib/release_analysis"
+
+const HARN_REPO = "burin-labs/harn"
+
+const STALENESS_LABEL = "harn-pin-staleness"
+
+/** What the alarm did about one repository, and whether that succeeded. */
+pub type AlarmReconciliation = {ok: bool, action: string, detail: string}
+
+pub type PinStalenessOptions = {
+  target?: string,
+  only?: string,
+  max_releases_behind: string,
+  dry_run: bool,
+  run_url?: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-fleet-pin-staleness",
+  args: [
+    {kind: "positional", name: "target", required: false},
+    {kind: "flag", name: "only", long: "--only"},
+    {kind: "flag", name: "max_releases_behind", long: "--max-releases-behind", default: "1"},
+    {kind: "switch", name: "dry_run", long: "--dry-run"},
+    {kind: "flag", name: "run_url", long: "--run-url"},
+  ],
+}
+
+pub fn parse_pin_staleness_args(args: list<string>) -> PinStalenessOptions {
+  return cli_options<PinStalenessOptions>(ARG_SPEC, args, schema_of(PinStalenessOptions))
+}
+
+/**
+ * The threshold as a number, refusing anything that is not one.
+ *
+ * A flag arrives as text, and `to_int` answers `nil` for garbage. Letting that
+ * `nil` reach the comparison would make every consumer read as not-stale — an
+ * alarm silently disarmed by a typo is worse than no alarm at all.
+ */
+pub fn resolve_max_releases_behind(raw: string) -> int {
+  const parsed = to_int(trim(raw))
+  if parsed == nil || parsed < 0 {
+    throw "--max-releases-behind must be a non-negative integer, got '${raw}'"
+  }
+  return parsed
+}
+
+/**
+ * Reconcile one repository's alarm with what the check just observed.
+ *
+ * Kept separate from the surveying above so that a failure to file an issue is
+ * reported rather than swallowed: an alarm that cannot raise itself is the
+ * original defect wearing a new hat, so it fails the run.
+ */
+pub fn reconcile_alarm(
+  harness: Harness,
+  row: PinStalenessRow,
+  target: string,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> AlarmReconciliation {
+  const listed = github_open_issues_with_label(harness, row.slug, STALENESS_LABEL, client)
+  if is_err(listed) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(listed))}
+  }
+  const marker = staleness_issue_marker(row.slug)
+  const existing = unwrap(listed).filter({ issue -> contains(issue.body, marker) }).to_list()
+  const open_issue = if len(existing) == 0 {
+    nil
+  } else {
+    existing[0]
+  }
+  if !row.stale {
+    if open_issue == nil {
+      return {ok: true, action: "none", detail: "no alarm open"}
+    }
+    if options.dry_run {
+      return {ok: true, action: "would_close", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    const closed = github_issue_update(
+      harness,
+      row.slug,
+      open_issue.number,
+      {state: "closed", state_reason: "completed"},
+      client,
+    )
+    if is_err(closed) {
+      return {ok: false, action: "close_failed", detail: to_string(unwrap_err(closed))}
+    }
+    return {ok: true, action: "closed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  const body = staleness_issue_body(row, target, options.run_url)
+  if open_issue != nil {
+    if options.dry_run {
+      return {ok: true, action: "would_refresh", detail: "issue #${to_string(open_issue.number)}"}
+    }
+    const refreshed = github_issue_update(
+      harness,
+      row.slug,
+      open_issue.number,
+      {title: staleness_issue_title(row.slug, target), body: body},
+      client,
+    )
+    if is_err(refreshed) {
+      return {ok: false, action: "refresh_failed", detail: to_string(unwrap_err(refreshed))}
+    }
+    return {ok: true, action: "refreshed", detail: "issue #${to_string(open_issue.number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_open", detail: row.detail}
+  }
+  const created = github_issue_create(
+    harness,
+    row.slug,
+    staleness_issue_title(row.slug, target),
+    body,
+    [STALENESS_LABEL],
+    client,
+  )
+  if is_err(created) {
+    return {ok: false, action: "open_failed", detail: to_string(unwrap_err(created))}
+  }
+  return {ok: true, action: "opened", detail: row.detail}
+}
+
+pipeline main(harness: Harness) {
+  const options = parse_pin_staleness_args(argv)
+  const max_behind = resolve_max_releases_behind(options.max_releases_behind)
+  const target = options.target ?? github_latest_release_tag(harness, HARN_REPO)
+  if !is_exact_harn_release_tag(target) {
+    harness.stdio.eprintln("error: target must be an exact Harn tag, got '${target}'")
+    return 2
+  }
+  const tags = github_published_release_tags(harness, HARN_REPO)
+  if is_err(tags) {
+    harness.stdio.eprintln("error: could not list Harn releases: ${to_string(unwrap_err(tags))}")
+    return 1
+  }
+  const release_tags = unwrap(tags)
+  const cargo_manifest = github_file_text_at_ref(harness, HARN_REPO, "Cargo.toml", "main") ?? ""
+  const open_harn_prs = github_pr_list(
+    harness,
+    HARN_REPO,
+    {base: "main", state: "open", limit: 100},
+  )
+  if is_err(open_harn_prs) {
+    harness.stdio.eprintln(
+      "error: could not inspect post-release development pull requests: ${to_string(unwrap_err(open_harn_prs))}",
+    )
+    return 1
+  }
+  const development_cutover = development_cutover_verdict(
+    workspace_version_from_manifest(cargo_manifest),
+    unwrap(open_harn_prs).map({ pr -> pr.head.ref }).to_list(),
+  )
+  const manifest = read_fleet_manifest(harness.fs)
+  const repositories = hydrate_remote_consumer_repositories(
+    harness,
+    manifest,
+    scoped_harn_pin_watch_repositories(manifest, options.only),
+    manifest.fleet.default_branch,
+  )
+  if len(repositories) == 0 {
+    harness.stdio.eprintln("error: no watched Harn pin repository matched '${options.only ?? ""}'")
+    return 1
+  }
+  let rows = []
+  let alarms = []
+  let failed = false
+  for repo in repositories {
+    const update = resolve_harn_update_spec(manifest, repo, target)
+    const pin = remote_pin(harness, update)
+    const behind = releases_behind(pin, release_tags)
+    const budget = repo.bump_max_releases_behind ?? max_behind
+    const verdict = pin_staleness_verdict(pin, target, behind, budget)
+    const row: PinStalenessRow = verdict
+      + {
+        slug: repo.slug,
+        pin: pin,
+        max_releases_behind: budget,
+        update_workflow: update.workflow_path,
+        update_branch: update.branch,
+      }
+    rows = rows + [row]
+    const reconciled = reconcile_alarm(harness, row, target, options)
+    if !reconciled.ok {
+      failed = true
+    }
+    alarms = alarms
+      + [{repo: repo.slug, action: reconciled.action, ok: reconciled.ok, detail: reconciled.detail}]
+  }
+  const undeclared = if options.only == nil {
+    undeclared_pin_rows(
+      unwatched_repositories(manifest).map(
+        { repo ->
+          {
+            slug: repo.slug,
+            pin_text: github_file_text_at_ref(
+              harness,
+              repo.slug,
+              ".harn-version",
+              manifest.fleet.default_branch,
+            ),
+          }
+        },
+      )
+        .to_list(),
+    )
+  } else {
+    []
+  }
+  const stale = stale_rows(rows)
+  const snapshot: FleetStalenessSnapshot = {
+    schema_version: "harn_bump_fleet.pin_staleness.v1",
+    target: target,
+    max_releases_behind: max_behind,
+    stale_count: len(stale),
+    development_cutover: development_cutover,
+    repositories: rows,
+  }
+  harness.stdio.println(
+    json_stringify_pretty(snapshot + {alarms: alarms, undeclared_pins: undeclared}),
+  )
+  for row in stale {
+    harness.stdio.eprintln("STALE ${row.slug}: ${row.detail}")
+  }
+  if development_cutover.blocked {
+    harness.stdio.eprintln("STALE development cutover: ${development_cutover.detail}")
+  }
+  for row in undeclared {
+    harness.stdio.eprintln("UNDECLARED PIN ${row.slug}: ${row.detail}")
+  }
+  // A stale consumer is a real finding, so the run goes red on purpose: the
+  // filed issue is the durable signal, and this is what makes the schedule's
+  // own history readable at a glance.
+  return if failed || len(stale) > 0 || len(undeclared) > 0 || development_cutover.blocked {
+    1
+  } else {
+    0
+  }
+}

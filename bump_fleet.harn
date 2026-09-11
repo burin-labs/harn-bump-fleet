@@ -1,0 +1,1499 @@
+#!/usr/bin/env harn
+//
+// bump_fleet.harn — orchestrate Harn-version bump PRs across every repository
+// declared with `harn_bump = true` in fleet.toml.
+//
+// Determinism: every GitHub interaction uses the typed connector boundary. The
+// single LLM call at the end is a read-only summary against a local model — it
+// never drives any side-effect.
+//
+// Usage:
+//   harn run --no-sandbox bump_fleet.harn                      // bump to latest harn release
+//   harn run --no-sandbox bump_fleet.harn -- v0.7.52           // pin to explicit tag
+//   harn run --no-sandbox bump_fleet.harn -- --dry-run         // discover-only, no dispatch
+//   harn run --no-sandbox bump_fleet.harn -- --dry-run v0.7.52
+//   harn run --no-sandbox bump_fleet.harn -- --retry-failed 3  // re-dispatch dispatch_failed/run_failure
+//                                                              // repos up to 3 more times each
+import { agent_host_tools } from "std/agent/host_tools"
+import { agent_loop } from "std/agent/loop"
+import { agent_preset } from "std/agent/presets"
+import { changelog_find_section } from "std/changelog"
+import { command_run } from "std/command"
+import { env_str } from "std/config"
+import { strip_think_blocks } from "std/llm/safe"
+import { poll_until } from "std/poll"
+import { strip_v } from "std/semver"
+import { elapsed_ms, end_timing, start_timing, timed } from "std/timing"
+import { workflow_run_repair } from "std/workflow/repair"
+import { live_bump_adapter_admission } from "lib/bump_adapter_admission"
+import {
+  BumpDecisionPr,
+  BumpDecisionProbe,
+  dry_run_predispatch_outcome,
+  harn_pin_decision,
+  local_pin_drift_detail,
+  satisfied_main_pr_decision,
+} from "lib/bump_decision"
+pub import { FleetOptions, parse_fleet_args } from "lib/bump_fleet_cli"
+import { skipped_run_session_view_gate } from "lib/bump_fleet_cli"
+import { fleet_execution_phase } from "lib/bump_fleet_execution"
+import { fleet_finalization_phase } from "lib/bump_fleet_finalization"
+import {
+  FleetRepo,
+  bump_workflow_dispatch_probe,
+  fleet_pre_dispatch_phase,
+} from "lib/bump_fleet_pre_dispatch"
+import { local_harn_pin } from "lib/bump_pins"
+import {
+  bump_summary_format_ok,
+  bump_summary_problem_outcome,
+  bump_summary_result,
+  bump_summary_skipped,
+  bump_summary_span_status,
+  bump_summary_was_dispatched,
+} from "lib/bump_summary"
+import { dispatch_bump_workflow } from "lib/bump_workflow_dispatch"
+import {
+  chat_cfg_from_run_dir,
+  chat_enabled,
+  pick_recent_run,
+  resolve_chat_run_path,
+} from "lib/chat_runs"
+import { checkout_cleanup } from "lib/checkout_cleanup"
+import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
+import { fleet_summary_context } from "lib/context_projection"
+import {
+  FleetDispatchLineage,
+  fleet_dispatch_continuation_receipt,
+  fleet_dispatch_continuation_write,
+  fleet_dispatch_lineage,
+  fleet_dispatch_scope,
+} from "lib/fleet_dispatch_continuation"
+import {
+  HarnUpdateSpec,
+  read_fleet_manifest,
+  resolve_fleet_root,
+  resolve_harn_update_spec,
+  scoped_harn_bump_repositories,
+} from "lib/fleet_manifest"
+import {
+  ensure_update_auto_merge,
+  observe_update_prerequisites,
+  update_remote_pin,
+  update_remote_pin_probe,
+} from "lib/fleet_update_runtime"
+import { remote_url_to_slug } from "lib/git"
+import {
+  github_latest_release_tag,
+  github_pr_close,
+  github_pr_comment,
+  github_pr_list,
+  github_release_at_tag,
+} from "lib/github"
+import {
+  PlannerDefaults,
+  cost_budget_audit_line,
+  install_cost_budget,
+  planner_defaults,
+  retrying_llm_caller,
+} from "lib/llm_defaults"
+import { run_chat_loop } from "lib/post_run_chat"
+import {
+  PublicSurfaceAnalysis,
+  PublicSurfaceImpactReport,
+  PublicSurfaceRepo,
+  public_surface_impact_for_repo,
+  public_surface_impact_for_repos,
+  public_surface_impact_markdown,
+  public_surface_impact_report_from_surfaces,
+  public_surface_release_diff,
+} from "lib/public_surface_impact"
+import { harn_release_readiness, release_readiness_detail } from "lib/release_readiness"
+import { FleetAuditReceipt, FleetOutcomeReceipt, fleet_audit_report_write } from "lib/run_receipts"
+import {
+  RunSessionViewMarkdownGate,
+  run_session_view_downstream_markdown,
+  run_session_view_fleet_gate,
+} from "lib/run_session_view_gate"
+import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
+import { timing_artifacts } from "lib/timing_report"
+
+const HARN_REPO = "burin-labs/harn"
+
+const POLL_INTERVAL_MS = 15000
+
+const POST_RUN_SETTLE_MS = 90 * 1000
+
+const POST_RUN_SETTLE_POLL_MS = 5000
+
+const MAX_POLL_MS = 30 * 60 * 1000
+
+const PARALLEL_LIMIT = 4
+
+const RELEASE_READINESS_POLL_MS = 15 * 1000
+
+const RELEASE_READINESS_MAX_MS = 45 * 60 * 1000
+
+/**
+ * Keep summary and tool-capable chat routing aligned with release_harn.
+ * HARN_BUMP_FLEET_MODEL / HARN_BUMP_FLEET_PROVIDER override shared defaults.
+ */
+fn bump_fleet_planner(env: HarnessEnv) -> PlannerDefaults {
+  return planner_defaults(env, "HARN_BUMP_FLEET")
+}
+
+type BumpOutcomeBase = FleetOutcomeReceipt
+
+type BumpPullRequest = BumpDecisionPr & {head: {ref: string, sha: string, ...rest}, ...rest}
+
+type BumpClassification = {outcome: FleetOutcomeReceipt, pr: BumpPullRequest?}
+
+type PostDispatchSnapshot = {
+  settled: bool,
+  pr: BumpPullRequest?,
+  pr_probe: BumpDecisionProbe?,
+  remote_pin: string?,
+}
+
+type PublicSurfaceAnalysisResult = {status: string, detail: string, analysis: PublicSurfaceAnalysis}
+
+type AnnotationResult = {success: bool, detail: string}
+
+const BUMP_CHAT_ARGV_PREFIXES = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "branch"],
+  ["git", "rev-parse"],
+  ["gh", "pr", "list"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "list"],
+  ["gh", "run", "view"],
+  ["gh", "workflow", "list"],
+  ["gh", "workflow", "view"],
+  ["gh", "release", "list"],
+  ["gh", "release", "view"],
+  ["rg"],
+  ["grep"],
+  ["head"],
+  ["tail"],
+  ["cat"],
+  ["ls"],
+  ["test"],
+]
+
+fn bump_chat_tools(_harness: Harness, fs: HarnessFs) {
+  return agent_host_tools(
+    _harness,
+    nil,
+    {
+      root: fs.cwd(),
+      cwd: fs.cwd(),
+      max_inline_bytes: 12000,
+      read_bytes: 12000,
+      tail_bytes: 12000,
+      search_max_matches: 120,
+      exclude_globs: [".git/**", "target/**"],
+      allow_argv_prefixes: BUMP_CHAT_ARGV_PREFIXES,
+      names: {
+        read_file: "fleet_read",
+        read_file_tail: "fleet_read_tail",
+        search_files: "fleet_search",
+        git_inspect: "fleet_git",
+        run_command: "fleet_run",
+        read_command_output: "fleet_run_output",
+        read_command_output_tail: "fleet_run_tail",
+        edit_file: "fleet_edit_file",
+        write_file: "fleet_write_file",
+      },
+      descriptions: {
+        read_file:
+          "Read a UTF-8 file under the harn-bump-fleet repo by repo-relative path. Prefer bounded reads with limit_bytes.",
+        search_files:
+          "Search harn-bump-fleet repo contents. Provide a pattern; use path/glob only to narrow the search.",
+        git_inspect:
+          "Inspect git status, diff, log, show, blame, branches, or remotes without mutating the repo.",
+        run_command:
+          "Run one bounded read-only inspection command from the harn-bump-fleet repo. Pass argv as an array of strings.",
+        edit_file:
+          "Apply an exact-text edit to a tracked file in harn-bump-fleet. The operator authorized chat-side edits.",
+        write_file:
+          "Overwrite a tracked file in harn-bump-fleet. Prefer edit_file for small edits.",
+      },
+      output_format: "json",
+    },
+  )
+}
+
+fn bump_chat_only(harness: Harness, parsed: FleetOptions) {
+  const planner = bump_fleet_planner(harness.env)
+  if !chat_enabled({term: harness.term, env: harness.env}, parsed) {
+    harness.stdio.eprintln("--chat-only requires an interactive terminal (and HARN_EXT_CHAT != 0)")
+    return 2
+  }
+  const kind = "bump-fleet"
+  const target_dir = if trim(parsed.chat_run ?? "") != "" {
+    resolve_chat_run_path(harness.fs, kind, parsed.chat_run)
+  } else {
+    const pick = pick_recent_run(harness, {stdio: harness.stdio, fs: harness.fs}, kind, 12)
+    if pick == nil {
+      nil
+    } else {
+      pick.dir
+    }
+  }
+  if target_dir == nil {
+    harness.stdio.println("(no run selected; exiting)")
+    return 0
+  }
+  const chat_cfg = chat_cfg_from_run_dir(
+    harness.fs,
+    {
+      provider: planner.provider,
+      model: planner.model,
+      repo: harness.fs.cwd(),
+      mock: false,
+      timeout_s: parsed.chat_timeout_s,
+      tools: bump_chat_tools(harness, harness.fs),
+      no_chat: parsed.no_chat,
+    },
+    kind,
+    target_dir,
+  )
+  run_chat_loop(harness, chat_cfg)
+  return 0
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// Repo discovery is a checked projection of fleet.toml. A declared repository
+// that is absent, points at the wrong remote, or loses its dispatch adapter is
+// drift and stops the run instead of silently shrinking the fleet.
+
+// -------------------------------------------------------------------------------------------------
+
+fn discover_repos(
+  harness: Harness,
+  target: string,
+  configured_root: string? = nil,
+  only: string? = nil,
+  repositories_json: string? = nil,
+) {
+  const home = harness.env.get_or("HOME", "")
+  const manifest = read_fleet_manifest(harness.fs)
+  const projects = resolve_fleet_root(configured_root ?? manifest.fleet.default_root, home)
+  let out = []
+  const declared_repositories = scoped_harn_bump_repositories(manifest, only, repositories_json)
+  const repositories = hydrate_remote_consumer_repositories(
+    harness,
+    manifest,
+    declared_repositories,
+    manifest.fleet.default_branch,
+  )
+  for declared in repositories {
+    const update = resolve_harn_update_spec(manifest, declared, target)
+    const dir = path_join(projects, declared.directory)
+    const workflow = path_join(dir, update.workflow_path)
+    if !harness.fs.exists(path_join(dir, ".git")) {
+      throw "fleet repository ${declared.slug} is not checked out at ${dir}"
+    }
+    if !harness.fs.exists(workflow) {
+      throw "fleet repository ${declared.slug} is missing ${workflow}"
+    }
+    const dispatch_probe = bump_workflow_dispatch_probe(harness.fs.read_text(workflow))
+    if !dispatch_probe.ok {
+      throw "fleet repository ${declared.slug} bump workflow contract failed: ${dispatch_probe.reason}"
+    }
+    const slug_probe = harness.process.shell_at(dir, "git remote get-url origin 2>/dev/null")
+    if !slug_probe.success {
+      throw "could not read origin for fleet repository ${declared.slug}"
+    }
+    const slug = remote_url_to_slug(trim(slug_probe.stdout))
+    if slug != declared.slug {
+      throw "fleet repository ${declared.slug} checkout points at ${slug ?? "an invalid remote"}"
+    }
+    const common_dir_probe = harness.process.shell_at(
+      dir,
+      "git rev-parse --git-common-dir 2>/dev/null",
+    )
+    if !common_dir_probe.success {
+      throw "could not resolve git common dir for fleet repository ${declared.slug}"
+    }
+    const raw_common = trim(common_dir_probe.stdout)
+    const common = if starts_with(raw_common, "/") {
+      raw_common
+    } else {
+      "${dir}/${raw_common}"
+    }
+    out = out + [{dir: dir, slug: declared.slug, common_dir: common, update: update}]
+  }
+  return out
+}
+
+// Pre-pin readback — best-effort current version per repo, for the audit.
+
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Returns `{pin, evidence}` where `pin` is the bare "X.Y.Z" string with any
+ * leading "v" stripped, matching the canonical form of
+ * `read_remote_pin_probe_at_ref`. Keeping local and remote pins in the same
+ * shape avoids asymmetric audit rows and stops the read-only summary LLM from
+ * hallucinating drift over a cosmetic `v` prefix.
+ */
+
+// -------------------------------------------------------------------------------------------------
+
+// Per-repo bump pipeline. Dispatch the workflow, poll for completion, locate
+// the resulting PR, ensure auto-merge is enabled.
+
+// -------------------------------------------------------------------------------------------------
+
+fn base_outcome_fields(repo: FleetRepo, local_pin: string?, remote_pin: string?) {
+  const dir: string = repo.dir
+  const slug: string = repo.slug
+  const run_id: int? = nil
+  const run_url: string? = nil
+  const pr_number: int? = nil
+  const pr_url: string? = nil
+  const auto_merge: string? = nil
+  return {
+    dir: dir,
+    slug: slug,
+    run_id: run_id,
+    run_url: run_url,
+    pr_number: pr_number,
+    pr_url: pr_url,
+    pre_pin: local_pin ?? remote_pin,
+    local_pin: local_pin,
+    remote_pin: remote_pin,
+    auto_merge: auto_merge,
+    duration_ms: 0,
+  }
+}
+
+fn make_outcome(repo: FleetRepo, local_pin: string?, remote_pin: string?) {
+  return base_outcome_fields(repo, local_pin, remote_pin) + {status: "pending", detail: ""}
+}
+
+fn timed_bump_phase(clock: HarnessClock, name: string, attrs: dict, callback: fn() -> any) {
+  const handle = start_timing(clock, name, attrs)
+  try {
+    const outcome = callback()
+    end_timing(
+      clock,
+      handle,
+      {status: bump_summary_span_status(outcome), outcome: outcome.status ?? ""},
+    )
+    return outcome
+  } catch (e) {
+    end_timing(clock, handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
+fn timed_bump_outcome(clock: HarnessClock, name: string, attrs: dict, callback: fn() -> any) {
+  const handle = start_timing(clock, name, attrs)
+  try {
+    const outcome = callback()
+    const timing = end_timing(
+      clock,
+      handle,
+      {status: bump_summary_span_status(outcome), outcome: outcome.status ?? ""},
+    )
+    return outcome + {duration_ms: timing.duration_ms}
+  } catch (e) {
+    end_timing(clock, handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
+fn local_harn_changelog_section(tools: HarnessTools, target: string, harn_repo: string) {
+  const result = command_run(
+    tools,
+    {
+      argv: ["git", "show", "${target}:CHANGELOG.md"],
+      cwd: harn_repo,
+      capture: {max_inline_bytes: 256000},
+    },
+    {timeout_ms: 30000},
+  )
+  if !(result?.success ?? false) {
+    return {
+      status: "local_changelog_unavailable",
+      detail: trim(to_string(result?.stderr ?? result?.stdout ?? "git show failed")),
+      body: "",
+    }
+  }
+  const section = changelog_find_section(result.stdout ?? "", target)
+  const body = is_ok(section) ? unwrap(section).body : ""
+  if trim(body) == "" {
+    return {
+      status: "local_changelog_section_missing",
+      detail: "CHANGELOG.md at ${target} did not contain a ## ${target} section",
+      body: "",
+    }
+  }
+  return {status: "local_tag_changelog", detail: "CHANGELOG.md section at ${target}", body: body}
+}
+
+fn release_public_surface_analysis(
+  harness: Harness,
+  target: string,
+  harn_repo: string,
+) -> PublicSurfaceAnalysisResult {
+  const empty = {
+    changelog_section: "",
+    changelog_unreleased_section: "",
+    diff_names: "",
+    commit_file_changes_since_latest_tag: "",
+    commit_stats_since_latest_tag: "",
+    public_surface_diff: "",
+  }
+  let evidence_parts = []
+  let source_statuses = []
+  let source_details = []
+  const local_changelog = local_harn_changelog_section(harness.tools, target, harn_repo)
+  if trim(local_changelog.body) != "" {
+    evidence_parts = evidence_parts + [local_changelog.body]
+    source_statuses = source_statuses + [local_changelog.status]
+    source_details = source_details + [local_changelog.detail]
+  }
+  const release_diff = public_surface_release_diff(harness.tools, target, harn_repo)
+  if release_diff.known {
+    source_statuses = source_statuses + [release_diff.status]
+    source_details = source_details + [release_diff.detail]
+  } else {
+    source_details = source_details + ["Git release diff unavailable: " + release_diff.detail]
+  }
+  const lookup = try {
+    github_release_at_tag(harness, HARN_REPO, target)
+  } catch (e) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_lookup_failed"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(source_details + ["GitHub release lookup failed: " + to_string(e)], "; "),
+      analysis: {
+        ...empty,
+        changelog_section: join(evidence_parts, "\n\n"),
+        public_surface_diff: release_diff.patch,
+      },
+    }
+  }
+  if is_err(lookup) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_lookup_failed"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(
+        source_details + ["GitHub release lookup failed: " + to_string(unwrap_err(lookup))],
+        "; ",
+      ),
+      analysis: {
+        ...empty,
+        changelog_section: join(evidence_parts, "\n\n"),
+        public_surface_diff: release_diff.patch,
+      },
+    }
+  }
+  const found = unwrap(lookup)
+  if !(found?.found ?? false) {
+    return {
+      status: if len(source_statuses) == 0 {
+        "release_not_found"
+      } else {
+        join(source_statuses, "+")
+      },
+      detail: join(source_details + ["GitHub release ${target} was not found"], "; "),
+      analysis: {
+        ...empty,
+        changelog_section: join(evidence_parts, "\n\n"),
+        public_surface_diff: release_diff.patch,
+      },
+    }
+  }
+  const release = found.release ?? {}
+  if trim(release.body ?? "") != "" {
+    evidence_parts = evidence_parts + [release.body]
+    source_statuses = source_statuses + ["github_release_notes"]
+    source_details = source_details + ["GitHub release body for ${target}"]
+  }
+  return {
+    status: if len(source_statuses) == 0 {
+      "release_notes_empty"
+    } else {
+      join(source_statuses, "+")
+    },
+    detail: if len(source_details) == 0 {
+      "no changelog or release-note evidence found for ${target}"
+    } else {
+      join(source_details, "; ")
+    },
+    analysis: {
+      ...empty,
+      changelog_section: join(evidence_parts, "\n\n"),
+      public_surface_diff: release_diff.patch,
+    },
+  }
+}
+
+fn public_surface_impact_scan(
+  harness: Harness,
+  target: string,
+  repos: list<PublicSurfaceRepo>,
+  harn_repo: string,
+) -> PublicSurfaceImpactReport {
+  const source = release_public_surface_analysis(harness, target, harn_repo)
+  const base = public_surface_impact_for_repos(harness.fs, target, source.analysis, repos)
+  return public_surface_impact_report_from_surfaces(
+    target,
+    base.surfaces,
+    base.affected_repos,
+    source.status,
+    source.detail,
+  )
+}
+
+fn skipped_public_surface_impact(target: string, reason: string) -> PublicSurfaceImpactReport {
+  return public_surface_impact_report_from_surfaces(target, [], [], "skipped", reason)
+}
+
+fn annotate_bump_pr_with_view_metadata(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  target: string,
+  view_gate: RunSessionViewMarkdownGate,
+  public_surface_impact: PublicSurfaceImpactReport,
+) -> AnnotationResult {
+  const repo_impact = public_surface_impact_for_repo(public_surface_impact, slug)
+  const body = run_session_view_downstream_markdown(target, view_gate)
+    + "\n\n"
+    + public_surface_impact_markdown(target, repo_impact)
+  const result = github_pr_comment(harness, slug, pr_number, body)
+  return if is_err(result) {
+    {success: false, detail: "metadata comment failed: " + to_string(unwrap_err(result))}
+  } else {
+    {success: true, detail: "run/session view and public-surface metadata comment posted"}
+  }
+}
+
+fn close_stale_pr(
+  harness: Harness,
+  slug: string,
+  pr: BumpPullRequest?,
+  target: string,
+  evidence: string,
+) -> string {
+  if pr == nil {
+    return "failed to close stale PR: pull request disappeared before close"
+  }
+  const msg =
+    "Closing stale Harn runtime bump PR: this fleet run targets ${target}, but ${evidence}."
+  const result = github_pr_close(harness, slug, pr.number, msg)
+  return if result.ok {
+    "closed stale PR #${pr.number}"
+  } else {
+    "failed to close stale PR #${pr.number}: " + to_string(result.error)
+  }
+}
+
+fn finish_outcome(base: any, fields: dict) {
+  return base + fields
+}
+
+fn already_current_outcome(
+  base: BumpOutcomeBase,
+  remote_pin: string?,
+  existing_pr: BumpPullRequest?,
+  detail: string,
+  stale_note: string = "",
+) -> FleetOutcomeReceipt {
+  const pr_n = if existing_pr == nil {
+    nil
+  } else {
+    existing_pr.number
+  }
+  const pr_u = if existing_pr == nil {
+    nil
+  } else {
+    existing_pr.url
+  }
+  return finish_outcome(
+    base,
+    {
+      status: "already_current",
+      detail: detail
+        + local_pin_drift_detail(base.local_pin, remote_pin)
+        + stale_note,
+      pr_number: pr_n,
+      pr_url: pr_u,
+    },
+  )
+}
+
+fn targeted_pr_outcome(
+  harness: Harness,
+  base: BumpOutcomeBase,
+  repo: FleetRepo,
+  target: string,
+  pr: BumpPullRequest,
+  view_gate: RunSessionViewMarkdownGate,
+  public_surface_impact: PublicSurfaceImpactReport,
+) -> FleetOutcomeReceipt {
+  const annotated = annotate_bump_pr_with_view_metadata(
+    harness,
+    repo.slug,
+    pr.number,
+    target,
+    view_gate,
+    public_surface_impact,
+  )
+  if !annotated.success {
+    return finish_outcome(
+      base,
+      {
+        status: "pr_open_for_target_schema_metadata_failed",
+        detail: "PR #${pr.number} already targets ${target}; " + annotated.detail,
+        pr_number: pr.number,
+        pr_url: pr.url,
+        auto_merge: nil,
+      },
+    )
+  }
+  const am = ensure_update_auto_merge(
+    harness,
+    repo.update,
+    {number: pr.number, auto_merge_armed: pr.auto_merge_armed, head: {sha: pr.head.sha}},
+  )
+  const final_status = if starts_with(am, "failed") {
+    "pr_open_for_target_auto_merge_failed"
+  } else {
+    "pr_open_for_target"
+  }
+  return finish_outcome(
+    base,
+    {
+      status: final_status,
+      detail: "PR #${pr.number} already targets ${target}; " + annotated.detail
+        + "; auto-merge: ${am}",
+      pr_number: pr.number,
+      pr_url: pr.url,
+      auto_merge: am,
+    },
+  )
+}
+
+fn predispatch_resolution(
+  harness: Harness,
+  repo: FleetRepo,
+  base: BumpOutcomeBase,
+  target: string,
+  target_no_v: string,
+  remote_pin: string?,
+  view_gate: RunSessionViewMarkdownGate,
+  public_surface_impact: PublicSurfaceImpactReport,
+) {
+  const existing_pr = find_existing_pr(harness, repo.update)
+  const existing_probe = if existing_pr == nil {
+    nil
+  } else {
+    pr_target_probe(harness, repo.update, existing_pr, target)
+  }
+  const remote_decision = if remote_pin == nil {
+    nil
+  } else {
+    harn_pin_decision(remote_pin, target_no_v)
+  }
+  if remote_decision != nil && !remote_decision.ok {
+    return {
+      done: true,
+      stale_note: "",
+      outcome: finish_outcome(
+        base,
+        {
+          status: "remote_pin_invalid",
+          detail: "cannot compare remote main pin with ${target}: ${remote_decision.detail}",
+        },
+      ),
+    }
+  }
+  if remote_decision?.satisfies_target ?? false {
+    const pr_decision = if existing_pr == nil {
+      nil
+    } else {
+      satisfied_main_pr_decision(remote_pin ?? "", existing_probe?.pin)
+    }
+    if pr_decision?.action == "refuse" {
+      return {
+        done: true,
+        stale_note: "",
+        outcome: finish_outcome(
+          base,
+          {
+            status: "bump_pr_pin_invalid",
+            detail: pr_decision?.detail ?? "open bump PR pin could not be compared with main",
+            pr_number: existing_pr?.number,
+            pr_url: existing_pr?.url,
+          },
+        ),
+      }
+    }
+    const closed = if pr_decision?.action != "close" {
+      ""
+    } else {
+      close_stale_pr(
+        harness,
+        repo.slug,
+        existing_pr,
+        target,
+        "remote main already satisfies the target; ${pr_decision?.detail}",
+      )
+    }
+    if starts_with(closed, "failed") {
+      return {
+        done: true,
+        stale_note: "",
+        outcome: finish_outcome(
+          base,
+          {
+            status: "stale_pr_close_failed",
+            detail: closed,
+            pr_number: existing_pr.number,
+            pr_url: existing_pr.url,
+          },
+        ),
+      }
+    }
+    return {
+      done: true,
+      outcome: already_current_outcome(
+        base,
+        remote_pin,
+        existing_pr,
+        remote_decision?.detail ?? "remote main satisfies target",
+        if closed == "" {
+          if pr_decision?.action == "preserve" {
+            "; preserved forward bump PR #${existing_pr?.number}: ${pr_decision?.detail}"
+          } else {
+            ""
+          }
+        } else {
+          "; ${closed}"
+        },
+      ),
+      stale_note: "",
+    }
+  }
+  if existing_pr != nil && existing_probe.matches {
+    return {
+      done: true,
+      outcome: targeted_pr_outcome(
+        harness,
+        base,
+        repo,
+        target,
+        existing_pr,
+        view_gate,
+        public_surface_impact,
+      ),
+      stale_note: "",
+    }
+  }
+  if existing_pr != nil {
+    const closed = close_stale_pr(harness, repo.slug, existing_pr, target, existing_probe.evidence)
+    if starts_with(closed, "failed") {
+      return {
+        done: true,
+        stale_note: "",
+        outcome: finish_outcome(
+          base,
+          {
+            status: "stale_pr_close_failed",
+            detail: closed,
+            pr_number: existing_pr.number,
+            pr_url: existing_pr.url,
+          },
+        ),
+      }
+    }
+    return {done: false, outcome: nil, stale_note: closed + "; "}
+  }
+  return {done: false, outcome: nil, stale_note: ""}
+}
+
+fn classify_post_dispatch(
+  harness: Harness,
+  repo: FleetRepo,
+  target: string,
+  target_no_v: string,
+  run_outcome: FleetOutcomeReceipt,
+  stale_note: string,
+) {
+  const post = wait_for_post_dispatch_state(harness, repo.update, target)
+  const pr = post.pr
+  const post_remote = post.remote_pin
+  const outcome = if pr == nil {
+    const same = post_remote != nil && post_remote == target_no_v
+    const remote_label = post_remote ?? "unknown"
+    {
+      ...run_outcome,
+      status: if run_outcome.status == "run_success" && same {
+        "already_current_post_run"
+      } else if run_outcome.status == "run_success" {
+        "run_success_no_target_change"
+      } else {
+        run_outcome.status
+      },
+      detail: stale_note + "${run_outcome.detail}; no open PR"
+        + if same {
+          " (remote pin now ${post_remote}, matches target)"
+        } else {
+          " (remote pin ${remote_label} does not match target ${target_no_v})"
+        },
+    }
+  } else {
+    const probe = post.pr_probe
+    {
+      ...run_outcome,
+      pr_number: pr.number,
+      pr_url: pr.url,
+      status: if run_outcome.status == "run_success" && probe.matches {
+        "pr_open"
+      } else if run_outcome.status == "run_success" {
+        "stale_pr_after_run"
+      } else {
+        run_outcome.status
+      },
+      detail: stale_note
+        + "${run_outcome.detail}; PR #${pr.number} on ${pr.head.ref}; ${probe.evidence}",
+    }
+  }
+  return {outcome: outcome, pr: pr}
+}
+
+fn with_auto_merge(
+  harness: Harness,
+  repo: FleetRepo,
+  classified: BumpClassification,
+  target: string,
+  view_gate: RunSessionViewMarkdownGate,
+  public_surface_impact: PublicSurfaceImpactReport,
+) -> FleetOutcomeReceipt {
+  const with_pr = classified.outcome
+  const pr = classified.pr
+  if pr == nil || with_pr.status == "stale_pr_after_run" {
+    return with_pr
+  }
+  const annotated = annotate_bump_pr_with_view_metadata(
+    harness,
+    repo.slug,
+    pr.number,
+    target,
+    view_gate,
+    public_surface_impact,
+  )
+  if !annotated.success {
+    return {
+      ...with_pr,
+      status: "pr_open_schema_metadata_failed",
+      detail: "${with_pr.detail}; " + annotated.detail,
+      auto_merge: nil,
+    }
+  }
+  const am = ensure_update_auto_merge(
+    harness,
+    repo.update,
+    {number: pr.number, auto_merge_armed: pr.auto_merge_armed, head: {sha: pr.head.sha}},
+  )
+  const detail = if starts_with(am, "failed") {
+    "${with_pr.detail}; auto-merge: ${am}"
+  } else {
+    with_pr.detail
+  }
+  return {...with_pr, auto_merge: am, detail: detail}
+}
+
+fn bump_one(
+  harness: Harness,
+  repo: FleetRepo,
+  target: string,
+  dry_run: bool,
+  view_gate: RunSessionViewMarkdownGate,
+  public_surface_impact: PublicSurfaceImpactReport,
+  continuation_receipt: string,
+  continuation_lineage: FleetDispatchLineage?,
+) -> FleetOutcomeReceipt {
+  return timed_bump_outcome(
+    harness.clock,
+    "bump.repo",
+    {repo: repo.slug, dry_run: dry_run, target: strip_v(target)},
+    { ->
+      const pins = timed(
+        harness.clock,
+        "bump.repo.preflight",
+        {repo: repo.slug},
+        { ->
+          return {
+            remote_pin: update_remote_pin(harness, repo.update),
+            local_pin: local_harn_pin(harness.fs, repo.dir, repo.update.pin),
+          }
+        },
+      ).result
+      const remote_pin = pins.remote_pin
+      const local_pin = pins.local_pin
+      const base = make_outcome(repo, local_pin, remote_pin)
+      const target_no_v = strip_v(target)
+      if dry_run {
+        const existing_pr = find_existing_pr(harness, repo.update)
+        const existing_probe = if existing_pr == nil {
+          nil
+        } else {
+          pr_target_probe(harness, repo.update, existing_pr, target)
+        }
+        return dry_run_predispatch_outcome(
+          base,
+          target,
+          target_no_v,
+          remote_pin,
+          existing_pr,
+          existing_probe,
+        )
+      }
+      const pre = timed(
+        harness.clock,
+        "bump.repo.pre_dispatch_resolution",
+        {repo: repo.slug},
+        { ->
+          return predispatch_resolution(
+            harness,
+            repo,
+            base,
+            target,
+            target_no_v,
+            remote_pin,
+            view_gate,
+            public_surface_impact,
+          )
+        },
+      ).result
+      if pre.done {
+        return pre.outcome
+      }
+      const prerequisite_policy = if continuation_lineage == nil {
+        {kind: "bounded_wait", timeout_ms: MAX_POLL_MS, interval_ms: POLL_INTERVAL_MS}
+      } else {
+        {kind: "snapshot"}
+      }
+      const prerequisites = observe_update_prerequisites(
+        harness,
+        repo.update,
+        target,
+        prerequisite_policy,
+      )
+      if !prerequisites.ready {
+        return finish_outcome(
+          base,
+          {status: "prerequisite_updates_pending", detail: prerequisites.detail},
+        )
+      }
+      const admission = live_bump_adapter_admission(harness, repo.update)
+      if !admission.ok {
+        return finish_outcome(base, {status: admission.status, detail: admission.detail})
+      }
+      const run_outcome = timed_bump_phase(
+        harness.clock,
+        "bump.repo.dispatch_workflow",
+        {repo: repo.slug},
+        { ->
+          return dispatch_bump_workflow(
+            harness,
+            {
+              repo: repo,
+              base: base,
+              target: target,
+              continuation_receipt: continuation_receipt,
+              continuation_lineage: continuation_lineage,
+              poll_timeout_ms: MAX_POLL_MS,
+              poll_interval_ms: POLL_INTERVAL_MS,
+            },
+          )
+        },
+      )
+      if run_outcome.status == "run_in_progress" && trim(continuation_receipt) != "" {
+        return run_outcome
+      }
+      const classified = timed(
+        harness.clock,
+        "bump.repo.post_dispatch_verification",
+        {repo: repo.slug},
+        { ->
+          return classify_post_dispatch(
+            harness,
+            repo,
+            target,
+            target_no_v,
+            run_outcome,
+            pre.stale_note,
+          )
+        },
+      ).result
+      return timed_bump_phase(
+        harness.clock,
+        "bump.repo.auto_merge",
+        {repo: repo.slug},
+        { ->
+          return with_auto_merge(
+            harness,
+            repo,
+            classified,
+            target,
+            view_gate,
+            public_surface_impact,
+          )
+        },
+      )
+    },
+  )
+}
+
+fn pr_target_probe(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  pr: BumpPullRequest,
+  target: string,
+) -> BumpDecisionProbe {
+  const target_no_v = strip_v(target)
+  const probe = update_remote_pin_probe(harness, update, pr.head.sha)
+  const pin = probe.pin
+  if pin == nil {
+    return {matches: false, pin: nil, evidence: "PR head pin is unknown: ${probe.evidence}"}
+  }
+  return {
+    matches: pin == target_no_v,
+    pin: pin,
+    evidence: "PR head pin is ${pin}; target is ${target_no_v}; ${probe.evidence}",
+  }
+}
+
+fn find_existing_pr(harness: Harness, update: HarnUpdateSpec) -> BumpPullRequest? {
+  const prs = github_pr_list(
+    harness,
+    update.repository,
+    {head: update.branch, base: update.base_branch, state: "open", limit: 1},
+  )
+  if is_err(prs) {
+    throw "GitHub PR lookup failed for ${update.repository}: " + to_string(unwrap_err(prs))
+  }
+  const found = unwrap(prs)
+  if len(found) == 0 {
+    return nil
+  }
+  return found[0]
+}
+
+fn probe_post_dispatch_state(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+  target_no_v: string,
+) -> PostDispatchSnapshot {
+  const pr = find_existing_pr(harness, update)
+  const remote = update_remote_pin(harness, update)
+  const probe = if pr == nil {
+    nil
+  } else {
+    pr_target_probe(harness, update, pr, target)
+  }
+  const settled = (pr != nil && probe.matches)
+    || (pr == nil && remote != nil && remote == target_no_v)
+  return {settled: settled, pr: pr, pr_probe: probe, remote_pin: remote}
+}
+
+fn settled_post_dispatch_state(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+  target_no_v: string,
+) -> PostDispatchSnapshot? {
+  const snap = probe_post_dispatch_state(harness, update, target, target_no_v)
+  if snap.settled {
+    return snap
+  }
+  return nil
+}
+
+fn wait_for_post_dispatch_state(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+) -> PostDispatchSnapshot {
+  const target_no_v = strip_v(target)
+  const hit = poll_until(
+    harness.clock,
+    fn() { return settled_post_dispatch_state(harness, update, target, target_no_v) },
+    {timeout_ms: POST_RUN_SETTLE_MS, interval_ms: POST_RUN_SETTLE_POLL_MS},
+  )
+  if hit != nil {
+    return hit
+  }
+  return probe_post_dispatch_state(harness, update, target, target_no_v)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Audit & summary.
+// -------------------------------------------------------------------------------------------------
+
+fn render_local_prompt(fs: HarnessFs, name: string, data: dict) -> string {
+  return fs.render_template(fs.read_text("prompts/" + name), data)
+}
+
+fn write_audit(fs: HarnessFs, run_id: string, payload: FleetAuditReceipt) {
+  return fleet_audit_report_write(
+    fs,
+    path_join(fs.cwd(), ".harn-runs/bump-fleet", run_id),
+    payload,
+    fn(receipt, audit_sha) { return render_local_prompt(
+      fs,
+      "audit_report.harn.prompt",
+      {...receipt, audit_sha: audit_sha},
+    ) },
+  )
+}
+
+fn summarize_with_local_llm(root: Harness, fs: HarnessFs, payload: any) {
+  // Single-node validate -> repair on harn's canonical `workflow_run_repair`
+  // primitive instead of a hand-rolled two-attempt loop. The inline executor
+  // owns each attempt: attempt 1 asks for bullets straight off the audit JSON;
+  // any later attempt (fired only when `bump_summary_format_ok` rejected the
+  // prior text) re-prompts through the `bump_summary_retry` template. Returning
+  // a `"failed"` branch while the format check fails is what drives the
+  // primitive's retry, capped at `max_attempts: 2` — byte-identical to the old
+  // first/second ceiling. Each attempt stashes its text on the attempt record's
+  // `verification`, so we rebuild the exact `[first]` / `[first, second]` list
+  // `bump_summary_result` expects (it selects the first valid attempt, else the
+  // deterministic fallback, so a bad final attempt still fails open).
+  const system = render_local_prompt(fs, "bump_summary_system.harn.prompt", {})
+  const context_json = json_stringify(fleet_summary_context(payload))
+  const executor = { ctx ->
+    const attempt_prompt = if ctx.attempt <= 1 {
+      "Bounded fleet context:\n```json\n" + context_json + "\n```\nBullets:\n"
+    } else {
+      render_local_prompt(fs, "bump_summary_retry.harn.prompt", {context_json: context_json})
+    }
+    const text = llm_summary_once(
+      root,
+      attempt_prompt,
+      system,
+      "bump-fleet-summary-" + payload.run_id + "-" + to_string(ctx.attempt),
+    )
+    const ok = bump_summary_format_ok(text)
+    return {
+      text: text,
+      verification: {ok: ok, text: text},
+      branch: if ok {
+        nil
+      } else {
+        "failed"
+      },
+      outcome: "completed",
+    }
+  }
+  let out = workflow_run_repair(
+    root,
+    {task: "bump-fleet-summary", executor: executor, max_attempts: 2},
+  )
+  let texts = []
+  for {index: _index, value} in (out.run?.stages[0]?.attempts ?? []).enumerate() {
+    texts = texts + [value?.verification?.text]
+  }
+  return bump_summary_result(payload, texts)
+}
+
+fn llm_summary_once(
+  harness: Harness,
+  prompt: string,
+  system: string,
+  session_id: string,
+) -> string {
+  const planner = bump_fleet_planner(harness.env)
+  const r = try {
+    const opts = agent_preset(
+      harness,
+      "summary",
+      {
+        system: system,
+        provider: planner.provider,
+        model: planner.model,
+        max_tokens: 400,
+        temperature: 0.0,
+        llm_caller: retrying_llm_caller(harness, 2),
+        session_id: session_id,
+      },
+    )
+    const result = agent_loop(harness, prompt, opts?.system, opts)
+    try {
+      harness.agent.close(session_id, {reason: result?.status ?? "completed"})
+    } catch (_close_error) {
+      nil
+    }
+    result
+  } catch (e) {
+    try {
+      harness.agent.close(session_id, {reason: "error", detail: to_string(e)})
+    } catch (_close_error) {
+      nil
+    }
+    return "(local LLM summary unavailable: ${e})"
+  }
+  const raw = trim(r.visible_text ?? r.text ?? r.prose ?? "")
+  return strip_think_blocks(raw)
+}
+
+fn resolve_latest_release(harness: Harness) {
+  return github_latest_release_tag(harness, HARN_REPO)
+}
+
+fn wait_for_target_release_readiness(harness: Harness, target: string) {
+  const stop_at_ms = harness.clock.now_ms() + RELEASE_READINESS_MAX_MS
+  let attempt = 1
+  let last = nil
+  while harness.clock.now_ms() <= stop_at_ms {
+    const snapshot = harn_release_readiness(harness, target)
+    last = snapshot
+    if snapshot.ready {
+      return snapshot + {timed_out: false, attempts: attempt}
+    }
+    harness.stdio.println("   attempt ${attempt}: ${release_readiness_detail(snapshot)}")
+    const remaining_ms = stop_at_ms - harness.clock.now_ms()
+    if remaining_ms <= 0 {
+      break
+    }
+    harness.clock.sleep_ms(
+      if remaining_ms < RELEASE_READINESS_POLL_MS {
+        remaining_ms
+      } else {
+        RELEASE_READINESS_POLL_MS
+      },
+    )
+    attempt = attempt + 1
+  }
+  return (last ?? harn_release_readiness(harness, target))
+    + {timed_out: true, attempts: attempt}
+}
+
+fn restore_local_checkout_to_main(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  dry_run: bool,
+) {
+  if dry_run {
+    return nil
+  }
+  return checkout_cleanup(harness.process, nil, "main", harness.fs.cwd())
+}
+
+fn error_outcome_for_repo(fs: HarnessFs, repo: FleetRepo, message: string) -> FleetOutcomeReceipt {
+  return base_outcome_fields(repo, local_harn_pin(fs, repo.dir, repo.update.pin), nil)
+    + {status: "error", detail: message}
+}
+
+pipeline main(harness: Harness) {
+  const preflight = ensure_unrestricted_sandbox(
+    {stdio: harness.stdio, system: harness.system},
+    "bump_fleet.harn",
+  )
+  if preflight != nil {
+    return preflight
+  }
+  let parsed = parse_fleet_args(argv)
+  if trim(parsed.harn_repo) == "" {
+    parsed.harn_repo = path_join(env_str(harness.env, "HOME") ?? "", "projects/harn")
+  }
+  if parsed.chat_only {
+    return bump_chat_only(harness, parsed)
+  }
+  const planner = bump_fleet_planner(harness.env)
+  const pre = fleet_pre_dispatch_phase(
+    harness.stdio,
+    parsed,
+    planner.model,
+    {
+      resolve_target: fn() { return timed(
+        harness.clock,
+        "bump.resolve_target",
+        {},
+        { -> return resolve_latest_release(harness) },
+      ).result },
+      start_run: fn(target, mode) { return {
+        run_id: harness.random.uuid_v7(),
+        started_iso: harness.clock.date_iso(),
+        mode: mode,
+        run_timing: start_timing(harness.clock, "bump.run", {mode: mode, target: strip_v(target)}),
+      } },
+      install_cost_budget: fn() {
+        const limit = install_cost_budget(
+          {env: harness.env, llm: harness.llm},
+          "HARN_EXT_BUMP_FLEET_COST_LIMIT_USD",
+        )
+        return cost_budget_audit_line(limit)
+      },
+      discover_repos: fn(target) { return timed(
+        harness.clock,
+        "bump.discovery",
+        {},
+        { ->
+          return discover_repos(
+            harness,
+            target,
+            parsed.fleet_root,
+            parsed.only,
+            parsed.repositories_json,
+          )
+        },
+      ).result },
+      wait_for_readiness: fn(target) { return timed(
+        harness.clock,
+        "bump.release_readiness",
+        {target: strip_v(target)},
+        { -> return wait_for_target_release_readiness(harness, target) },
+      ).result },
+      readiness_detail: fn(readiness) { return release_readiness_detail(readiness) },
+      skipped_view_gate:
+        fn(target, reason) { return skipped_run_session_view_gate(target, reason) },
+      run_view_gate: fn(harn_repo, target) { return timed(
+        harness.clock,
+        "bump.run_session_view_gate",
+        {target: strip_v(target), harn_repo: harn_repo},
+        { -> return run_session_view_fleet_gate(harness, harn_repo, target) },
+      ).result },
+      skipped_public_surface_impact: fn(target, reason) { return skipped_public_surface_impact(
+        target,
+        reason,
+      ) },
+      scan_public_surface: fn(target, repos, harn_repo) { return timed(
+        harness.clock,
+        "bump.public_surface_impact",
+        {target: strip_v(target), repo_count: len(repos)},
+        { -> return public_surface_impact_scan(harness, target, repos, harn_repo) },
+      ).result },
+      finish_run: fn(timing, result) { return end_timing(harness.clock, timing, result) },
+      timing_artifacts: fn() { return timing_artifacts(harness.obs) },
+      now_iso: fn() { return harness.clock.date_iso() },
+      operator: fn() { return harness.system.identity().username },
+      host: fn() { return harness.system.identity().hostname ?? "" },
+      write_audit: fn(run_id, payload) { return write_audit(harness.fs, run_id, payload) },
+    },
+  )
+  if !pre.ready {
+    return pre.exit_code
+  }
+  const context = pre.context
+  const continuation_lineage = if trim(parsed.continuation_receipt) == "" {
+    nil
+  } else {
+    fleet_dispatch_lineage(
+      context.target,
+      parsed.chain_id,
+      fleet_dispatch_scope(parsed.only, parsed.repositories_json),
+      parsed.update_round,
+      parsed.controller_run_id,
+      parsed.controller_run_attempt,
+    )
+  }
+  const execution = fleet_execution_phase(
+    harness.stdio,
+    context,
+    PARALLEL_LIMIT,
+    parsed.retry_failed,
+    {
+      dry_run: parsed.dry_run,
+      run_repo: fn(repo, target, dry_run, view_gate, impact, _retry) { return bump_one(
+        harness,
+        repo,
+        target,
+        dry_run,
+        view_gate,
+        impact,
+        parsed.continuation_receipt,
+        continuation_lineage,
+      ) },
+      error_outcome: fn(repo, message) { return error_outcome_for_repo(harness.fs, repo, message) },
+      timed_dispatch: fn(attrs, callback) { return timed(
+        harness.clock,
+        "bump.dispatch_settle",
+        attrs,
+        callback,
+      ).result },
+      timed_retries: fn(attrs, callback) { return timed(
+        harness.clock,
+        "bump.retry_failed",
+        attrs,
+        callback,
+      ).result },
+    },
+  )
+  if continuation_lineage != nil {
+    fleet_dispatch_continuation_write(
+      {fs: harness.fs, random: harness.random},
+      parsed.continuation_receipt,
+      fleet_dispatch_continuation_receipt(
+        unwrap(continuation_lineage),
+        context.repos,
+        execution.outcomes,
+      ),
+    )
+  }
+  const finalized = fleet_finalization_phase(
+    harness.stdio,
+    context,
+    execution.outcomes,
+    parsed,
+    planner.model,
+    planner.provider,
+    {
+      now_iso: fn() { return harness.clock.date_iso() },
+      elapsed_ms: fn(timing) { return elapsed_ms(harness.clock, timing) },
+      operator: fn() { return harness.system.identity().username },
+      host: fn() { return harness.system.identity().hostname ?? "" },
+      dispatched: fn(status) { return bump_summary_was_dispatched(status) },
+      summarize: fn(payload, dry_run) { return timed(
+        harness.clock,
+        "bump.summary",
+        {mode: context.mode, skipped: dry_run},
+        { ->
+          return if dry_run {
+            bump_summary_skipped(payload, "(skipped on dry-run)")
+          } else {
+            summarize_with_local_llm(harness, harness.fs, {...payload, summary_text: ""})
+          }
+        },
+      ).result },
+      cleanup: fn(dry_run) { return timed(
+        harness.clock,
+        "bump.checkout_cleanup",
+        {skipped: dry_run},
+        { ->
+          return restore_local_checkout_to_main({fs: harness.fs, process: harness.process}, dry_run)
+        },
+      ).result },
+      problem: fn(outcome) { return bump_summary_problem_outcome(outcome) },
+      finish_run: fn(timing, result) { return end_timing(harness.clock, timing, result) },
+      timing_artifacts: fn() { return timing_artifacts(harness.obs) },
+      write_audit: fn(run_id, payload) { return write_audit(harness.fs, run_id, payload) },
+      chat_enabled:
+        fn(options) { return chat_enabled({term: harness.term, env: harness.env}, options) },
+      run_dir: fn(run_id) { return path_join(harness.fs.cwd(), ".harn-runs/bump-fleet", run_id) },
+      repo_root: fn() { return harness.fs.cwd() },
+      chat_tools: fn() { return bump_chat_tools(harness, harness.fs) },
+      run_chat: fn(config) { run_chat_loop(harness, config) },
+    },
+  )
+  return finalized.exit_code
+}

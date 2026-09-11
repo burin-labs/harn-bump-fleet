@@ -1,0 +1,860 @@
+import {
+  CommandResult,
+  command_output_text,
+  command_result_fail,
+  command_result_ok,
+} from "std/command"
+import { candidate_record_read_remote } from "./candidate_archive_certification"
+import {
+  CandidateArchiveGateConfig,
+  CandidateArchiveGateStartedEvent,
+  CandidateArchiveReceipt,
+  candidate_archive_receipt_matches,
+  candidate_archive_receipt_overwrite_allowed,
+  candidate_archive_receipt_path,
+  candidate_archive_receipt_read,
+  candidate_archive_receipt_write,
+} from "./candidate_archive_receipt"
+import {
+  CANDIDATE_ARCHIVE_POLICY_PATHS,
+  candidate_archive_artifacts_named,
+  candidate_archive_certified_run,
+  candidate_archive_manifest_artifact_name,
+  candidate_archive_policy_matches,
+  candidate_archive_reuse_decision,
+} from "./candidate_archive_reuse"
+import {
+  github_actions_run,
+  github_actions_run_jobs,
+  github_is_rate_limited_read_error,
+  github_is_transient_read_error,
+  github_workflow_dispatch,
+} from "./github"
+import {
+  pre_tag_binary_size_gate_step_contract,
+  pre_tag_binary_size_gate_workflow_path,
+  recorded_step,
+  release_candidate_archive_gate_config,
+} from "./release_execution"
+import { ReleasePublication } from "./release_publication"
+import { release_log_event, release_repo_slug, release_run_root, run_git } from "./release_runtime"
+import {
+  PreTagBinaryGateConfig,
+  PreTagBinaryGateJob,
+  pre_tag_binary_gate_verdict,
+} from "./workflow_runs"
+
+pub type CandidateArchiveGatePhase = "dispatch" | "inspect" | "complete"
+
+pub type CandidateArchiveGateResult = {
+  success: bool,
+  phase: CandidateArchiveGatePhase,
+  run_id?: int,
+  completion_timeout_ms?: int,
+  view_attempts?: int,
+  transient_view_retries?: int,
+  run_url: string,
+  message: string,
+}
+
+pub type CandidateArchiveGateEvent = {
+  success: bool,
+  phase: CandidateArchiveGatePhase,
+  run_id: int?,
+  completion_timeout_ms: int?,
+  view_attempts: int?,
+  transient_view_retries: int?,
+  run_url: string,
+  message: string,
+}
+
+pub type CandidateArchiveGateRun = {
+  id: int,
+  event: string,
+  head_branch: string,
+  head_sha: string,
+  status: string,
+  conclusion: string?,
+  url: string,
+}
+
+pub type CandidateArchiveGateDispatch = {
+  accepted: bool,
+  run_id: int,
+  url: string,
+  event: string,
+  head_branch: string,
+  head_sha: string,
+  reused?: bool,
+}
+
+pub type CandidateArchiveGateError = {code: string, message: string, ...rest}
+
+pub type CandidateArchiveGateDispatchResult = CandidateArchiveGateDispatch \
+  | Result<CandidateArchiveGateDispatch, CandidateArchiveGateError>
+
+pub type CandidateArchiveGateView = {run: CandidateArchiveGateRun, jobs: list<PreTagBinaryGateJob>}
+
+pub type CandidateArchiveGateAdapter = {
+  dispatch: fn(CandidateArchiveGateConfig) -> CandidateArchiveGateDispatchResult,
+  view_run: fn(int) -> Result<CandidateArchiveGateView, CandidateArchiveGateError>,
+  wait: fn(int) -> nil,
+}
+
+pub type CandidateArchiveGateStartedHandler = fn(CandidateArchiveGateStartedEvent) -> nil
+
+pub type CandidateArchiveReceiptReuseDecision = "reuse" | "dispatch_new" | "reject_ambiguous"
+
+const RELEASE_POLICY_BRANCH = "main"
+
+fn gate_result(
+  success: bool,
+  phase: CandidateArchiveGatePhase,
+  message: string,
+  run_id: any = nil,
+  run_url: any = "",
+  completion_timeout_ms: any = nil,
+  view_attempts: any = nil,
+  transient_view_retries: any = nil,
+) -> CandidateArchiveGateResult {
+  return {
+    success: success,
+    phase: phase,
+    run_id: run_id,
+    completion_timeout_ms: completion_timeout_ms,
+    view_attempts: view_attempts,
+    transient_view_retries: transient_view_retries,
+    run_url: run_url,
+    message: message,
+  }
+}
+
+pub fn candidate_archive_gate_failure(message: string) -> CandidateArchiveGateResult {
+  return gate_result(false, "dispatch", message)
+}
+
+pub fn candidate_archive_gate_command_result(result: CandidateArchiveGateResult) -> CommandResult {
+  if result.success {
+    return command_result_ok(result.message + "\n")
+  }
+  return command_result_fail(2, result.message)
+}
+
+pub fn candidate_archive_gate_event(
+  result: CandidateArchiveGateResult,
+) -> CandidateArchiveGateEvent {
+  return {
+    success: result.success,
+    phase: result.phase,
+    run_id: result.run_id,
+    completion_timeout_ms: result.completion_timeout_ms,
+    view_attempts: result.view_attempts,
+    transient_view_retries: result.transient_view_retries,
+    run_url: result.run_url,
+    message: result.message,
+  }
+}
+
+/**
+ * `effective_policy_sha` is the policy commit the observed run is required to
+ * carry. For a fresh dispatch that is the release's own policy head. For an
+ * adopted archive it is the head that run was dispatched under, whose archive
+ * policy was already proven byte-identical before adoption; asserting today's
+ * commit instead would refuse every reuse.
+ */
+fn candidate_archive_gate_verdict(
+  config: CandidateArchiveGateConfig,
+  run: CandidateArchiveGateRun,
+  jobs: list<PreTagBinaryGateJob>,
+  effective_policy_sha: string,
+) -> {action: string, message: string} {
+  const size_config: PreTagBinaryGateConfig = {
+    workflow: config.workflow,
+    event: config.event,
+    policy_ref: config.policy_ref,
+    expected_policy_sha: lowercase(trim(effective_policy_sha)),
+    source_ref: config.source_ref,
+    expected_source_sha: config.expected_source_sha,
+    target_job: config.target_job,
+    required_source_step: config.required_source_step,
+    required_fuse_step: config.required_fuse_step,
+    required_size_step: config.required_size_step,
+    benchmark_only: false,
+    runner_profile: config.runner_profile,
+    targets: config.targets,
+    completion_timeout_ms: config.completion_timeout_ms,
+    completion_interval_ms: config.completion_interval_ms,
+    transient_view_retry_max_attempts: config.transient_view_retry_max_attempts,
+    transient_view_retry_base_ms: config.transient_view_retry_base_ms,
+    transient_view_retry_cap_ms: config.transient_view_retry_cap_ms,
+  }
+  const verdict = pre_tag_binary_gate_verdict(size_config, run, jobs)
+  if verdict.action == "pass" {
+    return {
+      action: "pass",
+      message:
+        "run ${run.id} built candidate archives and cleared the Linux size gate for ${config.source_ref} at ${config.expected_source_sha} under policy ${config.policy_ref}@${lowercase(trim(effective_policy_sha))}",
+    }
+  }
+  return verdict
+}
+
+fn view_exact_run_with_transient_retry(
+  config: CandidateArchiveGateConfig,
+  adapter: any,
+  run_id: int,
+) {
+  const max_attempts = if config.transient_view_retry_max_attempts > 0 {
+    config.transient_view_retry_max_attempts
+  } else {
+    1
+  }
+  const base_delay_ms = if config.transient_view_retry_base_ms > 0 {
+    config.transient_view_retry_base_ms
+  } else {
+    1
+  }
+  const cap_delay_ms = if config.transient_view_retry_cap_ms >= base_delay_ms {
+    config.transient_view_retry_cap_ms
+  } else {
+    base_delay_ms
+  }
+  let attempts = 0
+  let delay_ms = base_delay_ms
+  let last_error = nil
+  while attempts < max_attempts {
+    const viewed = adapter.view_run(run_id)
+    attempts = attempts + 1
+    if !is_err(viewed) || !github_is_transient_read_error(unwrap_err(viewed)) {
+      return {viewed: viewed, attempts: attempts, transient_retries: attempts - 1}
+    }
+    last_error = unwrap_err(viewed)
+    if attempts < max_attempts {
+      adapter.wait(delay_ms)
+      delay_ms = min(delay_ms * 2, cap_delay_ms)
+    }
+  }
+  return {viewed: Err(last_error), attempts: attempts, transient_retries: attempts - 1}
+}
+
+fn candidate_archive_gate_started_event(config: CandidateArchiveGateConfig, dispatched: any) {
+  return {
+    workflow: config.workflow,
+    event: config.event,
+    policy_ref: config.policy_ref,
+    expected_policy_sha: config.expected_policy_sha,
+    source_ref: config.source_ref,
+    expected_source_sha: config.expected_source_sha,
+    target_job: config.target_job,
+    required_source_step: config.required_source_step,
+    required_fuse_step: config.required_fuse_step,
+    required_size_step: config.required_size_step,
+    candidate_only: config.candidate_only,
+    runner_profile: config.runner_profile,
+    targets: config.targets,
+    completion_timeout_ms: config.completion_timeout_ms,
+    completion_interval_ms: config.completion_interval_ms,
+    transient_view_retry_max_attempts: config.transient_view_retry_max_attempts,
+    transient_view_retry_base_ms: config.transient_view_retry_base_ms,
+    transient_view_retry_cap_ms: config.transient_view_retry_cap_ms,
+    run_id: dispatched.run_id,
+    run_url: dispatched.url,
+    observed_event: dispatched.event,
+    observed_head_branch: dispatched.head_branch,
+    observed_head_sha: dispatched.head_sha,
+    reused: dispatched.reused ?? false,
+    archive_digests: nil,
+  }
+}
+
+/** Decide whether a durable receipt may be reused or must refuse ambiguous active runs. */
+pub fn candidate_archive_receipt_reuse_decision(
+  prior: CandidateArchiveReceipt?,
+  slug: string,
+  config: CandidateArchiveGateConfig,
+  active_run_ids: list<int>,
+) -> CandidateArchiveReceiptReuseDecision {
+  if prior != nil && candidate_archive_receipt_matches(prior, slug, config) {
+    return "reuse"
+  }
+  if len(active_run_ids) > 1 {
+    return "reject_ambiguous"
+  }
+  if len(active_run_ids) == 1 && prior == nil {
+    return "reject_ambiguous"
+  }
+  return "dispatch_new"
+}
+
+pub type CandidateArchiveAdoption = {run_id: int, url: string, head_sha: string}
+
+/** Cross the dispatch boundary only when archive selection found no reusable run. */
+pub fn candidate_archive_dispatch_after_selection(
+  adoption: CandidateArchiveAdoption?,
+  gate: CandidateArchiveGateConfig,
+  dispatch: fn() -> Result<CandidateArchiveGateDispatch, CandidateArchiveGateError>,
+) -> Result<CandidateArchiveGateDispatch, CandidateArchiveGateError> {
+  if adoption != nil {
+    return Ok(
+      {
+        accepted: true,
+        run_id: adoption.run_id,
+        url: adoption.url,
+        event: gate.event,
+        head_branch: gate.policy_ref,
+        head_sha: adoption.head_sha,
+        reused: true,
+      },
+    )
+  }
+  return dispatch()
+}
+
+fn archive_policy_census(
+  io: {env: HarnessEnv, process: HarnessProcess},
+  cfg: any,
+  commit: string,
+) -> dict<string, string> {
+  let census: dict<string, string> = {}
+  if trim(commit) == "" {
+    return census
+  }
+  for path in CANDIDATE_ARCHIVE_POLICY_PATHS {
+    const shown = run_git(io, cfg, ["rev-parse", "${trim(commit)}:${path}"])
+    if shown.success {
+      const oid = candidate_archive_policy_oid(shown.stdout ?? "")
+      if oid != nil {
+        census[path] = oid
+      }
+    }
+  }
+  return census
+}
+
+/**
+ * Read one `rev-parse` line as a blob object id, or nil when it is anything
+ * else. `rev-parse` prints its diagnosis on success in some shapes, so the
+ * census keeps only output that is exactly an object id.
+ */
+pub fn candidate_archive_policy_oid(raw: string) -> string? {
+  const oid = lowercase(trim(raw))
+  return if len(regex_captures("^[0-9a-f]{40}$", oid)) == 1 {
+    oid
+  } else {
+    nil
+  }
+}
+
+/**
+ * Find the already-certified archive run for this exact candidate, if one
+ * exists and its binaries are still retrievable.
+ *
+ * `Ok(nil)` means the name was searched and nothing usable was found, which is
+ * the signal to build. A read failure is an `Err` and stops the gate: an
+ * unreadable artifact census must not be mistaken for "never built", because
+ * that mistake costs the release forty minutes of rebuild every time it
+ * happens silently.
+ */
+/** Select the durable candidate record, or this run's pre-certification receipt. */
+fn certified_archive_run(
+  fs: HarnessFs,
+  durable_receipt: CandidateArchiveReceipt?,
+  local_path: string,
+  slug: string,
+  gate: CandidateArchiveGateConfig,
+) -> Result<int, string> {
+  if durable_receipt != nil {
+    return candidate_archive_certified_run(
+      schema_expect(durable_receipt, schema_of(CandidateArchiveReceipt)),
+      slug,
+      gate,
+    )
+  }
+  const receipt = candidate_archive_receipt_read(fs, trim(local_path))
+  if receipt == nil {
+    return Ok(0)
+  }
+  return candidate_archive_certified_run(receipt ?? {}, slug, gate)
+}
+
+fn remote_certified_archive_run(
+  harness: Harness,
+  cfg: any,
+  slug: string,
+  gate: CandidateArchiveGateConfig,
+  receipt_path: string,
+) -> Result<CandidateArchiveAdoption?, CandidateArchiveGateError> {
+  const io = {env: harness.env, process: harness.process}
+  const durable = candidate_record_read_remote(io, cfg, gate.expected_source_sha)
+  if is_err(durable) && unwrap_err(durable).code != "missing" {
+    return Err(
+      {
+        code: "candidate_archive_receipt",
+        message: "could not authenticate durable candidate archive certification: "
+          + unwrap_err(durable).message,
+      },
+    )
+  }
+  const durable_receipt = if is_ok(durable) {
+    unwrap(durable).archive_receipt
+  } else {
+    nil
+  }
+  const certified = certified_archive_run(harness.fs, durable_receipt, receipt_path, slug, gate)
+  if is_err(certified) {
+    return Err({code: "candidate_archive_receipt", message: unwrap_err(certified)})
+  }
+  const expected_policy = archive_policy_census(io, cfg, gate.expected_policy_sha)
+  if len(expected_policy.keys().to_list()) != len(CANDIDATE_ARCHIVE_POLICY_PATHS) {
+    // Nothing to compare against, so nothing can be adopted. Build.
+    return Ok(nil)
+  }
+  const listed = candidate_archive_artifacts_named(
+    harness,
+    slug,
+    candidate_archive_manifest_artifact_name(gate.expected_source_sha),
+  )
+  if is_err(listed) {
+    return Err(
+      {
+        code: "archive_census_unreadable",
+        message: "could not read candidate archive artifacts for ${gate.expected_source_sha}: "
+          + to_string(unwrap_err(listed)),
+      },
+    )
+  }
+  let policy_cache: dict<string, bool> = {}
+  const decision = candidate_archive_reuse_decision(
+    unwrap(listed),
+    gate,
+    { head ->
+      const key = lowercase(trim(head))
+      if policy_cache[key] == nil {
+        policy_cache[key] = candidate_archive_policy_matches(
+          expected_policy,
+          archive_policy_census(io, cfg, key),
+        )
+      }
+      return policy_cache[key] ?? false
+    },
+    unwrap(certified),
+  )
+  if !cfg.mock {
+    harness.stdio.println("   candidate archive: ${decision.reason}")
+  }
+  if decision.action == "reject_ambiguous" {
+    return Err({code: "ambiguous_certified_archive", message: decision.reason})
+  }
+  if decision.action == "dispatch_new" {
+    return Ok(nil)
+  }
+  return Ok(
+    {
+      run_id: decision.run_id,
+      url: "https://github.com/${slug}/actions/runs/${to_string(decision.run_id)}",
+      head_sha: decision.run_head_sha,
+    },
+  )
+}
+
+pub fn run_candidate_archive_gate(
+  config: CandidateArchiveGateConfig,
+  adapter: CandidateArchiveGateAdapter,
+  on_started: CandidateArchiveGateStartedHandler? = nil,
+) -> CandidateArchiveGateResult {
+  const dispatched = adapter.dispatch(config)
+  if is_err(dispatched) {
+    return gate_result(false, "dispatch", to_string(unwrap_err(dispatched)))
+  }
+  const dispatch = unwrap(dispatched)
+  if on_started != nil {
+    on_started(candidate_archive_gate_started_event(config, dispatch))
+  }
+  const run_id = dispatch.run_id
+  const run_url = dispatch.url
+  // A reused run was dispatched under an earlier policy commit, by definition:
+  // it exists because a previous attempt built this candidate. Its policy
+  // identity was already proven by content before it was adopted, so asserting
+  // today's policy commit here would refuse every reuse and rebuild five
+  // platforms whenever main moved.
+  const reused = dispatch.reused ?? false
+  if !reused
+    && (dispatch.event != config.event || dispatch.head_branch != config.policy_ref
+      || lowercase(dispatch.head_sha)
+        != lowercase(config.expected_policy_sha)) {
+    return gate_result(
+      false,
+      "dispatch",
+      "dispatch policy identity ${run_id} was ${dispatch.event} on ${dispatch.head_branch} at ${dispatch.head_sha}; expected ${config.event} on ${config.policy_ref} at ${config.expected_policy_sha}",
+      run_id,
+      run_url,
+    )
+  }
+  if reused && (dispatch.event != config.event || dispatch.head_branch != config.policy_ref) {
+    return gate_result(
+      false,
+      "dispatch",
+      "reused archive run ${run_id} was ${dispatch.event} on ${dispatch.head_branch}; expected ${config.event} on ${config.policy_ref}",
+      run_id,
+      run_url,
+    )
+  }
+  const effective_policy_sha = if reused {
+    lowercase(trim(dispatch.head_sha))
+  } else {
+    lowercase(trim(config.expected_policy_sha))
+  }
+  let attempt = 0
+  let view_attempts = 0
+  let transient_view_retries = 0
+  const max_attempts = config.completion_timeout_ms / config.completion_interval_ms
+  while attempt < max_attempts {
+    const view = view_exact_run_with_transient_retry(config, adapter, run_id)
+    view_attempts = view_attempts + view.attempts
+    transient_view_retries = transient_view_retries + view.transient_retries
+    const viewed = view.viewed
+    if is_err(viewed) {
+      if github_is_rate_limited_read_error(unwrap_err(viewed)) {
+        transient_view_retries = transient_view_retries + 1
+        attempt = attempt + 1
+        if attempt < max_attempts {
+          adapter.wait(config.completion_interval_ms)
+        }
+        continue
+      }
+      const retry_suffix = if transient_view_retries > 0 {
+        " after ${transient_view_retries} transient status-read retries"
+      } else {
+        ""
+      }
+      return gate_result(
+        false,
+        "inspect",
+        to_string(unwrap_err(viewed)) + retry_suffix,
+        run_id,
+        run_url,
+        nil,
+        view_attempts,
+        transient_view_retries,
+      )
+    }
+    const verdict = candidate_archive_gate_verdict(
+      config,
+      unwrap(viewed).run,
+      unwrap(viewed).jobs,
+      effective_policy_sha,
+    )
+    if verdict.action == "pass" || verdict.action == "fail" {
+      const recovery_suffix = if transient_view_retries > 0 {
+        " after ${transient_view_retries} transient status-read retries"
+      } else {
+        ""
+      }
+      return gate_result(
+        verdict.action == "pass",
+        "complete",
+        verdict.message + recovery_suffix,
+        run_id,
+        run_url,
+        nil,
+        view_attempts,
+        transient_view_retries,
+      )
+    }
+    attempt = attempt + 1
+    if attempt < max_attempts {
+      adapter.wait(config.completion_interval_ms)
+    }
+  }
+  return gate_result(
+    false,
+    "complete",
+    "run ${run_id} did not complete within ${config.completion_timeout_ms}ms",
+    run_id,
+    run_url,
+    config.completion_timeout_ms,
+    view_attempts,
+    transient_view_retries,
+  )
+}
+
+fn release_policy_head(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+) -> Result<string, string> {
+  if cfg.mock {
+    return Ok(cfg.pin_sha)
+  }
+  const fetched = run_git(harness, cfg, ["fetch", "origin", "--quiet", RELEASE_POLICY_BRANCH])
+  if !fetched.success {
+    return Err(
+      "could not fetch current release policy from origin/${RELEASE_POLICY_BRANCH}: "
+        + trim(command_output_text(fetched)),
+    )
+  }
+  const resolved = run_git(harness, cfg, ["rev-parse", "origin/${RELEASE_POLICY_BRANCH}^{commit}"])
+  if !resolved.success {
+    return Err(
+      "could not resolve current release policy at origin/${RELEASE_POLICY_BRANCH}: "
+        + trim(command_output_text(resolved)),
+    )
+  }
+  const sha = lowercase(trim(resolved.stdout ?? ""))
+  if regex_match("^[0-9a-f]{40}$", sha) == nil {
+    return Err("origin/${RELEASE_POLICY_BRANCH} resolved to an invalid commit: ${sha}")
+  }
+  return Ok(sha)
+}
+
+pub type ReleaseCandidateArchiveGateResult = {steps: list<dict>, success: bool}
+
+/** Dispatch and poll the pre-tag candidate archive matrix for one immutable publication. */
+pub fn run_release_candidate_archive_gate(
+  harness: Harness,
+  cfg: dict,
+  publication: ReleasePublication,
+  steps: list<dict>,
+  run_id: string,
+) -> ReleaseCandidateArchiveGateResult {
+  const slug = if cfg.mock {
+    "burin-labs/harn"
+  } else {
+    release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  }
+  const result = if slug == "" {
+    candidate_archive_gate_failure("could not resolve the GitHub repository slug")
+  } else {
+    const policy_head = release_policy_head({env: harness.env, process: harness.process}, cfg)
+    if is_err(policy_head) {
+      candidate_archive_gate_failure(unwrap_err(policy_head))
+    } else {
+      const config = release_candidate_archive_gate_config(
+        RELEASE_POLICY_BRANCH,
+        unwrap(policy_head),
+        publication.remote_ref,
+        publication.head_oid,
+      )
+      const shown = if cfg.mock {
+        {success: true, stdout: ""}
+      } else {
+        run_git(
+          {env: harness.env, process: harness.process},
+          cfg,
+          ["show", "${unwrap(policy_head)}:${pre_tag_binary_size_gate_workflow_path()}"],
+        )
+      }
+      const contract = pre_tag_binary_size_gate_step_contract(
+        cfg.mock,
+        shown.success,
+        shown.stdout ?? "",
+        config,
+      )
+      if !contract.ok {
+        return {
+          steps: steps
+            + [
+              recorded_step(
+                "candidate-archive-and-size-gate",
+                "require SHA-matched five-target archives and Linux size proof",
+                candidate_archive_gate_command_result(
+                  candidate_archive_gate_failure(
+                    if contract.unreadable {
+                      "could not read ${pre_tag_binary_size_gate_workflow_path()} at ${unwrap(policy_head)}; refusing to dispatch an unverified candidate gate"
+                    } else {
+                      "${pre_tag_binary_size_gate_workflow_path()} at ${unwrap(policy_head)} does not define required candidate gate step(s): ${join(contract.missing, ", ")}"
+                    },
+                  ),
+                ),
+              ),
+            ],
+          success: false,
+        }
+      }
+      const adapter = if cfg.mock {
+        mock_candidate_archive_gate_adapter(config)
+      } else {
+        const receipt_path = candidate_archive_receipt_path(
+          release_run_root(harness.fs),
+          publication.head_oid,
+        )
+        {
+          dispatch: fn(gate) {
+            const prior = candidate_archive_receipt_read(harness.fs, receipt_path)
+            const remote = remote_certified_archive_run(harness, cfg, slug, gate, receipt_path)
+            if is_err(remote) {
+              return remote
+            }
+            const adopted = unwrap(remote)
+            return candidate_archive_dispatch_after_selection(
+              adopted,
+              gate,
+              fn() {
+                if !candidate_archive_receipt_overwrite_allowed(prior) {
+                  return Err(
+                    {
+                      code: "receipt_exists",
+                      message:
+                        "candidate archive receipt already exists at ${receipt_path} with a different run identity",
+                    },
+                  )
+                }
+                const dispatched = github_workflow_dispatch(
+                  harness,
+                  slug,
+                  gate.workflow,
+                  {
+                    candidate_only: gate.candidate_only,
+                    candidate_source_ref: gate.source_ref,
+                    candidate_source_sha: gate.expected_source_sha,
+                    runner_profile: gate.runner_profile,
+                    targets: gate.targets,
+                  },
+                  gate.policy_ref,
+                )
+                return if is_err(dispatched) {
+                  dispatched
+                } else {
+                  Ok(unwrap(dispatched) + {reused: false})
+                }
+              },
+            )
+          },
+          view_run: fn(action_run_id) {
+            const run = github_actions_run(harness, slug, action_run_id)
+            if is_err(run) {
+              return run
+            }
+            const observed = unwrap(run)
+            const jobs = github_actions_run_jobs(harness, slug, action_run_id)
+            if is_err(jobs) {
+              return jobs
+            }
+            return Ok(
+              {
+                run: {
+                  id: observed.id,
+                  event: observed.event,
+                  head_branch: observed.head_branch,
+                  head_sha: observed.head_sha,
+                  status: observed.status,
+                  conclusion: observed.conclusion,
+                  url: observed.url,
+                },
+                jobs: unwrap(jobs).jobs.map(
+                  { job ->
+                    return {
+                      name: job.name,
+                      status: job.status,
+                      conclusion: job.conclusion ?? "",
+                      steps: job.steps.map(
+                        { step ->
+                          return {
+                            name: step.name,
+                            status: step.status,
+                            conclusion: step.conclusion ?? "",
+                          }
+                        },
+                      )
+                        .to_list(),
+                    }
+                  },
+                )
+                  .to_list(),
+              },
+            )
+          },
+          wait: fn(ms) { harness.clock.sleep_ms(ms) },
+        }
+      }
+      run_candidate_archive_gate(
+        config,
+        adapter,
+        { started ->
+          const receipt_path = candidate_archive_receipt_path(
+            release_run_root(harness.fs),
+            publication.head_oid,
+          )
+          candidate_archive_receipt_write(
+            {fs: harness.fs, random: harness.random},
+            receipt_path,
+            slug,
+            started,
+            harness.clock.date_iso(),
+          )
+          if !cfg.mock {
+            harness.stdio.println("   candidate archive receipt: ${receipt_path}")
+          }
+          release_log_event(
+            {clock: harness.clock, fs: harness.fs},
+            run_id,
+            "candidate_archive_gate_started",
+            started + {receipt_path: receipt_path},
+          )
+          return nil
+        },
+      )
+    }
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "candidate_archive_gate",
+    candidate_archive_gate_event(result),
+  )
+  const gate: ReleaseCandidateArchiveGateResult = {
+    steps: steps
+      + [
+        recorded_step(
+          "candidate-archive-and-size-gate",
+          "require SHA-matched five-target archives and Linux size proof",
+          candidate_archive_gate_command_result(result),
+        ),
+      ],
+    success: result.success,
+  }
+  return gate
+}
+
+/** Deterministic successful adapter used by release_harn's mock rehearsal. */
+pub fn mock_candidate_archive_gate_adapter(
+  config: CandidateArchiveGateConfig,
+) -> CandidateArchiveGateAdapter {
+  const run_id = 702
+  return {
+    dispatch: fn(_config) { return {
+      accepted: true,
+      run_id: run_id,
+      url: "https://github.test/run/${run_id}",
+      event: config.event,
+      head_branch: config.policy_ref,
+      head_sha: config.expected_policy_sha,
+    } },
+    view_run: fn(_run_id) { return Ok(
+      {
+        run: {
+          id: run_id,
+          event: config.event,
+          head_branch: config.policy_ref,
+          head_sha: config.expected_policy_sha,
+          status: "completed",
+          conclusion: "success",
+          url: "https://github.test/run/${run_id}",
+        },
+        jobs: [
+          {
+            name: config.target_job,
+            status: "completed",
+            conclusion: "success",
+            steps: [
+              {name: config.required_source_step, status: "completed", conclusion: "success"},
+              {name: config.required_fuse_step, status: "completed", conclusion: "success"},
+              {name: config.required_size_step, status: "completed", conclusion: "success"},
+            ],
+          },
+        ],
+      },
+    ) },
+    wait: fn(_interval_ms) {
+    },
+  }
+}

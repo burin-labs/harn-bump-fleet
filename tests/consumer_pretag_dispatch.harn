@@ -1,0 +1,1463 @@
+import {
+  CONSUMER_PRETAG_DISPATCH_ATTEMPTS,
+  CONSUMER_PRETAG_GATE_POLICY,
+  ConsumerPretagGateAdapter,
+  ConsumerPretagGatePolicy,
+  ConsumerPretagRunRow,
+  consumer_pretag_dispatch_backoff_ms,
+  consumer_pretag_dispatch_is_retryable,
+  consumer_pretag_gate_policy,
+  derive_consumer_pretag_exclusions,
+  parse_consumer_pretag_proof_runs_json,
+  run_consumer_pretag_gates,
+} from "../lib/consumer_pretag_dispatch"
+import { ConsumerPretagGateTarget, consumer_pretag_gate_verdict } from "../lib/consumer_pretag_gate"
+
+const FAST: ConsumerPretagGatePolicy = {poll_interval_ms: 1, deadline_ms: 50}
+
+const REVISION = "1234567890abcdef1234567890abcdef12345678"
+
+const OTHER_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
+
+pipeline test_corrected_consumer_adopts_only_its_own_proof() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        runs: fn(_target) { return Ok(
+          [
+            row(11, "completed", "failure") + {head_sha: OTHER_REVISION},
+            row(12, "completed", "success"),
+          ],
+        ) },
+        dispatch: fn(_target) {
+          throw "existing corrected proof must be adopted"
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
+}
+
+pipeline test_two_runs_on_same_consumer_revision_are_ambiguous() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        runs: fn(_target) { return Ok(
+          [row(11, "completed", "failure"), row(12, "completed", "success")],
+        ) },
+        dispatch: fn(_target) {
+          throw "ambiguous proof must not dispatch"
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_missing_consumer_revision_refuses_before_dispatch() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        consumer_revision: fn(_target) { return Ok("") },
+        dispatch: fn(_target) {
+          throw "missing revision must not dispatch"
+        },
+        runs: fn(_target) {
+          throw "missing revision must not list"
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_candidate_run_without_revision_refuses_before_dispatch() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        runs: fn(_target) { return Ok([row(11, "completed", "success") + {head_sha: ""}]) },
+        dispatch: fn(_target) {
+          throw "unknown identity must not dispatch"
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_dispatch_preserves_captured_revision_and_records_drifted_run() {
+  let reads = 0
+  let recorded = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        consumer_revision: fn(_target) {
+          reads = reads + 1
+          return Ok(REVISION)
+        },
+        dispatch: fn(target) {
+          assert_eq(target.consumer_revision, REVISION)
+          return Ok({run_id: 22, head_sha: OTHER_REVISION})
+        },
+        run: fn(_target, _id) {
+          throw "drifted dispatch must not be polled as proof"
+        },
+      },
+    ),
+    FAST,
+    fn(_slug, id) { recorded = id },
+  )
+  assert_eq(reads, 1)
+  assert_eq(recorded, 22)
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "moved during dispatch"))
+}
+
+pipeline test_run_poll_cannot_replace_captured_consumer_revision() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "success") + {head_sha: OTHER_REVISION}]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_run_poll_refuses_wrong_run_or_candidate_identity() {
+  for changed in [
+    row(12, "completed", "success"),
+    row(11, "completed", "success", "Harn candidate v0.10.129 @ ${REVISION}"),
+  ] {
+    const receipts = run_consumer_pretag_gates([target()], adapter([changed]), FAST)
+    assert_eq(receipts[0]?.status, "unreadable")
+  }
+}
+
+fn target(slug: string = "owner/consumer") -> ConsumerPretagGateTarget {
+  return {
+    slug: slug,
+    workflow: "candidate-gate.yml",
+    version: "v0.10.130",
+    revision: REVISION,
+    inputs: {source_revision: REVISION},
+  }
+}
+
+fn job_target() -> ConsumerPretagGateTarget {
+  return target()
+    + {proof_job: {name: "Candidate product proof", step: "Exercise the candidate"}}
+}
+
+fn row(id: int, status: string, conclusion: string, title: string = "") -> ConsumerPretagRunRow {
+  return {
+    id: id,
+    head_sha: REVISION,
+    status: status,
+    conclusion: conclusion,
+    html_url: "https://runs.test/${to_string(id)}",
+    display_title: if title == "" {
+      "Harn candidate v0.10.130 @ ${REVISION}"
+    } else {
+      title
+    },
+  }
+}
+
+fn explicit_row(id: int, status: string, conclusion: string) -> ConsumerPretagRunRow {
+  return row(id, status, conclusion)
+    + {workflow_path: ".github/workflows/candidate-gate.yml", event: "workflow_dispatch"}
+}
+
+fn attestation() {
+  return {
+    run_id: 42,
+    proof_job_id: 102,
+    proof_step: "Run the harn-linked TUI suite against the candidate",
+    excluded_job_ids: [101, 104],
+    excluded_checks: ["clean/harness-ownership"],
+    baseline_run_id: 90,
+    baseline_job_id: 901,
+    baseline_workflow_path: ".github/workflows/ci.yml",
+  }
+}
+
+fn job(id: int, run_id: int, name: string, conclusion: string, head_sha: string = REVISION) {
+  return {
+    id: id,
+    run_id: run_id,
+    name: name,
+    status: "completed",
+    conclusion: conclusion,
+    head_sha: head_sha,
+    steps: [],
+  }
+}
+
+fn jobs_page(run_id: int, jobs: list<dict>, head_sha: string = REVISION) {
+  return {
+    repo: "owner/consumer",
+    run_id: run_id,
+    total_count: len(jobs),
+    jobs: jobs.map({ value -> value + {run_id: run_id, head_sha: head_sha} }).to_list(),
+  }
+}
+
+fn declared_proof_job(
+  id: int = 102,
+  status: string = "completed",
+  conclusion: string = "success",
+  step_status: string = "completed",
+  step_conclusion: string = "success",
+) {
+  return job(id, 11, "Candidate product proof", conclusion)
+    + {
+      status: status,
+      steps: [{name: "Exercise the candidate", status: step_status, conclusion: step_conclusion}],
+    }
+}
+
+pipeline test_declared_job_success_is_the_gate_and_other_jobs_are_advisory() {
+  const jobs = [
+    job(100, 11, "Setup", "success"),
+    declared_proof_job(),
+    job(103, 11, "Advisory rehearsal", "failure"),
+    job(104, 11, "Advisory report", "") + {status: "in_progress"},
+  ]
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "in_progress", "")],
+      {jobs: fn(_target, id) { return Ok(jobs_page(id, jobs)) }},
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.job_proof?.job?.id, 102)
+  assert_eq(receipts[0]?.job_proof?.job?.step, "Exercise the candidate")
+  assert_eq(len(receipts[0]?.job_proof?.advisory_jobs ?? []), 3)
+  assert_eq(receipts[0]?.job_proof?.advisory_jobs?.[1]?.conclusion, "failure")
+  assert_eq(receipts[0]?.job_proof?.advisory_jobs?.[2]?.status, "in_progress")
+}
+
+pipeline test_missing_duplicate_skipped_or_failed_declared_proof_refuses() {
+  const cases = [
+    {jobs: [], expected: "unreadable"},
+    {jobs: [job(100, 11, "Another job", "success")], expected: "unreadable"},
+    {
+      jobs: [declared_proof_job(102, "completed", "skipped", "completed", "skipped")],
+      expected: "unreadable",
+    },
+    {
+      jobs: [declared_proof_job(102, "completed", "failure", "completed", "failure")],
+      expected: "failed",
+    },
+    {
+      jobs: [declared_proof_job(102, "completed", "success", "completed", "skipped")],
+      expected: "unreadable",
+    },
+    {
+      jobs: [declared_proof_job(102, "completed", "success", "completed", "failure")],
+      expected: "failed",
+    },
+    {jobs: [declared_proof_job() + {steps: []}], expected: "unreadable"},
+    {
+      jobs: [
+        declared_proof_job()
+          + {
+            steps: [
+              {name: "Exercise the candidate", status: "completed", conclusion: "success"},
+              {name: "Exercise the candidate", status: "completed", conclusion: "success"},
+            ],
+          },
+      ],
+      expected: "unreadable",
+    },
+    {jobs: [declared_proof_job(102), declared_proof_job(103)], expected: "unreadable"},
+  ]
+  for candidate in cases {
+    const receipts = run_consumer_pretag_gates(
+      [job_target()],
+      adapter(
+        [row(11, "completed", "failure")],
+        {jobs: fn(_target, id) { return Ok(jobs_page(id, candidate.jobs)) }},
+      ),
+      FAST,
+    )
+    assert_eq(receipts[0]?.status, candidate.expected)
+    assert(!consumer_pretag_gate_verdict([job_target()], receipts).proven)
+  }
+}
+
+pipeline test_a_nonterminal_declared_proof_step_stays_unproven_at_the_deadline() {
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        jobs: fn(_target, id) { return Ok(
+          jobs_page(id, [declared_proof_job(102, "completed", "success", "in_progress", "")]),
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "declared-job proof"))
+  assert(!consumer_pretag_gate_verdict([job_target()], receipts).proven)
+}
+
+pipeline test_pending_declared_proof_polls_until_its_step_passes() {
+  let reads = 0
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "in_progress", "")],
+      {
+        jobs: fn(_target, id) {
+          reads = reads + 1
+          return Ok(
+            jobs_page(
+              id,
+              if reads == 1 {
+                [declared_proof_job(102, "in_progress", "", "in_progress", "")]
+              } else {
+                [declared_proof_job()]
+              },
+            ),
+          )
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(reads, 2)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_wrong_candidate_identity_refuses_before_reading_declared_job() {
+  let job_reads = 0
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "completed", "success", "Harn candidate v0.10.129 @ ${REVISION}")],
+      {
+        jobs: fn(_target, id) {
+          job_reads = job_reads + 1
+          return Ok(jobs_page(id, [declared_proof_job()]))
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(job_reads, 0)
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_incomplete_declared_job_census_refuses_the_proof() {
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        jobs:
+          fn(_target, id) { return Ok(jobs_page(id, [declared_proof_job()]) + {total_count: 2}) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "completely describe"))
+  assert(!consumer_pretag_gate_verdict([job_target()], receipts).proven)
+}
+
+pipeline test_incomplete_active_job_census_waits_for_terminal_proof() {
+  let job_reads = 0
+  let waits = 0
+  const receipts = run_consumer_pretag_gates(
+    [job_target()],
+    adapter(
+      [row(11, "in_progress", ""), row(11, "completed", "success")],
+      {
+        jobs: fn(_target, id) {
+          job_reads = job_reads + 1
+          return Ok(
+            if job_reads == 1 {
+              jobs_page(id, []) + {total_count: 1}
+            } else {
+              jobs_page(id, [declared_proof_job()])
+            },
+          )
+        },
+        wait: fn(ms) {
+          waits = waits + ms
+          return nil
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(job_reads, 2)
+  assert(waits > 0)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_explicit_run_input_is_closed_and_canonical() {
+  assert_eq(
+    parse_consumer_pretag_proof_runs_json("{\"z/repo\":22,\"a/repo\":11}"),
+    {"a/repo": 11, "z/repo": 22},
+  )
+  for invalid in ["[]", "{\"owner/repo\":0}", "{\"owner/repo\":\"11\"}", "{\"bad\":11}"] {
+    let failed = false
+    try {
+      let _ = parse_consumer_pretag_proof_runs_json(invalid)
+    } catch (_error) {
+      failed = true
+    }
+    assert(failed)
+  }
+  const recovered = parse_consumer_pretag_proof_runs_json(
+    "{\"owner/repo\":${json_stringify(attestation())}}",
+  )
+  assert_eq(recovered["owner/repo"], attestation())
+}
+
+pipeline test_one_baseline_backed_failure_can_be_attested_but_no_other_red_can() {
+  const run_reader = fn(_target, id) { return Ok(
+    if id == 42 {
+      explicit_row(42, "completed", "failure")
+    } else {
+      explicit_row(90, "completed", "failure")
+        + {
+          workflow_path: ".github/workflows/ci.yml",
+          event: "push",
+          head_branch: "main",
+          head_sha: OTHER_REVISION,
+        }
+    },
+  ) }
+  const candidate_jobs = [
+    job(100, 42, "Detect repin machinery changes", "success"),
+    job(101, 42, "Rehearse the Harn repin surface", "failure"),
+    job(102, 42, "Prove the candidate against the harn-linked TUI suite", "success")
+      + {
+        steps: [
+          {
+            name: "Run the harn-linked TUI suite against the candidate",
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
+      },
+    job(104, 42, "Harn repin rehearsal", "failure"),
+  ]
+  const adapter_with_jobs = fn(extra: list<dict>) { return adapter(
+    [],
+    {
+      run: run_reader,
+      jobs: fn(_target, id) { return Ok(
+        if id == 42 {
+          jobs_page(42, candidate_jobs + extra)
+        } else {
+          jobs_page(90, [job(901, 90, "Harn lint", "failure", OTHER_REVISION)], OTHER_REVISION)
+        },
+      ) },
+    },
+  ) }
+  const accepted = run_consumer_pretag_gates(
+    [target()],
+    adapter_with_jobs([]),
+    FAST,
+    nil,
+    {"owner/consumer": attestation()},
+  )
+  assert_eq(accepted[0]?.status, "passed")
+  assert_eq(accepted[0]?.attestation?.candidate_revision, REVISION)
+  assert_eq(accepted[0]?.attestation?.consumer_revision, REVISION)
+  assert_eq(accepted[0]?.attestation?.proof_job?.id, 102)
+  assert_eq(accepted[0]?.attestation?.excluded_checks, ["clean/harness-ownership"])
+  assert_eq(len(accepted[0]?.attestation?.excluded_jobs ?? []), 2)
+  assert_eq(accepted[0]?.attestation?.baseline_run?.id, 90)
+  const refused = run_consumer_pretag_gates(
+    [target()],
+    adapter_with_jobs([job(103, 42, "Unexpected candidate test", "failure")]),
+    FAST,
+    nil,
+    {"owner/consumer": attestation()},
+  )
+  assert_eq(refused[0]?.status, "unreadable")
+  assert(contains(refused[0]?.detail ?? "", "unaccounted or missing failed jobs"))
+  for invalid_attestation in [
+    attestation() + {proof_step: "A proof step that never ran"},
+    attestation() + {baseline_job_id: 902},
+  ] {
+    const invalid = run_consumer_pretag_gates(
+      [target()],
+      adapter_with_jobs([]),
+      FAST,
+      nil,
+      {"owner/consumer": invalid_attestation},
+    )
+    assert_eq(invalid[0]?.status, "unreadable")
+  }
+  const pending_job = run_consumer_pretag_gates(
+    [target()],
+    adapter_with_jobs([job(103, 42, "Still running", "") + {status: "in_progress"}]),
+    FAST,
+    nil,
+    {"owner/consumer": attestation()},
+  )
+  assert_eq(pending_job[0]?.status, "unreadable")
+  assert(contains(pending_job[0]?.detail ?? "", "pending jobs"))
+  const pending_run = run_consumer_pretag_gates(
+    [target()],
+    adapter([], {run: fn(_target, _id) { return Ok(explicit_row(42, "in_progress", "")) }}),
+    FAST,
+    nil,
+    {"owner/consumer": attestation()},
+  )
+  assert_eq(pending_run[0]?.status, "unreadable")
+  assert(contains(pending_run[0]?.detail ?? "", "not terminal"))
+}
+
+pipeline test_unknown_explicit_run_refuses_the_whole_request_before_io() {
+  let calls = 0
+  const refuse_io = fn(_target) {
+    calls = calls + 1
+    return Ok(REVISION)
+  }
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        consumer_revision: refuse_io,
+        runs: fn(_target) {
+          calls = calls + 1
+          return Ok([])
+        },
+        dispatch: fn(_target) {
+          calls = calls + 1
+          return Ok({run_id: 99, head_sha: REVISION})
+        },
+        run: fn(_target, _run_id) {
+          calls = calls + 1
+          return Ok(explicit_row(42, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+    nil,
+    {"owner/consumer": 42, "owner/unknown": 43},
+  )
+  assert_eq(calls, 0)
+  assert_eq(len(receipts), 1)
+  assert_eq(receipts[0]?.slug, "owner/unknown")
+  assert_eq(receipts[0]?.status, "unreadable")
+}
+
+pipeline test_explicit_run_binds_its_source_when_consumer_main_moved() {
+  let dispatches = 0
+  let list_reads = 0
+  let main_reads = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        consumer_revision: fn(_target) {
+          main_reads = main_reads + 1
+          return Ok(OTHER_REVISION)
+        },
+        runs: fn(_target) {
+          list_reads = list_reads + 1
+          return Ok([])
+        },
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 99, head_sha: OTHER_REVISION})
+        },
+        run: fn(_target, id) {
+          assert_eq(id, 42)
+          return Ok(explicit_row(42, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+    nil,
+    {"owner/consumer": 42},
+  )
+  assert_eq(main_reads, 0)
+  assert_eq(list_reads, 0)
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_explicit_in_progress_run_waits_under_the_existing_deadline() {
+  let reads = 0
+  let waits = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        run: fn(_target, id) {
+          assert_eq(id, 42)
+          reads = reads + 1
+          return Ok(
+            explicit_row(
+              42,
+              if reads < 3 {
+                "in_progress"
+              } else {
+                "completed"
+              },
+              if reads < 3 {
+                ""
+              } else {
+                "success"
+              },
+            ),
+          )
+        },
+        wait: fn(ms) {
+          waits = waits + ms
+          return nil
+        },
+      },
+    ),
+    FAST,
+    nil,
+    {"owner/consumer": 42},
+  )
+  assert_eq(reads, 3)
+  assert(waits > 0)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_explicit_run_identity_mismatches_fail_without_fallback_dispatch() {
+  for changed in [
+    explicit_row(41, "completed", "success"),
+    explicit_row(42, "completed", "success")
+      + {workflow_path: ".github/workflows/other.yml"},
+    explicit_row(42, "completed", "success") + {event: "push"},
+    explicit_row(42, "completed", "success")
+      + {display_title: "Harn candidate v0.10.129 @ ${REVISION}"},
+    explicit_row(42, "completed", "success") + {head_sha: ""},
+  ] {
+    let dispatches = 0
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      adapter(
+        [],
+        {
+          run: fn(_target, _id) { return Ok(changed) },
+          dispatch: fn(_target) {
+            dispatches = dispatches + 1
+            return Ok({run_id: 99, head_sha: REVISION})
+          },
+        },
+      ),
+      FAST,
+      nil,
+      {"owner/consumer": 42},
+    )
+    assert_eq(dispatches, 0)
+    assert_eq(receipts[0]?.status, "unreadable")
+  }
+}
+
+pipeline test_missing_or_nonjudging_explicit_run_fails_closed() {
+  for result in [
+    Err({code: "not_found"}),
+    Ok(explicit_row(42, "completed", "")),
+    Ok(explicit_row(42, "completed", "cancelled")),
+    Ok(explicit_row(42, "completed", "skipped")),
+  ] {
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      adapter([], {run: fn(_target, _id) { return result }}),
+      FAST,
+      nil,
+      {"owner/consumer": 42},
+    )
+    assert_eq(receipts[0]?.status, "unreadable")
+    assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+  }
+}
+
+/**
+ * An adapter over a scripted run timeline. `sequence` is read once per poll of
+ * the same run, so a test can hand back "running, running, completed" and prove
+ * the gate actually waited instead of reading one answer and stopping.
+ */
+fn adapter(
+  sequence: list<ConsumerPretagRunRow>,
+  overrides: dict = {},
+) -> ConsumerPretagGateAdapter {
+  let cursor = 0
+  let clock = 0
+  let dispatched = false
+  const base: dict = {
+    consumer_revision: fn(_target) { return Ok(REVISION) },
+    dispatch: fn(_target) {
+      dispatched = true
+      return Ok({run_id: 11, head_sha: REVISION})
+    },
+    runs: fn(_target) { return Ok(
+      if dispatched {
+        [row(11, "queued", "")]
+      } else {
+        []
+      },
+    ) },
+    run: fn(_target, _run_id) {
+      const answer = sequence[cursor] ?? sequence[len(sequence) - 1]
+      cursor = cursor + 1
+      return Ok(answer ?? row(11, "completed", "success"))
+    },
+    wait: fn(ms) { clock = clock + ms },
+    now_ms: fn() {
+      clock = clock + 1
+      return clock
+    },
+  }
+  return schema_expect(base + overrides, ConsumerPretagGateAdapter)
+}
+
+pipeline test_a_green_consumer_run_proves_the_candidate() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "success")]),
+    FAST,
+  )
+  assert_eq(len(receipts), 1)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/11")
+  assert(consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_completed_candidate_run_is_adopted_without_redispatch() {
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok([row(11, "completed", "success")]) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/11")
+}
+
+pipeline test_an_active_candidate_run_is_adopted_until_success_without_redispatch() {
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", ""), row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok([row(11, "in_progress", "")]) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_a_consumer_that_settles_after_seventy_one_minutes_is_still_observed() {
+  const seventy_one_minutes = 71 * 60 * 1000
+  let now = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", ""), row(11, "completed", "success")],
+      {
+        wait: fn(ms) {
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {poll_interval_ms: seventy_one_minutes, deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms},
+  )
+  assert_eq(CONSUMER_PRETAG_GATE_POLICY.deadline_ms, 180 * 60 * 1000)
+  assert_eq(now, seventy_one_minutes)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_a_consumer_still_running_at_the_three_hour_bound_stays_pending() {
+  const one_hour = 60 * 60 * 1000
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "in_progress", "")]),
+    {poll_interval_ms: one_hour, deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms},
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "still running at the gate deadline"))
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_recovery_visibility_is_inside_the_three_hour_total_deadline() {
+  const one_hour = 60 * 60 * 1000
+  let now = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "in_progress", "")],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 11, head_sha: REVISION}) },
+        runs: fn(_target) { return Ok([]) },
+        wait: fn(ms) {
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {
+      poll_interval_ms: one_hour,
+      deadline_ms: CONSUMER_PRETAG_GATE_POLICY.deadline_ms,
+      recovery_visibility_ms: 60 * 1000,
+    },
+  )
+  assert_eq(now, CONSUMER_PRETAG_GATE_POLICY.deadline_ms)
+  assert_eq(receipts[0]?.status, "pending")
+}
+
+pipeline test_recovery_reconciles_an_accepted_dispatch_before_it_becomes_visible() {
+  let now = 0
+  let visible = false
+  // One dispatch was already accepted by the process that crashed. This
+  // invocation must adopt it instead of sending a second one.
+  let total_dispatches = 1
+  const recovery = consumer_pretag_gate_policy(true)
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          total_dispatches = total_dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok(
+          if visible {
+            [row(11, "completed", "success")]
+          } else {
+            []
+          },
+        ) },
+        wait: fn(ms) {
+          now = now + ms
+          visible = true
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    recovery,
+  )
+  assert_eq(consumer_pretag_gate_policy(false).recovery_visibility_ms ?? -1, 0)
+  assert_eq(recovery.recovery_visibility_ms ?? -1, 60 * 1000)
+  assert_eq(total_dispatches, 1)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+pipeline test_same_commit_under_a_different_version_is_not_adopted() {
+  let list_reads = 0
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(12, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 12, head_sha: REVISION})
+        },
+        runs: fn(_target) {
+          list_reads = list_reads + 1
+          return Ok([row(11, "completed", "success", "Harn candidate v0.10.129 @ ${REVISION}")])
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 1)
+  assert_eq(list_reads, 1)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
+}
+
+pipeline test_preexisting_nonjudging_terminal_runs_escalate_without_dispatch_or_registration() {
+  for conclusion in ["cancelled", "stale", "startup_failure"] {
+    let dispatches = 0
+    let registrations = 0
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      adapter(
+        [row(11, "completed", conclusion)],
+        {
+          dispatch: fn(_target) {
+            dispatches = dispatches + 1
+            return Ok({run_id: 11, head_sha: REVISION})
+          },
+          runs: fn(_target) { return Ok([row(11, "completed", conclusion)]) },
+        },
+      ),
+      FAST,
+      fn(_slug, _run_id) {
+        registrations = registrations + 1
+        return nil
+      },
+    )
+    assert_eq(dispatches, 0)
+    assert_eq(registrations, 0)
+    assert_eq(receipts[0]?.status, "unreadable")
+    assert(contains(receipts[0]?.detail ?? "", "without judging the candidate"))
+  }
+}
+
+pipeline test_a_fresh_dispatch_binds_the_authoritative_receipt_without_list_visibility() {
+  let list_reads = 0
+  let bound_run_id = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(12, "completed", "success")],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 12, head_sha: REVISION}) },
+        runs: fn(_target) {
+          list_reads = list_reads + 1
+          return Ok(
+            [row(11, "completed", "success", "Harn candidate v0.10.129 @ ${OTHER_REVISION}")],
+          )
+        },
+        run: fn(_target, run_id) {
+          bound_run_id = run_id
+          return Ok(row(run_id, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(list_reads, 1)
+  assert_eq(bound_run_id, 12)
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
+}
+
+pipeline test_a_fresh_dispatch_retries_stale_identity_with_bounded_exponential_backoff() {
+  let reads = 0
+  let now = 0
+  let waits: list<int> = []
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 12, head_sha: REVISION}) },
+        runs: fn(_target) { return Ok([]) },
+        run: fn(_target, run_id) {
+          assert_eq(run_id, 12)
+          reads = reads + 1
+          return Ok(
+            if reads < 3 {
+              row(11, "completed", "success", "Harn candidate v0.10.129 @ ${OTHER_REVISION}")
+            } else {
+              row(12, "completed", "success")
+            },
+          )
+        },
+        wait: fn(ms) {
+          waits = waits + [ms]
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {initial_poll_interval_ms: 1, poll_interval_ms: 8, deadline_ms: 50},
+  )
+  assert_eq(reads, 3)
+  assert_eq(waits, [1, 2])
+  assert_eq(receipts[0]?.status, "passed")
+  assert_eq(receipts[0]?.run_url, "https://runs.test/12")
+}
+
+pipeline test_a_dispatched_run_hidden_through_the_deadline_fails_with_identity() {
+  let now = 0
+  let waits: list<int> = []
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 12, head_sha: REVISION}) },
+        runs: fn(_target) { return Ok([]) },
+        run: fn(_target, run_id) {
+          assert_eq(run_id, 12)
+          return Ok(row(11, "completed", "success"))
+        },
+        wait: fn(ms) {
+          waits = waits + [ms]
+          now = now + ms
+          return nil
+        },
+        now_ms: fn() { return now },
+      },
+    ),
+    {initial_poll_interval_ms: 1, poll_interval_ms: 8, deadline_ms: 15},
+  )
+  assert_eq(waits, [1, 2, 4, 8])
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "run 12"))
+  assert(contains(receipts[0]?.detail ?? "", "exact dispatched candidate"))
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_red_consumer_run_refuses_the_candidate() {
+  // The falsifier: the same path with the conclusion flipped must not prove.
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "failure")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "failed")
+  const verdict = consumer_pretag_gate_verdict([target()], receipts)
+  assert(!verdict.proven)
+  assert_eq(verdict.failing, ["owner/consumer:candidate-gate.yml"])
+}
+
+pipeline test_a_cancelled_run_judged_nothing_and_says_so() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "completed", "cancelled")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_run_that_never_finishes_is_pending_not_passed() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter([row(11, "in_progress", "")]),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "pending")
+  assert(contains(receipts[0]?.detail ?? "", "still running at the gate deadline"))
+  assert(!consumer_pretag_gate_verdict([target()], receipts).proven)
+}
+
+pipeline test_a_dispatch_without_a_valid_run_identity_is_not_a_pass() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) { return Ok({run_id: 0, head_sha: REVISION}) },
+        runs: fn(_target) { return Ok([]) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "no valid run identity"))
+}
+
+pipeline test_multiple_existing_candidate_runs_are_refused_without_redispatch() {
+  let dispatches = 0
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok(
+          [row(11, "completed", "success"), row(12, "completed", "failure")],
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "refusing to guess"))
+}
+
+pipeline test_a_failed_dispatch_is_reported_not_swallowed() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {dispatch: fn(_target) { return Err({code: "dispatch_failed"}) }},
+    ),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "dispatch failed"))
+}
+
+pipeline test_every_target_is_dispatched_before_any_is_waited_on() {
+  let order: list<string> = []
+  const receipts = run_consumer_pretag_gates(
+    [target("owner/a"), target("owner/b")],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(gate) {
+          order = order + ["dispatch:${gate.slug}"]
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_gate) { return Ok([]) },
+        run: fn(gate, _run_id) {
+          order = order + ["poll:${gate.slug}"]
+          return Ok(row(11, "completed", "success"))
+        },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(len(receipts), 2)
+  // Both dispatches must precede the first poll, or the gate costs the sum of
+  // its consumers' run times rather than the slowest one.
+  assert_eq(order[0], "dispatch:owner/a")
+  assert_eq(order[1], "dispatch:owner/b")
+  assert(starts_with(order[2] ?? "", "poll:"))
+}
+
+fn candidate_job(id: int, name: string, conclusion: string) {
+  return job(id, 42, name, conclusion)
+}
+
+fn baseline_job(id: int, name: string, conclusion: string) {
+  return job(id, 90, name, conclusion, OTHER_REVISION)
+}
+
+/**
+ * A consumer-side red on a job the candidate cannot reach must not fail the
+ * gate, and must not need an operator to type JSON to say so. Remove the
+ * derivation and this fails: the run's conclusion alone reads as `failed`.
+ */
+pipeline test_consumer_red_already_red_on_its_own_main_is_excluded_by_default() {
+  const derived = derive_consumer_pretag_exclusions(
+    [
+      candidate_job(101, "harness ownership", "failure"),
+      candidate_job(102, "candidate suite", "success"),
+    ],
+    [baseline_job(901, "harness ownership", "failure")],
+  )
+  assert_eq(derived.admissible, true)
+  assert_eq(derived.excluded, [{id: 101, name: "harness ownership"}])
+  assert_eq(derived.unbacked, [])
+  assert_eq(derived.succeeded, 1)
+  assert(contains(derived.reason, "already failing on the consumer's main"))
+}
+
+/**
+ * The negative control. A red the consumer's own main does not already carry
+ * is the candidate's, and still fails the gate.
+ */
+pipeline test_a_red_the_consumer_main_does_not_carry_still_fails() {
+  const derived = derive_consumer_pretag_exclusions(
+    [
+      candidate_job(101, "harness ownership", "failure"),
+      candidate_job(103, "candidate suite", "failure"),
+      candidate_job(104, "lint", "success"),
+    ],
+    [baseline_job(901, "harness ownership", "failure")],
+  )
+  assert_eq(derived.admissible, false)
+  assert_eq(derived.unbacked, ["candidate suite"])
+  assert(contains(derived.reason, "candidate suite"))
+  // A baseline job of the same name that PASSED on main is not a backing.
+  const green_baseline = derive_consumer_pretag_exclusions(
+    [candidate_job(101, "harness ownership", "failure"), candidate_job(104, "lint", "success")],
+    [baseline_job(901, "harness ownership", "success")],
+  )
+  assert_eq(green_baseline.admissible, false)
+  assert_eq(green_baseline.unbacked, ["harness ownership"])
+}
+
+/**
+ * An unread baseline is not an empty one. A census that answered nothing must
+ * exclude nothing, or every consumer whose history cannot be read passes.
+ */
+pipeline test_unread_consumer_baseline_excludes_nothing() {
+  const derived = derive_consumer_pretag_exclusions(
+    [
+      candidate_job(101, "harness ownership", "failure"),
+      candidate_job(102, "candidate suite", "success"),
+    ],
+    [],
+  )
+  assert_eq(derived.admissible, false)
+  assert_eq(derived.excluded, [])
+  assert_eq(derived.unbacked, ["harness ownership"])
+  assert(contains(derived.reason, "no jobs"))
+}
+
+/** Excluding every job proves nothing, however well each failure is explained. */
+pipeline test_a_run_where_nothing_passed_is_never_admissible() {
+  const derived = derive_consumer_pretag_exclusions(
+    [
+      candidate_job(101, "harness ownership", "failure"),
+      candidate_job(103, "candidate suite", "failure"),
+    ],
+    [
+      baseline_job(901, "harness ownership", "failure"),
+      baseline_job(903, "candidate suite", "failure"),
+    ],
+  )
+  assert_eq(derived.admissible, false)
+  assert_eq(derived.succeeded, 0)
+  assert_eq(derived.unbacked, [])
+  assert(contains(derived.reason, "prove nothing"))
+}
+
+/**
+ * The whole seam, through the gate: a failed consumer proof run whose only red
+ * is already red on the consumer's main passes, carrying the derived
+ * attestation as evidence rather than as an operator's word.
+ */
+pipeline test_gate_passes_a_derived_attestation_without_operator_json() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "failure")],
+      {
+        runs: fn(_target) { return Ok([row(11, "completed", "failure")]) },
+        run: fn(_target, run_id) { return Ok(
+          if run_id == 90 {
+            row(90, "completed", "failure")
+              + {
+                workflow_path: ".github/workflows/candidate-gate.yml",
+                event: "push",
+                head_branch: "main",
+                head_sha: OTHER_REVISION,
+              }
+          } else {
+            row(11, "completed", "failure")
+          },
+        ) },
+        main_runs: fn(_target) { return Ok(
+          [
+            row(90, "completed", "failure")
+              + {
+                workflow_path: ".github/workflows/candidate-gate.yml",
+                event: "push",
+                head_branch: "main",
+                head_sha: OTHER_REVISION,
+              },
+          ],
+        ) },
+        jobs: fn(_target, run_id) { return Ok(
+          if run_id == 90 {
+            jobs_page(90, [baseline_job(901, "harness ownership", "failure")], OTHER_REVISION)
+          } else {
+            jobs_page(
+              11,
+              [
+                job(101, 11, "harness ownership", "failure"),
+                job(102, 11, "candidate suite", "success"),
+              ],
+            )
+          },
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(len(receipts), 1)
+  assert_eq(receipts[0]?.status, "passed")
+  assert(contains(receipts[0]?.detail ?? "", "derived attestation"))
+  assert_eq(receipts[0]?.attestation?.excluded_jobs, [{id: 101, name: "harness ownership"}])
+  assert_eq(receipts[0]?.attestation?.baseline_run?.id, 90)
+  assert_eq(receipts[0]?.attestation?.proof_job?.id, 102)
+}
+
+/** Without a readable main history the same run still fails the gate. */
+pipeline test_gate_without_a_main_history_keeps_the_red() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "failure")],
+      {
+        runs: fn(_target) { return Ok([row(11, "completed", "failure")]) },
+        main_runs: fn(_target) { return Ok([]) },
+        jobs: fn(_target, _run_id) { return Ok(
+          jobs_page(
+            11,
+            [
+              job(101, 11, "harness ownership", "failure"),
+              job(102, 11, "candidate suite", "success"),
+            ],
+          ),
+        ) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(len(receipts), 1)
+  assert_eq(receipts[0]?.status, "failed")
+}
+
+// The retry spends the gate's own deadline, so a fixture that exercises it
+// needs a window wide enough to hold the backoff. Production allows three
+// hours, against a bound of about two minutes.
+const RETRY_WINDOW: ConsumerPretagGatePolicy = {poll_interval_ms: 1, deadline_ms: 600000}
+
+const NETWORK_ERROR: dict = {
+  message: {
+    category: "network",
+    code: "network",
+    message: "http: request failed: error sending request for url (…/dispatches)",
+  },
+}
+
+const NOT_FOUND_ERROR: dict = {
+  message: {category: "not_found", code: "not_found", message: "workflow does not exist"},
+}
+
+/**
+ * A gate whose dispatch drops the first `failures` sends and then succeeds.
+ *
+ * `sends` counts every send, so a test can tell a retry that ran from one that
+ * was merely configured.
+ */
+fn flaky_dispatch_adapter(failures: int, error: dict) -> ConsumerPretagGateAdapter {
+  let sends = 0
+  let clock = 0
+  return {
+    consumer_revision: fn(_target) { return Ok(REVISION) },
+    dispatch: fn(_target) {
+      sends = sends + 1
+      if sends <= failures {
+        return Err(error)
+      }
+      return Ok({run_id: 11, head_sha: REVISION})
+    },
+    runs: fn(_target) { return Ok(
+      if sends > failures {
+        [row(11, "queued", "")]
+      } else {
+        []
+      },
+    ) },
+    run: fn(_target, _run_id) { return Ok(row(11, "completed", "success")) },
+    wait: fn(ms) { clock = clock + ms },
+    now_ms: fn() {
+      clock = clock + 1
+      return clock
+    },
+  }
+}
+
+/**
+ * The release that was lost: one dropped request failed a candidate that had
+ * already been built and certified. Four dropped sends must now be survivable,
+ * and the receipt must be able to prove the retry happened.
+ */
+pipeline test_a_dropped_dispatch_is_retried_and_the_gate_still_proves() {
+  for failures in [1, 2, 4] {
+    const receipts = run_consumer_pretag_gates(
+      [target()],
+      flaky_dispatch_adapter(failures, NETWORK_ERROR),
+      RETRY_WINDOW,
+    )
+    assert_eq(receipts[0]?.status, "passed")
+    // The recorded attempts are the proof the retry ran. A gate reporting one
+    // attempt while the bound is five is a gate whose retry never fired.
+    assert_eq(len(receipts[0]?.dispatch_attempts ?? []), failures)
+  }
+}
+
+/**
+ * When every send fails the run still stops, but it stops naming the bound and
+ * the transport, not a bare "unreadable" a release owner has to decode.
+ */
+pipeline test_an_unreachable_dispatch_names_the_bound_and_the_cause() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    flaky_dispatch_adapter(99, NETWORK_ERROR),
+    RETRY_WINDOW,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert_eq(receipts[0]?.cause, "consumer_dispatch_unreachable")
+  assert_eq(len(receipts[0]?.dispatch_attempts ?? []), CONSUMER_PRETAG_DISPATCH_ATTEMPTS)
+  assert(contains(receipts[0]?.detail ?? "", "unreachable after"))
+  assert(contains(receipts[0]?.detail ?? "", "error sending request"))
+}
+
+/**
+ * The negative control on the retry. A refusal the remote actually answered is
+ * a fact about this request, so it must be reported on the first send. Retrying
+ * it would delay a real answer behind two minutes of waiting for nothing.
+ */
+pipeline test_a_refusal_the_remote_answered_is_not_retried() {
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    flaky_dispatch_adapter(99, NOT_FOUND_ERROR),
+    FAST,
+  )
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert_eq(receipts[0]?.cause, "consumer_dispatch_rejected")
+  assert_eq(len(receipts[0]?.dispatch_attempts ?? []), 1)
+  assert(!contains(receipts[0]?.detail ?? "", "unreachable after"))
+}
+
+/** The classifier decides on structured fields, never on message prose. */
+pipeline test_only_transport_failures_are_retryable() {
+  assert(consumer_pretag_dispatch_is_retryable(NETWORK_ERROR))
+  assert(consumer_pretag_dispatch_is_retryable({message: {category: "network", code: "timeout"}}))
+  assert(consumer_pretag_dispatch_is_retryable({category: "network", code: "network"}))
+  assert(!consumer_pretag_dispatch_is_retryable(NOT_FOUND_ERROR))
+  assert(
+    !consumer_pretag_dispatch_is_retryable({message: {category: "permission", code: "forbidden"}}),
+  )
+  // Prose alone must not make a failure retryable, or the first reword of the
+  // message silently changes which class gets retried.
+  assert(!consumer_pretag_dispatch_is_retryable({message: {message: "network error"}}))
+}
+
+/** The bound is real: five sends spread over roughly two minutes. */
+pipeline test_the_retry_bound_is_five_sends_over_about_two_minutes() {
+  assert_eq(CONSUMER_PRETAG_DISPATCH_ATTEMPTS, 5)
+  let total = 0
+  for attempt in [1, 2, 3, 4] {
+    total = total + consumer_pretag_dispatch_backoff_ms(attempt)
+  }
+  assert_eq(total, 120000)
+}

@@ -1,0 +1,741 @@
+import { CommandResult, command_run } from "std/command"
+import { poll_until } from "std/poll"
+import { remote_url_to_slug } from "./git"
+import {
+  GithubConnectorError,
+  github_connector_options,
+  github_merge_queue_entries,
+  github_pr_view,
+} from "./github"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+import {
+  GithubClientOptions,
+  GithubConnectorResult,
+  GithubWorktreeCommitReceipt,
+  GithubWorktreeCommitRequest,
+  github_pr_commits,
+} from "harn-github-connector/default"
+// The worktree adapter is the connector's only module that shells out to local
+// `git`, and it is exported separately from the pure API surface.
+import { github_commit_worktree } from "harn-github-connector/worktree"
+
+const DEFAULT_BASE = "main"
+
+const DEFAULT_TRAILER = "Co-Authored-By: Codex <codex@openai.com>"
+
+pub type SignedBotCommit = {
+  oid: string,
+  message: string,
+  signature_verified: bool,
+  signature_reason: string,
+}
+
+pub type SignedBotPullRequest = {
+  slug: string,
+  number: int,
+  title: string,
+  url: string,
+  state: string,
+  base_ref_name: string,
+  head_ref_name: string,
+  head_oid: string,
+  head_repo: string,
+  head_owner: string,
+  author_login: string,
+  author_type: string,
+  merge_state_status: string,
+  auto_merge_enabled: bool,
+  cross_repository: bool,
+  commits: list<SignedBotCommit>,
+}
+
+pub type SignedBotDecisionAction = "refuse" | "already_signed" | "rewrite"
+
+pub type SignedBotDecision = {
+  eligible: bool,
+  action: SignedBotDecisionAction,
+  errors: list<string>,
+  unsigned_count: int,
+  detail: string,
+}
+
+pub type SignedBotRewriteOptions = {
+  allow_fork?: bool,
+  allow_non_bot?: bool,
+  base?: string,
+  home?: string,
+  checkout?: string,
+  temp_root?: string,
+  temp_path?: string,
+  trailer?: string,
+}
+
+pub type SignedBotRewriteCommand = {name: string, argv: list<string>}
+
+/**
+ * One rewrite, as the three parts a caller runs in order.
+ *
+ * `prepare` builds an exact local Git state and nothing else: a detached
+ * worktree at the PR head, soft-reset onto the base, leaving the index holding
+ * the tree the PR proposes while `HEAD` is the base commit. `publish` turns
+ * that state into a single GitHub-signed commit on the head branch. `cleanup`
+ * removes the worktree, and runs whatever happened above it.
+ *
+ * The signature is GitHub's, not this machine's. `createCommitOnBranch` signs
+ * server-side under the identity of the token the caller already holds, so this
+ * path needs no signing key and no `git push` -- the mutation is the write.
+ * That is what lets a hosted workflow rewrite its own blocked PR, which a
+ * `git commit -S` plus leased push could only ever do from a machine holding a
+ * key GitHub would verify.
+ */
+pub type SignedBotRewritePlan = {
+  checkout: string,
+  temp_path: string,
+  branch: string,
+  old_head: string,
+  prepare: list<SignedBotRewriteCommand>,
+  publish: GithubWorktreeCommitRequest,
+  cleanup: SignedBotRewriteCommand,
+}
+
+pub type SignedBotCommandResult = CommandResult
+
+pub type SignedBotCommandRunner = fn(list<string>) -> SignedBotCommandResult
+
+pub type SignedBotCheckoutOriginCheck = {ok: bool, detail: string}
+
+pub type SignedBotRewriteStep = {name: string, command: string, result: SignedBotCommandResult}
+
+type SignedBotPrepareResult = {
+  ok: bool,
+  failed_step: string,
+  detail: string,
+  steps: list<SignedBotRewriteStep>,
+}
+
+/**
+ * The publish half of a rewrite, as a capability.
+ *
+ * Named separately from `github_commit_worktree` so the order the three parts
+ * run in can be exercised without a repository, a network, or a signing
+ * identity. That ordering is the whole contract of `run_rewrite_with`: cleanup
+ * runs on every path, and only the publish decides the outcome.
+ */
+pub type SignedBotPublishResult = GithubConnectorResult<GithubWorktreeCommitReceipt>
+
+pub type SignedBotPublisher = fn(GithubWorktreeCommitRequest) -> SignedBotPublishResult
+
+/**
+ * `receipt` is present whenever GitHub answered the publish at all, including
+ * the empty-delta refusal, so a caller reporting the outcome never has to
+ * reconstruct what the connector already returned.
+ */
+pub type SignedBotRewriteResult = {
+  success: bool,
+  failed_step: string,
+  detail: string,
+  steps: list<SignedBotRewriteStep>,
+  receipt: GithubWorktreeCommitReceipt?,
+}
+
+/** The step name reported when the signed-commit mutation is what failed. */
+pub const SIGNED_BOT_PUBLISH_STEP: string = "publish-signed-commit"
+
+pub type SignedBotAutoMergeState = {state: string}
+
+pub type SignedBotAutoMergeResult = Result<SignedBotAutoMergeState, GithubConnectorError>
+
+fn slug_parts(slug: any) {
+  const parts = split(to_string(slug ?? ""), "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    return nil
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+fn compact_slug(slug: any) {
+  return replace(replace(to_string(slug), "/", "-"), ".", "-")
+}
+
+fn first_line(text: any) {
+  return split(trim(to_string(text ?? "")), "\n")[0] ?? ""
+}
+
+fn bool_option(options: any, name: any) {
+  return (options ?? {})[name] ?? false
+}
+
+fn text_option(options: any, name: any, fallback: any) {
+  const value = (options ?? {})[name]
+  if value == nil || trim(to_string(value)) == "" {
+    return fallback
+  }
+  return to_string(value)
+}
+
+/** Parse a comma-separated PR list, rejecting empty or non-positive entries. */
+pub fn parse_pr_numbers(raw: string) -> list<int> {
+  let out = []
+  for part in split(to_string(raw ?? ""), ",") {
+    const trimmed = trim(part)
+    if trimmed == "" {
+      continue
+    }
+    const n = to_int(trimmed)
+    if n == nil || n <= 0 {
+      throw "invalid pull request number: " + trimmed
+    }
+    out = out + [n]
+  }
+  return out
+}
+
+pub fn load_pr_signature_metadata(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  options: GithubClientOptions = github_connector_options(),
+) -> SignedBotPullRequest {
+  const parts = slug_parts(slug)
+  if parts == nil {
+    throw "repo must be owner/name, got: " + to_string(slug)
+  }
+  const viewed = github_pr_view(harness, slug, pr_number, options)
+  if is_err(viewed) {
+    throw "GitHub PR view failed: " + to_string(unwrap_err(viewed))
+  }
+  const pr = unwrap(viewed)
+  const evidence = github_pr_commits(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: pr.number,
+      expected_head_oid: pr.head.sha,
+      options: options,
+    },
+  )
+  if is_err(evidence) {
+    throw "GitHub PR commit evidence failed: " + to_string(unwrap_err(evidence))
+  }
+  const commits = unwrap(evidence).commits
+  return {
+    slug: slug,
+    number: pr.number,
+    title: pr.title,
+    url: pr.url,
+    state: pr.github_state,
+    base_ref_name: pr.base.ref,
+    head_ref_name: pr.head.ref,
+    head_oid: pr.head.sha,
+    head_repo: pr.head.repo,
+    head_owner: pr.head.owner,
+    author_login: pr.user?.login ?? "",
+    author_type: pr.user?.type ?? "",
+    merge_state_status: pr.mergeable_state,
+    auto_merge_enabled: pr.auto_merge_armed,
+    cross_repository: pr.head.repo != slug,
+    commits: commits.map(
+      { commit ->
+        return {
+          oid: commit.sha,
+          message: commit.message,
+          signature_verified: commit.signature.verified,
+          signature_reason: commit.signature.reason,
+        }
+      },
+    )
+      .to_list(),
+  }
+}
+
+pub fn load_queued_pr_numbers(
+  harness: Harness,
+  slug: string,
+  base: string = DEFAULT_BASE,
+  options: GithubClientOptions = github_connector_options(),
+) -> list<int> {
+  const queue = github_merge_queue_entries(harness, slug, base, 100, options)
+  if is_err(queue) {
+    throw "GitHub merge queue lookup failed: " + to_string(unwrap_err(queue))
+  }
+  return unwrap(queue).entries.map({ entry -> entry.pull_number }).to_list()
+}
+
+pub fn is_bot_pr_author(pr: SignedBotPullRequest?) -> bool {
+  const login = lowercase(pr?.author_login ?? "")
+  const typ = pr?.author_type ?? ""
+  return typ == "Bot"
+    || contains(login, "[bot]")
+    || login == "dependabot"
+    || login == "github-actions"
+    || login == "renovate"
+}
+
+pub fn unsigned_commits(pr: SignedBotPullRequest?) -> list<SignedBotCommit> {
+  return (pr?.commits ?? []).filter({ commit -> !commit.signature_verified }).to_list()
+}
+
+pub fn signed_bot_pr_decision(
+  pr: SignedBotPullRequest?,
+  queued_numbers: list<int> = [],
+  options: SignedBotRewriteOptions = {},
+) -> SignedBotDecision {
+  if pr == nil {
+    return {
+      eligible: false,
+      action: "refuse",
+      errors: ["pull request metadata was not found"],
+      unsigned_count: 0,
+      detail: "pull request metadata was not found",
+    }
+  }
+  let errors = []
+  if trim(pr.head_ref_name ?? "") == "" {
+    errors = errors + ["missing head branch"]
+  }
+  if trim(pr.head_oid ?? "") == "" {
+    errors = errors + ["missing head oid"]
+  }
+  if pr.cross_repository && !bool_option(options, "allow_fork") {
+    errors = errors + ["cross-repository or fork PR"]
+  }
+  if contains(queued_numbers, pr.number) {
+    errors = errors + ["PR is already in the merge queue"]
+  }
+  if !is_bot_pr_author(pr) && !bool_option(options, "allow_non_bot") {
+    errors = errors + ["author is not recognized as a bot: " + (pr.author_login ?? "")]
+  }
+  const unsigned = unsigned_commits(pr)
+  if len(unsigned) == 0 {
+    return {
+      eligible: false,
+      action: "already_signed",
+      errors: [],
+      unsigned_count: 0,
+      detail: "all commits already have VALID signatures; no rewrite needed",
+    }
+  }
+  if len(errors) > 0 {
+    return {
+      eligible: false,
+      action: "refuse",
+      errors: errors,
+      unsigned_count: len(unsigned),
+      detail: join(errors, "; "),
+    }
+  }
+  return {
+    eligible: true,
+    action: "rewrite",
+    errors: [],
+    unsigned_count: len(unsigned),
+    detail: "rewrite " + to_string(len(unsigned)) + " unsigned commit(s) as one signed commit",
+  }
+}
+
+fn default_checkout_path(slug: any, home: any) {
+  const parts = slug_parts(slug)
+  if parts == nil {
+    return ""
+  }
+  return path_join(home, "projects/" + parts.repo)
+}
+
+/** Keep concurrent rewrites isolated while retaining the PR and observed head in recovery paths. */
+pub fn default_temp_path(
+  random: HarnessRandom,
+  slug: string,
+  pr_number: int,
+  head_oid: string,
+  temp_root: string = "/tmp/harn-signed-bot-prs",
+) -> string {
+  const suffix = if trim(head_oid ?? "") == "" {
+    to_string(pr_number)
+  } else {
+    substring(head_oid, 0, 12)
+  }
+  return path_join(
+    temp_root,
+    compact_slug(slug) + "-pr-" + to_string(pr_number) + "-" + suffix + "-" + random.uuid_v7(),
+  )
+}
+
+/**
+ * The publish half of a rewrite: one prepared worktree, addressed and leased.
+ *
+ * Every field here is a decision the retired `git commit -S` plus
+ * `git push --force-with-lease` made implicitly, written down instead.
+ */
+fn worktree_publish_request(
+  slug: string,
+  pr: SignedBotPullRequest,
+  temp_path: string,
+  headline: string,
+  trailer: string,
+) -> GithubWorktreeCommitRequest {
+  const parts = slug_parts(slug)
+  if parts == nil {
+    throw "repo must be owner/name, got: " + to_string(slug)
+  }
+  return {
+    owner: parts.owner,
+    repo: parts.repo,
+    branch: pr.head_ref_name,
+    headline: headline,
+    body: trailer,
+    repo_dir: temp_path,
+    // The prepared worktree's real index, which `soft-reset-to-base` left
+    // holding exactly the tree the PR proposes. `worktree` would restage from
+    // the working tree and sweep in anything untracked that happened to be
+    // sitting there; the index is what `git commit` would have committed.
+    source: "index",
+    // The same guarantee the retired `--force-with-lease=<branch>:<oid>`
+    // carried: rewind this branch only while it is still at the head the
+    // decision to rewrite was made against. A branch that moved, or that was
+    // deleted, refuses with `stale_head` and writes nothing.
+    expected_branch_oid: pr.head_oid,
+    // The branch sits at the PR head, not the base, so publishing one squashed
+    // commit onto the base necessarily rewinds it first.
+    reset_branch: true,
+    options: github_connector_options(),
+  }
+}
+
+pub fn rewrite_plan(
+  random: HarnessRandom,
+  slug: string,
+  pr: SignedBotPullRequest,
+  options: SignedBotRewriteOptions = {},
+) -> SignedBotRewritePlan {
+  const base = text_option(options, "base", pr.base_ref_name)
+  const home = text_option(options, "home", "")
+  const checkout = text_option(options, "checkout", default_checkout_path(slug, home))
+  const temp_root = text_option(options, "temp_root", "/tmp/harn-signed-bot-prs")
+  const temp_path = text_option(
+    options,
+    "temp_path",
+    default_temp_path(random, slug, pr.number, pr.head_oid, temp_root),
+  )
+  const trailer = text_option(options, "trailer", DEFAULT_TRAILER)
+  const title = first_line(pr.title)
+  const branch = pr.head_ref_name
+  const old_head = pr.head_oid
+  return {
+    checkout: checkout,
+    temp_path: temp_path,
+    branch: branch,
+    old_head: old_head,
+    prepare: [
+      {
+        name: "fetch-pr-head",
+        argv: [
+          "git",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "-C",
+          checkout,
+          "fetch",
+          "origin",
+          base,
+          branch,
+          "--prune",
+        ],
+      },
+      {name: "mkdir-temp-root", argv: ["mkdir", "-p", temp_root]},
+      {
+        name: "add-temp-worktree",
+        argv: ["git", "-C", checkout, "worktree", "add", "--detach", temp_path, old_head],
+      },
+      {
+        name: "disable-temp-fsmonitor",
+        argv: ["git", "-C", temp_path, "config", "core.fsmonitor", "false"],
+      },
+      {
+        name: "soft-reset-to-base",
+        argv: [
+          "git",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "-C",
+          temp_path,
+          "reset",
+          "--soft",
+          "origin/" + base,
+        ],
+      },
+    ],
+    publish: worktree_publish_request(slug, pr, temp_path, title, trailer),
+    cleanup: {
+      name: "remove-temp-worktree",
+      argv: ["git", "-C", checkout, "worktree", "remove", "--force", temp_path],
+    },
+  }
+}
+
+pub fn checkout_origin_check(
+  checkout: string,
+  expected_slug: string,
+  runner: SignedBotCommandRunner,
+) -> SignedBotCheckoutOriginCheck {
+  const result = runner(["git", "-C", checkout, "remote", "get-url", "origin"])
+  if !(result.success ?? false) {
+    return {ok: false, detail: "could not read checkout origin: " + trim(result.stderr ?? "")}
+  }
+  const actual = remote_url_to_slug(trim(result.stdout ?? ""))
+  if actual != expected_slug {
+    return {
+      ok: false,
+      detail: "checkout origin is ${actual ?? "unknown"}, expected ${expected_slug}",
+    }
+  }
+  return {ok: true, detail: "checkout origin matches ${expected_slug}"}
+}
+
+fn live_command_runner(tools: HarnessTools, argv: list<string>) -> SignedBotCommandResult {
+  return command_run(tools, argv)
+}
+
+pub fn live_checkout_origin_check(
+  tools: HarnessTools,
+  checkout: string,
+  expected_slug: string,
+) -> SignedBotCheckoutOriginCheck {
+  return checkout_origin_check(
+    checkout,
+    expected_slug,
+    { argv -> live_command_runner(tools, argv) },
+  )
+}
+
+fn command_label(argv: any) {
+  return join(argv.map({ a -> to_string(a) }), " ")
+}
+
+fn rewrite_step(
+  command: SignedBotRewriteCommand,
+  result: SignedBotCommandResult,
+) -> SignedBotRewriteStep {
+  return {name: command.name, command: command_label(command.argv), result: result}
+}
+
+/** Build the exact local Git state the publish reads, stopping at the first refusal. */
+fn run_rewrite_prepare(
+  runner: SignedBotCommandRunner,
+  plan: SignedBotRewritePlan,
+) -> SignedBotPrepareResult {
+  let steps = []
+  for command in plan.prepare {
+    const result = runner(command.argv)
+    steps = steps + [rewrite_step(command, result)]
+    if !result.success {
+      return {
+        ok: false,
+        failed_step: command.name,
+        detail: trim(to_string(result.stderr ?? "")),
+        steps: steps,
+      }
+    }
+  }
+  return {ok: true, failed_step: "", detail: "", steps: steps}
+}
+
+/**
+ * Remove the scratch worktree, and never let that decide the rewrite's outcome.
+ *
+ * By the time this runs the commit is published or refused; a failure here
+ * leaves a directory behind and nothing else. Calling that a failed rewrite
+ * would send an operator -- or a release workflow with no operator at all --
+ * back to redo work GitHub has already accepted, and the published head would
+ * then fail the lease on the second attempt.
+ */
+fn run_rewrite_cleanup(
+  runner: SignedBotCommandRunner,
+  plan: SignedBotRewritePlan,
+) -> SignedBotRewriteStep {
+  return rewrite_step(plan.cleanup, runner(plan.cleanup.argv))
+}
+
+/** Read one publish attempt as the rewrite's outcome. */
+fn rewrite_publish_result(
+  published: SignedBotPublishResult,
+  steps: list<SignedBotRewriteStep>,
+) -> SignedBotRewriteResult {
+  if is_err(published) {
+    const failure = unwrap_err(published)
+    return {
+      success: false,
+      failed_step: SIGNED_BOT_PUBLISH_STEP,
+      detail: to_string(failure?.message ?? failure),
+      steps: steps,
+      receipt: nil,
+    }
+  }
+  const receipt = unwrap(published)
+  // An empty delta is a clean outcome for the connector and a failed rewrite
+  // here: the PR proposes the base tree unchanged, so there is no content to
+  // republish under a signature and the unsigned head is still the head.
+  if !receipt.committed {
+    return {
+      success: false,
+      failed_step: SIGNED_BOT_PUBLISH_STEP,
+      detail: "the PR head proposes no change against " + receipt.base_oid
+        + ", so there was nothing to publish as a signed commit",
+      steps: steps,
+      receipt: receipt,
+    }
+  }
+  return {success: true, failed_step: "", detail: "", steps: steps, receipt: receipt}
+}
+
+/**
+ * Prepare, publish, and clean up one rewrite, over injected capabilities.
+ *
+ * The publisher is reached only from a prepared worktree, and the cleanup runs
+ * whether or not it was.
+ */
+pub fn run_rewrite_with(
+  runner: SignedBotCommandRunner,
+  publisher: SignedBotPublisher,
+  plan: SignedBotRewritePlan,
+) -> SignedBotRewriteResult {
+  const prepared = run_rewrite_prepare(runner, plan)
+  if !prepared.ok {
+    return {
+      success: false,
+      failed_step: prepared.failed_step,
+      detail: prepared.detail,
+      steps: prepared.steps + [run_rewrite_cleanup(runner, plan)],
+      receipt: nil,
+    }
+  }
+  const published = publisher(plan.publish)
+  return rewrite_publish_result(published, prepared.steps + [run_rewrite_cleanup(runner, plan)])
+}
+
+/** Run one rewrite against the live machine and the live GitHub API. */
+pub fn run_rewrite(harness: Harness, plan: SignedBotRewritePlan) -> SignedBotRewriteResult {
+  return run_rewrite_with(
+    { argv -> live_command_runner(harness.tools, argv) },
+    { request -> github_commit_worktree(harness, request) },
+    plan,
+  )
+}
+
+/**
+ * How long to let GitHub's pull request record catch up to a publish.
+ *
+ * Sized against an API that is eventually consistent by design, not against a
+ * queue or a build: the observed gap was one read wide. Twenty seconds is far
+ * past anything that is still lag rather than a branch someone else moved.
+ */
+const PUBLISHED_HEAD_ATTEMPTS = 10
+
+const PUBLISHED_HEAD_INTERVAL_MS = 2000
+
+pub type SignedBotPrReader = fn() -> SignedBotPullRequest
+
+pub type SignedBotAwaitOptions = {max_attempts?: int, interval_ms?: int}
+
+pub type SignedBotAwaitResult = {
+  settled: bool,
+  attempts: int,
+  pr: SignedBotPullRequest?,
+  detail: string,
+}
+
+/**
+ * Re-read the pull request until GitHub agrees the published commit is its head.
+ *
+ * Publishing is two writes — the branch is reset to the base, then the commit is
+ * created on it — and the pull request record catches up to each separately. One
+ * read lands in that gap often enough to matter: the #660 probe saw `head_oid`
+ * still at the base and no commits at all, for a rewrite that had already
+ * published a verified commit and left the branch pointing at it. The commits
+ * read does not merely disagree there, it fails outright, so an attempt that
+ * throws is a retry rather than a verdict.
+ *
+ * Calling that gap a failed rewrite is worse than slow: it sends a workflow back
+ * to redo a rewrite that succeeded, and the retry then refuses on its own lease
+ * against the head this one published.
+ *
+ * The last observation comes back either way, so a caller that gives up reports
+ * what GitHub actually said rather than nothing.
+ */
+pub fn await_published_head(
+  clock: HarnessClock,
+  read: SignedBotPrReader,
+  commit_oid: string,
+  options: SignedBotAwaitOptions = {},
+) -> SignedBotAwaitResult {
+  const expected = lowercase(trim(to_string(commit_oid)))
+  if expected == "" {
+    return {settled: false, attempts: 0, pr: nil, detail: "the publish named no commit to confirm"}
+  }
+  const max = options.max_attempts ?? PUBLISHED_HEAD_ATTEMPTS
+  const interval = options.interval_ms ?? PUBLISHED_HEAD_INTERVAL_MS
+  let attempts = 0
+  let last: SignedBotPullRequest? = nil
+  let failure = ""
+  const settled = poll_until(
+    clock,
+    { ->
+      attempts = attempts + 1
+      const observed = try {
+        read()
+      } catch (e) {
+        failure = to_string(e)
+        nil
+      }
+      if observed == nil {
+        return nil
+      }
+      last = observed
+      failure = ""
+      return if lowercase(trim(observed.head_oid)) == expected {
+        observed
+      } else {
+        nil
+      }
+    },
+    {max_attempts: max, interval_ms: interval, timeout_ms: max * interval * 2},
+  )
+  if settled != nil {
+    return {settled: true, attempts: attempts, pr: settled, detail: ""}
+  }
+  const detail = if failure != "" {
+    "could not re-read the pull request after publishing ${expected}: ${failure}"
+  } else {
+    "published ${expected}, but the pull request still reports head"
+      + " ${last?.head_oid ?? "(none)"} after ${attempts} attempt(s)"
+  }
+  return {settled: false, attempts: attempts, pr: last, detail: detail}
+}
+
+pub fn maybe_enable_auto_merge(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  expected_head_oid: string,
+  enabled: bool = true,
+) -> SignedBotAutoMergeResult {
+  if !enabled {
+    return Ok({state: "skipped"})
+  }
+  const result = github_enable_auto_merge_with_release_lease(
+    harness,
+    slug,
+    pr_number,
+    expected_head_oid,
+    "squash",
+  )
+  return if is_err(result) {
+    Err(unwrap_err(result))
+  } else {
+    Ok({state: to_string(unwrap(result).state)})
+  }
+}

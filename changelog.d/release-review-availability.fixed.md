@@ -1,0 +1,1 @@
+Release-readiness review findings are now classified before they can fail a cut: a review that never arrived proceeds when deterministic notes exist, a loop that ended early proceeds only when its audit closed the evidence contract, and an incomplete evidence contract always surfaces instead of being suppressed when zero tools ran.

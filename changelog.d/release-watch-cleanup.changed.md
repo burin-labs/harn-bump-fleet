@@ -1,0 +1,1 @@
+The resumable release watcher now streams deduplicated workflow, job, and active-step progress with a bounded heartbeat. After terminal hosted proof it deletes only version-matched content-addressed release attempt and certification refs under exact target leases, recording an idempotent cleanup receipt and failing closed if any ref moved.

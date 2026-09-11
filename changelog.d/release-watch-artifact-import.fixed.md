@@ -1,0 +1,1 @@
+Release watchers now import hosted receipts through a credential-minimal short-lived GitHub artifact boundary, redact signed redirect queries before subprocess recording, then return to the narrower long-running release allowlist.

@@ -1,0 +1,213 @@
+import { FleetManifest, FleetRepository, bump_adapter_contract } from "./fleet_manifest"
+import {
+  WorkflowProjectionSyncResult,
+  append_workflow_string_input,
+  sync_workflow_projection,
+} from "./workflow_projection"
+
+/**
+ * Render manifest-owned rationale as YAML comments above `refresh-command`.
+ *
+ * A generated adapter otherwise has nowhere to say *why* a step looks the way
+ * it does, so the explanation ends up hand-edited into the projected file —
+ * where the next `--apply` silently deletes it, and where it stops being the
+ * owner's answer. Keeping it in the manifest means the reason ships with the
+ * command it explains.
+ */
+fn bump_refresh_note_lines(notes: string) -> list<string> {
+  const body = trim(notes)
+  if body == "" {
+    return []
+  }
+  let out: list<string> = []
+  for line in split(body, "\n") {
+    out = out
+      + [
+        if trim(line) == "" {
+          "      #"
+        } else {
+          "      # ${line}"
+        },
+      ]
+  }
+  return out
+}
+
+/**
+ * Project the consumer-side half of the manifest/adapter invariant.
+ *
+ * The consumer manifest is the semantic owner, while this workflow is its
+ * generated adapter. Path-filtered pull-request and push runs make a change to
+ * either half execute the same digest comparison before it can read as green.
+ *
+ * The digest travels under a `FLEET_` name, never `HARN_`. The runtime owns the
+ * `HARN_` prefix and aborts with `HARN-ENV-001` on a member it does not know,
+ * so an unregistered `HARN_*` name rendered here breaks any `harn` invocation
+ * that inherits it and is refused outright by consumer namespace guards.
+ */
+/**
+ * Job keys the renderer may emit beside the delegated `bump` job. The release
+ * verifier reads this list, so a job added here is accepted there in the same
+ * change; a verifier that counted jobs read every renderer change as a
+ * consumer's local orchestration and refused publication.
+ */
+pub const FLEET_OWNED_ADAPTER_JOBS: list<string> = ["consumer-contract-projection"]
+
+fn consumer_contract_gate_lines(contract_sha256: string) -> list<string> {
+  return [
+    "  consumer-contract-projection:",
+    "    name: Consumer contract projection",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - name: Checkout",
+    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+    // A persisted checkout credential writes an `include.path` into
+    // `.git/config` pointing at a `$RUNNER_TEMP` file. Git treats an
+    // unreadable include as fatal, so a later step reading git under a
+    // different temp root fails on configuration rather than on its own work.
+    // This job only hashes a file, so it needs no credential at all, and
+    // consumers refuse a workflow checkout that keeps one.
+    "        with:",
+    "          persist-credentials: false",
+    "      - name: Compare contract and adapter",
+    "        env:",
+    "          FLEET_ADAPTER_CONTRACT_SHA256: ${contract_sha256}",
+    "        shell: bash",
+    "        run: |",
+    "          set -euo pipefail",
+    "          contract_path=.harn/fleet-projections.toml",
+    "          if [[ ! -f \"$contract_path\" ]]; then",
+    "            echo \"consumer contract projection drift: $contract_path is missing\" >&2",
+    "            exit 1",
+    "          fi",
+    "          if command -v sha256sum >/dev/null 2>&1; then",
+    "            observed=$(sha256sum \"$contract_path\" | awk '{print $1}')",
+    "          else",
+    "            observed=$(shasum -a 256 \"$contract_path\" | awk '{print $1}')",
+    "          fi",
+    "          if [[ \"$observed\" != \"$FLEET_ADAPTER_CONTRACT_SHA256\" ]]; then",
+    "            echo \"consumer contract projection drift: $contract_path digest $observed does not match generated adapter digest $FLEET_ADAPTER_CONTRACT_SHA256\" >&2",
+    "            exit 1",
+    "          fi",
+    "",
+  ]
+}
+
+/** Render the exact thin runtime-bump adapter owned by the fleet manifest. */
+pub fn render_bump_workflow(manifest: FleetManifest, repo: FleetRepository) -> string {
+  if repo.bump_workflow_ownership != "fleet" {
+    throw "repository '${repo.slug}' does not delegate bump workflow ownership to the fleet"
+  }
+  const expression = "$"
+  const contract = bump_adapter_contract(manifest, repo)
+  let inputs = [
+    "      orchestration-sha: ${contract.orchestration_sha}",
+    "      version: ${expression}{{ inputs.version }}",
+  ]
+  inputs = inputs + bump_refresh_note_lines(repo.bump_refresh_notes ?? "")
+  inputs = append_workflow_string_input(inputs, "refresh-command", contract.refresh_command)
+  inputs = append_workflow_string_input(inputs, "validate-command", contract.validation_command)
+  if contract.publish_failure_for_repair {
+    inputs = inputs + ["      publish-failure-for-repair: true"]
+  }
+  // Always projected, never inferred from the reusable workflow's own default:
+  // the adapter states the decision it is making, so a change to that default
+  // upstream cannot silently re-enable an unattended source rewrite here.
+  const behavior_preserving_fixes = if contract.apply_behavior_preserving_fixes {
+    "true"
+  } else {
+    "false"
+  }
+  inputs = inputs + ["      apply-behavior-preserving-fixes: ${behavior_preserving_fixes}"]
+  if !contract.enable_auto_merge {
+    inputs = inputs + ["      enable-auto-merge: false"]
+  }
+  if contract.node_version != "" {
+    inputs = inputs + ["      node-version: \"${contract.node_version}\""]
+  }
+  const consumer_contract_sha256 = repo.consumer_contract_sha256
+  return join(
+    [
+      "name: Bump Harn Runtime",
+      "",
+      "# fleet.toml in harn-bump-fleet owns this generated dispatch adapter.",
+    ]
+      + if consumer_contract_sha256 == nil {
+        []
+      } else {
+        ["# Consumer contract SHA-256: ${consumer_contract_sha256}"]
+      }
+      + ["on:"]
+      + if consumer_contract_sha256 == nil {
+        []
+      } else {
+        [
+          "  push:",
+          "    paths:",
+          "      - \".harn/fleet-projections.toml\"",
+          "      - \".github/workflows/bump-harn.yml\"",
+          "  pull_request:",
+          "    paths:",
+          "      - \".harn/fleet-projections.toml\"",
+          "      - \".github/workflows/bump-harn.yml\"",
+        ]
+      }
+      + [
+        "  workflow_dispatch:",
+        "    inputs:",
+        "      version:",
+        "        description: \"Optional exact Harn tag (vX.Y.Z). Defaults to latest.\"",
+        "        required: false",
+        "        type: string",
+        "",
+        "permissions:",
+        "  contents: read",
+        "",
+        "jobs:",
+      ]
+      + if consumer_contract_sha256 == nil {
+        []
+      } else {
+        consumer_contract_gate_lines(consumer_contract_sha256 ?? "")
+      }
+      + ["  bump:"]
+      + if consumer_contract_sha256 == nil {
+        []
+      } else {
+        [
+          "    if: github.event_name == 'workflow_dispatch'",
+          "    needs: consumer-contract-projection",
+        ]
+      }
+      + ["    uses: ${contract.workflow_reference}", "    with:"]
+      + inputs
+      + [
+        "    secrets:",
+        "      app-client-id: ${expression}{{ secrets.RELEASE_APP_CLIENT_ID }}",
+        "      app-private-key: ${expression}{{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+        "",
+      ],
+    "\n",
+  )
+}
+
+/** Check or write one manifest-owned runtime-bump adapter in a local checkout. */
+pub fn sync_bump_workflow_repo(
+  fs: HarnessFs,
+  manifest: FleetManifest,
+  repo: FleetRepository,
+  projects_root: string,
+  apply: bool,
+) -> WorkflowProjectionSyncResult {
+  const repo_path = path_join(projects_root, repo.directory)
+  return sync_workflow_projection(
+    fs,
+    {
+      slug: repo.slug,
+      repo_path: repo_path,
+      relative_path: ".github/workflows/bump-harn.yml",
+      expected: render_bump_workflow(manifest, repo),
+    },
+    apply,
+  )
+}

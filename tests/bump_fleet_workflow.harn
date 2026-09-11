@@ -1,0 +1,1021 @@
+import { shell_quote } from "std/runtime"
+import { fleet_operation_scope, fleet_scope_digest } from "../lib/fleet_operation_scope"
+import { fleet_workflow_chain_run_name } from "../lib/fleet_workflow_run"
+import { decode_github_workflow, github_projection_has_trigger } from "../lib/github_workflow"
+import { harn_update_continuation_workflow_probe } from "../lib/harn_update_continuation"
+import { pinned_test_runtime } from "./pinned_runtime"
+
+fn workflow_source(fs: HarnessFs) -> string {
+  return fs.read_text(path_join(dirname(fs.cwd()), ".github", "workflows", "bump-fleet.yml"))
+}
+
+fn workflow(fs: HarnessFs) {
+  return decode_github_workflow(workflow_source(fs))
+}
+
+fn cancelled_reporter_source(fs: HarnessFs) -> string {
+  return fs.read_text(
+    path_join(dirname(fs.cwd()), ".github", "workflows", "report-cancelled-fleet-bump.yml"),
+  )
+}
+
+fn requires_valid_dispatch_lineage(condition: string) -> bool {
+  return contains(condition, "steps.dispatch-lineage.outcome == 'success'")
+}
+
+fn is_attempt_qualified_immutable_artifact(name: any, overwrite: any) -> bool {
+  return contains(to_string(name ?? ""), "artifact_name") && overwrite == nil
+}
+
+pipeline test_hosted_bump_runs_the_canonical_controller(harness: Harness, task: any) {
+  const projected = workflow(harness.fs)
+  assert(github_projection_has_trigger(projected, "workflow_dispatch"))
+  let source = ""
+  for job in projected.jobs {
+    for step in job.value.steps ?? [] {
+      source = source + "\n" + (step.run ?? "")
+    }
+  }
+  assert(contains(source, "materialize_fleet.harn"))
+  assert(contains(source, "bump_fleet.harn"))
+  assert(contains(source, "wait_fleet_convergence.harn"))
+  assert(contains(source, "--fleet-root"))
+  assert_eq(contains(source, "dispatch_bump_fleet.harn"), false)
+}
+
+/**
+ * API authentication does not authenticate raw HTTPS Git. Materialization
+ * includes private repositories, so the App token must be installed as a Git
+ * helper before the checkout controller runs, without embedding it in a URL.
+ */
+pipeline test_private_fleet_clone_credentials_are_armed_before_materialization(
+  harness: Harness,
+  task: any,
+) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let arm_index = -1
+  let materialize_index = -1
+  let index = 0
+  for step in steps {
+    if step.name == "Arm Git credentials for private fleet clones" {
+      arm_index = index
+      assert_eq(step.env?.get("GH_TOKEN"), "$" + "{{ steps.app-token.outputs.token }}")
+      assert(contains(step.run ?? "", "gh auth setup-git --hostname github.com"))
+      assert_eq(contains(step.run ?? "", "x-access-token:"), false)
+    }
+    if contains(step.run ?? "", "materialize_fleet.harn") {
+      materialize_index = index
+    }
+    index = index + 1
+  }
+  assert(arm_index >= 0)
+  assert(materialize_index > arm_index)
+}
+
+pipeline test_hosted_repair_enters_the_brokered_release_environment(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs)
+  assert(contains(source, "environment: release"))
+  assert(!contains(source, "OPENROUTER_API_KEY"))
+  assert(!contains(source, "FIREWORKS_API_KEY"))
+  assert(contains(source, "CEREBRAS_API_KEY: $" + "{{ secrets.CEREBRAS_API_KEY }}"))
+  assert(!contains(source, "HARN_UPDATE_PROVIDER_SECRET_REFERENCE"))
+  assert(contains(source, "--provider-secret-reference CEREBRAS_API_KEY"))
+  assert(contains(source, "HARN_UPDATE_VALUE_PROVIDER: cerebras"))
+  assert(contains(source, "HARN_UPDATE_VALUE_MODEL: gpt-oss-120b"))
+  assert(contains(source, "HARN_UPDATE_STRONG_PROVIDER: cerebras"))
+  assert(contains(source, "HARN_UPDATE_STRONG_MODEL: zai-glm-4.7"))
+}
+
+pipeline test_hosted_repair_bootstraps_the_exact_target_runtime(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs)
+  assert(contains(source, "- name: Resolve exact update target and bounded round"))
+  assert(contains(source, "- name: Install exact target Harn"))
+  assert(contains(source, "version: $" + "{{ steps.update-plan.outputs.target }}"))
+  assert(!contains(source, "HARN_UPDATE_CONTROLLER_REVISION"))
+  assert(contains(source, "--controller-revision \"$" + "{{ github.sha }}\""))
+}
+
+pipeline test_hosted_bump_token_has_only_required_write_scopes(harness: Harness, task: any) {
+  const projected = workflow(harness.fs)
+  let minted = []
+  let minted_count = 0
+  for job in projected.jobs {
+    for step in job.value.steps ?? [] {
+      if starts_with(step.uses ?? "", "actions/create-github-app-token@") {
+        minted = minted + [(step.with ?? {}).keys().sorted()]
+        minted_count = minted_count + 1
+      }
+    }
+  }
+  // The registry of what this token may ask for. Equality, not containment, so
+  // an unlisted permission fails here rather than reaching a mint unreviewed.
+  const required_scopes = [
+    "client-id",
+    "owner",
+    "permission-actions",
+    "permission-checks",
+    "permission-contents",
+    "permission-pull-requests",
+    "permission-workflows",
+    "private-key",
+  ]
+  // Seven: the sixth is the chain lease release, which mints its own token
+  // because it runs after a failing round where an earlier token step may have
+  // been skipped.
+  assert_eq(minted_count, 7)
+  for scopes in minted {
+    assert_eq(scopes, required_scopes)
+  }
+  for job in projected.jobs {
+    for step in job.value.steps ?? [] {
+      if starts_with(step.uses ?? "", "actions/create-github-app-token@") {
+        assert_eq(step.with["permission-contents"], "write")
+        // Checks is a census read. Nothing in these workflows reports a check
+        // result, so this level is the ceiling and not a starting point.
+        assert_eq(step.with["permission-checks"], "read")
+        assert(step.with["permission-checks"] != "write")
+      }
+    }
+  }
+}
+
+pipeline test_continuation_authority_is_preflighted_before_fleet_work(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs)
+  const ready = harn_update_continuation_workflow_probe(source)
+  assert_eq(ready, {ok: true, reason: "controller_token_and_preflight_ready"})
+  // Negative control: the same production projection without Workflows write
+  // permission must be measured as blocked, not as an empty or missing read.
+  const under_scoped = harn_update_continuation_workflow_probe(
+    source.replace("          permission-workflows: write\n", ""),
+  )
+  assert_eq(under_scoped.ok, false)
+  assert(contains(under_scoped.reason, "lacks controller lease scopes"))
+}
+
+pipeline test_authorization_failure_receipt_is_persisted_before_the_preflight_fails(
+  harness: Harness,
+  task: any,
+) {
+  const root = dirname(harness.fs.cwd())
+  const script = harness.fs.read_text(path_join(root, "preflight_harn_update_continuation.harn"))
+  const write_index = script.index_of("harness.fs.write_text(options.receipt, rendered)")
+  const failure_index = script.index_of("if !receipt.authorized")
+  assert(write_index >= 0)
+  assert(failure_index > write_index)
+  assert(
+    contains(workflow_source(harness.fs), "fleet-update-continuation-authorization-receipt.json"),
+  )
+}
+
+/**
+ * GitHub App installation tokens expire after one hour. Fleet observation can
+ * legitimately outlive that, so every bounded observation period must mint its
+ * own token immediately before polling instead of borrowing the job's startup
+ * token. The timeout margin leaves enough time for action and API teardown.
+ */
+pipeline test_convergence_waits_use_fresh_bounded_tokens(harness: Harness, task: any) {
+  const job = workflow(harness.fs).jobs.get("update")
+  const steps = job?.steps ?? []
+  assert_eq(job?.env?.FLEET_TOKEN_EPOCH_TIMEOUT_S, "3000")
+  let waits = 0
+  let previous = nil
+  for step in steps {
+    if contains(step.run ?? "", "wait_fleet_convergence.harn") {
+      waits = waits + 1
+      assert(starts_with(previous?.uses ?? "", "actions/create-github-app-token@"))
+      const token_ref = "$" + "{{ steps." + (previous?.id ?? "") + ".outputs.token }}"
+      assert_eq(step.env?.GH_TOKEN, token_ref)
+      assert_eq(step.env?.GITHUB_TOKEN, token_ref)
+      assert(contains(step.run ?? "", "--timeout-s \"$FLEET_TOKEN_EPOCH_TIMEOUT_S\""))
+      assert_eq(contains(step.run ?? "", "--timeout-s 7200"), false)
+    }
+    previous = step
+  }
+  assert_eq(waits, 2)
+}
+
+pipeline test_failed_convergence_requires_semantic_repair_before_reproof(
+  harness: Harness,
+  task: any,
+) {
+  const projected = workflow(harness.fs)
+  let converge = nil
+  let observe = nil
+  let repair = nil
+  let prove = nil
+  for job in projected.jobs {
+    for step in job.value.steps ?? [] {
+      if step.name == "Start Harn updates" {
+        converge = step
+      }
+      if step.name == "Check Harn updates" {
+        observe = step
+      }
+      if step.name == "Repair failed Harn updates" {
+        repair = step
+      }
+      if step.name == "Prove Harn updates" {
+        prove = step
+      }
+    }
+  }
+  assert_eq(converge?.["continue-on-error"], true)
+  assert(contains(converge?.run ?? "", "--continuation-receipt fleet-dispatch-continuation.json"))
+  assert_eq(observe?.["continue-on-error"], true)
+  assert(contains(observe?.run ?? "", "--continuation-receipt fleet-dispatch-continuation.json"))
+  assert(contains(repair?.if ?? "", "observe-convergence.outcome == 'failure'"))
+  assert(contains(repair?.run ?? "", "repair_fleet_convergence.harn"))
+  assert(contains(repair?.run ?? "", "--fleet-root \"$FLEET_ROOT\""))
+  assert(contains(repair?.run ?? "", "--max-attempts 3"))
+  assert(contains(repair?.run ?? "", "--max-cost-per-repository-usd 0.90"))
+  assert(contains(repair?.run ?? "", "--max-cost-per-run-usd 4.00"))
+  assert(contains(repair?.run ?? "", "--continuation-receipt fleet-dispatch-continuation.json"))
+  assert(contains(repair?.run ?? "", "--write-root \"$FLEET_ROOT\""))
+  assert(contains(repair?.run ?? "", "--sandbox-write-root \"$FLEET_ROOT\""))
+  const expression = "$"
+  assert_eq(repair?.env?.FLEET_ROOT, expression + "{{ github.workspace }}/.fleet")
+  assert(contains(repair?.run ?? "", "--allow-process-network"))
+  assert(contains(repair?.run ?? "", "--environment-policy granted"))
+  assert(!contains(repair?.run ?? "", "--no-sandbox"))
+  assert(contains(repair?.run ?? "", "repair_provider=env:CEREBRAS_API_KEY"))
+  assert_eq(repair?.env?.HARN_EGRESS_ALLOW, "api.github.com:443,api.cerebras.ai:443")
+  assert_eq(repair?.env?.HARN_EGRESS_DEFAULT, "deny")
+  assert_eq(repair?.env?.HARN_EGRESS_BLOCK_PRIVATE, "private")
+  assert(contains(repair?.run ?? "", "repair_egress_allow=env:HARN_EGRESS_ALLOW"))
+  assert(contains(repair?.run ?? "", "repair_egress_default=env:HARN_EGRESS_DEFAULT"))
+  assert(contains(repair?.run ?? "", "repair_egress_private=env:HARN_EGRESS_BLOCK_PRIVATE"))
+  assert(!contains(repair?.env?.HARN_EGRESS_ALLOW ?? "", "*"))
+  assert(!contains(repair?.run ?? "", "--max-repositories"))
+  assert_eq(repair?.env?.OPENROUTER_API_KEY, nil)
+  assert(contains(repair?.env?.CEREBRAS_API_KEY ?? "", "secrets.CEREBRAS_API_KEY"))
+  assert_eq(repair?.id, "repair-convergence")
+  assert_eq(repair?.["continue-on-error"], nil)
+  assert(contains(prove?.if ?? "", "always()"))
+  assert(requires_valid_dispatch_lineage(prove?.if ?? ""))
+  assert(
+    !contains(prove?.if ?? "", "steps.repair-convergence.outcome"),
+    "deterministic proof must not inherit the paid repair admission decision",
+  )
+  assert_eq(prove?.["continue-on-error"], true)
+  assert(contains(prove?.run ?? "", "--continuation-receipt fleet-dispatch-continuation.json"))
+  assert(contains(prove?.run ?? "", "fleet-convergence-proof-receipt.json"))
+}
+
+pipeline test_repair_spend_stop_keeps_proof_and_successor_live(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const proof_token = steps.find({ step -> step.name == "Mint proof GitHub App token" })
+  const proof = steps.find({ step -> step.name == "Prove Harn updates" })
+  const successor = steps.find(
+    { step -> step.name == "Schedule the next hosted round when proof is still incomplete" },
+  )
+  const gate = steps.find({ step -> step.name == "Require exact update proof" })
+  for step in [proof_token, proof] {
+    assert(contains(step?.if ?? "", "always()"))
+    assert(requires_valid_dispatch_lineage(step?.if ?? ""))
+    assert(
+      !contains(step?.if ?? "", "steps.repair-convergence.outcome"),
+      "a failed or cost-stopped repair cannot skip read-only proof",
+    )
+  }
+  assert(
+    contains(successor?.if ?? "", "steps.prove-convergence.outcome == 'failure'"),
+    "an incomplete proof must still schedule the bounded successor",
+  )
+  const gate_script = gate?.run ?? ""
+  assert(!contains(gate_script, "the long proof wait was skipped"))
+  assert(
+    contains(gate_script, "Deterministic fleet proof still ran after paid repair stopped"),
+    "the terminal gate must distinguish a spend stop from a proof skip",
+  )
+}
+
+pipeline test_exact_proof_refuses_empty_or_inconsistent_receipts(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs)
+  assert(contains(source, ".scope_proven == true"))
+  assert(contains(source, ".total_count > 0"))
+  assert(contains(source, ".unproven_count == 0"))
+  assert(contains(source, "fleet proof: total="))
+  assert(contains(source, "pending="))
+  assert(contains(source, "unproven: "))
+  assert(contains(source, "refusing a vacuous green"))
+}
+
+pipeline test_incomplete_proof_schedules_one_fresh_hosted_round(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let continuation = nil
+  let repair_count = 0
+  for step in steps {
+    if step.name == "Schedule the next hosted round when proof is still incomplete" {
+      continuation = step
+    }
+    if contains(step.run ?? "", "repair_fleet_convergence.harn") {
+      repair_count = repair_count + 1
+    }
+  }
+  assert(contains(continuation?.if ?? "", "always()"))
+  assert(requires_valid_dispatch_lineage(continuation?.if ?? ""))
+  assert(
+    contains(continuation?.if ?? "", "steps.persist-dispatch-continuation.outcome == 'success'"),
+  )
+  assert(contains(continuation?.run ?? "", "continue_harn_update.harn"))
+  assert(contains(continuation?.run ?? "", "--proof-receipt fleet-convergence-proof-receipt.json"))
+  assert(contains(continuation?.run ?? "", "--chain-id \"$CHAIN_ID\""))
+  assert(contains(continuation?.run ?? "", "--controller-revision \"$GITHUB_SHA\""))
+  assert_eq(continuation?.env?.TARGET, "$" + "{{ steps.update-plan.outputs.target }}")
+  assert_eq(continuation?.env?.CHAIN_ID, "$" + "{{ steps.update-plan.outputs.chain_id }}")
+  assert(contains(workflow_source(harness.fs), "run-name: Update Harn fleet /"))
+  assert_eq(repair_count, 1)
+}
+
+pipeline test_successor_restores_exact_predecessor_before_fleet_work(harness: Harness, task: any) {
+  const projected = workflow(harness.fs)
+  const predecessor = projected.workflow_dispatch?.inputs?.get("predecessor_run_id")
+  const predecessor_attempt = projected.workflow_dispatch?.inputs?.get("predecessor_run_attempt")
+  assert(predecessor != nil, "successor dispatch must declare its predecessor run")
+  assert_eq(predecessor?.type, "string")
+  assert(predecessor_attempt != nil, "successor dispatch must declare its predecessor attempt")
+  assert_eq(predecessor_attempt?.type, "string")
+  const steps = projected.jobs.get("update")?.steps ?? []
+  let restore = nil
+  let validate = nil
+  let start = nil
+  let observe = nil
+  let persist = nil
+  let schedule = nil
+  let restore_index = -1
+  let validate_index = -1
+  let start_index = -1
+  let observe_index = -1
+  let persist_index = -1
+  let schedule_index = -1
+  let index = 0
+  for step in steps {
+    if step.name == "Restore predecessor dispatch continuation" {
+      restore = step
+      restore_index = index
+    }
+    if step.name == "Validate predecessor dispatch continuation" {
+      validate = step
+      validate_index = index
+    }
+    if step.name == "Start Harn updates" {
+      start = step
+      start_index = index
+    }
+    if step.name == "Check Harn updates" {
+      observe = step
+      observe_index = index
+    }
+    if step.name == "Upload dispatch continuation for successor" {
+      persist = step
+      persist_index = index
+    }
+    if step.name == "Schedule the next hosted round when proof is still incomplete" {
+      schedule = step
+      schedule_index = index
+    }
+    index = index + 1
+  }
+  assert(starts_with(restore?.uses ?? "", "actions/download-artifact@"))
+  assert_eq(
+    restore?.with?.get("name"),
+    "$" + "{{ steps.update-plan.outputs.predecessor_artifact_name }}",
+  )
+  assert_eq(
+    restore?.with?.get("run-id"),
+    "$" + "{{ steps.update-plan.outputs.predecessor_run_id }}",
+  )
+  assert(contains(validate?.run ?? "", "validate_fleet_dispatch_continuation.harn"))
+  assert(contains(validate?.run ?? "", "--current-run-id \"$GITHUB_RUN_ID\""))
+  assert(contains(validate?.run ?? "", "--current-run-attempt \"$GITHUB_RUN_ATTEMPT\""))
+  assert(contains(validate?.run ?? "", "--predecessor-run-attempt"))
+  assert(contains(validate?.run ?? "", "args+=(--only \"$ONLY\")"))
+  assert(restore_index >= 0 && validate_index > restore_index)
+  assert(start_index > validate_index && observe_index > validate_index)
+  assert(contains(start?.if ?? "", "steps.dispatch-lineage.outcome == 'success'"))
+  assert(contains(start?.if ?? "", "steps.update-plan.outputs.needs_predecessor == 'false'"))
+  assert(starts_with(persist?.uses ?? "", "actions/upload-artifact@"))
+  assert_eq(persist?.with?.get("name"), "$" + "{{ steps.update-plan.outputs.artifact_name }}")
+  assert_eq(persist?.with?.get("overwrite"), nil)
+  assert(persist_index > observe_index && schedule_index > persist_index)
+  assert(contains(schedule?.if ?? "", "steps.persist-dispatch-continuation.outcome == 'success'"))
+  assert(contains(schedule?.run ?? "", "--controller-run-id \"$GITHUB_RUN_ID\""))
+  assert(contains(schedule?.run ?? "", "--controller-run-attempt \"$GITHUB_RUN_ATTEMPT\""))
+  assert(
+    contains(
+      workflow_source(harness.fs),
+      "continuation rounds require an exact positive predecessor run ID and attempt",
+    ),
+  )
+}
+
+pipeline test_hosted_artifact_keeps_startup_and_terminal_authority_receipts(
+  harness: Harness,
+  task: any,
+) {
+  const source = workflow_source(harness.fs)
+  assert(contains(source, "fleet-repair-startup-receipt.json"))
+  assert(contains(source, "fleet-dispatch-continuation.json"))
+  assert(contains(source, "fleet-repair-bootstrap-failure-receipt.json"))
+  assert(contains(source, "fleet-repair-receipt.json"))
+  assert(contains(source, "fleet-convergence-proof-receipt.json"))
+  assert(contains(source, "fleet-runtime-cost-receipt.json"))
+  assert(contains(source, "harn_bump_fleet.runtime_cost.v2"))
+  assert(contains(source, "scripts/write_harn_cost_receipt.sh"))
+  for name in ["materialize", "update", "observe", "repair", "proof", "continuation", "policy"] {
+    assert(contains(source, "--summary-file runtime-usage/${name}.json"))
+  }
+  assert(contains(source, "include-hidden-files: true"))
+}
+
+pipeline test_unproven_round_names_the_blocking_repositories(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const proof = steps.find({ step -> step.name == "Require exact update proof" })
+  assert(proof != nil, "the hosted round must keep an exact update proof gate")
+  const script = (proof ?? {}).run ?? ""
+  assert(contains(script, "fleet-convergence-proof-receipt.json"))
+  assert(
+    contains(script, "select(.state != \"proven\")"),
+    "the failure must name the unproven repositories instead of leaving the receipt to be parsed",
+  )
+  assert(contains(script, "unproven: \\(.repo) [\\(.state)] \\(.reason)"))
+}
+
+pipeline test_failed_target_resolution_stops_unprepared_dependents(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let guarded = []
+  for step in steps {
+    if step.name == "Mint proof GitHub App token"
+      || step.name == "Prove Harn updates"
+      || step.name
+        == "Schedule the next hosted round when proof is still incomplete"
+      || step.name
+        == "Mint projection verification GitHub App token"
+      || step.name == "Require exact update proof" {
+      guarded = guarded + [step]
+    }
+  }
+  assert_eq(len(guarded), 5)
+  for step in guarded {
+    assert(contains(step.if ?? "", "always()"))
+    assert(contains(step.if ?? "", "steps.update-plan.outcome == 'success'"))
+    assert(requires_valid_dispatch_lineage(step.if ?? ""))
+  }
+}
+
+pipeline test_rejected_predecessor_cannot_reach_proof_upload_or_schedule(
+  harness: Harness,
+  task: any,
+) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const guarded_names = [
+    "Check Harn updates",
+    "Persist repair launch receipt before provider credentials",
+    "Mint repair GitHub App token",
+    "Repair failed Harn updates",
+    "Mint proof GitHub App token",
+    "Prove Harn updates",
+    "Upload dispatch continuation for successor",
+    "Schedule the next hosted round when proof is still incomplete",
+    "Mint projection verification GitHub App token",
+    "Verify remote fleet projections",
+    "Persist exact runtime cost receipt",
+    "Upload fleet receipts",
+    "Require exact update proof",
+  ]
+  let reached = 0
+  let admission = nil
+  for step in steps {
+    if step.name == "Admit initial or validated dispatch lineage" {
+      admission = step
+    }
+    if guarded_names.contains(step.name ?? "") {
+      reached = reached + 1
+      assert(requires_valid_dispatch_lineage(step.if ?? ""))
+    }
+  }
+  assert_eq(reached, len(guarded_names), "the negative control must inspect every side effect")
+  assert_eq(
+    admission?.if,
+    "always() && steps.update-plan.outcome == 'success' && steps.require-release-ready.outcome == 'success'",
+  )
+  assert(
+    contains(
+      admission?.run ?? "",
+      "if [[ \"$NEEDS_PREDECESSOR\" == \"false\" || \"$VALIDATION_OUTCOME\" == \"success\" ]]; then",
+    ),
+  )
+  assert(contains(admission?.run ?? "", "proof and side effects are blocked"))
+  assert_eq(
+    requires_valid_dispatch_lineage("always() && steps.update-plan.outcome == 'success'"),
+    false,
+    "the old under-gated condition must fail the control",
+  )
+}
+
+pipeline test_reruns_restore_attempt_qualified_artifacts_without_redispatch_or_overwrite(
+  harness: Harness,
+  task: any,
+) {
+  const source = workflow_source(harness.fs)
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let start = nil
+  let restore = nil
+  let persist = nil
+  for step in steps {
+    if step.name == "Start Harn updates" {
+      start = step
+    }
+    if step.name == "Restore predecessor dispatch continuation" {
+      restore = step
+    }
+    if step.name == "Upload dispatch continuation for successor" {
+      persist = step
+    }
+  }
+  assert(contains(source, "if (( GITHUB_RUN_ATTEMPT > 1 )); then"))
+  assert(contains(source, "predecessor_run_id=\"$GITHUB_RUN_ID\""))
+  assert(contains(source, "predecessor_run_attempt=\"$((GITHUB_RUN_ATTEMPT - 1))\""))
+  assert(contains(start?.if ?? "", "steps.dispatch-lineage.outcome == 'success'"))
+  assert(contains(start?.if ?? "", "steps.update-plan.outputs.needs_predecessor == 'false'"))
+  assert_eq(restore?.if, "steps.update-plan.outputs.needs_predecessor == 'true'")
+  assert(contains(to_string(restore?.with?.get("name") ?? ""), "predecessor_artifact_name"))
+  assert(
+    is_attempt_qualified_immutable_artifact(
+      persist?.with?.get("name"),
+      persist?.with?.get("overwrite"),
+    ),
+  )
+  assert_eq(
+    is_attempt_qualified_immutable_artifact("harn-update-dispatch-continuation", true),
+    false,
+    "the old fixed-name overwrite must fire the negative control",
+  )
+  const expression = "$"
+  assert(
+    contains(
+      source,
+      "harn-update-receipts-"
+        + expression
+        + "{{ github.run_id }}-"
+        + expression
+        + "{{ github.run_attempt }}",
+    ),
+  )
+  assert_eq(
+    contains(
+      source.replace("if (( GITHUB_RUN_ATTEMPT > 1 )); then", "if false; then"),
+      "if (( GITHUB_RUN_ATTEMPT > 1 )); then",
+    ),
+    false,
+    "removing the rerun branch must fire the negative control",
+  )
+}
+
+pipeline test_repair_launch_receipt_precedes_repair_credentials(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let receipt_index = -1
+  let token_index = -1
+  let repair_index = -1
+  let index = 0
+  for step in steps {
+    if step.name == "Persist repair launch receipt before provider credentials" {
+      receipt_index = index
+      assert(contains(step.run ?? "", "\"status\":\"launch_pending\""))
+      assert_eq(step.env?.CEREBRAS_API_KEY, nil)
+    }
+    if step.name == "Mint repair GitHub App token" {
+      token_index = index
+    }
+    if step.name == "Repair failed Harn updates" {
+      repair_index = index
+      assert(contains(step.run ?? "", "harn_startup_failed_before_controller_entry"))
+    }
+    index = index + 1
+  }
+  assert(receipt_index >= 0)
+  assert(token_index > receipt_index)
+  assert(repair_index > token_index)
+}
+
+pipeline test_scoped_bump_preserves_one_scope_through_every_controller_entrypoint(
+  harness: Harness,
+  task: any,
+) {
+  const projected = workflow(harness.fs)
+  const repositories = projected.workflow_dispatch?.inputs?.get("repositories_json")
+  assert_eq(repositories?.type, "string")
+  assert_eq(repositories?.required, false)
+  const source = workflow_source(harness.fs)
+  assert_eq(source.split("\n")[1], "run-name: " + fleet_workflow_chain_run_name())
+  assert_eq(projected.workflow_dispatch?.inputs?.get("scope_digest")?.type, "string")
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const preflight = steps.find({ step -> step.name == "Validate exact fleet scope identity" })
+  assert_eq(preflight?.env?.ONLY, "$" + "{{ inputs.only }}")
+  assert_eq(preflight?.env?.REPOSITORIES_JSON, "$" + "{{ inputs.repositories_json }}")
+  assert_eq(preflight?.env?.SCOPE_DIGEST, "$" + "{{ inputs.scope_digest }}")
+  assert(contains(preflight?.run ?? "", "--scope-digest \"$SCOPE_DIGEST\""))
+  assert(contains(preflight?.run ?? "", "validate_fleet_scope.harn"))
+  assert(contains(preflight?.run ?? "", "--require-canonical-repositories-json"))
+  let preflight_index = -1
+  let first_effect_index = -1
+  let step_index = 0
+  for step in steps {
+    if step.name == "Validate exact fleet scope identity" {
+      preflight_index = step_index
+    }
+    if step.name == "Preflight continuation controller authority" {
+      first_effect_index = step_index
+    }
+    step_index = step_index + 1
+  }
+  assert(preflight_index >= 0 && first_effect_index > preflight_index)
+  const consumers = [
+    "Validate predecessor dispatch continuation",
+    "Materialize manifest-owned fleet",
+    "Start Harn updates",
+    "Check Harn updates",
+    "Repair failed Harn updates",
+    "Prove Harn updates",
+    "Schedule the next hosted round when proof is still incomplete",
+    "Verify remote fleet projections",
+  ]
+  let reached = 0
+  for step in steps {
+    if consumers.contains(step.name ?? "") {
+      reached = reached + 1
+      assert_eq(step.env?.ONLY, "$" + "{{ inputs.only }}")
+      assert_eq(step.env?.REPOSITORIES_JSON, "$" + "{{ inputs.repositories_json }}")
+      assert(contains(step.run ?? "", "if [[ -n \"$ONLY\" ]]; then"))
+      assert(contains(step.run ?? "", "args+=(--only \"$ONLY\")"))
+      assert(contains(step.run ?? "", "if [[ -n \"$REPOSITORIES_JSON\" ]]; then"))
+      assert(contains(step.run ?? "", "args+=(--repositories-json \"$REPOSITORIES_JSON\")"))
+    }
+  }
+  assert_eq(reached, len(consumers))
+}
+
+pipeline test_direct_workflow_scope_refuses_noncanonical_title_identity_before_work(
+  harness: Harness,
+  task: any,
+) {
+  const root = dirname(harness.fs.cwd())
+  const harn = pinned_test_runtime({fs: harness.fs, process: harness.process}, root)
+  const entry = path_join(root, "validate_fleet_scope.harn")
+  const prefix = "cd "
+    + shell_quote(root)
+    + " && "
+    + shell_quote(harn)
+    + " run --no-sandbox "
+    + shell_quote(entry)
+    + " -- --require-canonical-repositories-json --repositories-json "
+  const canonical = harness.process.shell(
+    prefix + "'[\"burin-labs/20eq\",\"burin-labs/harn-cloud\"]'",
+  )
+  assert(canonical.success, canonical.combined)
+  const wire = "[\"burin-labs/20eq\",\"burin-labs/harn-cloud\"]"
+  const digest = fleet_scope_digest(fleet_operation_scope(nil, wire))
+  const bound = harness.process.shell(prefix + shell_quote(wire) + " --scope-digest " + digest)
+  assert(bound.success, bound.combined)
+  for invalid in ["", "wrong", fleet_scope_digest(fleet_operation_scope("burin-labs/harn-cloud"))] {
+    const refused = harness.process.shell(
+      prefix + shell_quote(wire) + " --scope-digest " + shell_quote(invalid),
+    )
+    assert(!refused.success)
+    assert(contains(refused.combined, "canonical repository scope digest"), refused.combined)
+  }
+  const missing_controller = harness.process.shell(
+    prefix + "'[\"burin-labs/20eq\",\"burin-labs/harn-cloud\"]' --require-controller",
+  )
+  assert_eq(missing_controller.success, false)
+  assert(contains(missing_controller.combined, "required harn-bump-fleet controller"))
+  const with_controller = harness.process.shell(
+    prefix + "'[\"burin-labs/harn-bump-fleet\",\"burin-labs/harn-cloud\"]' --require-controller",
+  )
+  assert(with_controller.success, with_controller.combined)
+  const noncanonical = harness.process.shell(
+    prefix + "'[\"burin-labs/harn-cloud\", \"burin-labs/20eq\"]'",
+  )
+  assert_eq(noncanonical.success, false)
+  assert(contains(noncanonical.combined, "canonical compact sorted repository list"))
+}
+
+/**
+ * The daily scheduled trigger carries no version input, so target resolution
+ * asks the GitHub API for the latest Harn release. gh refuses to call the API
+ * in a hosted workflow without a token, so every scheduled round died during
+ * target resolution (observed 2026-08-15) while dispatched continuation
+ * rounds, which pass an explicit version, sailed past the same step.
+ */
+pipeline test_scheduled_target_resolution_carries_a_token(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  let resolve = nil
+  for step in steps {
+    if step.name == "Resolve exact update target and bounded round" {
+      resolve = step
+    }
+  }
+  assert(resolve != nil)
+  assert(contains(resolve?.run ?? "", "releases/latest"))
+  assert_eq(resolve?.env?.get("GH_TOKEN"), "$" + "{{ github.token }}")
+}
+
+/**
+ * Scheduled cron and chain follow-ups must not share one concurrency group.
+ * The old static `group: bump-harn-fleet` discarded whichever run queued
+ * second, including the daily schedule, with no jobs and no notification.
+ */
+pipeline test_fleet_concurrency_separates_schedule_from_chain(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs)
+  assert(contains(source, "github.event_name == 'schedule'"))
+  assert(contains(source, "bump-harn-fleet-schedule"))
+  assert(contains(source, "bump-harn-fleet-chain-"))
+  assert(contains(source, "inputs.chain_id || github.run_id"))
+  assert(contains(source, "cancel-in-progress: false"))
+  assert_eq(
+    contains(source, "group: bump-harn-fleet"),
+    false,
+    "the old static concurrency group must be gone",
+  )
+}
+
+/**
+ * A run cancelled from the queue produces no jobs. This sibling workflow is
+ * the durable page: it fires on the bump-fleet name, gates on cancelled, and
+ * fails so GitHub treats the eviction like a failed run.
+ */
+pipeline test_cancelled_fleet_bump_is_reported_as_failure(harness: Harness, task: any) {
+  const source = cancelled_reporter_source(harness.fs)
+  const projected = decode_github_workflow(source)
+  assert_eq(github_projection_has_trigger(projected, "workflow_run"), true)
+  assert(contains(source, "workflows: [Update repositories for a Harn release]"))
+  assert(contains(source, "types: [completed]"))
+  assert(contains(source, "github.event.workflow_run.conclusion == 'cancelled'"))
+  assert(contains(source, "exit 1"))
+  assert(contains(source, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"))
+  assert(contains(source, "if: always()"))
+  assert(contains(source, "cancelled-fleet-bump-receipt.json"))
+  assert(contains(source, "source_run_id"))
+  // Folding this into bump-fleet.yml would not run when GitHub cancels the
+  // parent from the queue before any job starts.
+  assert_eq(contains(workflow_source(harness.fs), "report-cancelled-fleet-bump"), false)
+}
+
+/**
+ * The fleet bootstraps the runtime it is rolling out, so the target release's
+ * binaries have to exist before this job can run at all. That made the readiness
+ * wait unreachable in the one case it exists for. On v0.10.127 a dispatch at
+ * 15:43Z died at 15:45Z inside the setup action on a missing SHA256SUMS, the
+ * first release asset landed at 16:10Z, and no repository was dispatched: the
+ * Homebrew tap stayed on the previous release until a person dispatched it.
+ *
+ * The wait must therefore run before the target runtime is installed, on a
+ * runtime that exists by definition, or a setup action decides the readiness
+ * question by failing and nothing reports which assets were missing.
+ */
+pipeline test_release_readiness_is_reachable_before_the_target_runtime(
+  harness: Harness,
+  task: any,
+) {
+  const source = workflow_source(harness.fs)
+  const pinned_install = source.index_of("- name: Install the pinned Harn runtime")
+  const wait = source.index_of("- name: Wait for the target release to be ready")
+  const target_install = source.index_of("- name: Install exact target Harn")
+  assert(pinned_install >= 0, "the fleet installs a runtime that already exists")
+  assert(wait >= 0, "the fleet waits for the target release to be ready")
+  assert(target_install >= 0, "the fleet still installs the exact target runtime")
+  assert(pinned_install < wait, "the readiness wait needs a runtime before it can run")
+  assert(wait < target_install, "waiting after the target install is waiting too late")
+  // The wait reaches GitHub through the installed connector package.
+  const deps = source.index_of("- name: Install locked Harn dependencies for the readiness wait")
+  assert(deps > pinned_install && deps < wait, "the lockfile is installed before the wait")
+  // The readiness runtime must not be the target, or the deadlock is unchanged.
+  const pinned_block = source.slice(pinned_install, deps)
+  assert(!contains(pinned_block, "steps.update-plan.outputs.target"))
+  assert(contains(pinned_block, "steps.pinned-harn.outputs.version"))
+}
+
+/**
+ * Fleet run 33950604192 exhausted its readiness poll with `ready=false`, but
+ * the shared wait command intentionally returned zero for skip semantics. The
+ * workflow treated process success as release readiness, installed the target,
+ * and reached mutation preflight with an App token minted 62 minutes earlier.
+ */
+pipeline test_false_readiness_blocks_target_setup_and_mints_fresh_mutation_authority(
+  harness: Harness,
+  task: any,
+) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const wait_index = steps.find_index(
+    { step -> step.name == "Wait for the target release to be ready" },
+  )
+  const gate_index = steps.find_index(
+    { step -> step.name == "Require positive target release readiness" },
+  )
+  const target_index = steps.find_index({ step -> step.name == "Install exact target Harn" })
+  const token_index = steps.find_index({ step -> step.name == "Mint fleet GitHub App token" })
+  const preflight_index = steps.find_index(
+    { step -> step.name == "Preflight continuation controller authority" },
+  )
+  const dispatch_index = steps.find_index({ step -> step.name == "Start Harn updates" })
+  assert(
+    wait_index >= 0 && gate_index > wait_index && target_index > gate_index
+      && token_index > target_index
+      && preflight_index > token_index
+      && dispatch_index > preflight_index,
+    "readiness, exact setup, and freshly minted mutation authority must stay ordered",
+  )
+  const wait = steps[wait_index]
+  assert_eq(wait.id, "release-ready")
+  assert_eq(wait.env?.GH_TOKEN, "$" + "{{ github.token }}")
+  assert_eq(wait.env?.GITHUB_TOKEN, "$" + "{{ github.token }}")
+  assert_eq(contains(wait.env?.GH_TOKEN ?? "", "app-token"), false)
+  const gate = steps[gate_index]
+  assert_eq(gate.env?.RELEASE_READY, "$" + "{{ steps.release-ready.outputs.ready }}")
+  const false_readiness = harness.process.shell(
+    "RELEASE_READY=false bash -c " + shell_quote(gate.run ?? ""),
+  )
+  assert_eq(false_readiness.success, false)
+  assert(contains(false_readiness.combined, "repository updates remain blocked"))
+  const positive_readiness = harness.process.shell(
+    "RELEASE_READY=true bash -c " + shell_quote(gate.run ?? ""),
+  )
+  assert(positive_readiness.success, positive_readiness.combined)
+  const lineage = steps.find({ step -> step.name == "Admit initial or validated dispatch lineage" })
+  assert(contains(lineage?.if ?? "", "steps.require-release-ready.outcome == 'success'"))
+  // The chain lease release is the one tail step that must NOT inherit this
+  // gate. Readiness failing is a round that already holds the lease its
+  // predecessor claimed, so gating cleanup on readiness held the ref for
+  // exactly the failures the release step exists for.
+  const lease_token = steps.find(
+    { step -> step.name == "Mint chain lease release GitHub App token" },
+  )
+  assert_eq(
+    contains(lease_token?.if ?? "", "steps.require-release-ready.outcome"),
+    false,
+    "the chain lease release must not be gated on target release readiness",
+  )
+  assert(contains(lease_token?.if ?? "", "steps.chain-lease.outcome == 'success'"))
+}
+
+/**
+ * The chain lease must have an owner on every exit, including the failing ones.
+ *
+ * On v0.10.127 round 2 the proof step aborted, the successor scheduler died on
+ * the wreckage, and nothing released `harn-update-chain/33659789177`. The lease
+ * sat held at an exact OID that predates the fix while a fresh chain had to be
+ * started around it. The release step therefore has to run last and
+ * unconditionally, after the gate that exits 1, and it has to read the
+ * scheduler's own outcome rather than guess whether a successor exists.
+ */
+pipeline test_every_round_ends_with_an_owner_for_the_chain_lease(harness: Harness, task: any) {
+  const projected = workflow(harness.fs)
+  let steps: list<any> = []
+  for job in projected.jobs {
+    if job.key == "update" {
+      steps = job.value.steps ?? []
+    }
+  }
+  assert(len(steps) > 0, "the update job must be projected")
+  const last = unwrap(steps[len(steps) - 1])
+  assert(
+    contains(to_string(last.name ?? ""), "Release the chain lease"),
+    "the lease release must be the LAST step, so a failing proof gate cannot skip it, got '${to_string(last.name ?? "")}'",
+  )
+  const condition = to_string(last.if ?? "")
+  assert(
+    contains(condition, "always()"),
+    "the lease release must run on a failing and a cancelled round, not only a green one",
+  )
+  const body = to_string(last.run ?? "")
+  assert(contains(body, "release_harn_update_chain.harn"))
+  assert(
+    contains(body, "--scheduler-outcome"),
+    "the release must read whether a successor was dispatched from the scheduler's own outcome",
+  )
+  // The scheduler needs an id for that outcome to be readable at all. Without
+  // it the expression silently evaluates to the empty string, which the script
+  // would read as an unknown successor and refuse forever.
+  let scheduler_id = ""
+  for step in steps {
+    if contains(to_string(step.name ?? ""), "Schedule the next hosted round") {
+      scheduler_id = to_string(step.id ?? "")
+    }
+  }
+  assert_eq(scheduler_id, "schedule-successor")
+  assert(contains(to_string(last.env?.SCHEDULER_OUTCOME ?? ""), "steps.${scheduler_id}.outcome"))
+  // The lease identity has to be resolvable before the first step that can
+  // fail, or the release is gated on the plan step it is supposed to survive.
+  const chain_index = steps.find_index({ step -> step.name == "Resolve the chain lease identity" })
+  const plan_index = steps.find_index(
+    { step -> step.name == "Resolve exact update target and bounded round" },
+  )
+  assert(
+    chain_index >= 0 && plan_index > chain_index,
+    "the chain lease identity must be resolved before the update plan",
+  )
+  assert_eq(to_string(last.env?.CHAIN_ID ?? ""), "$" + "{{ steps.chain-lease.outputs.chain_id }}")
+  assert_eq(
+    contains(condition, "steps.update-plan.outcome"),
+    false,
+    "a round that dies in or before the update plan still holds the lease",
+  )
+  // The negative control: the condition this replaced must fail the same check.
+  assert_eq(
+    contains(
+      "always() && steps.update-plan.outcome == 'success' && steps.lease-token.outcome == 'success'",
+      "steps.update-plan.outcome",
+    ),
+    true,
+    "the old under-gated condition must fail the control",
+  )
+}
+
+/**
+ * A round killed before the plan step must still be able to name its lease.
+ *
+ * The resolver is the second step of the job and reads the same expression as
+ * `run-name` and `concurrency`, so this executes its actual body rather than
+ * asserting on its text.
+ */
+pipeline test_chain_lease_identity_resolves_before_any_fleet_work(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const resolve = steps.find({ step -> step.name == "Resolve the chain lease identity" })
+  const body = to_string(resolve?.run ?? "")
+  assert(body != "", "the chain lease resolver must exist")
+  const inherited = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID=33659789177 GITHUB_RUN_ID=99 bash -c "
+      + shell_quote(body),
+  )
+  assert(inherited.success, inherited.combined)
+  assert(contains(inherited.stdout, "chain_id=33659789177"), inherited.combined)
+  const originating = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID= GITHUB_RUN_ID=33659789177 bash -c "
+      + shell_quote(body),
+  )
+  assert(originating.success, originating.combined)
+  assert(contains(originating.stdout, "chain_id=33659789177"), originating.combined)
+  const malformed = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout REQUESTED_CHAIN_ID=not-a-run-id GITHUB_RUN_ID=99 bash -c "
+      + shell_quote(body),
+  )
+  assert_eq(malformed.success, false, malformed.combined)
+  assert(contains(malformed.combined, "chain id must be a positive integer"))
+}
+
+/**
+ * A round that never installed the runtime still has to clear the lease.
+ *
+ * The step used to warn and exit zero, which named the ref and left it held
+ * with nothing scheduled to clear it. It now bootstraps the pinned runtime, and
+ * when even that is impossible it fails loudly and names the reaper.
+ */
+pipeline test_chain_lease_release_bootstraps_a_missing_runtime(harness: Harness, task: any) {
+  const steps = workflow(harness.fs).jobs.get("update")?.steps ?? []
+  const release = unwrap(steps[len(steps) - 1])
+  const body = to_string(release.run ?? "")
+  const probe_index = steps.find_index(
+    { step -> step.name == "Probe for a Harn runtime before releasing the chain lease" },
+  )
+  const setup_index = steps.find_index(
+    { step -> step.name == "Install a Harn runtime for the chain lease release" },
+  )
+  const deps_index = steps.find_index(
+    { step -> step.name == "Install locked Harn dependencies for the chain lease release" },
+  )
+  assert(
+    probe_index >= 0 && setup_index > probe_index && deps_index > setup_index
+      && deps_index
+        < len(steps) - 1,
+    "a round with no runtime must acquire one before the lease release runs",
+  )
+  const probe = unwrap(steps[probe_index])
+  assert(contains(to_string(probe.if ?? ""), "always()"))
+  const setup = unwrap(steps[setup_index])
+  assert(
+    contains(to_string(setup.if ?? ""), "steps.lease-runtime-probe.outputs.present == 'false'"),
+    "the runtime install must be reached only when there is no runtime",
+  )
+  assert(starts_with(to_string(setup.uses ?? ""), "burin-labs/harn/.github/actions/setup-harn@"))
+  assert_eq(
+    contains(body, "could not be released and may still be held"),
+    false,
+    "a warn-and-exit-zero release leaves the ref held with nothing scheduled to clear it",
+  )
+  // The probe answers `present=false` on a round whose runtime install never
+  // ran, which is the whole reason the install step above exists.
+  const probed = harness.process.shell(
+    "GITHUB_OUTPUT=/dev/stdout PATH=/usr/bin:/bin bash -c "
+      + shell_quote(to_string(probe.run ?? "")),
+  )
+  assert(probed.success, probed.combined)
+  assert(contains(probed.stdout, "present=false"), probed.combined)
+  // The one case that can still leave residue must be an error naming the ref
+  // and the reaper, not a silent success.
+  const stranded = harness.process.shell(
+    "cd / && PATH=/usr/bin:/bin CHAIN_ID=33659789177 bash -c " + shell_quote(body),
+  )
+  assert_eq(stranded.success, false, stranded.combined)
+  assert(contains(stranded.combined, "harn-update-chain/33659789177"), stranded.combined)
+  assert(contains(stranded.combined, "reap_chain_refs.harn"), stranded.combined)
+}

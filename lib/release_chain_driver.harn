@@ -1,0 +1,406 @@
+//
+// The one thing that moves a release chain, and the only thing that applies an
+// effect.
+//
+// The chain already has typed stage receipts and a pure reducer that decides
+// what should happen next. Nothing drove them, so "a stand-down abandons the
+// remaining stages" was a property of a reducer nobody called rather than of
+// the release. An invariant no code path enforces is a comment.
+//
+// This driver closes that. Every effect reaches the world through
+// `adapter.apply_effect`, and the only place that is called is the arm handling
+// a planned repair. A stop is read before anything is observed, so a stand-down
+// does not merely stop the reporting: the driver never looks at the next stage,
+// never applies its effect, and names the stages it abandoned.
+import { ReleaseChainPlannedEffect } from "./release_chain_effect"
+import { ReleaseChainRepairDecision } from "./release_chain_repair"
+import {
+  ReleaseChainControlReceipt,
+  ReleaseChainEffectReceipt,
+  ReleaseChainReceipt,
+  ReleaseChainStage,
+  release_chain_append_stage,
+  release_chain_expected_stages,
+  release_chain_has_proven,
+  release_chain_with_control_cursor,
+} from "./release_chain_state"
+import {
+  ReleaseChainObservation,
+  ReleaseChainTransitionAction,
+  release_chain_reduce,
+} from "./release_chain_transition"
+
+/** What one step of the chain did. */
+pub type ReleaseChainStepOutcome = "advanced" \
+  | "repairing" \
+  | "waiting" \
+  | "stopped" \
+  | "escalated" \
+  | "complete"
+
+/**
+ * The world, behind three closures.
+ *
+ * `observe` reads one stage's subjects through that stage's current semantic
+ * owner. `apply_effect` is the only door to a side effect anywhere in the
+ * chain. `controls` returns the control events not yet consumed at a cursor, so
+ * a stand-down raised between two stages is seen before the next one is read.
+ */
+pub type ReleaseChainDriverAdapter = {
+  observe: fn(ReleaseChainStage) -> ReleaseChainObservation?,
+  apply_effect: fn(ReleaseChainPlannedEffect) -> ReleaseChainEffectReceipt,
+  controls: fn(int) -> list<ReleaseChainControlReceipt>,
+  now: fn() -> string,
+}
+
+pub type ReleaseChainStepReceipt = {
+  schema_version: "harn.release-chain.step.v1",
+  outcome: ReleaseChainStepOutcome,
+  action: ReleaseChainTransitionAction,
+  stage: ReleaseChainStage,
+  reason: string,
+  observed: bool,
+  effects_applied: list<ReleaseChainEffectReceipt>,
+}
+
+/**
+ * What the whole run proved and what it did not.
+ *
+ * `pending_stages` and `abandoned_stages` carry names rather than counts alone,
+ * because the count is the part a reader cannot act on. A run that stopped
+ * reports what it walked away from; a run that is merely waiting reports the
+ * same set under a different outcome, and the two are never the same word.
+ */
+pub type ReleaseChainRunReceipt = {
+  schema_version: "harn.release-chain.run.v1",
+  outcome: ReleaseChainStepOutcome,
+  reason: string,
+  steps: list<ReleaseChainStepReceipt>,
+  proven_stages: list<ReleaseChainStage>,
+  pending_stages: list<ReleaseChainStage>,
+  pending_count: int,
+  abandoned_stages: list<ReleaseChainStage>,
+  abandoned_count: int,
+  effects_applied: int,
+  receipt: ReleaseChainReceipt,
+}
+
+fn terminal(outcome: ReleaseChainStepOutcome) -> bool {
+  return outcome == "stopped" || outcome == "escalated" || outcome == "complete"
+    || outcome == "waiting"
+}
+
+fn outcome_for(action: ReleaseChainTransitionAction) -> ReleaseChainStepOutcome {
+  if action == "record_stage" {
+    return "advanced"
+  }
+  if action == "plan_repair" {
+    return "repairing"
+  }
+  if action == "stop" {
+    return "stopped"
+  }
+  if action == "complete" {
+    return "complete"
+  }
+  if action == "wait" {
+    return "waiting"
+  }
+  // `restart_revision` is an operator action, not something a driver may take
+  // on its own: a new revision re-pins identity the current one was built on.
+  return "escalated"
+}
+
+fn step(
+  outcome: ReleaseChainStepOutcome,
+  action: ReleaseChainTransitionAction,
+  stage: ReleaseChainStage,
+  reason: string,
+  observed: bool,
+  effects: list<ReleaseChainEffectReceipt>,
+) -> ReleaseChainStepReceipt {
+  return {
+    schema_version: "harn.release-chain.step.v1",
+    outcome: outcome,
+    action: action,
+    stage: stage,
+    reason: reason,
+    observed: observed,
+    effects_applied: effects,
+  }
+}
+
+/**
+ * Apply one planned repair and prove the receipt describes the effect asked
+ * for. An adapter that answered with some other effect's receipt would let the
+ * chain record a repair it never made, which is the same shape as a stage
+ * reporting proven over evidence it never read.
+ */
+fn apply_planned(
+  adapter: ReleaseChainDriverAdapter,
+  planned: ReleaseChainPlannedEffect,
+) -> ReleaseChainEffectReceipt {
+  const applied = adapter.apply_effect(planned)
+  if applied.kind != planned.kind {
+    throw "release chain effect receipt is for ${applied.kind}, planned ${planned.kind}"
+  }
+  if applied.idempotency_key != planned.idempotency_key {
+    throw "release chain effect receipt does not carry the planned idempotency key"
+  }
+  if applied.target != planned.target {
+    throw "release chain effect receipt names ${applied.target}, planned ${planned.target}"
+  }
+  if len(applied.read_back) == 0 {
+    throw "release chain effect receipt must read back what it changed"
+  }
+  return applied
+}
+
+fn planned_effects(repairs: list<ReleaseChainRepairDecision>) -> list<ReleaseChainPlannedEffect> {
+  let effects: list<ReleaseChainPlannedEffect> = []
+  for repair in repairs {
+    if repair.action == "plan_effect" && repair.effect != nil {
+      effects = effects + [unwrap(repair.effect)]
+    }
+  }
+  return effects
+}
+
+/**
+ * Take one step.
+ *
+ * The control events are read and reduced before the stage is observed. That
+ * ordering is the whole point: a stop raised between two stages is answered
+ * without looking at the next one, so no observation, and therefore no effect,
+ * can happen after a stand-down.
+ */
+pub fn release_chain_step(
+  receipt: ReleaseChainReceipt,
+  adapter: ReleaseChainDriverAdapter,
+) -> {step: ReleaseChainStepReceipt, receipt: ReleaseChainReceipt} {
+  const controls = adapter.controls(receipt.control_cursor)
+  // The reducer refuses a malformed control journal, and some of those
+  // refusals throw rather than return. This is the one read a stand-down
+  // travels through, so an unhandled throw here would end a release with a
+  // crash instead of a reason. The observing reduce below is wrapped for the
+  // same purpose.
+  const control_read = try {
+    {ok: true, decision: release_chain_reduce(receipt, nil, controls), detail: ""}
+  } catch (error) {
+    {ok: false, decision: nil, detail: to_string(error)}
+  }
+  if !control_read.ok {
+    return {
+      step: step(
+        "escalated",
+        "escalate",
+        receipt.current_stage,
+        "the control journal could not be read: ${control_read.detail}",
+        true,
+        [],
+      ),
+      receipt: receipt,
+    }
+  }
+  const control_only = unwrap(control_read.decision)
+  if control_only.action != "wait" {
+    const outcome = outcome_for(control_only.action)
+    const moved = if control_only.control_cursor > receipt.control_cursor {
+      release_chain_with_control_cursor(receipt, control_only.control_cursor, adapter.now())
+    } else {
+      receipt
+    }
+    return {
+      step: step(
+        outcome,
+        control_only.action,
+        receipt.current_stage,
+        control_only.reason,
+        false,
+        [],
+      ),
+      receipt: moved,
+    }
+  }
+  const observation = adapter.observe(receipt.current_stage)
+  if observation == nil {
+    return {
+      step: step(
+        "waiting",
+        "wait",
+        receipt.current_stage,
+        "the current stage's owner reported nothing to judge yet",
+        false,
+        [],
+      ),
+      receipt: receipt,
+    }
+  }
+  // The repair policy is bounded, and it signals an exhausted bound by
+  // throwing. That is a decision the driver may not make on its own, so it
+  // becomes an escalation that applies nothing rather than an unhandled crash
+  // in the middle of a release.
+  const reduced = try {
+    {ok: true, decision: release_chain_reduce(receipt, observation, controls), detail: ""}
+  } catch (error) {
+    {ok: false, decision: nil, detail: to_string(error)}
+  }
+  if !reduced.ok {
+    return {
+      step: step(
+        "escalated",
+        "escalate",
+        receipt.current_stage,
+        "the bounded repair policy refused to plan another attempt: ${reduced.detail}",
+        true,
+        [],
+      ),
+      receipt: receipt,
+    }
+  }
+  const decision = unwrap(reduced.decision)
+  const stage_receipt = decision.stage_receipt
+  if decision.action == "record_stage" {
+    if stage_receipt == nil {
+      throw "release chain recorded a stage with no stage receipt"
+    }
+    return {
+      step: step("advanced", decision.action, receipt.current_stage, decision.reason, true, []),
+      receipt: release_chain_append_stage(receipt, unwrap(stage_receipt), adapter.now()),
+    }
+  }
+  if decision.action == "plan_repair" {
+    if stage_receipt == nil {
+      throw "release chain planned a repair with no stage receipt"
+    }
+    let applied: list<ReleaseChainEffectReceipt> = []
+    for planned in planned_effects(decision.repairs) {
+      applied = applied + [apply_planned(adapter, planned)]
+    }
+    if len(applied) == 0 {
+      throw "release chain planned a repair that named no effect to apply"
+    }
+    return {
+      step: step(
+        "repairing",
+        decision.action,
+        receipt.current_stage,
+        decision.reason,
+        true,
+        applied,
+      ),
+      receipt: release_chain_append_stage(receipt, unwrap(stage_receipt), adapter.now()),
+    }
+  }
+  // Every remaining action is one the driver may not act on. Nothing is
+  // applied and nothing is appended, so the chain is left exactly where an
+  // operator will find it.
+  return {
+    step: step(
+      outcome_for(decision.action),
+      decision.action,
+      receipt.current_stage,
+      decision.reason,
+      true,
+      [],
+    ),
+    receipt: receipt,
+  }
+}
+
+fn unproven_stages(receipt: ReleaseChainReceipt) -> list<ReleaseChainStage> {
+  let pending: list<ReleaseChainStage> = []
+  for stage in release_chain_expected_stages(receipt) {
+    if !release_chain_has_proven(receipt, stage) {
+      pending = pending + [stage]
+    }
+  }
+  return pending
+}
+
+fn proven_stages(receipt: ReleaseChainReceipt) -> list<ReleaseChainStage> {
+  let proven: list<ReleaseChainStage> = []
+  for stage in release_chain_expected_stages(receipt) {
+    if release_chain_has_proven(receipt, stage) {
+      proven = proven + [stage]
+    }
+  }
+  return proven
+}
+
+/**
+ * Drive the chain until it finishes, stops, escalates, or runs out of steps.
+ *
+ * `max_steps` is a bound, not a schedule. Reaching it is reported as waiting
+ * with the pending stages named, never as a run that finished, because a driver
+ * that hit its ceiling has proven nothing about the stages it never reached.
+ */
+pub fn release_chain_drive(
+  receipt: ReleaseChainReceipt,
+  adapter: ReleaseChainDriverAdapter,
+  max_steps: int = 32,
+) -> ReleaseChainRunReceipt {
+  if max_steps < 1 {
+    throw "release chain driver needs at least one step"
+  }
+  let current = receipt
+  let steps: list<ReleaseChainStepReceipt> = []
+  let effects = 0
+  let outcome: ReleaseChainStepOutcome = "waiting"
+  let reason = "the driver took no step"
+  let taken = 0
+  while taken < max_steps {
+    const result = release_chain_step(current, adapter)
+    taken = taken + 1
+    steps = steps + [result.step]
+    current = result.receipt
+    effects = effects + len(result.step.effects_applied)
+    outcome = result.step.outcome
+    reason = result.step.reason
+    if terminal(outcome) {
+      break
+    }
+  }
+  if taken >= max_steps && !terminal(outcome) {
+    outcome = "waiting"
+    reason = "the driver reached its ${max_steps}-step ceiling with stages still pending"
+  }
+  const pending = unproven_stages(current)
+  // Abandoned is not the same set as pending. A chain that is waiting will be
+  // driven again and its pending stages are still owed; a chain that stopped or
+  // escalated will not, so its pending stages are what it walked away from.
+  const abandoned = if outcome == "stopped" || outcome == "escalated" {
+    pending
+  } else {
+    []
+  }
+  return {
+    schema_version: "harn.release-chain.run.v1",
+    outcome: outcome,
+    reason: reason,
+    steps: steps,
+    proven_stages: proven_stages(current),
+    pending_stages: pending,
+    pending_count: len(pending),
+    abandoned_stages: abandoned,
+    abandoned_count: len(abandoned),
+    effects_applied: effects,
+    receipt: current,
+  }
+}
+
+/** Lead with what a reader must decide, then what is owed and to whom. */
+pub fn release_chain_run_summary(run: ReleaseChainRunReceipt) -> string {
+  let lines = [
+    "release chain ${run.receipt.chain_id} ${run.outcome}: ${run.reason}",
+    "  target    : ${run.receipt.target.tag}",
+    "  proven    : ${len(run.proven_stages)} (${join(run.proven_stages, ", ")})",
+    "  pending   : ${run.pending_count} (${join(run.pending_stages, ", ")})",
+  ]
+  if run.abandoned_count > 0 {
+    lines = lines
+      + ["  abandoned : ${run.abandoned_count} (${join(run.abandoned_stages, ", ")})"]
+  }
+  lines = lines + ["  effects   : ${run.effects_applied} applied over ${len(run.steps)} step(s)"]
+  return join(lines, "\n") + "\n"
+}

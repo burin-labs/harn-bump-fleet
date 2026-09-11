@@ -1,0 +1,1 @@
+Let a pin-owned repository declare its package validation command in the fleet manifest. The release's consumer contract compares that input for every packaged repository, so restricting the declaration to fleet-owned package CI left a pin-owned repository unable to record validation it is entitled to author, and the contract refused publication until the command was removed.

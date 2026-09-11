@@ -1,0 +1,638 @@
+import { CommandResult, command_step } from "std/command"
+import { is_absolute, normalize } from "std/path"
+import { shell_quote } from "std/runtime"
+import { end_timing, start_timing } from "std/timing"
+import { step_classification, step_recovery_hint } from "./release_execution"
+
+const RELEASE_AUDIT_ENV_UNSETS = [
+  "HARN_BIN",
+  "HARN_EGRESS_ALLOW",
+  "HARN_EGRESS_DENY",
+  "HARN_EGRESS_DEFAULT",
+  "HARN_EGRESS_BLOCK_PRIVATE",
+  "HARN_EGRESS_ALLOW_LOOPBACK",
+]
+
+const RELEASE_AUDIT_USER_TMP_ROOT = "/tmp/harn-workspace/harn-bump-fleet"
+
+const RELEASE_AUDIT_TMP_SUBDIR = "release-harn-target/tmp"
+
+/** Cold exact-pin CLI builds routinely exceed the discovery-process deadline. */
+pub const RELEASE_PIN_CLI_WARM_TIMEOUT_MS: int = 30 * 60 * 1000
+
+pub type ReleaseCommandContext = "plain" | "release_build"
+
+pub type ReleaseCommandRunner = fn(dict, dict) -> CommandResult
+
+pub type ReleaseCommandStepResult = {
+  steps: list<dict>,
+  step: dict,
+  success: bool,
+  status: string,
+  exit_code: int,
+  stdout: string,
+  stderr: string,
+}
+
+pub type ReleaseFlagChoice = {value: string, note: string}
+
+fn release_audit_unset_env_prefix() {
+  return join(RELEASE_AUDIT_ENV_UNSETS.map({ key -> "-u " + key }), " ")
+}
+
+pub fn default_release_cargo_target_dir(home: string, xdg_cache_home: string = "") -> string {
+  const xdg_cache = trim(xdg_cache_home ?? "")
+  if xdg_cache != "" {
+    return path_join(xdg_cache, "harn-bump-fleet/release-harn-target")
+  }
+  const user_home = trim(home ?? "")
+  if user_home != "" {
+    return path_join(user_home, ".cache/harn-bump-fleet/release-harn-target")
+  }
+  return "/tmp/harn-bump-fleet-release-harn-target"
+}
+
+pub fn resolve_release_cargo_target_dir(
+  explicit_target_dir: string,
+  home: string,
+  xdg_cache_home: string = "",
+) -> string {
+  const explicit = trim(explicit_target_dir ?? "")
+  if explicit != "" {
+    return explicit
+  }
+  return default_release_cargo_target_dir(home, xdg_cache_home)
+}
+
+pub fn release_cargo_build_dir(cargo_target_dir: string) -> string {
+  const target = trim(cargo_target_dir ?? "")
+  if target == "" {
+    return ""
+  }
+  return path_join(target, "build")
+}
+
+pub fn release_audit_tmp_dir(repo: string = "") -> string {
+  const normalized_repo = trim(normalize(repo ?? ""))
+  const raw_owner = if normalized_repo == "" {
+    "shared"
+  } else {
+    basename(normalized_repo)
+  }
+  const safe_owner = regex_replace("^-+|-+$", "", regex_replace("[^A-Za-z0-9_.-]+", "-", raw_owner))
+  if safe_owner == "" {
+    throw "release Cargo temporary owner has no path-safe identity"
+  }
+  const owner = if normalized_repo == "" {
+    safe_owner
+  } else {
+    safe_owner + "-" + substring(sha256(normalized_repo), 0, 12)
+  }
+  return path_join(RELEASE_AUDIT_USER_TMP_ROOT, RELEASE_AUDIT_TMP_SUBDIR, owner)
+}
+
+/** Refresh generated Cargo build-script outputs while retaining compiled crates. */
+pub fn release_cargo_build_script_refresh_command(
+  cargo_target_dir: string,
+  refresh_token: string = "",
+) -> string {
+  const target_arg = shell_quote(cargo_target_dir)
+  const build_arg = shell_quote(release_cargo_build_dir(cargo_target_dir))
+  const wipe =
+    "rm -rf \"$target_dir/debug/build\" \"$target_dir/release/build\" \"$build_dir/debug/build\" \"$build_dir/release/build\""
+  const token = trim(refresh_token ?? "")
+  if token == "" {
+    return "target_dir=${target_arg}; build_dir=${build_arg}; " + wipe
+  }
+  // Once per token, not once per warm. The wipe below discards every
+  // build-script OUT_DIR, so Cargo must re-run each build script and recompile
+  // everything downstream of one: measured, a rebuild that would finish in
+  // 0.00s recompiles the whole build-script-dependent graph instead. A release
+  // warms the exact-pin CLI more than once, and repeating the wipe made the
+  // second warm cold by construction (342.7s then 345.6s on v0.10.92, for the
+  // same pin on the same target).
+  //
+  // The stale-fingerprint hazard the wipe exists for is a property of a
+  // long-lived target dir across runs, not of one run touching it twice, so a
+  // per-run stamp keeps the protection and drops the repeat. An empty token
+  // keeps the unconditional behavior for callers that have no run identity.
+  const stamp_arg = shell_quote(cargo_target_dir + "/.release-build-script-refresh")
+  const token_arg = shell_quote(token)
+  return "target_dir=${target_arg}; build_dir=${build_arg}; stamp=${stamp_arg}; token=${token_arg}; "
+    + "if [ \"$(cat \"$stamp\" 2>/dev/null)\" = \"$token\" ]; then "
+    + "printf 'release cargo build scripts: already refreshed for this run; keeping %s warm\\n' \"$target_dir\"; "
+    + "else "
+    + wipe
+    + "; mkdir -p \"$target_dir\" && printf '%s' \"$token\" > \"$stamp\"; "
+    + "printf 'release cargo build scripts: refreshed OUT_DIRs under %s\\n' \"$target_dir\"; "
+    + "fi"
+}
+
+/**
+ * Bound the shared release target without discarding reusable compiled crates.
+ *
+ * Cargo can retain a valid crate fingerprint after a generated `OUT_DIR` file
+ * disappears from a long-lived target. Always refresh build-script output
+ * directories before the exact-pin warm so Cargo regenerates those artifacts.
+ */
+pub fn release_cargo_cache_prune_command(
+  cargo_target_dir: string,
+  max_total_gb: int = 64,
+  min_free_gb: int = 96,
+  repo: string = "",
+  refresh_token: string = "",
+) -> string {
+  const target_arg = shell_quote(cargo_target_dir)
+  const build_dir = release_cargo_build_dir(cargo_target_dir)
+  const build_arg = shell_quote(build_dir)
+  const tmp_dir = release_audit_tmp_dir(repo)
+  const tmp_arg = shell_quote(tmp_dir)
+  let max_gib = to_int(max_total_gb) ?? 64
+  if max_gib <= 0 {
+    max_gib = 64
+  }
+  let min_free_gib = to_int(min_free_gb) ?? 96
+  if min_free_gib <= 0 {
+    min_free_gib = 96
+  }
+  const build_script_refresh = release_cargo_build_script_refresh_command(
+    cargo_target_dir,
+    refresh_token,
+  )
+  return "target_dir=${target_arg}; build_dir=${build_arg}; tmp_dir=${tmp_arg}; max_gib=${max_gib}; min_free_gib=${min_free_gib}; "
+    + "rm -rf \"$tmp_dir\"; mkdir -p \"$target_dir\" \"$build_dir\" \"$tmp_dir\"; "
+    + "printf 'release cargo temp: owner_dir=%s\\n' \"$tmp_dir\"; "
+    + build_script_refresh
+    + "; "
+    + "cache_gib() { cache_kib=$(du -sk \"$target_dir\" | awk '{print $1}'); echo $((cache_kib / 1024 / 1024)); }; "
+    + "free_gib() { free_kib=$(df -Pk \"$target_dir\" | awk 'NR==2 {print $4}'); echo $((free_kib / 1024 / 1024)); }; "
+    + "if [ -d \"$target_dir\" ]; then "
+    + "total_gib=$(cache_gib); "
+    + "free_before=$(free_gib); "
+    + "printf 'release cargo cache: dir=%s total_gib=%s max_gib=%s free_gib=%s min_free_gib=%s\\n' \"$target_dir\" \"$total_gib\" \"$max_gib\" \"$free_before\" \"$min_free_gib\"; "
+    + "if [ \"$total_gib\" -gt \"$max_gib\" ]; then "
+    + "echo 'release cargo cache above cap; pruning legacy profile dirs'; "
+    + "rm -rf \"$target_dir/debug\" \"$target_dir/release\"; total_gib=$(cache_gib); "
+    + "fi; "
+    + "if [ \"$total_gib\" -gt \"$max_gib\" ]; then "
+    + "echo 'release cargo cache still above cap; pruning package verification cache'; "
+    + "rm -rf \"$target_dir/package-check-target\"; total_gib=$(cache_gib); "
+    + "fi; "
+    + "if [ \"$total_gib\" -gt \"$max_gib\" ]; then "
+    + "free_now=$(free_gib); "
+    + "if [ \"$free_now\" -lt \"$min_free_gib\" ]; then "
+    + "echo 'release cargo cache still above cap and disk free space is below floor; pruning canonical build cache'; "
+    + "rm -rf \"$build_dir\"; total_gib=$(cache_gib); "
+    + "else "
+    + "printf 'release cargo cache still above cap but disk has %s GiB free; preserving canonical build cache\\n' \"$free_now\"; "
+    + "fi; "
+    + "fi; "
+    + "printf 'release cargo cache after pruning: total_gib=%s\\n' \"$total_gib\"; "
+    + "fi"
+}
+
+fn release_path_text(path: any) {
+  const normalized = trim(normalize(to_string(path ?? "")))
+  const stripped = regex_replace("/+$", "", normalized)
+  if stripped == "" && starts_with(normalized, "/") {
+    return "/"
+  }
+  return stripped
+}
+
+pub fn release_cargo_target_dir_guard_error(repo: string, target_dir: string) -> string? {
+  const target = release_path_text(target_dir)
+  if target == "" {
+    return "release cargo target dir is empty"
+  }
+  if !is_absolute(target) {
+    return "release cargo target dir must be absolute and outside the release repo: " + target
+  }
+  const repo_path = release_path_text(repo)
+  if repo_path != "" && is_absolute(repo_path)
+    && (target == repo_path
+      || starts_with(target, repo_path + "/")) {
+    return "release cargo target dir must be outside the release repo; refusing " + target
+      + " under "
+      + repo_path
+  }
+  return nil
+}
+
+pub fn release_prepare_env(
+  repo: string,
+  bootstrap_new_crates: bool = false,
+  target_dir_override: string = "",
+) -> string {
+  const target_override = trim(target_dir_override ?? "")
+  const raw_target_dir = if target_override == "" {
+    default_release_cargo_target_dir("", "")
+  } else {
+    target_override
+  }
+  const guard_error = release_cargo_target_dir_guard_error(repo, raw_target_dir)
+  if guard_error != nil {
+    throw guard_error
+  }
+  const target_dir = shell_quote(raw_target_dir)
+  const build_dir = shell_quote(release_cargo_build_dir(raw_target_dir))
+  const tmp_dir = shell_quote(release_audit_tmp_dir(repo))
+  let release_env = "env "
+    + release_audit_unset_env_prefix()
+    + " RUSTC_WRAPPER= SCCACHE_DISABLE=1 CARGO_TARGET_DIR=${target_dir} CARGO_BUILD_BUILD_DIR=${build_dir} TMPDIR=${tmp_dir} TMP=${tmp_dir} TEMP=${tmp_dir} HARN_RELEASE_HARNESS=1"
+  if bootstrap_new_crates ?? false {
+    release_env = release_env + " HARN_BOOTSTRAP_NEW_CRATES=1"
+  }
+  return release_env
+}
+
+/**
+ * Resolve a release command through its declared execution context.
+ *
+ * Build-backed checks must share the exact Cargo/build/tmp environment used by
+ * release prepare. Plain checks stay plain so lightweight validation does not
+ * accidentally acquire Cargo policy or pay build setup costs.
+ */
+pub fn release_command_in_context(
+  command: string,
+  context: ReleaseCommandContext,
+  repo: string,
+  bootstrap_new_crates: bool = false,
+  target_dir_override: string = "",
+) -> string {
+  match context {
+    "plain" -> { return command }
+    "release_build" -> { return release_prepare_env(repo, bootstrap_new_crates, target_dir_override)
+      + " "
+      + command }
+  }
+}
+
+/**
+ * Validate the bumped CLI AOT payload with the generator `release_ship.sh`
+ * already built before rewriting the workspace version.
+ *
+ * Cargo fingerprints every workspace package version, so an unqualified
+ * `make check-cli-aot` after prepare recompiles the generator's Harn VM graph
+ * even though the generator source and feature set are unchanged. Prepare only
+ * returns successfully after building this binary in the canonical release
+ * target; selecting it explicitly preserves the drift check without a second
+ * semantic build. The `.exe` fallback keeps the command portable for a future
+ * Windows-hosted release owner.
+ */
+pub fn release_prepared_cli_aot_check_command(
+  target_dir: string,
+  artifact_version: string,
+) -> string {
+  const target = trim(target_dir ?? "")
+  if target == "" {
+    throw "prepared CLI AOT check requires the canonical release target directory"
+  }
+  const version = trim(artifact_version ?? "")
+  if version == "" {
+    throw "prepared CLI AOT check requires the reconciled release version"
+  }
+  const generator = target + "/debug/harn-cli-aot-gen"
+  const script = "generator="
+    + shell_quote(generator)
+    + "; if [ ! -x \"$generator\" ] && [ -x \"$generator.exe\" ]; then generator=\"$generator.exe\"; fi"
+    + "; if [ ! -x \"$generator\" ]; then echo \"prepared CLI AOT generator is missing: $generator\" >&2; exit 1; fi"
+    + "; HARN_CLI_AOT_GEN_BIN=\"$generator\" HARN_CLI_AOT_ARTIFACT_VERSION="
+    + shell_quote(version)
+    + " make check-cli-aot"
+  return "sh -c " + shell_quote(script)
+}
+
+/**
+ * Path of the shielded copy of the exact-pin release CLI.
+ *
+ * Keyed by pin SHA because the bytes are a function of the pin, so two runs at
+ * the same pin may share one copy. It lives beside the Cargo target rather than
+ * inside `debug/`, which the cache prune deletes.
+ */
+pub fn release_shielded_harn_bin(cargo_target_dir: string, pin_sha: string) -> string {
+  const pin = lowercase(trim(pin_sha ?? ""))
+  if len(regex_captures("^[0-9a-f]{40}$", pin)) == 0 {
+    throw "release CLI shielding requires a full 40-character commit SHA"
+  }
+  return path_join(trim(cargo_target_dir ?? ""), "shielded-cli", pin, "harn")
+}
+
+/**
+ * Stage `source` at `staged` so the release never executes the path Cargo
+ * rewrites.
+ *
+ * Cargo publishes `<target>/debug/harn` by overwriting that path in place. A
+ * concurrent release or recovery build therefore rewrites the binary another
+ * in-flight process has mapped, and macOS kills that process with
+ * `SIGKILL (Code Signature Invalid)` when a paged-in page stops matching the
+ * signature. Installing through a temporary file plus `mv -f` is a rename, which
+ * swaps the directory entry and leaves any running process on its own inode, so
+ * restaging can never kill a live run.
+ */
+pub fn release_shield_harn_binary_command(source: string, staged: string) -> string {
+  const src = trim(source ?? "")
+  const dst = trim(staged ?? "")
+  if src == "" || dst == "" {
+    throw "release CLI shielding requires both a source and a staged path"
+  }
+  const src_arg = shell_quote(src)
+  const dst_arg = shell_quote(dst)
+  const dir_arg = shell_quote(dirname(dst))
+  const tmp_arg = shell_quote(dst + ".staging")
+  return "mkdir -p ${dir_arg} && cp ${src_arg} ${tmp_arg} && chmod 755 ${tmp_arg} && mv -f ${tmp_arg} ${dst_arg} && printf 'shielded release CLI: %s\\n' ${dst_arg}"
+}
+
+/**
+ * Warm the exact pinned checkout's CLI once under the same isolated Cargo
+ * target and wrapper settings used by release prepare. The explicit HARN_BIN
+ * unset prevents an ambient binary from satisfying derived-file generation.
+ */
+pub fn release_pin_cli_warm_command(
+  repo: string,
+  pin_sha: string,
+  bootstrap_new_crates: bool = false,
+  target_dir_override: string = "",
+  refresh_token: string = "",
+) -> string {
+  const pin = trim(pin_sha ?? "")
+  if len(regex_captures("^[0-9a-fA-F]{40}$", pin)) == 0 {
+    throw "release pin CLI warm requires a full 40-character commit SHA"
+  }
+  const target_dir = if trim(target_dir_override ?? "") == "" {
+    default_release_cargo_target_dir("", "")
+  } else {
+    target_dir_override
+  }
+  const script =
+    "test \"$(git rev-parse HEAD)\" = \"${lowercase(pin)}\" && cargo build -p harn-cli --bin harn --locked"
+  return release_cargo_cache_prune_command(target_dir, 64, 96, repo, refresh_token)
+    + " && "
+    + release_prepare_env(repo, bootstrap_new_crates, target_dir)
+    + " sh -c "
+    + shell_quote(script)
+}
+
+/**
+ * Resolve a `command` argument into a `std/command` spec and a human-readable
+ * label suitable for step display / classification.
+ *
+ * Strings build a shell-mode spec (with the SH bourne shell pinned) for
+ * commands that intentionally rely on shell features like `&&`, `||`, or
+ * `2>/dev/null`. Lists build an argv-mode spec, which is the preferred path
+ * for `git`/`gh` invocations since argv bypasses shell quoting entirely.
+ */
+fn release_raw_command(command: any) {
+  if command?.argv != nil || command?.command != nil {
+    return command.command ?? command.argv
+  }
+  return command
+}
+
+fn release_command_label(command: any) {
+  const raw = release_raw_command(command)
+  if type_of(raw) == "list" {
+    return join(raw.map({ arg -> to_string(arg) }), " ")
+  }
+  return raw
+}
+
+fn release_command_env(command: any) {
+  return command?.env
+}
+
+fn release_command_spec(cfg: any, command: any) {
+  const env = release_command_env(command)
+  const raw_command = release_raw_command(command)
+  if type_of(raw_command) == "list" {
+    const label = join(raw_command.map({ a -> to_string(a) }), " ")
+    // Carry the shell-equivalent label on the spec so `step.command` is
+    // populated for downstream consumers (audit logs, recovery checks, the
+    // step_classification closure) — `std/command` lifts `spec.command` onto
+    // the step record unchanged.
+    let spec = {mode: "argv", argv: raw_command, command: label, cwd: cfg.repo}
+    if env != nil {
+      spec = spec + {env: env}
+    }
+    return {spec: spec, label: label}
+  }
+  let spec = {mode: "shell", command: raw_command, shell: {id: "sh"}, cwd: cfg.repo}
+  if env != nil {
+    spec = spec + {env: env}
+  }
+  return {spec: spec, label: raw_command}
+}
+
+fn release_command_options(label: any, runner: any, extra: any = nil) {
+  let opts = {
+    capture: {max_inline_bytes: 12000},
+    tail_bytes: 12000,
+    classify: { step -> step_classification(label, step) },
+    recovery_hint: { step -> step_recovery_hint(label, step) },
+  }
+  if runner != nil {
+    opts = opts + {runner: runner}
+  }
+  const extra_opts = extra ?? {}
+  return opts + extra_opts
+}
+
+fn live_logged_shell_command(command: any, log_path: any) {
+  const log_arg = shell_quote(log_path)
+  return "{ " + command + "; } > " + log_arg
+    + " 2>&1; __harn_status=$?; printf 'full output: %s\\n' "
+    + log_arg
+    + "; exit $__harn_status"
+}
+
+fn live_log_path_for(command: any, extra: any) {
+  if type_of(release_raw_command(command)) == "list" {
+    return ""
+  }
+  return extra?.live_log_path ?? ""
+}
+
+fn release_command_category(command: any) {
+  const raw_command = release_raw_command(command)
+  if type_of(raw_command) == "list" {
+    if len(raw_command) == 0 {
+      return "argv"
+    }
+    return basename(to_string(raw_command[0]))
+  }
+  const parts = trim(to_string(raw_command)).split(" ").filter({ part -> part != "" })
+  if len(parts) == 0 {
+    return "shell"
+  }
+  return basename(parts[0])
+}
+
+fn release_step_span_status(step: any) {
+  return if step.success {
+    "ok"
+  } else {
+    "error"
+  }
+}
+
+/**
+ * Format a step duration (ms) for inline progress output.
+ *
+ * Sub-100ms steps render as `<n>ms`; 100ms+ steps round to the nearest
+ * tenth of a second so the user has a feel for cost on each command
+ * without the noise of millisecond-level precision.
+ */
+fn format_step_duration_ms(elapsed_ms: any) {
+  const ms = elapsed_ms ?? 0
+  if ms < 100 {
+    return "${ms}ms"
+  }
+  const tenths = (ms + 50) / 100
+  const whole = tenths / 10
+  const frac = tenths - whole * 10
+  return "${whole}.${frac}s"
+}
+
+/**
+ * Run one release command through std/command and append its normalized step.
+ *
+ * `command` accepts either a string (shell-mode) or a list (argv-mode) — see
+ * `release_command_spec` for the rationale.
+ */
+pub fn append_std_command_step<T>(
+  harness: Harness,
+  cfg: dict,
+  steps: list<dict>,
+  name: string,
+  command: T,
+  runner: ReleaseCommandRunner? = nil,
+  extra: dict? = nil,
+) -> ReleaseCommandStepResult {
+  const print_progress = !(cfg.mock ?? false) && !(cfg.quiet ?? false)
+  if print_progress {
+    harness.stdio.println("   → ${name}")
+  }
+  const live_log_path = live_log_path_for(command, extra)
+  const command_to_run = if live_log_path == "" {
+    command
+  } else {
+    const logged = live_logged_shell_command(to_string(release_raw_command(command)), live_log_path)
+    const env = release_command_env(command)
+    if env == nil {
+      logged
+    } else {
+      {command: logged, env: env}
+    }
+  }
+  const resolved = release_command_spec(cfg, command_to_run)
+  const label = release_command_label(command)
+  const timing = start_timing(
+    harness.clock,
+    "release.command",
+    {step: name, category: release_command_category(command), mode: resolved.spec.mode ?? ""},
+  )
+  let step = try {
+    command_step(
+      harness.tools,
+      harness.clock,
+      name,
+      resolved.spec,
+      release_command_options(label, runner, extra),
+    )
+  } catch (e) {
+    end_timing(harness.clock, timing, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+  step = step + {command: label}
+  if extra?.timeout_ms != nil {
+    step = step + {timeout_ms: extra.timeout_ms}
+  }
+  if live_log_path != "" {
+    step = step + {live_log: live_log_path}
+  }
+  const timing_report = end_timing(
+    harness.clock,
+    timing,
+    {
+      status: release_step_span_status(step),
+      outcome: step.classification ?? "",
+      exit_code: step.exit_code ?? 0,
+    },
+  )
+  // The receipt carries the step, so the step carries its own duration. The
+  // span alone is not enough: every shell step shares the span name
+  // `release.command`, so the aggregate summary collapses them into one row
+  // and no per-stage number survives into the receipt.
+  step = step + {duration_ms: timing_report.duration_ms}
+  if print_progress {
+    const mark = if step.success {
+      "✓"
+    } else {
+      "✗"
+    }
+    const elapsed = format_step_duration_ms(timing_report.duration_ms)
+    const suffix = if step.success {
+      ""
+    } else {
+      " (exit ${step.exit_code})"
+    }
+    harness.stdio.println("   ${mark} ${name} (${elapsed})${suffix}")
+  }
+  const current_steps = steps ?? []
+  return {
+    steps: current_steps + [step],
+    step: step,
+    success: step.success,
+    status: step.status,
+    exit_code: step.exit_code,
+    stdout: step.stdout,
+    stderr: step.stderr,
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Interactive flag resolution helpers (pure; the terminal read lives in release_harn).
+// -------------------------------------------------------------------------------------------------
+
+/** True when `flag` (e.g. `"--mode"`) was passed explicitly on the command line. */
+pub fn release_flag_passed(argv: list<string>, flag: string) -> bool {
+  for a in argv ?? [] {
+    const s = to_string(a)
+    if s == flag || starts_with(s, flag + "=") {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Resolve a prompted flag answer against the allowed choices. Pure, so the
+ * validation is testable apart from the terminal read. `ok` is the
+ * `std/io::read_line` success flag; on timeout/EOF (`ok == false`), a blank
+ * answer, or an answer outside `choices`, fall back to `default_val`. Returns
+ * `{value, note}` where `note` is a one-line explanation to echo (empty when
+ * the typed answer was accepted verbatim).
+ */
+pub fn coerce_flag_choice(
+  raw_value: string,
+  ok: bool,
+  choices: list<string>,
+  default_val: string,
+) -> ReleaseFlagChoice {
+  if !ok {
+    return {value: default_val, note: "no input within timeout; using ${default_val}"}
+  }
+  const v = lowercase(trim(raw_value ?? ""))
+  if v == "" {
+    return {value: default_val, note: "using ${default_val}"}
+  }
+  for c in choices {
+    if v == c {
+      return {value: c, note: ""}
+    }
+  }
+  return {
+    value: default_val,
+    note: "'${raw_value}' is not ${join(choices, "/")}; using ${default_val}",
+  }
+}

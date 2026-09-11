@@ -1,0 +1,319 @@
+/**
+ * Which contexts a release requires green on the commit it is about to cut.
+ *
+ * The rulesets on a repository answer a different question from the one a
+ * release asks. A ruleset says what may merge; it is the branch's own bar for
+ * admitting a commit. A release asks what may ship, and those are not the same
+ * bar. Read live on burin-labs/harn the ruleset-required set is exactly two
+ * entries, the aggregate `CI status` check and `drift`, and everything else the
+ * repository runs sits outside it.
+ *
+ * The gap that motivates this module is a lane that is in neither of the two
+ * sets a release already computes. `lib/release_only_checks` classifies a
+ * workflow as release-only when it has no push or merge-group trigger, so a
+ * slow suite that does run on every default-branch push is correctly called
+ * branch-covered and is not waited on. If that same suite is also not
+ * ruleset-required, no release gate reads it at all: it can be red on the exact
+ * commit being tagged and the cut proceeds. `CLI end-to-end behavior` in the
+ * runtime repository has precisely that shape.
+ *
+ * The fix is a declaration rather than a wider inference. A repository names,
+ * in `fleet.toml`, the contexts its releases need, and the decision runs on the
+ * union of that list with the ruleset-required set. Two properties are
+ * deliberate:
+ *
+ * - A declared context with no row on the candidate is pending, named, and
+ *   counted. It is never dropped and never reads as satisfied, because a check
+ *   that did not report has not passed.
+ * - A declared context no workflow at the candidate revision can produce is a
+ *   named refusal, not a quietly dropped row. A list that silently forgets its
+ *   own entries decays into a gate that asserts nothing, and that decay is
+ *   invisible precisely when it matters.
+ *
+ * Nothing here reads GitHub or the filesystem. The whole decision is a function
+ * of an observed ruleset set, an observed declaration, an observed inventory of
+ * producible check names, and observed check rows, so every rule below is
+ * falsifiable without a network.
+ */
+import {
+  admission_state_is_passing,
+  admission_state_is_unfinished,
+  required_check_state,
+} from "./pr_admission"
+
+/** Why one context is in the set the release decision runs over. */
+pub type ReleaseContextOrigin = "ruleset" | "declared" | "both"
+
+/** One context in the release's required set, with where it came from. */
+pub type ReleaseContextEntry = {name: string, origin: ReleaseContextOrigin}
+
+/**
+ * Whether the repository-owned declaration was actually read.
+ *
+ * `unreadable` exists so a failed manifest read is distinguishable from a
+ * repository that declares nothing. Both fall back to the ruleset set, which is
+ * today's behavior, but only one of them is a measurement.
+ */
+pub type ReleaseContextDeclarationSource = "none" | "manifest" | "unreadable"
+
+/**
+ * The resolved set a release decision runs over, with its shape kept visible.
+ *
+ * `contexts` is the union and is what the decision consumes. The three lists
+ * beside it are not decoration: a reader who sees a refusal on a declared-only
+ * context needs to know it was declared here rather than required by the
+ * branch, and a reader who sees the ruleset set alone needs to be able to tell
+ * "nothing was declared" from "the declaration could not be read".
+ */
+pub type ReleaseContextSet = {
+  contexts: list<string>,
+  entries: list<ReleaseContextEntry>,
+  ruleset_required: list<string>,
+  declared: list<string>,
+  declared_only: list<string>,
+  refused: list<string>,
+  producible_observed: bool,
+  declaration_source: ReleaseContextDeclarationSource,
+}
+
+/** One context resolved against the candidate commit. */
+pub type ReleaseContextRow = {
+  name: string,
+  origin: ReleaseContextOrigin,
+  state: string,
+  passing: bool,
+  pending: bool,
+  failing: bool,
+}
+
+/** Where the release's declared and required contexts stand on one commit. */
+pub type ReleaseContextReadiness = {
+  ok: bool,
+  state: "ready" | "pending" | "failed" | "refused" | "unrequired",
+  rows: list<ReleaseContextRow>,
+  pending_names: list<string>,
+  pending_count: int,
+  failing_names: list<string>,
+  refused_names: list<string>,
+  reason: string,
+}
+
+fn normalized(names: list<string>?) -> list<string> {
+  let out: list<string> = []
+  for raw in names ?? [] {
+    const name = trim(to_string(raw ?? ""))
+    if name != "" && !out.contains(name) {
+      out = out + [name]
+    }
+  }
+  return out.sort()
+}
+
+/**
+ * The contexts one repository declares its releases require.
+ *
+ * Normalization is owned here rather than at the manifest seam so every caller
+ * asks the same question of the same shape: blanks dropped, duplicates folded,
+ * order made deterministic. A caller that passes nil gets the empty list, which
+ * is a repository with no declaration.
+ */
+pub fn release_declared_contexts(declared: list<string>?) -> list<string> {
+  return normalized(declared)
+}
+
+/**
+ * Resolve the set a release decision runs over.
+ *
+ * `producible` is the complete inventory of check names some workflow at the
+ * candidate revision can emit. Passing nil says that inventory was not
+ * observed, which is different from observing an empty one: a declared context
+ * is only refused as nonexistent when the inventory was actually read and did
+ * not contain it. An unread inventory refuses nothing and drops nothing; the
+ * declared context stays in the union and still has to report green.
+ *
+ * A ruleset-required context is never refused for being absent from the
+ * inventory. The branch requires it, so its existence is the branch's claim to
+ * make, not this function's.
+ */
+pub fn release_context_set(
+  ruleset_required: list<string>?,
+  declared: list<string>?,
+  producible: list<string>? = nil,
+  declaration_source: ReleaseContextDeclarationSource = "none",
+) -> ReleaseContextSet {
+  const required = normalized(ruleset_required)
+  const named = normalized(declared)
+  const known = normalized(producible)
+  const observed = producible != nil
+  let declared_only: list<string> = []
+  let refused: list<string> = []
+  for name in named {
+    if !required.contains(name) {
+      declared_only = declared_only + [name]
+    }
+    if observed && !known.contains(name) && !required.contains(name) {
+      refused = refused + [name]
+    }
+  }
+  const union = normalized(required + named)
+  let entries: list<ReleaseContextEntry> = []
+  for name in union {
+    entries = entries
+      + [
+        {
+          name: name,
+          origin: if required.contains(name) && named.contains(name) {
+            "both"
+          } else if named.contains(name) {
+            "declared"
+          } else {
+            "ruleset"
+          },
+        },
+      ]
+  }
+  return {
+    contexts: union,
+    entries: entries,
+    ruleset_required: required,
+    declared: named,
+    declared_only: declared_only,
+    refused: refused,
+    producible_observed: observed,
+    declaration_source: declaration_source,
+  }
+}
+
+/**
+ * Resolve every context in the set against one commit's check rows.
+ *
+ * States come from `pr_admission`, which already reduces a rollup to its latest
+ * row per name and answers `MISSING` for a name that never reported. Reusing it
+ * is the point: a release and an admission must not disagree about what a
+ * conclusion means, and a second opinion here is how they would.
+ *
+ * The verdict order is refused, then failed, then pending. A refusal outranks a
+ * red because a list naming a context nothing can produce is broken as a list,
+ * and repairing the red would not make the gate mean anything.
+ */
+pub fn release_context_readiness(
+  set: ReleaseContextSet,
+  states: dict<string, string>,
+) -> ReleaseContextReadiness {
+  let resolved: list<ReleaseContextRow> = []
+  let pending: list<string> = []
+  let failing: list<string> = []
+  for entry in set.entries {
+    // A context the caller could not resolve is `MISSING`, which is pending.
+    // Reading an absent key as anything else is the exact misread this module
+    // exists to prevent.
+    const state = trim(to_string(states[entry.name] ?? "MISSING"))
+    const passing = admission_state_is_passing(state)
+    const unfinished = !passing && admission_state_is_unfinished(state)
+    if unfinished {
+      pending = pending + [entry.name]
+    } else if !passing {
+      failing = failing + [entry.name]
+    }
+    resolved = resolved
+      + [
+        {
+          name: entry.name,
+          origin: entry.origin,
+          state: state,
+          passing: passing,
+          pending: unfinished,
+          failing: !passing && !unfinished,
+        },
+      ]
+  }
+  const shape = "${to_string(len(pending))} pending, ${to_string(len(failing))} failing"
+    + " of ${to_string(len(set.contexts))} required"
+  if len(set.refused) > 0 {
+    return {
+      ok: false,
+      state: "refused",
+      rows: resolved,
+      pending_names: pending,
+      pending_count: len(pending),
+      failing_names: failing,
+      refused_names: set.refused,
+      reason: "declared release contexts no workflow at this revision produces:"
+        + " ${set.refused.join(", ")}",
+    }
+  }
+  if len(set.contexts) == 0 {
+    return {
+      ok: false,
+      state: "unrequired",
+      rows: resolved,
+      pending_names: [],
+      pending_count: 0,
+      failing_names: [],
+      refused_names: [],
+      reason: "no release context was required, which proves nothing rather than everything",
+    }
+  }
+  if len(failing) > 0 {
+    return {
+      ok: false,
+      state: "failed",
+      rows: resolved,
+      pending_names: pending,
+      pending_count: len(pending),
+      failing_names: failing,
+      refused_names: [],
+      reason: "${shape}; failing: ${failing.join(", ")}",
+    }
+  }
+  if len(pending) > 0 {
+    return {
+      ok: false,
+      state: "pending",
+      rows: resolved,
+      pending_names: pending,
+      pending_count: len(pending),
+      failing_names: [],
+      refused_names: [],
+      reason: "${shape}; pending: ${pending.join(", ")}",
+    }
+  }
+  return {
+    ok: true,
+    state: "ready",
+    rows: resolved,
+    pending_names: [],
+    pending_count: 0,
+    failing_names: [],
+    refused_names: [],
+    reason: "${shape}, none missing",
+  }
+}
+
+/**
+ * Resolve every context in the set directly from one commit's rollup rows.
+ *
+ * The adapter, not a second opinion: it turns rows into resolved states using
+ * admission's owner and then asks the same verdict function every other caller
+ * asks. A caller that already resolved its states another way, such as the
+ * drift evidence with its pull-request-head fallback, hands those states in and
+ * gets the identical rules applied to them.
+ */
+pub fn release_context_states_from_rows(
+  set: ReleaseContextSet,
+  rows: list?,
+) -> dict<string, string> {
+  let states = {}
+  for entry in set.entries {
+    states[entry.name] = required_check_state(rows, entry.name)
+  }
+  return states
+}
+
+/** Readiness computed straight from one commit's rollup rows. */
+pub fn release_context_readiness_from_rows(
+  set: ReleaseContextSet,
+  rows: list?,
+) -> ReleaseContextReadiness {
+  return release_context_readiness(set, release_context_states_from_rows(set, rows))
+}

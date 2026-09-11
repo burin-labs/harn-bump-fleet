@@ -1,0 +1,236 @@
+#!/usr/bin/env harn
+import { ParserSpec } from "std/cli/argparse"
+import { env_str } from "std/config"
+import { GithubClientOptions } from "harn-github-connector/default"
+import { cli_options, parse_pull_request_numbers } from "lib/cli_options"
+import {
+  FleetManifest,
+  fleet_scope_excluding,
+  operation_harn_bump_repositories,
+  read_fleet_manifest,
+} from "lib/fleet_manifest"
+import {
+  fleet_operation_scope,
+  fleet_scope_members,
+  require_release_controller_scope,
+} from "lib/fleet_operation_scope"
+import {
+  github_actions_run,
+  github_actions_run_cancel,
+  github_connector_options,
+  github_workflow_dispatch,
+} from "lib/github"
+import {
+  HostedReleaseDispatchAdapter,
+  HostedReleaseDispatchReceipt,
+  HostedReleaseInputs,
+  hosted_release_dispatch,
+  hosted_release_receipt_read,
+  hosted_release_receipt_write,
+  hosted_release_replace,
+  hosted_release_source_repo_error,
+} from "lib/hosted_release_dispatch"
+import { release_certified_pin_from_github } from "lib/release_certified_pin_runtime"
+
+const REPO = "burin-labs/harn-bump-fleet"
+
+const WORKFLOW = "hosted-release.yml"
+
+const REF = "main"
+
+type Options = {
+  mode: string,
+  bump: string,
+  preid: string,
+  at_sha: string,
+  base: string,
+  no_converge_fleet: bool,
+  repositories_json?: string,
+  skip_consumers?: string,
+  resume_tagged_release: bool,
+  receipt_out?: string,
+  replace_receipt?: string,
+  agent: bool,
+  yes_live_release: bool,
+  no_chat: bool,
+  repo?: string,
+  expect_pr: list<string>,
+  consumer_proof_runs_json?: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "dispatch-hosted-release",
+  args: [
+    {kind: "flag", name: "mode", long: "--mode", default: "audit"},
+    {kind: "flag", name: "bump", long: "--bump", default: "patch"},
+    {kind: "flag", name: "preid", long: "--preid", default: ""},
+    {kind: "flag", name: "at_sha", long: "--at-sha", default: ""},
+    {kind: "flag", name: "base", long: "--base", default: "main"},
+    {kind: "switch", name: "no_converge_fleet", long: "--no-converge-fleet"},
+    {kind: "flag", name: "repositories_json", long: "--repositories-json"},
+    {kind: "flag", name: "skip_consumers", long: "--skip-consumers-json"},
+    {kind: "switch", name: "resume_tagged_release", long: "--resume-tagged-release"},
+    {kind: "flag", name: "receipt_out", long: "--receipt-out"},
+    {kind: "flag", name: "replace_receipt", long: "--replace-receipt"},
+    // Accepted because run_harn_release.sh uses the same public argv. Hosted
+    // release policy already makes these properties structural.
+    {kind: "switch", name: "agent", long: "--agent"},
+    {kind: "switch", name: "yes_live_release", long: "--yes-live-release"},
+    {kind: "switch", name: "no_chat", long: "--no-chat"},
+    // `run_harn_release.sh` exposes the local source checkout. Hosted release
+    // can represent only the canonical Harn repository, validated below.
+    {kind: "flag", name: "repo", long: "--repo"},
+    {kind: "flag", name: "expect_pr", long: "--expect-pr", multi: true, default: []},
+    {kind: "flag", name: "consumer_proof_runs_json", long: "--consumer-proof-runs-json"},
+  ],
+}
+
+fn changing_input_was_supplied(args: list<string>) -> bool {
+  for arg in args {
+    for prefix in [
+      "--mode",
+      "--bump",
+      "--preid",
+      "--at-sha",
+      "--base",
+      "--no-converge-fleet",
+      "--repositories-json",
+      "--skip-consumers-json",
+      "--resume-tagged-release",
+      "--repo",
+      "--expect-pr",
+      "--consumer-proof-runs-json",
+    ] {
+      if arg == prefix || starts_with(arg, prefix + "=") {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+/** Convert either public selector into the one durable exact-inclusion identity. */
+pub fn hosted_release_repository_scope(
+  manifest: FleetManifest,
+  repositories_json: string? = nil,
+  skip_consumers_json: string? = nil,
+) -> string? {
+  const exclusions = if skip_consumers_json == "" {
+    nil
+  } else {
+    skip_consumers_json
+  }
+  if repositories_json != nil && exclusions != nil {
+    throw "repository selection and skip_consumers are mutually exclusive"
+  }
+  if exclusions != nil {
+    return json_stringify(
+      unwrap(fleet_scope_members(fleet_scope_excluding(manifest, unwrap(exclusions)))),
+    )
+  }
+  if repositories_json == nil {
+    return nil
+  }
+  const scope = fleet_operation_scope(nil, repositories_json)
+  operation_harn_bump_repositories(manifest, scope)
+  require_release_controller_scope(scope)
+  return json_stringify(unwrap(fleet_scope_members(scope)))
+}
+
+pub fn hosted_release_adapter(
+  harness: Harness,
+  prior: HostedReleaseDispatchReceipt? = nil,
+  pin_options: GithubClientOptions = github_connector_options(),
+) -> HostedReleaseDispatchAdapter {
+  const repo = prior?.repo ?? REPO
+  const workflow = prior?.workflow ?? WORKFLOW
+  const ref = prior?.ref ?? REF
+  return {
+    dispatch: fn(inputs) {
+      let fields = {
+        mode: inputs.mode,
+        bump: inputs.bump,
+        prerelease_identifier: inputs.prerelease_identifier,
+        at_sha: inputs.at_sha,
+        converge_fleet: inputs.converge_fleet,
+        expected_prs: (inputs.expected_prs ?? []).map({ number -> to_string(number) }).join(","),
+        skip_consumers: "",
+        resume_tagged_release: inputs.resume_tagged_release ?? false,
+        consumer_proof_runs_json: inputs.consumer_proof_runs_json ?? "",
+      }
+      if inputs.repositories_json != nil {
+        fields.repositories_json = unwrap(inputs.repositories_json)
+      }
+      return github_workflow_dispatch(harness, repo, workflow, fields, ref)
+    },
+    run: fn(run_id) { return github_actions_run(harness, repo, run_id) },
+    cancel: fn(run_id) { return github_actions_run_cancel(harness, repo, run_id) },
+    resolve_pin: fn() { return release_certified_pin_from_github(
+      harness,
+      "burin-labs/harn",
+      "main",
+      20,
+      pin_options,
+    ) },
+  }
+}
+
+fn default_receipt_path(run_id: int) -> string {
+  return path_join(".harn-runs", "hosted-release-dispatch-${run_id}.json")
+}
+
+pipeline main(harness: Harness) {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const canonical_repo = path_join(env_str(harness.env, "HOME") ?? "", "projects", "harn")
+  const repo_error = hosted_release_source_repo_error(options.repo, canonical_repo)
+  if repo_error != nil {
+    throw repo_error
+  }
+  if options.base != "main" {
+    throw "hosted release workflow owns base main; got ${options.base}"
+  }
+  let result = nil
+  if options.replace_receipt != nil {
+    if changing_input_was_supplied(argv) {
+      throw "replacement replays the prior receipt; release input flags are not accepted"
+    }
+    const prior = hosted_release_receipt_read(harness.fs, options.replace_receipt)
+    if prior == nil {
+      throw "replacement requires a valid hosted release dispatch receipt"
+    }
+    if prior.repo != REPO || prior.workflow != WORKFLOW || prior.ref != REF {
+      throw "replacement receipt does not name the canonical hosted release workflow"
+    }
+    result = hosted_release_replace(prior, hosted_release_adapter(harness, prior))
+  } else {
+    const repositories_json = hosted_release_repository_scope(
+      read_fleet_manifest(harness.fs),
+      options.repositories_json,
+      options.skip_consumers,
+    )
+    let inputs: HostedReleaseInputs = {
+      mode: options.mode,
+      bump: options.bump,
+      prerelease_identifier: options.preid,
+      at_sha: options.at_sha,
+      converge_fleet: !options.no_converge_fleet,
+      expected_prs: parse_pull_request_numbers("expected_prs", options.expect_pr),
+      resume_tagged_release: options.resume_tagged_release,
+    }
+    if options.consumer_proof_runs_json != nil {
+      inputs.consumer_proof_runs_json = options.consumer_proof_runs_json
+    }
+    if repositories_json != nil {
+      inputs.repositories_json = unwrap(repositories_json)
+    }
+    result = hosted_release_dispatch(REPO, WORKFLOW, REF, inputs, hosted_release_adapter(harness))
+  }
+  if is_err(result) {
+    throw "hosted release dispatch refused: " + json_stringify(unwrap_err(result))
+  }
+  const receipt = unwrap(result)
+  const receipt_path = options.receipt_out ?? default_receipt_path(receipt.run_id)
+  hosted_release_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
+  harness.stdio.eprintln("hosted release dispatch receipt: " + receipt_path)
+  harness.stdio.println(json_stringify_pretty(receipt))
+}

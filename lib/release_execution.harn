@@ -1,0 +1,750 @@
+import {
+  CommandResult,
+  command_output_text,
+  command_result_fail,
+  command_result_ok,
+} from "std/command"
+import { CandidateArchiveGateConfig } from "./candidate_archive_receipt"
+import { EMPTY_AUDIT_FINDING, NO_VISIBLE_AUDIT_FINDING } from "./release_audit"
+import { PreTagBinaryGateConfig } from "./workflow_runs"
+
+const PRE_TAG_BINARY_WORKFLOW = "build-release-binaries.yml"
+
+// Five cold platform builds share one release gate. Standard Windows runners
+// have exceeded 90 minutes while the hosted release job still had ample time.
+// Keep this below that job's 180-minute ceiling but above observed healthy
+// archive latency; the single-target pre-tag size gate retains its tighter
+// independent budget.
+const CANDIDATE_ARCHIVE_TIMEOUT_MS = 7200000
+
+const PRE_TAG_BINARY_TARGET = "x86_64-unknown-linux-gnu"
+
+// These two names are matched against a workflow this repo does not own. The
+// GitHub API identifies a step only by its display name — there is no stable
+// step id — so a rename in harn is an ordinary reviewable change there and
+// silently unmatchable here. harn#6226 renamed `Check binary size budget` to
+// `Evaluate the binary-size growth signal`; the step then ran and PASSED, while
+// this gate reported it "did not execute successfully" and cancelled both
+// platform lanes, 43 minutes in. `pre_tag_binary_size_gate_step_contract`
+// proves the names still resolve before anything is dispatched.
+const PRE_TAG_BINARY_SIZE_STEP = "Evaluate the binary-size growth signal"
+
+// The step that can actually refuse a tag.
+//
+// This gate used to require only the growth step, and inherited its fuse
+// coverage: the workflow skips the growth step when the fuse step fails, and a
+// skipped step reads as "did not execute successfully" here. That chain held,
+// but it meant the one blocking size question was never named. Requiring the
+// fuse step by name makes the dependency structural, and survives a workflow
+// change that stops skipping the growth step on a fuse failure.
+//
+// It matters more now that growth is advisory in harn: the growth step passes
+// on a crossing, so it is no longer a proxy for anything blocking.
+const PRE_TAG_BINARY_FUSE_STEP = "Check the distribution fuse"
+
+const PRE_TAG_BINARY_SOURCE_STEP = "Verify benchmark source revision"
+
+const CANDIDATE_BINARY_SOURCE_STEP = "Verify candidate source revision"
+
+const PRE_TAG_BINARY_WORKFLOW_PATH = ".github/workflows/build-release-binaries.yml"
+
+pub type MarkdownlintViolation = {
+  path: string,
+  line: int,
+  column: int,
+  rule: string,
+  rule_name: string,
+  message: string,
+  raw: string,
+}
+
+pub type MarkdownlintSourceContext = {
+  path: string,
+  line: int,
+  column: int,
+  rule: string,
+  rule_name: string,
+  context: list<dict>,
+}
+
+pub type ReleaseFailureExplanation = {headline: string, next: string}
+
+pub type ReleaseRecoveryStepRef = {
+  name: string,
+  command: string | list<string>,
+  success: bool,
+  status: string,
+  exit_code: int,
+  classification: string,
+  recovery_hint: string,
+  command_id: string,
+  output_path: string,
+  live_log: string,
+  tail: string,
+  stdout: string,
+  stderr: string,
+}
+
+pub type ReleaseRecordedStep = {
+  name: string,
+  command: string | list<string>,
+  success: bool,
+  status: string,
+  exit_code: int,
+  cwd: string,
+  stdout: string,
+  stderr: string,
+  classification: string,
+  recovery_hint: string,
+}
+
+/** Validate the legacy release step stream once before typed orchestration consumes it. */
+fn release_step_string(step: dict, field: string) -> string {
+  const value = step.get(field)
+  if type_of(value) != "string" {
+    throw "release step ${field} must be a string"
+  }
+  return value
+}
+
+fn release_step_command(step: dict) -> string | list<string> {
+  const value = step.get("command")
+  if type_of(value) == "string" {
+    return value
+  }
+  if type_of(value) != "list" {
+    throw "release step command must be a string or list<string>"
+  }
+  let argv: list<string> = []
+  for argument in value {
+    if type_of(argument) != "string" {
+      throw "release step command arguments must be strings"
+    }
+    argv = argv + [argument]
+  }
+  return argv
+}
+
+pub fn release_recorded_steps(steps: list<dict>) -> list<ReleaseRecordedStep> {
+  let typed: list<ReleaseRecordedStep> = []
+  for step in steps {
+    if type_of(step.get("success")) != "bool" || type_of(step.get("exit_code")) != "int" {
+      throw "release step success and exit_code must be typed"
+    }
+    const record: ReleaseRecordedStep = {
+      name: release_step_string(step, "name"),
+      command: release_step_command(step),
+      success: step.success,
+      status: release_step_string(step, "status"),
+      exit_code: step.exit_code,
+      cwd: release_step_string(step, "cwd"),
+      stdout: release_step_string(step, "stdout"),
+      stderr: release_step_string(step, "stderr"),
+      classification: release_step_string(step, "classification"),
+      recovery_hint: release_step_string(step, "recovery_hint"),
+    }
+    typed = typed + [record]
+  }
+  return typed
+}
+
+/** Typed policy for the non-publishing pre-tag Linux binary-size gate. */
+pub fn pre_tag_binary_size_gate_config(
+  policy_ref: string,
+  expected_policy_sha: string,
+  source_ref: string,
+  expected_source_sha: string,
+) -> PreTagBinaryGateConfig {
+  return {
+    workflow: PRE_TAG_BINARY_WORKFLOW,
+    event: "workflow_dispatch",
+    policy_ref: policy_ref,
+    expected_policy_sha: lowercase(expected_policy_sha),
+    source_ref: source_ref,
+    expected_source_sha: lowercase(expected_source_sha),
+    target_job: "Build ${PRE_TAG_BINARY_TARGET}",
+    required_source_step: PRE_TAG_BINARY_SOURCE_STEP,
+    required_fuse_step: PRE_TAG_BINARY_FUSE_STEP,
+    required_size_step: PRE_TAG_BINARY_SIZE_STEP,
+    benchmark_only: true,
+    runner_profile: "standard",
+    targets: PRE_TAG_BINARY_TARGET,
+    completion_timeout_ms: 5400000,
+    // A release build can run for close to an hour. Two-minute reads keep the
+    // 90-minute gate responsive while bounding its normal REST cost to 45.
+    completion_interval_ms: 120000,
+    // A status read is idempotent once dispatch has returned its exact run
+    // identity. Retry only its explicitly typed transport failures; release
+    // mutations still execute exactly once.
+    transient_view_retry_max_attempts: 3,
+    transient_view_retry_base_ms: 1000,
+    transient_view_retry_cap_ms: 5000,
+  }
+}
+
+/**
+ * The artifact harn publishes for one measured revision.
+ *
+ * Source-qualified because a benchmark dispatch's run head SHA is the policy
+ * ref, not the revision it measured: run metadata alone cannot answer whether
+ * an exact commit has already been built. The artifact's existence can, which
+ * is what lets a repeat attempt reuse a measurement instead of spending
+ * another ~40-minute Linux build reproducing it.
+ *
+ * harn owns the name (`.github/workflows/build-release-binaries.yml`). A
+ * rename there is invisible here in the same way a step rename was, except the
+ * consequence is a redundant build rather than a false verdict.
+ */
+pub fn pre_tag_binary_size_report_artifact(source_sha: string) -> string {
+  return "harn-binary-size-${PRE_TAG_BINARY_TARGET}-${lowercase(trim(source_sha))}"
+}
+
+/**
+ * Step names this gate matches on that the workflow source no longer defines.
+ *
+ * Pure on purpose: the caller reads the file at the exact revision the gate
+ * dispatches, so this can be tested without a checkout and cannot disagree with
+ * what the dispatch will actually see.
+ *
+ * A missing name is a hard stop rather than a warning. The failure it prevents
+ * is not "the size step regressed" — it is the gate declaring a step that ran
+ * and PASSED to be unexecuted, after paying for a full release build.
+ */
+pub type ReleaseBinaryGateStepNames = {
+  required_source_step: string,
+  required_fuse_step: string,
+  required_size_step: string,
+}
+
+pub fn pre_tag_binary_size_gate_missing_steps(
+  workflow_source: string,
+  config: ReleaseBinaryGateStepNames,
+) -> list<string> {
+  let missing: list<string> = []
+  for name in [config.required_source_step, config.required_fuse_step, config.required_size_step] {
+    if !workflow_source.contains("name: " + name) {
+      missing = missing + [name]
+    }
+  }
+  return missing
+}
+
+/** The workflow whose step names [`pre_tag_binary_size_gate_missing_steps`] proves. */
+pub fn pre_tag_binary_size_gate_workflow_path() -> string {
+  return PRE_TAG_BINARY_WORKFLOW_PATH
+}
+
+pub type PreTagStepContractVerdict = {ok: bool, unreadable: bool, missing: list<string>}
+
+/**
+ * The whole pre-dispatch decision, as a value.
+ *
+ * The caller does the I/O and renders the verdict; every branch lives here so
+ * each one is reachable from a test. `unreadable` is deliberately NOT folded
+ * into an empty `missing` list: "the contract holds" and "the contract was
+ * never checked" must not produce the same verdict, or the gate reports the
+ * same silence either way and the release spends ~45 minutes on a check that
+ * did not run.
+ */
+pub fn pre_tag_binary_size_gate_step_contract(
+  mock: bool,
+  read_succeeded: bool,
+  workflow_source: string,
+  config: ReleaseBinaryGateStepNames,
+) -> PreTagStepContractVerdict {
+  if mock {
+    return {ok: true, unreadable: false, missing: []}
+  }
+  if !read_succeeded || trim(workflow_source) == "" {
+    return {ok: false, unreadable: true, missing: []}
+  }
+  const missing = pre_tag_binary_size_gate_missing_steps(workflow_source, config)
+  return {ok: missing.count == 0, unreadable: false, missing: missing}
+}
+
+/** Bind current workflow policy to one immutable release-candidate source. */
+pub fn release_candidate_pre_tag_binary_size_gate_config(
+  policy_ref: string,
+  policy_sha: string,
+  candidate_ref: string,
+  candidate_sha: string,
+) -> PreTagBinaryGateConfig {
+  return pre_tag_binary_size_gate_config(policy_ref, policy_sha, candidate_ref, candidate_sha)
+}
+
+/** Typed policy for the pre-tag five-target candidate archive gate. */
+pub fn release_candidate_archive_gate_config(
+  policy_ref: string,
+  policy_sha: string,
+  candidate_ref: string,
+  candidate_sha: string,
+) -> CandidateArchiveGateConfig {
+  return {
+    workflow: PRE_TAG_BINARY_WORKFLOW,
+    event: "workflow_dispatch",
+    policy_ref: policy_ref,
+    expected_policy_sha: lowercase(policy_sha),
+    source_ref: candidate_ref,
+    expected_source_sha: lowercase(candidate_sha),
+    target_job: "Build ${PRE_TAG_BINARY_TARGET}",
+    required_source_step: CANDIDATE_BINARY_SOURCE_STEP,
+    required_fuse_step: PRE_TAG_BINARY_FUSE_STEP,
+    required_size_step: PRE_TAG_BINARY_SIZE_STEP,
+    candidate_only: true,
+    runner_profile: "policy",
+    targets: "",
+    completion_timeout_ms: CANDIDATE_ARCHIVE_TIMEOUT_MS,
+    completion_interval_ms: 120000,
+    transient_view_retry_max_attempts: 3,
+    transient_view_retry_base_ms: 1000,
+    transient_view_retry_cap_ms: 5000,
+  }
+}
+
+pub type ReleaseTagCreateInput = {
+  tag: string,
+  version: string,
+  target_oid: string,
+  candidate_oid: string,
+}
+
+/** Build the git argv for creating a signed release tag at one exact object. */
+pub fn release_tag_create_args(input: ReleaseTagCreateInput) -> list<string> {
+  const message = if trim(input.candidate_oid) == "" {
+    "Release v${input.version}"
+  } else {
+    "Release v${input.version}\n\nHarn-Release-Candidate: ${lowercase(trim(input.candidate_oid))}"
+  }
+  return ["git", "tag", "-s", input.tag, "-m", message, input.target_oid]
+}
+
+/**
+ * Repository-owned trust root for both maintainer and hosted-bot release tags.
+ *
+ * The keys are configuration in the Harn repository, not release-harness
+ * policy. Supplying the path explicitly prevents recovery and cleanup from
+ * inheriting a laptop's unrelated allowed-signers file.
+ */
+pub const HARN_RELEASE_ALLOWED_SIGNERS_FILE = ".github/release-bot-allowed-signers"
+
+/** Build git subcommand args for verifying a release tag against Harn policy. */
+pub fn release_tag_verify_git_args(tag: string) -> list<string> {
+  return [
+    "-c",
+    "gpg.ssh.allowedSignersFile=${HARN_RELEASE_ALLOWED_SIGNERS_FILE}",
+    "verify-tag",
+    "--raw",
+    tag,
+  ]
+}
+
+/** Build full git argv for verifying a release tag against Harn policy. */
+pub fn release_tag_verify_args(tag: string) -> list<string> {
+  return ["git"] + release_tag_verify_git_args(tag)
+}
+
+/** Deterministic signed-tag command adapter for release mock rehearsals. */
+pub fn mock_release_tag_command(command: string, verify_fail: bool) -> CommandResult? {
+  if contains(command, "git tag -s") {
+    return command_result_ok("")
+  }
+  if contains(command, "verify-tag --raw") {
+    if verify_fail {
+      return command_result_fail(1, "error: no signature found\n")
+    }
+    return command_result_ok(
+      "Good git signature for v0.7.53 with ED25519 key SHA256:Vf3ne/4ERhdAwPTfWNGNE0dIYy9hH7tiHtiL2Lz46MU\n",
+    )
+  }
+  return nil
+}
+
+/** Build the exact-object refspec for publishing an immutable release tag. */
+pub fn release_tag_push_args(tag: string, tag_oid: string) -> list<string> {
+  return ["git", "push", "origin", "${tag_oid}:refs/tags/${tag}"]
+}
+
+/** Verify one captured commit object rather than a mutable branch name. */
+pub fn release_commit_verify_args(commit_oid: string) -> list<string> {
+  return ["git", "verify-commit", "--raw", commit_oid]
+}
+
+/** Parse markdownlint-cli2 output into structured violation records. */
+pub fn markdownlint_violations_from_text(text: string) -> list<MarkdownlintViolation> {
+  let violations = []
+  for line in (text ?? "").split("\n") {
+    const m = regex_captures(
+      "^([^:\\n]+):([0-9]+):([0-9]+)\\s+error\\s+(MD[0-9]+)/([^\\s]+)\\s+(.+)$",
+      line,
+    )
+    if len(m) == 0 {
+      continue
+    }
+    const groups = m[0].groups
+    violations = violations
+      + [
+        {
+          path: groups[0],
+          line: to_int(groups[1]),
+          column: to_int(groups[2]),
+          rule: groups[3],
+          rule_name: groups[4],
+          message: groups[5],
+          raw: line,
+        },
+      ]
+  }
+  return violations
+}
+
+fn numbered_line_context(text: string?, start_line: any, end_line: any) {
+  let out = []
+  for {index, value} in (text ?? "").split("\n").enumerate() {
+    const line_no = index + 1
+    if line_no >= start_line && line_no <= end_line {
+      out = out + [{line: line_no, text: value}]
+    }
+  }
+  return out
+}
+
+/** Attach nearby source lines to markdownlint violations from a path->text map. */
+pub fn markdownlint_source_context(
+  violations: list<MarkdownlintViolation>,
+  files: dict,
+  radius: int,
+) -> list<MarkdownlintSourceContext> {
+  let out = []
+  const window = radius ?? 2
+  for violation in violations ?? [] {
+    const path = violation.path ?? ""
+    const text = files[path] ?? ""
+    if path == "" || text == "" {
+      continue
+    }
+    const line_no = violation.line ?? 1
+    let start_line = line_no - window
+    if start_line < 1 {
+      start_line = 1
+    }
+    const end_line = line_no + window
+    out = out
+      + [
+        {
+          path: path,
+          line: violation.line,
+          column: violation.column,
+          rule: violation.rule,
+          rule_name: violation.rule_name,
+          context: numbered_line_context(text, start_line, end_line),
+        },
+      ]
+  }
+  return out
+}
+
+/** Return true when a push failure is only a green-test pre-push wall-clock budget timeout. */
+pub fn push_hook_budget_exceeded(command: string, r: CommandResult) -> bool {
+  if r.success || !starts_with(command, "git push ") {
+    return false
+  }
+  let out = lowercase(command_output_text(r))
+  const hook_like = contains(out, "pre-push") || contains(out, "pre push")
+    || contains(out, "hook")
+  const budget_like = contains(out, "budget") || contains(out, "timed out")
+    || contains(out, "timeout")
+    || contains(out, "exceeded")
+  const green_like = contains(out, "passed") || contains(out, "test result: ok")
+    || contains(out, "0 failed")
+    || contains(out, "/3187")
+    || contains(out, "3187/3187")
+  return hook_like && budget_like && green_like
+}
+
+/** Classify a side-effecting release command result for audit and recovery handling. */
+pub fn step_classification(command: string, r: CommandResult) -> string {
+  if r.success {
+    return "ok"
+  }
+  if push_hook_budget_exceeded(command, r) {
+    return "push_hook_budget_exceeded_after_green_tests"
+  }
+  if contains(command, "lint-md") || contains(command, "markdownlint-cli2") {
+    return "generated_markdown_lint_failed"
+  }
+  if contains(command, "check-cli-aot") {
+    return "generated_cli_aot_failed"
+  }
+  if starts_with(command, "git push ") {
+    return "push_failed"
+  }
+  return "command_failed"
+}
+
+/** Return operator-facing recovery advice for known release command failure classes. */
+pub fn step_recovery_hint(command: string, r: CommandResult) -> string {
+  if push_hook_budget_exceeded(command, r) {
+    return "Tests reported green before the pre-push hook exceeded its wall-clock budget. The hook has nothing left to prove, so retry with `git push --no-verify` and keep both attempts in the run artifacts."
+  }
+  if !r.success && starts_with(command, "git push ") {
+    return "Push failed for a reason that was not classified as a green-test hook budget timeout. Keep the release branch and commit, inspect stdout/stderr in the run artifacts, then rerun or push manually after fixing the hook failure."
+  }
+  if !r.success && (contains(command, "lint-md") || contains(command, "markdownlint-cli2")) {
+    return "Generated markdown failed the repository markdown lint. Let the recovery agent edit the generated release diff, then retry the same lint command before committing."
+  }
+  if !r.success && contains(command, "check-cli-aot") {
+    return "Committed CLI AOT bytecode does not match the reconciled Harn version or sources. Run `make gen-cli-aot`, review the generated artifact diff, then retry `make check-cli-aot` before committing."
+  }
+  return ""
+}
+
+/**
+ * Plain-language, jargon-free explanation of a failed release step for the
+ * operator-facing run summary. The raw `step.name` (e.g.
+ * `agent-review-validation`) and numeric exit status assume knowledge of the
+ * harness internals; this maps the known failure points to a sentence that
+ * says what broke and what to do next. Returns `{headline, next}` where
+ * `next` may be empty.
+ */
+/** Return a failed step's captured output, for classifying which failure it was. */
+fn step_failure_details(step: dict) -> string {
+  return trim((step?.stdout ?? "") + "\n" + (step?.stderr ?? ""))
+}
+
+pub fn release_failure_explanation(step: dict) -> ReleaseFailureExplanation {
+  const name = step.name ?? ""
+  const cls = step.classification ?? ""
+  const hint = trim(step.recovery_hint ?? "")
+  if contains(name, "agent-review") {
+    // Two failures reach this step and they need opposite remediations. Telling
+    // an operator to check provider credentials when the model answered fine and
+    // the audit merely failed validation sends them to the wrong system, so key
+    // the message on the findings the validator actually emitted.
+    const details = step_failure_details(step)
+    if contains(details, NO_VISIBLE_AUDIT_FINDING) || contains(details, EMPTY_AUDIT_FINDING) {
+      return {
+        headline: "the release-readiness review never produced a usable audit",
+        next:
+          "The review model returned no final audit text—usually a provider auth/rate-limit error or an empty response. Check the `planner` line, confirm the configured env files contain the required key, then rerun with `scripts/run_harn_release.sh`.",
+      }
+    }
+    return {
+      headline: "the release-readiness review produced an audit that failed validation",
+      next:
+        "The model answered; the audit it wrote did not satisfy the release-audit contract. Provider credentials are not implicated. Read the validation findings printed above—each one names the exact problem—then fix the audit prompt or the contract and rerun with `scripts/run_harn_release.sh`.",
+    }
+  }
+  if contains(name, "prepare") {
+    return {
+      headline: "the prepare step failed (cargo audit, publish dry-run, or version/CHANGELOG bump)",
+      next:
+        "Open the prepare live log printed above and scroll to the first failing check, fix it on `main`, then re-run.",
+    }
+  }
+  if cls == "push_hook_budget_exceeded_after_green_tests" {
+    return {
+      headline: "the pre-push hook ran out of wall-clock budget after tests were already green",
+      next: hint,
+    }
+  }
+  if cls == "push_failed" || contains(name, "push") {
+    return {headline: "pushing the release branch or tag to origin failed", next: hint}
+  }
+  if cls == "generated_markdown_lint_failed" || contains(name, "markdown-lint") {
+    return {headline: "the generated release notes failed the repository markdown lint", next: hint}
+  }
+  if cls == "generated_cli_aot_failed" || contains(name, "cli-aot") {
+    return {
+      headline: "the generated CLI bytecode no longer matches the reconciled release version",
+      next: hint,
+    }
+  }
+  if contains(name, "create-release-tag") || contains(name, "verify-release-tag-signature") {
+    return {
+      headline: "creating or verifying the signed release tag failed",
+      next:
+        "Configure Git's signing key, verify the tag against `.github/release-bot-allowed-signers`, then rerun; the tag was not pushed.",
+    }
+  }
+  if contains(name, "release-tag-github-trust")
+    || contains(name, "release-tag-signing-config") {
+    return {
+      headline: "GitHub cannot attribute the release tag signature to the active operator",
+      next:
+        "Inspect the recorded `git config --show-origin --show-scope --get-all user.signingkey` output. Select an existing key whose fingerprint matches one of the reported GitHub-registered fingerprints, then rerun; the tag was not pushed.",
+    }
+  }
+  if contains(name, "create-pr") || contains(name, "auto-merge") {
+    return {
+      headline: "opening (or enabling auto-merge on) the release pull request failed",
+      next:
+        "The release branch, commit, and tag are intact — inspect the `gh` error in the run artifacts and finish the PR manually if needed.",
+    }
+  }
+  if contains(name, "commit") {
+    return {headline: "committing the staged release content failed", next: hint}
+  }
+  // Fallback: lead with the step's own human description when it reads like
+  // prose (recorded_step stores it in `command`); otherwise name the step.
+  const desc = trim(step.command ?? "")
+  const headline = if desc != "" && !contains(desc, "&&") && !starts_with(desc, "git ")
+    && !starts_with(desc, "./")
+    && !starts_with(desc, "harn ") {
+    desc
+  } else {
+    "the `${name}` step failed"
+  }
+  return {headline: headline, next: hint}
+}
+
+/** Convert a command result into the normalized release execution step shape. */
+pub fn recorded_step(
+  name: string,
+  command: string | list<string>,
+  r: CommandResult,
+) -> ReleaseRecordedStep {
+  const command_text = if type_of(command) == "list" {
+    command.join(" ")
+  } else {
+    command
+  }
+  const status = if type_of(r.status) == "string" {
+    r.status
+  } else if r.success {
+    "completed"
+  } else {
+    "failed"
+  }
+  return {
+    name: name,
+    command: command,
+    success: r.success,
+    status: status,
+    exit_code: r.exit_code,
+    cwd: r.cwd ?? "",
+    stdout: r.stdout,
+    stderr: r.stderr,
+    classification: step_classification(command_text, r),
+    recovery_hint: step_recovery_hint(command_text, r),
+  }
+}
+
+/** Return the compact failure context passed to recovery agents and reports. */
+pub fn recovery_step_ref(step: dict?) -> ReleaseRecoveryStepRef? {
+  if step == nil {
+    return nil
+  }
+  return {
+    name: step.name,
+    command: step.command,
+    success: step.success,
+    status: step.status,
+    exit_code: step.exit_code,
+    classification: step.classification ?? "",
+    recovery_hint: step.recovery_hint ?? "",
+    command_id: step.command_id ?? "",
+    output_path: step.output_path ?? "",
+    live_log: step.live_log ?? "",
+    tail: step.tail ?? "",
+    stdout: if (step.live_log ?? "") == "" {
+      step.stdout
+    } else {
+      "(full output is in live_log)"
+    },
+    stderr: if (step.live_log ?? "") == "" {
+      step.stderr
+    } else {
+      "(full output is in live_log)"
+    },
+  }
+}
+
+/** Return compact failure contexts for all recorded execution steps. */
+pub fn recovery_step_refs(steps: list<dict>) -> list<ReleaseRecoveryStepRef> {
+  let out = []
+  for step in steps ?? [] {
+    const ref = recovery_step_ref(step)
+    if ref != nil {
+      out = out + [ref]
+    }
+  }
+  return out
+}
+
+/** Return true if execution contains an unrecovered failed step. */
+pub fn execution_failed(execution: list<dict>?) -> bool {
+  if execution == nil {
+    return false
+  }
+  let recovered_budget_push = false
+  let recovered_after_agent_repair = []
+  for step in execution {
+    if step.name == "push-no-verify-after-green-hook-budget" && step.success {
+      recovered_budget_push = true
+    }
+    if ends_with(step.name, "-after-agent-repair") && step.success {
+      recovered_after_agent_repair = recovered_after_agent_repair
+        + [step.name[0:len(step.name) - len("-after-agent-repair")]]
+    }
+  }
+  for step in execution {
+    if !step.success {
+      if step.classification == "push_hook_budget_exceeded_after_green_tests"
+        && recovered_budget_push {
+        continue
+      }
+      if recovered_after_agent_repair.contains(step.name) {
+        continue
+      }
+      return true
+    }
+  }
+  return false
+}
+
+/** Return the last failed execution step, or nil when all steps succeeded. */
+pub fn last_failed_step(execution: list<dict>?) -> dict? {
+  let failed = nil
+  if execution == nil {
+    return nil
+  }
+  for step in execution {
+    if !step.success {
+      failed = step
+    }
+  }
+  return failed
+}
+
+/**
+ * Return the concrete failure that decided a fan-out result.
+ *
+ * Candidate certification appends cancellation receipts and a join failure
+ * after the lane that actually failed. Those steps describe cleanup and the
+ * aggregate result; they must not hide the actionable lane failure in the
+ * operator summary. Recovery still uses `last_failed_step`, where exact
+ * execution order is load-bearing.
+ */
+pub fn decisive_failed_step(execution: list<dict>?) -> dict? {
+  let decisive = nil
+  if execution == nil {
+    return nil
+  }
+  for step in execution {
+    if step.success {
+      continue
+    }
+    if step.name == "candidate-certification-join"
+      || step.name
+        == "candidate-certification-lane-cancelled"
+      || step.name
+        == "candidate-certification-lane-interrupted" {
+      continue
+    }
+    decisive = step
+  }
+  if decisive != nil {
+    return decisive
+  }
+  return last_failed_step(execution)
+}

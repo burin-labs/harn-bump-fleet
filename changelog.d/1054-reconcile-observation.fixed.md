@@ -1,0 +1,1 @@
+Published-tail read-only reconciliation proves current repository state without waiting for a workflow title, while still requiring an accepted dispatch. Fleet convergence now binds each main pin to an exact commit and requires a complete, positively successful required-check census on that commit.

@@ -1,0 +1,1 @@
+Release recovery identifies consumer certification by both the release candidate and the consumer source revision, so a corrected consumer can replace its earlier failed proof. A consumer branch that moves during dispatch cannot silently certify a different revision.

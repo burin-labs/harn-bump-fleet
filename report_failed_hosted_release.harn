@@ -1,0 +1,262 @@
+#!/usr/bin/env harn
+//
+// Turn a failed hosted release run into one typed receipt.
+//
+// A red release run stops the train until somebody notices it, opens the job
+// page, reads the failing step, decides whether the failure is mechanical, and
+// reconstructs the dispatch by hand. Every one of those four reads structured
+// evidence the run already has: the failing step is a named field on the job,
+// and the dispatch inputs are a closed set the run recorded when it started.
+//
+// This finalizer reads both and writes what failed, whether a re-dispatch is
+// the right answer, and the exact inputs that re-dispatch would carry. It never
+// dispatches anything itself.
+import { ParserSpec } from "std/cli/argparse"
+import { cli_options } from "lib/cli_options"
+import {
+  github_actions_run,
+  github_actions_run_jobs,
+  github_commit_reachable_from_branch,
+} from "lib/github"
+import { decode_github_workflow } from "lib/github_workflow"
+import {
+  HostedReleaseFailureReceipt,
+  HostedReleaseJobTemplate,
+  HostedReleaseStepOrder,
+  HostedReleaseWorkflowJob,
+  hosted_release_failure_receipt,
+  hosted_release_failure_summary,
+  hosted_release_run_steps,
+  hosted_release_step_order,
+} from "lib/hosted_release_failure"
+import {
+  RELEASE_LAUNCH_RECEIPT_PATH,
+  preflight_reported_causes,
+} from "lib/release_launch_preflight"
+import { release_landing_admission } from "lib/release_merge_lease"
+import { release_watch_receipt_read } from "lib/release_watch_state"
+
+const REPO = "burin-labs/harn-bump-fleet"
+
+const WORKFLOW = "hosted-release.yml"
+
+const WORKFLOW_PATH = ".github/workflows/hosted-release.yml"
+
+const REF = "main"
+
+type Options = {
+  run_id: int,
+  inputs_path: string,
+  preflight_receipt: string,
+  receipt_out: string,
+  summary_out: string,
+  watch_receipt: string,
+}
+
+type RecordedInputsDocument = {
+  schema_version: "harn_bump_fleet.hosted_release_inputs.v1",
+  mode: string,
+  bump: string,
+  prerelease_identifier: string,
+  at_sha: string,
+  expected_prs: string,
+  resume_tagged_release: bool,
+  converge_fleet: bool,
+  repositories_json: string,
+  skip_consumers: string,
+  consumer_proof_runs_json: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "report-failed-hosted-release",
+  args: [
+    {kind: "flag", name: "run_id", long: "--run-id", parse: "int", required: true},
+    {
+      kind: "flag",
+      name: "preflight_receipt",
+      long: "--preflight-receipt",
+      default: RELEASE_LAUNCH_RECEIPT_PATH,
+    },
+    {
+      kind: "flag",
+      name: "inputs_path",
+      long: "--inputs",
+      default: ".harn-runs/hosted-release-inputs.json",
+    },
+    {
+      kind: "flag",
+      name: "receipt_out",
+      long: "--receipt-out",
+      default: ".harn-runs/hosted-release-failure.json",
+    },
+    {kind: "flag", name: "summary_out", long: "--summary-out", default: ""},
+    {kind: "flag", name: "watch_receipt", long: "--watch-receipt", default: ""},
+  ],
+}
+
+fn workflow_jobs(fs: HarnessFs) -> list<HostedReleaseWorkflowJob> {
+  const workflow = decode_github_workflow(fs.read_text(WORKFLOW_PATH))
+  let jobs: list<HostedReleaseWorkflowJob> = []
+  for job in workflow.jobs {
+    const declared = job.value.needs
+    const needs: list<string> = if declared == nil {
+      []
+    } else if type_of(declared) == "string" {
+      [to_string(declared)]
+    } else {
+      declared
+    }
+    jobs = jobs
+      + [
+        {
+          job: job.key,
+          needs: needs,
+          steps: (job.value.steps ?? []).map({ step -> return step.name }).to_list(),
+        },
+      ]
+  }
+  return jobs
+}
+
+fn job_templates(fs: HarnessFs) -> list<HostedReleaseJobTemplate> {
+  const workflow = decode_github_workflow(fs.read_text(WORKFLOW_PATH))
+  let templates: list<HostedReleaseJobTemplate> = []
+  for job in workflow.jobs {
+    templates = templates + [{key: job.key, name: job.value.name ?? job.key}]
+  }
+  return templates
+}
+
+/**
+ * Read the inputs the run recorded, or nil when it recorded none.
+ *
+ * Nil is a real answer and not an error: a run that died before it could write
+ * them leaves nothing to replay, and the receipt escalates on exactly that
+ * rather than inventing a dispatch.
+ */
+fn recorded_inputs(fs: HarnessFs, path: string) -> RecordedInputsDocument? {
+  if !fs.exists(path) {
+    return nil
+  }
+  return try {
+    const parsed = json_parse(fs.read_text(path))
+    if schema_is(parsed, schema_of(RecordedInputsDocument)) {
+      schema_expect(parsed, schema_of(RecordedInputsDocument))
+    } else {
+      nil
+    }
+  } catch (_error) {
+    nil
+  }
+}
+
+/**
+ * The launch preflight receipt this run wrote, if it wrote one.
+ *
+ * A run that failed before the preflight ran leaves no receipt. That is
+ * reported as no cause named, never as a preflight that passed: with no cause
+ * the row's own repair applies, and that repair points at this file by name
+ * instead of asserting which precondition broke.
+ */
+fn preflight_causes(fs: HarnessFs, path: string) -> list<string> {
+  if trim(path) == "" || !fs.exists(path) {
+    return []
+  }
+  const parsed = try {
+    json_parse(fs.read_text(path))
+  } catch (_error) {
+    return []
+  }
+  return preflight_reported_causes(parsed)
+}
+
+pipeline main(harness: Harness) {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  if options.run_id <= 0 {
+    harness.stdio.eprintln("failed hosted release: --run-id must be a positive run id")
+    return 2
+  }
+  const run = github_actions_run(harness, REPO, options.run_id)
+  if is_err(run) {
+    harness.stdio.eprintln(
+      "failed hosted release: could not read run ${options.run_id}: "
+        + to_string(unwrap_err(run)),
+    )
+    return 1
+  }
+  const observed = unwrap(run)
+  const jobs = github_actions_run_jobs(harness, REPO, options.run_id)
+  // An unreadable job list is the one case that must not become a receipt: the
+  // receipt's whole job is to name what failed, and inventing an empty step
+  // list would report the run as having failed at nothing.
+  if is_err(jobs) {
+    harness.stdio.eprintln(
+      "failed hosted release: could not read the jobs of run ${options.run_id}: "
+        + to_string(unwrap_err(jobs)),
+    )
+    return 1
+  }
+  const steps = hosted_release_run_steps(job_templates(harness.fs), unwrap(jobs).jobs)
+  const order: HostedReleaseStepOrder = hosted_release_step_order(workflow_jobs(harness.fs))
+  // A workflow whose tag boundary cannot be read cannot say whether a failure
+  // happened before or after the release went out, and guessing the wrong way
+  // hands somebody a re-dispatch that re-cuts a published version.
+  if len(order.refusals) > 0 {
+    for refusal in order.refusals {
+      harness.stdio.eprintln("failed hosted release: ${refusal}")
+    }
+    return 1
+  }
+  const inputs = recorded_inputs(harness.fs, options.inputs_path)
+  const watch = if trim(options.watch_receipt) == "" {
+    nil
+  } else {
+    release_watch_receipt_read(harness.fs, options.watch_receipt)
+  }
+  const landing_admission = if watch == nil {
+    nil
+  } else {
+    release_landing_admission(
+      unwrap(watch).landing,
+      fn(oid) {
+        const reachable = github_commit_reachable_from_branch(
+          harness,
+          "burin-labs/harn",
+          oid,
+          "main",
+        )
+        return is_ok(reachable) && unwrap(reachable).reachable
+      },
+    )
+  }
+  const receipt: HostedReleaseFailureReceipt = hosted_release_failure_receipt(
+    {
+      repo: REPO,
+      workflow: WORKFLOW,
+      ref: REF,
+      run_id: options.run_id,
+      run_url: observed.url,
+      run_attempt: observed.run_attempt ?? 1,
+    },
+    order,
+    steps,
+    if inputs == nil {
+      nil
+    } else {
+      unwrap(inputs)
+    },
+    preflight_causes(harness.fs, options.preflight_receipt),
+    watch?.landing,
+    landing_admission,
+  )
+  harness.fs.write_text(options.receipt_out, json_stringify_pretty(receipt) + "\n")
+  const summary = hosted_release_failure_summary(receipt)
+  if trim(options.summary_out) != "" {
+    harness.fs.append(options.summary_out, summary)
+  }
+  harness.stdio.println(summary)
+  // The receipt is the product. A classification this finalizer could not make
+  // is reported as an escalation and still exits zero, because the finalizer
+  // succeeded at saying so; only a failure to read the run is its own failure.
+  return 0
+}

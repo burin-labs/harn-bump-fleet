@@ -1,0 +1,865 @@
+import { FleetProjectionTarget } from "./fleet_projection_targets"
+import {
+  github_branch_commit,
+  github_branch_head,
+  github_claim_ref,
+  github_connector_options,
+  github_file_text_at_ref,
+  github_file_text_at_ref_result,
+  github_pr_close,
+  github_pr_list,
+  github_pr_upsert,
+  github_pr_view,
+  github_ref_snapshot,
+} from "./github"
+import { pr_title_for_consumer } from "./pr_title_convention"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+/**
+ * Prefix for repository projection proposal branches.
+ *
+ * One stable name per exact rendered projection keeps a scheduled run
+ * idempotent while parenting each new projection from current main. Reusing
+ * one branch forever makes its pull request conflict as main advances.
+ */
+pub const REMOTE_PROJECTION_BRANCH_PREFIX: string = "automation/fleet-projections"
+
+/**
+ * How many whole days a standing projection proposal may sit before the run
+ * turns red.
+ *
+ * The scheduled loop re-arms every night. A proposal that is still open after
+ * three of those runs is no longer waiting on checks: it is stuck on a red
+ * gate, a conflict, or a protection the App cannot satisfy. Silence through
+ * that window is the defect — a fleet that quietly stopped converging reads
+ * exactly like a fleet with nothing to converge.
+ */
+pub const DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS: int = 3
+
+const SECONDS_PER_DAY: int = 86400
+
+const PROJECTION_HEADLINE = "chore: restore fleet-owned projections"
+
+/** One fresh, idempotent branch for one exact rendered projection. */
+pub fn remote_projection_branch(targets: list<FleetProjectionTarget>) -> string {
+  const identity = json_stringify(
+    targets.sort_by({ target -> target.path }).map(
+      { target -> {path: target.path, expected: target.expected} },
+    )
+      .to_list(),
+  )
+  return REMOTE_PROJECTION_BRANCH_PREFIX + "-" + substring(sha256(identity), 0, 12)
+}
+
+/**
+ * Outcome of converging one repository's fleet-owned files.
+ *
+ * The first four states mean what they mean for a local sync: `clean` is
+ * already correct, `drift` is a difference this run did not repair, `applied`
+ * wrote, `error` could not tell. `pending` is the state only a remote sync can
+ * be in — the repair is already proposed and waiting on review, which is
+ * neither drift the run should re-report nor work it should redo. `overdue` is
+ * the time axis that `pending` itself does not have: a standing proposal
+ * younger than the age budget is still waiting, and one past it has failed.
+ */
+pub type RemoteConvergenceResult = {
+  slug: string,
+  status: "clean" | "drift" | "pending" | "applied" | "error",
+  drifted: list<string>,
+  branch?: string,
+  commit?: string,
+  pull_request?: int,
+  url?: string,
+  error?: string,
+  created_at?: string,
+  age_days?: int,
+  overdue?: bool,
+  auto_merge?: AutoMergeOutcome,
+  sweep?: ProposalSweep,
+  /** Exact read proved the deterministic proposal branch and PR are both absent. */
+  effect_absent?: bool,
+}
+
+/**
+ * One superseded proposal, and what this run did about it.
+ *
+ * `would_close` is what `--check` reports, so a dry run names every proposal it
+ * would retire without retiring one. `refused` is GitHub declining one close.
+ * It is recorded rather than raised so one repository declining housekeeping
+ * cannot abort the other twenty-five. The sweep's own listing failure is
+ * different: that is `ProposalSweep.error`, and it does fail the run, because
+ * not being able to look is silence.
+ */
+pub type SweptProposal = {
+  pull_request: int,
+  branch: string,
+  url: string,
+  state: "closed" | "would_close" | "refused",
+  error?: string,
+}
+
+/**
+ * What the sweep found in one repository.
+ *
+ * `error` is the sweep itself failing — the listing this run could not read.
+ * It is separate from a per-proposal refusal because it means the opposite
+ * thing: not "this proposal resisted closing" but "this run cannot say whether
+ * any superseded proposal is open." Silence would read like a clean fleet.
+ */
+pub type ProposalSweep = {superseded: list<SweptProposal>, error?: string}
+
+/**
+ * What arming asked GitHub for, and what GitHub said.
+ *
+ * `held` is the operator's brake rather than a failure. `refused` is GitHub
+ * declining — a repository with auto-merge switched off, a queue that owns the
+ * strategy, a gate the App may not satisfy. It fails the run. An unarmed
+ * proposal that stays green forever is the silence this loop exists to end.
+ */
+pub type AutoMergeOutcome = {
+  state: "armed" | "already_armed" | "held" | "refused",
+  method?: string,
+  error?: string,
+}
+
+/** Unix seconds, or nil when the stamp is empty or unreadable. */
+fn unix_seconds(iso: string) -> int? {
+  const stamp = trim(iso)
+  if stamp == "" {
+    return nil
+  }
+  return try {
+    to_int(date_parse(stamp))
+  } catch (_e) {
+    nil
+  }
+}
+
+/**
+ * Whole days from `created_at` to `now`, or nil when either stamp is unreadable.
+ *
+ * An unreadable timestamp reports no age rather than a wrong one. Inventing a
+ * day count from a missing GitHub field would escalate a young proposal or
+ * hide an old one, and both of those are worse than leaving `age_days` unset.
+ */
+pub fn pull_request_age_days(created_at: string, now: string) -> int? {
+  const created = unix_seconds(created_at)
+  const observed = unix_seconds(now)
+  if created == nil || observed == nil || (observed ?? 0) < (created ?? 0) {
+    return nil
+  }
+  return ((observed ?? 0) - (created ?? 0)) / SECONDS_PER_DAY
+}
+
+/** Whether the proposal is at least `age_budget_days` old. */
+pub fn pull_request_older_than(created_at: string, now: string, age_budget_days: int) -> bool {
+  const age = pull_request_age_days(created_at, now)
+  return age != nil && (age ?? 0) >= age_budget_days
+}
+
+/**
+ * Measure a standing proposal against the age budget.
+ *
+ * Only `pending` with an open pull request has a clock. A human-closed branch
+ * stays `pending` without a number; measuring that would invent age for a
+ * decision the cron is forbidden to reopen. Applied, clean, drift, and error
+ * outcomes keep the fields unset.
+ */
+pub fn with_projection_pr_age(
+  result: RemoteConvergenceResult,
+  now: string,
+  age_budget_days: int = DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS,
+) -> RemoteConvergenceResult {
+  if age_budget_days < 0 {
+    throw "projection PR age budget must not be negative"
+  }
+  const created_at = trim(result.created_at ?? "")
+  if result.status != "pending" || result.pull_request == nil || created_at == "" {
+    return result
+  }
+  const age = pull_request_age_days(created_at, now)
+  if age == nil {
+    return result
+  }
+  return result + {age_days: age, overdue: (age ?? 0) >= age_budget_days}
+}
+
+/** Read `created_at` from the typed pull-request view, or empty if it cannot. */
+fn observe_pull_created_at(
+  harness: Harness,
+  slug: string,
+  number: int,
+  options: GithubClientOptions,
+) -> string {
+  if number <= 0 {
+    return ""
+  }
+  const viewed = github_pr_view(harness, slug, number, options)
+  if is_err(viewed) {
+    return ""
+  }
+  return trim(to_string(unwrap(viewed)?.created_at ?? ""))
+}
+
+/**
+ * Attach the standing proposal's age, reading `created_at` when the result
+ * does not already carry it.
+ *
+ * `github.pr.list` returns a summary without timestamps. The view is the
+ * typed owner of `created_at`, so a pending proposal that omitted the field
+ * is observed once rather than treated as ageless forever.
+ */
+fn observe_projection_pr_age(
+  harness: Harness,
+  result: RemoteConvergenceResult,
+  options: GithubClientOptions,
+  now: string,
+  age_budget_days: int,
+) -> RemoteConvergenceResult {
+  const observed_now = if trim(now) == "" {
+    harness.clock.date_iso()
+  } else {
+    now
+  }
+  let created_at = trim(result.created_at ?? "")
+  if created_at == "" && result.status == "pending" && result.pull_request != nil {
+    created_at = observe_pull_created_at(harness, result.slug, result.pull_request ?? 0, options)
+  }
+  const aged = if created_at == "" {
+    result
+  } else {
+    result + {created_at: created_at}
+  }
+  return with_projection_pr_age(aged, observed_now, age_budget_days)
+}
+
+/**
+ * Artifact name for the projection-convergence JSON document. Distinct from the bump-fleet wait receipt.
+ */
+pub const PROJECTION_CONVERGENCE_RECEIPT_NAME: string = "fleet-projection-convergence-receipt.json"
+
+/** Name what the sweep did to this repository, or say nothing when it did nothing. */
+fn swept_summary(result: RemoteConvergenceResult) -> string {
+  const failure = result.sweep?.error
+  if failure != nil {
+    return " [sweep failed: ${failure ?? "unknown"}]"
+  }
+  const superseded = result.sweep?.superseded ?? []
+  if len(superseded) == 0 {
+    return ""
+  }
+  // Each proposal carries its own outcome rather than one verb for the group: a
+  // run that closed two and was refused a third must not read as three closes.
+  const rendered = superseded.map(
+    { proposal -> "#${to_string(proposal.pull_request)} ${proposal.state}" },
+  )
+    .to_list()
+  return " [superseded: ${join(rendered, ", ")}]"
+}
+
+/** One human status line. Goes to stderr so stdout can stay a JSON document. */
+pub fn projection_status_line(result: RemoteConvergenceResult) -> string {
+  if result.status == "error" {
+    return "error ${result.slug}: ${result.error ?? "unknown error"}"
+  }
+  // A refusal is the one outcome a reader would otherwise have to infer from
+  // its absence, so it is named on the same line as the repair it belongs to.
+  const arming = if (result.auto_merge?.state ?? "") == "refused" {
+    " [auto-merge refused: ${result.auto_merge?.error ?? "unknown"}]"
+  } else {
+    ""
+  }
+  const aging = if result.overdue ?? false {
+    " [overdue: ${to_string(result.age_days ?? 0)}d]"
+  } else {
+    ""
+  }
+  // Retiring somebody else's pull request is a write worth naming on the line
+  // it happened on, not only in the receipt a reader may never open.
+  return "${result.status} ${result.slug}: ${join(result.drifted, ", ")}${arming}${aging}${swept_summary(result)}"
+}
+
+/** Print the per-repository status on stderr. The JSON receipt owns stdout. */
+pub fn report_projection_status(stdio: HarnessStdio, result: RemoteConvergenceResult) {
+  stdio.eprintln(projection_status_line(result))
+}
+
+fn unwrap_or_throw(result: unknown, context: string) -> unknown {
+  if is_err(result) {
+    throw context + ": " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+/** Describe the proposal for a reader who has the diff but not the manifest. */
+fn proposal_body(slug: string, targets: list<FleetProjectionTarget>) -> string {
+  let lines = [
+    "`fleet.toml` in `burin-labs/harn-bump-fleet` owns the projections below,",
+    "and they had drifted from it. This pull request restores the rendered",
+    "projection; it does not change what the manifest says or replace",
+    "repository-owned workflow jobs.",
+    "",
+    "Edit the projection at its owner and let the fleet re-render it. An edit",
+    "made here is reverted by the next convergence run.",
+    "",
+  ]
+  for target in targets {
+    lines = lines + ["- `${target.path}` — ${target.origin}"]
+  }
+  return join(lines + ["", "Repository: `${slug}`."], "\n")
+}
+
+/** Refuse a partial-file proposal if its repository-owned input moved. */
+fn validate_derived_inputs(
+  harness: Harness,
+  slug: string,
+  ref: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions,
+) {
+  for target in targets {
+    const expected_source = target.derived_from_sha256
+    if expected_source == nil {
+      continue
+    }
+    const current = github_file_text_at_ref(harness, slug, target.path, ref, options)
+    if current == nil || sha256(current ?? "") != (expected_source ?? "") {
+      throw "${target.path} changed after its pin projection was derived; retry from current default-branch bytes"
+    }
+  }
+}
+
+fn drifted_targets(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions,
+) -> list<FleetProjectionTarget> {
+  return targets.filter(
+    { target ->
+      github_file_text_at_ref(harness, slug, target.path, default_branch, options)
+        != target.expected
+    },
+  )
+    .to_list()
+}
+
+/**
+ * Read one deterministic projection identity without proposing or rearming it.
+ * This stricter recovery read distinguishes an unreadable default-branch file
+ * from real drift, then proves both the exact content-addressed ref and its
+ * pull-request identity are absent before authorizing a lost-effect retry.
+ */
+pub fn observe_remote_projection_effect(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions = github_connector_options(),
+) -> RemoteConvergenceResult {
+  return try {
+    let drifted: list<FleetProjectionTarget> = []
+    for target in targets {
+      const current = github_file_text_at_ref_result(
+        harness,
+        slug,
+        target.path,
+        default_branch,
+        options,
+      )
+      if is_err(current) {
+        throw "could not read ${slug}:${target.path} at ${default_branch}: "
+          + to_string(unwrap_err(current))
+      }
+      if unwrap(current) != target.expected {
+        drifted = drifted + [target]
+      }
+    }
+    if len(drifted) == 0 {
+      return {slug: slug, status: "clean", drifted: [], effect_absent: false}
+    }
+    const branch = remote_projection_branch(drifted)
+    const snapshot = github_ref_snapshot(harness, slug, "refs/heads/${branch}", options)
+    if is_err(snapshot) {
+      throw "could not inspect exact projection branch ${branch}: "
+        + to_string(unwrap_err(snapshot))
+    }
+    const listed = github_pr_list(
+      harness,
+      slug,
+      {state: "all", head: branch, base: default_branch, per_page: 100},
+      options,
+    )
+    if is_err(listed) {
+      throw "could not inspect exact projection pull request ${branch}: "
+        + to_string(unwrap_err(listed))
+    }
+    if len(unwrap(listed)) >= 100 {
+      throw "exact projection pull-request census may be truncated"
+    }
+    for pull in unwrap(listed) {
+      if pull.head.ref != branch || pull.base.ref != default_branch {
+        throw "exact projection pull-request census returned another identity"
+      }
+    }
+    const paths = drifted.map({ target -> target.path }).to_list()
+    if unwrap(snapshot).state == "absent" && len(unwrap(listed)) == 0 {
+      return {slug: slug, status: "drift", drifted: paths, branch: branch, effect_absent: true}
+    }
+    if len(unwrap(listed)) > 1 {
+      throw "multiple pull requests claim exact projection branch ${branch}"
+    }
+    const pull = if len(unwrap(listed)) == 1 {
+      unwrap(listed)[0]
+    } else {
+      nil
+    }
+    if pull != nil && !pull.merged && lowercase(trim(pull.state)) != "open" {
+      throw "exact projection pull request #${pull.number} was closed"
+    }
+    return {
+      slug: slug,
+      status: "pending",
+      drifted: paths,
+      branch: branch,
+      commit: if unwrap(snapshot).state == "present" {
+        unwrap(snapshot).oid
+      } else {
+        pull?.head?.sha
+      },
+      pull_request: pull?.number,
+      url: pull?.url,
+      effect_absent: false,
+    }
+  } catch (error) {
+    {slug: slug, status: "error", drifted: [], error: to_string(error), effect_absent: false}
+  }
+}
+
+/**
+ * Whether this exact projection branch already carries every byte this run would write.
+ *
+ * A branch that survived from another run for the same rendered identity holds
+ * an open pull request. Adding an identical commit would publish a no-op, so
+ * the check separates "already proposed" from hash collision or corruption.
+ */
+fn branch_already_proposes(
+  harness: Harness,
+  slug: string,
+  branch: string,
+  targets: list<FleetProjectionTarget>,
+  options: GithubClientOptions,
+) -> bool {
+  for target in targets {
+    if github_file_text_at_ref(harness, slug, target.path, branch, options)
+      != target.expected {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Arm auto-merge on a proposal, leased to the exact commit this run published.
+ *
+ * The lease carries the safety argument. `commit_oid` is the commit holding the
+ * manifest's bytes and nothing else, so a branch someone appended to between
+ * that commit and this call fails closed rather than merging work the fleet
+ * never rendered. Arming is also not merging: it asks GitHub to merge *if and
+ * when the repository's own required checks pass*, so a red projection stays
+ * open exactly as it did before, and every gate each repository set for itself
+ * still decides.
+ */
+fn arm_auto_merge(
+  harness: Harness,
+  slug: string,
+  pull_number: int,
+  commit_oid: string,
+  options: GithubClientOptions,
+) -> AutoMergeOutcome {
+  const armed = github_enable_auto_merge_with_release_lease(
+    harness,
+    slug,
+    pull_number,
+    commit_oid,
+    "squash",
+    options,
+  )
+  if is_err(armed) {
+    return {state: "refused", error: to_string(unwrap_err(armed))}
+  }
+  const receipt = unwrap(armed)
+  return {
+    state: if receipt.already_enabled {
+      "already_armed"
+    } else {
+      "armed"
+    },
+    method: receipt.merge_method,
+  }
+}
+
+/** Arm the proposal, or record that the operator asked this run not to. */
+fn arm_or_hold(
+  harness: Harness,
+  slug: string,
+  pull_number: int,
+  commit_oid: string,
+  arm: bool,
+  options: GithubClientOptions,
+) -> AutoMergeOutcome {
+  if !arm {
+    return {state: "held"}
+  }
+  return arm_auto_merge(harness, slug, pull_number, commit_oid, options)
+}
+
+/** Say why this proposal is being retired, to a reader who has only its diff. */
+fn superseded_comment(
+  slug: string,
+  branch: string,
+  keep: string,
+  default_branch: string,
+) -> string {
+  const reason = if keep == "" {
+    "`${default_branch}` already carries every fleet-owned projection `fleet.toml` renders, so this proposal has no drift left to repair."
+  } else {
+    "`fleet.toml` now renders this projection on `${keep}`, so the bytes on `${branch}` are no longer what the manifest says."
+  }
+  return join(
+    [
+      "Closing as superseded.",
+      "",
+      reason,
+      "",
+      "`fleet.toml` in `burin-labs/harn-bump-fleet` owns these bytes. Merging this",
+      "proposal now would restore a projection the manifest has already moved past.",
+      "",
+      "Closing costs nothing: the next byte change proposes again on its own.",
+      "",
+      "Repository: `${slug}`.",
+    ],
+    "\n",
+  )
+}
+
+/**
+ * Retire the projection proposals this run has already moved past.
+ *
+ * Every proposal lives on a branch named for the exact bytes it carries, so one
+ * whose branch is not the branch this run renders is proposing bytes the
+ * manifest no longer says. Nothing else in this loop ever looks at it again —
+ * the next render opens its own branch, and the only lookup here is scoped to
+ * that branch. What it leaves behind is not idle: a superseded proposal keeps an
+ * armed auto-merge that can never fire once its pull request conflicts, so it
+ * reads like active work forever.
+ *
+ * Two guards keep this to the automation's own leavings. The branch must carry
+ * the projection prefix, which also reaches proposals left on the single stable
+ * branch this loop used before each render got its own. The title must still be
+ * the one this loop writes: a proposal someone renamed is a proposal someone is
+ * holding, and closing it would be the same overreach as reopening one they
+ * closed.
+ */
+fn sweep_superseded_proposals(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  keep: string,
+  apply: bool,
+  options: GithubClientOptions,
+) -> ProposalSweep {
+  const listed = github_pr_list(
+    harness,
+    slug,
+    {state: "open", base: default_branch, per_page: 100},
+    options,
+  )
+  if is_err(listed) {
+    return {superseded: [], error: to_string(unwrap_err(listed))}
+  }
+  let superseded = []
+  for pull in unwrap(listed) {
+    const ref = to_string(pull?.head?.ref ?? "")
+    const title = to_string(pull?.title ?? "")
+    if !starts_with(ref, REMOTE_PROJECTION_BRANCH_PREFIX) || title != PROJECTION_HEADLINE {
+      continue
+    }
+    if ref == keep {
+      continue
+    }
+    const number = to_int(pull?.number) ?? 0
+    const url = to_string(pull?.url ?? "")
+    if !apply {
+      superseded = superseded
+        + [{pull_request: number, branch: ref, url: url, state: "would_close"}]
+      continue
+    }
+    const closed = github_pr_close(
+      harness,
+      slug,
+      number,
+      superseded_comment(slug, ref, keep, default_branch),
+      options,
+    )
+    superseded = superseded
+      + [
+        if closed.ok {
+          {pull_request: number, branch: ref, url: url, state: "closed"}
+        } else {
+          {
+            pull_request: number,
+            branch: ref,
+            url: url,
+            state: "refused",
+            error: to_string(closed.error),
+          }
+        },
+      ]
+  }
+  return {superseded: superseded}
+}
+
+fn converge_repository(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  apply: bool,
+  arm: bool,
+  options: GithubClientOptions,
+  retry_stale_pull: bool = true,
+  pr_title_area: string = "",
+) -> RemoteConvergenceResult {
+  const drifted = drifted_targets(harness, slug, default_branch, targets, options)
+  const paths = drifted.map({ target -> target.path }).to_list()
+  // Empty when nothing drifted: there is no branch for this run to render, so
+  // every open proposal is superseded by the default branch itself.
+  const branch = if len(drifted) == 0 {
+    ""
+  } else {
+    remote_projection_branch(drifted)
+  }
+  // The sweep runs before the repair and for every repository, drifting or not.
+  // A repository whose projections are already correct is exactly the one whose
+  // open proposal has nothing left to propose, so gating this on drift would
+  // miss the case that produces the most debris. The retry below re-enters this
+  // function from fresh remote facts and inherits this result: a second listing
+  // would only re-report what the first already closed.
+  const sweep = if retry_stale_pull {
+    sweep_superseded_proposals(harness, slug, default_branch, branch, apply, options)
+  } else {
+    {superseded: []}
+  }
+  if len(drifted) == 0 {
+    return {slug: slug, status: "clean", drifted: [], sweep: sweep}
+  }
+  if !apply {
+    return {slug: slug, status: "drift", drifted: paths, sweep: sweep}
+  }
+  const head = unwrap_or_throw(
+    github_branch_head(harness, slug, default_branch, options),
+    "branch head lookup failed",
+  )
+  const claim = unwrap_or_throw(
+    github_claim_ref(
+      harness,
+      slug,
+      "refs/heads/" + branch,
+      {oid: to_string(head?.oid ?? "")},
+      options,
+    ),
+    "projection branch claim failed",
+  )
+  const branch_oid = to_string(claim?.oid ?? "")
+  const body = proposal_body(slug, drifted)
+  if !(claim?.claimed ?? false)
+    && branch_already_proposes(harness, slug, branch, drifted, options) {
+    // The identity branch already says what this run would say, so it must not
+    // commit again: that duplicate is exactly what the stable digest prevents.
+    // Arming is still retried, because a run that published a commit but could
+    // not arm it has to recover on its own. Leaving that proposal unarmed
+    // forever would rebuild the pile-up this loop exists to prevent, one
+    // repository at a time.
+    if !arm {
+      return {
+        slug: slug,
+        status: "pending",
+        drifted: paths,
+        branch: branch,
+        commit: branch_oid,
+        auto_merge: {state: "held"},
+        sweep: sweep,
+      }
+    }
+    const listed = github_pr_list(
+      harness,
+      slug,
+      {state: "open", head: branch, base: default_branch},
+      options,
+    )
+    if is_err(listed) {
+      throw "projection pull request lookup failed: " + to_string(unwrap_err(listed))
+    }
+    const open = unwrap(listed)
+    // No open proposal means someone closed it. The drift is still reported,
+    // but reopening the pull request nightly would overrule a human decision
+    // with a cron job. The next byte change proposes again on its own.
+    if len(open) == 0 {
+      return {
+        slug: slug,
+        status: "pending",
+        drifted: paths,
+        branch: branch,
+        commit: branch_oid,
+        sweep: sweep,
+      }
+    }
+    const open_number = to_int(open[0]?.number) ?? 0
+    return {
+      slug: slug,
+      status: "pending",
+      drifted: paths,
+      branch: branch,
+      commit: branch_oid,
+      pull_request: open_number,
+      auto_merge: arm_or_hold(harness, slug, open_number, branch_oid, arm, options),
+      sweep: sweep,
+    }
+  }
+  if !(claim?.claimed ?? false) {
+    throw "projection branch already exists with bytes that do not match its content identity"
+  }
+  validate_derived_inputs(harness, slug, branch, drifted, options)
+  const commit = unwrap_or_throw(
+    github_branch_commit(
+      harness,
+      {
+        slug: slug,
+        branch: branch,
+        expected_head_oid: branch_oid,
+        headline: PROJECTION_HEADLINE,
+        body: body,
+        files: drifted.map({ target -> {path: target.path, contents: target.expected} }).to_list(),
+      },
+      options,
+    ),
+    "projection commit failed",
+  )
+  const head_oid = to_string(commit?.oid ?? "")
+  const pull_attempt = github_pr_upsert(
+    harness,
+    {
+      slug: slug,
+      head: branch,
+      base: default_branch,
+      title: pr_title_for_consumer(pr_title_area, PROJECTION_HEADLINE),
+      body: body,
+      expected_head_oid: head_oid,
+    },
+    options,
+  )
+  if is_err(pull_attempt)
+    && retry_stale_pull
+    && to_string(unwrap_err(pull_attempt)?.code ?? "") == "stale_head" {
+    // Another convergence run can publish the same projection between our
+    // signed commit and PR upsert. Re-enter once from fresh remote facts. The
+    // normal fixed-point path verifies the branch bytes and adopts its current
+    // head without adding another commit; a second race still fails closed.
+    return converge_repository(
+      harness,
+      slug,
+      default_branch,
+      targets,
+      apply,
+      arm,
+      options,
+      false,
+      pr_title_area,
+    )
+      + {sweep: sweep}
+  }
+  const pull = unwrap_or_throw(pull_attempt, "projection pull request failed")
+  const pull_number = to_int(pull?.number) ?? 0
+  return {
+    slug: slug,
+    status: "applied",
+    drifted: paths,
+    branch: branch,
+    commit: head_oid,
+    pull_request: pull_number,
+    url: to_string(pull?.url ?? ""),
+    auto_merge: arm_or_hold(harness, slug, pull_number, head_oid, arm, options),
+    sweep: sweep,
+  }
+}
+
+/**
+ * Bring one repository's fleet-owned files back to their manifest bytes.
+ *
+ * The repair is always a proposal on a branch, never a write to the default
+ * branch: the fleet owns what these files should say, but each repository still
+ * owns its own merge gate, and a projection that cannot pass that gate is a
+ * manifest problem rather than something to force past review.
+ *
+ * With `arm`, that proposal also asks GitHub to merge it once those same gates
+ * pass. That does not move the gate — GitHub merges only what the repository's
+ * required checks already accepted — it removes the human whose only remaining
+ * job was to agree with a byte comparison this loop had already made. What it
+ * cannot remove is the lease: arming names the exact commit this run
+ * published, so an appended commit fails closed instead of riding along.
+ *
+ * A provider failure ends this repository and no other. Twenty-six repositories
+ * share one run, and the fleet has already been taken down once by a single
+ * check that aborted the whole job, so the failure of one is reported rather
+ * than raised.
+ */
+pub fn converge_remote_repository(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  targets: list<FleetProjectionTarget>,
+  apply: bool,
+  arm: bool = false,
+  options: GithubClientOptions = github_connector_options(),
+  now: string = "",
+  age_budget_days: int = DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS,
+  pr_title_area: string = "",
+) -> RemoteConvergenceResult {
+  const attempt = try {
+    converge_repository(
+      harness,
+      slug,
+      default_branch,
+      targets,
+      apply,
+      arm,
+      options,
+      true,
+      pr_title_area,
+    )
+  }
+  if is_err(attempt) {
+    return {slug: slug, status: "error", drifted: [], error: to_string(unwrap_err(attempt))}
+  }
+  return observe_projection_pr_age(harness, unwrap(attempt), options, now, age_budget_days)
+}
+
+/**
+ * Whether an outcome leaves the fleet out of conformance once the run ends.
+ *
+ * `drift` and `error` are the local-sync failures. `refused` arming and a
+ * sweep that could not list are the remote-sync failures that used to hide in
+ * the receipt. `overdue` is a standing proposal that outlived its age budget.
+ * A young `pending` proposal, a held arm, and a single close GitHub declined
+ * do not fail the run.
+ */
+pub fn remote_convergence_failed(result: RemoteConvergenceResult) -> bool {
+  return result.status == "drift"
+    || result.status == "error"
+    || (result.auto_merge?.state ?? "") == "refused"
+    || (result.sweep?.error ?? "") != ""
+    || (result.overdue ?? false)
+}

@@ -1,0 +1,1054 @@
+import { git_ls_remote, git_push } from "std/git"
+import {
+  PlatformCertificationAdapter,
+  PlatformCertificationConfig,
+  begin_platform_certification,
+  cancel_recorded_platform_certification_runs,
+  ensure_platform_certification_branch,
+  finish_platform_certification,
+  mock_platform_certification_adapter,
+  platform_certification_branch,
+  platform_certification_dispatch_registry,
+  platform_certification_duration_ms,
+  platform_certification_join,
+  record_platform_certification_dispatch,
+  resolve_platform_certification,
+} from "../lib/platform_certification"
+
+pipeline test_recorded_hosted_runs_cancel_by_exact_run_id(harness: Harness, task: any) {
+  const recorded = platform_certification_dispatch_registry(
+    harness.runtime,
+    "recorded-platform-cancellation",
+  )
+  record_platform_certification_dispatch(harness.runtime, recorded, "windows", 6001)
+  record_platform_certification_dispatch(harness.runtime, recorded, "macos", 6002)
+  const receipts = cancel_recorded_platform_certification_runs(
+    harness,
+    "burin-labs/harn",
+    recorded,
+    true,
+  )
+  assert_eq(
+    receipts.map({ receipt -> {run_id: receipt.run_id, success: receipt.success} }).to_list(),
+    [{run_id: 6001, success: true}, {run_id: 6002, success: true}],
+  )
+}
+
+const PIN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const BINARY_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+/** A certification-branch head that advanced past `PIN` while lanes were running. */
+const MOVED_SHA = "dddddddddddddddddddddddddddddddddddddddd"
+
+/**
+ * The shared certification config.
+ *
+ * Production prepare publishes `release-certify/<pin>` first; these unit tests
+ * keep that branch name so identity fixtures match the live dispatch ref shape.
+ */
+fn config() -> PlatformCertificationConfig {
+  return {
+    repo: "burin-labs/harn",
+    branch: platform_certification_branch(PIN),
+    pin_sha: PIN,
+    workspace: "/tmp/harn",
+    harn_bin: "/tmp/harn-bin",
+  }
+}
+
+fn sh(process: HarnessProcess, command: any) {
+  const result = process.shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+fn certify_fixture(harness: Harness) {
+  const root = path_join(harness.fs.temp_dir(), "release-certify-" + harness.random.uuid_v7())
+  const origin = path_join(root, "origin.git")
+  const work = path_join(root, "work")
+  sh(harness.process, "git init --bare -q '" + origin + "'")
+  sh(harness.process, "git init -q '" + work + "'")
+  sh(harness.process, "git -C '" + work + "' config user.email test@example.com")
+  sh(harness.process, "git -C '" + work + "' config user.name test")
+  sh(harness.process, "git -C '" + work + "' checkout -q -b main")
+  harness.fs.write_text(path_join(work, "fixture.txt"), "first\n")
+  sh(
+    harness.process,
+    "git -C '" + work + "' add fixture.txt && git -C '" + work + "' commit -q -m first",
+  )
+  sh(harness.process, "git -C '" + work + "' remote add origin '" + origin + "'")
+  return {
+    root: root,
+    origin: origin,
+    work: work,
+    pin: trim(sh(harness.process, "git -C '" + work + "' rev-parse HEAD").stdout),
+  }
+}
+
+pipeline test_platform_certification_branch_is_oid_qualified(task: any) {
+  assert_eq(platform_certification_branch(PIN), "release-certify/${PIN}")
+  const error = try {
+    platform_certification_branch("not-a-sha")
+  } catch (e) {
+    e
+  }
+  assert(contains(to_string(error), "full 40-hex OID"))
+}
+
+pipeline test_ensure_platform_certification_branch_publishes_and_resumes(
+  harness: Harness,
+  task: any,
+) {
+  const f = certify_fixture(harness)
+  const branch = platform_certification_branch(f.pin)
+  const first = ensure_platform_certification_branch(harness.process, f.work, f.pin, false)
+  assert_eq(first.success, true)
+  assert_eq(first.action, "published")
+  assert_eq(first.branch, branch)
+  const remote = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${branch}"], heads: true},
+  )
+  assert_eq(remote.success, true)
+  assert_eq(remote.data.refs[0]?.oid, f.pin)
+  const resumed = ensure_platform_certification_branch(harness.process, f.work, f.pin, false)
+  assert_eq(resumed.success, true)
+  assert_eq(resumed.action, "resume")
+  const mock = ensure_platform_certification_branch(harness.process, f.work, f.pin, true)
+  assert_eq(mock.success, true)
+  assert_eq(mock.action, "mock")
+}
+
+pipeline test_ensure_platform_certification_branch_refuses_conflicting_tip(
+  harness: Harness,
+  task: any,
+) {
+  const f = certify_fixture(harness)
+  const branch = platform_certification_branch(f.pin)
+  assert_eq(
+    ensure_platform_certification_branch(harness.process, f.work, f.pin, false).success,
+    true,
+  )
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "second\n")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' add fixture.txt && git -C '" + f.work + "' commit -q -m second",
+  )
+  const other = trim(sh(harness.process, "git -C '" + f.work + "' rev-parse HEAD").stdout)
+  // Force the OID-named ref onto a different commit to model corruption.
+  assert_eq(
+    git_push(harness.process, "origin", "+${other}:refs/heads/${branch}", f.work).success,
+    true,
+  )
+  const conflict = ensure_platform_certification_branch(harness.process, f.work, f.pin, false)
+  assert_eq(conflict.success, false)
+  assert_eq(conflict.action, "conflict")
+  assert(contains(conflict.reason, "refusing to overwrite"))
+}
+
+/** An adapter whose post-lane re-read reports the certify branch advanced past the pin. */
+fn moved_base_adapter(cfg: PlatformCertificationConfig) -> PlatformCertificationAdapter {
+  const base = mock_platform_certification_adapter(cfg)
+  return {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: fn() {
+      const result = base.remote_sha()
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok(MOVED_SHA)
+    },
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+}
+
+pipeline test_boundary_failures_have_typed_decision_codes(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const invalid_binary = resolve_platform_certification(harness, cfg, "not-a-sha", base)
+  assert_eq(invalid_binary.success, false)
+  assert_eq(invalid_binary.code, "invalid_binary_sha")
+  assert_eq(invalid_binary.cancellations, [])
+  const dispatch_failure: PlatformCertificationAdapter = {
+    acquire: fn(_spec) { return Err({code: "network", message: "offline"}) },
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const failed_dispatch = resolve_platform_certification(harness, cfg, BINARY_SHA, dispatch_failure)
+  assert_eq(failed_dispatch.success, false)
+  assert_eq(failed_dispatch.code, "dispatch_failed")
+  assert_eq(failed_dispatch.cancellations, [])
+  const local_source_failure: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: fn() { return Err({code: "provider_detail", message: "local audit failed"}) },
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const failed_local_source = resolve_platform_certification(
+    harness,
+    cfg,
+    BINARY_SHA,
+    local_source_failure,
+  )
+  assert_eq(failed_local_source.code, "lane_failed")
+  assert_eq(failed_local_source.cause?.category, "local_source")
+  assert_eq(failed_local_source.cause?.code, "local_source_failed")
+}
+
+pipeline test_acquired_session_closes_once_without_duplicate_dispatch(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  let acquisitions = 0
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      acquisitions = acquisitions + 1
+      return base.acquire(spec)
+    },
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const session = begin_platform_certification(harness, cfg, adapter)
+  assert_eq(session.success, true)
+  assert_eq(session.code, "acquired")
+  assert_eq(session.dispatches.map({ row -> row.run_id }).to_list(), [6001, 6002])
+  assert_eq(acquisitions, 2)
+  const decision = finish_platform_certification(harness, cfg, BINARY_SHA, session, adapter)
+  assert_eq(decision.success, true)
+  assert_eq(decision.receipt?.warm?.binary_sha256, BINARY_SHA)
+  assert_eq(acquisitions, 2)
+}
+
+pipeline test_acquired_session_cancels_if_warm_digest_is_invalid(harness: Harness, task: any) {
+  const cfg = config()
+  const adapter = mock_platform_certification_adapter(cfg)
+  const session = begin_platform_certification(harness, cfg, adapter)
+  const decision = finish_platform_certification(harness, cfg, "not-a-sha", session, adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "invalid_binary_sha")
+  assert_eq(decision.cancellations.map({ row -> row.run_id }).to_list(), [6001, 6002])
+}
+
+pipeline test_exact_hosted_and_local_evidence_closes_v2_receipt(harness: Harness, task: any) {
+  const cfg = config()
+  const decision = resolve_platform_certification(
+    harness,
+    cfg,
+    BINARY_SHA,
+    mock_platform_certification_adapter(cfg),
+  )
+  assert_eq(decision.success, true)
+  assert_eq(decision.code, "certified")
+  const receipt = decision.receipt
+  assert(receipt != nil)
+  if receipt != nil {
+    assert_eq(receipt.schema_version, "harn.release_audit_receipt.v2")
+    assert_eq(receipt.proof_kind, "hosted_platform")
+    assert_eq(receipt.source.sha, PIN)
+    assert_eq(receipt.source.remote_sha_after, PIN)
+    assert_eq(receipt.platforms.map({ proof -> proof.platform }).to_list(), ["windows", "macos"])
+    assert_eq(receipt.local_source.lane_names, ["rust-audit", "harn-audit", "package-audit"])
+    assert(
+      receipt.join.duration_ms
+        >= receipt.platforms.map({ proof -> proof.duration_ms }).max(),
+    )
+    assert(receipt.join.duration_ms >= receipt.local_source.duration_ms)
+    assert_eq(receipt.warm.binary_sha256, BINARY_SHA)
+  }
+}
+
+pipeline test_join_timing_is_the_longest_overlapped_lane_not_the_sum(task: any) {
+  const join = platform_certification_join(
+    [
+      {platform: "windows", started_at_ms: 100, completed_at_ms: 1000, duration_ms: 900},
+      {platform: "macos", started_at_ms: 100, completed_at_ms: 800, duration_ms: 700},
+    ],
+    {started_at_ms: 100, completed_at_ms: 600, duration_ms: 500},
+  )
+  assert_eq(join.started_at_ms, 100)
+  assert_eq(join.completed_at_ms, 1000)
+  assert_eq(join.duration_ms, 900)
+  assert_eq(join.critical_path, "windows")
+  assert(join.duration_ms < 900 + 700 + 500)
+}
+
+pipeline test_receipt_duration_normalizes_legacy_epoch_seconds(task: any) {
+  assert_eq(
+    platform_certification_duration_ms(
+      {started_at_ms: 1784938127, completed_at_ms: 1784940213, duration_ms: 2086},
+    ),
+    2086000,
+  )
+  assert_eq(
+    platform_certification_duration_ms(
+      {started_at_ms: 1784938127000, completed_at_ms: 1784940213000, duration_ms: 2086000},
+    ),
+    2086000,
+  )
+}
+
+pipeline test_typed_network_reads_retry_the_exact_dispatched_runs(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const run_reads = harness.runtime.shared_map(
+    {scope: "task_group", key: "network-run-reads-${harness.random.uuid_v7()}"},
+  )
+  const job_reads = harness.runtime.shared_map(
+    {scope: "task_group", key: "network-job-reads-${harness.random.uuid_v7()}"},
+  )
+  const waits = harness.runtime.atomic(0)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: fn(id) {
+      const key = to_string(id)
+      const attempts = harness.runtime.shared_map_get(run_reads, key, 0) + 1
+      harness.runtime.shared_map_set(run_reads, key, attempts)
+      if attempts == 1 {
+        return Err({code: "network", message: "temporary run read failure"})
+      }
+      return base.run(id)
+    },
+    jobs: fn(id) {
+      const key = to_string(id)
+      const attempts = harness.runtime.shared_map_get(job_reads, key, 0) + 1
+      harness.runtime.shared_map_set(job_reads, key, attempts)
+      if attempts == 1 {
+        return Err({code: "network", message: "temporary job read failure"})
+      }
+      return base.jobs(id)
+    },
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: fn(ms) {
+      if ms == 1000 {
+        harness.runtime.atomic_add(waits, 1)
+      }
+      return nil
+    },
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, true)
+  assert_eq(harness.runtime.shared_map_get(run_reads, "6001", nil), 2)
+  assert_eq(harness.runtime.shared_map_get(run_reads, "6002", nil), 2)
+  assert_eq(harness.runtime.shared_map_get(job_reads, "6001", nil), 2)
+  assert_eq(harness.runtime.shared_map_get(job_reads, "6002", nil), 2)
+  assert_eq(harness.runtime.atomic_get(waits), 4)
+  assert_eq(decision.receipt?.platforms[0]?.run.id, 6001)
+  assert_eq(decision.receipt?.platforms[1]?.run.id, 6002)
+}
+
+pipeline test_rerun_waits_for_the_selected_attempt_before_reading_jobs(
+  harness: Harness,
+  task: any,
+) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const run_reads = harness.runtime.shared_map(
+    {scope: "task_group", key: "rerun-run-reads-${harness.random.uuid_v7()}"},
+  )
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok(
+        {
+          ...unwrap(result),
+          run_attempt: 2,
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const key = to_string(id)
+      const reads = harness.runtime.shared_map_get(run_reads, key, 0) + 1
+      harness.runtime.shared_map_set(run_reads, key, reads)
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok(
+        {
+          ...unwrap(result),
+          run_attempt: if reads == 1 {
+            1
+          } else {
+            2
+          },
+        },
+      )
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, true)
+  assert_eq(harness.runtime.shared_map_get(run_reads, "6001", nil), 2)
+  assert_eq(harness.runtime.shared_map_get(run_reads, "6002", nil), 2)
+  assert_eq(decision.receipt?.platforms[0]?.run.run_attempt, 2)
+  assert_eq(decision.receipt?.platforms[0]?.acquisition.action, "rerun_failed")
+  assert_eq(decision.receipt?.platforms[0]?.acquisition.selection_reason, "retryable_failed_run")
+  assert_eq(decision.receipt?.platforms[0]?.acquisition.reused, true)
+}
+
+pipeline test_dispatch_identity_mismatch_cancels_exact_returned_run(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      return Ok({...dispatch, head_sha: "cccccccccccccccccccccccccccccccccccccccc"})
+    },
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "dispatch_identity_invalid")
+  assert_eq(len(decision.cancellations), 1)
+  assert_eq(decision.cancellations[0]?.run_id, 6001)
+}
+
+pipeline test_dispatch_identity_uses_requested_ref_not_provider_branch_alias(
+  harness: Harness,
+  task: any,
+) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const alias = "gh-readonly-queue/main/pr-5733-deadbeef"
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok({...unwrap(result), head_branch: alias})
+    },
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok({...unwrap(result), head_branch: alias})
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, true)
+  assert_eq(decision.receipt?.source.remote_sha_after, PIN)
+}
+
+pipeline test_dispatch_identity_rejects_wrong_requested_ref(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Ok({...unwrap(result), ref: "main"})
+    },
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "dispatch_identity_invalid")
+  assert_eq(len(decision.cancellations), 1)
+  assert_eq(decision.cancellations[0]?.run_id, 6001)
+}
+
+pipeline test_red_run_or_duplicate_jobs_fails_closed_and_cleans_up(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const red_adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      return Ok(
+        {
+          ...run,
+          conclusion: if id == 6001 {
+            "failure"
+          } else {
+            "success"
+          },
+        },
+      )
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const red = resolve_platform_certification(harness, cfg, BINARY_SHA, red_adapter)
+  assert_eq(red.success, false)
+  assert_eq(red.code, "lane_failed")
+  assert_eq(red.cause?.category, "platform_proof")
+  assert_eq(red.cause?.code, "run_unsuccessful")
+  assert_eq(len(red.cancellations), 2)
+  const duplicate_adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: fn(id) {
+      const result = base.jobs(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const page = unwrap(result)
+      return Ok(
+        {
+          ...page,
+          total_count: 2,
+          jobs: page.jobs + [{...page.jobs[0], id: page.jobs[0]?.id + 1000}],
+        },
+      )
+    },
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const duplicate = resolve_platform_certification(harness, cfg, BINARY_SHA, duplicate_adapter)
+  assert_eq(duplicate.success, false)
+  assert_eq(duplicate.code, "lane_failed")
+  assert_eq(duplicate.cause?.category, "platform_proof")
+  assert_eq(duplicate.cause?.code, "jobs_duplicate_identity")
+  assert_eq(len(duplicate.cancellations), 2)
+}
+
+pipeline test_source_movement_discards_all_successful_lane_evidence(harness: Harness, task: any) {
+  const cfg = config()
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, moved_base_adapter(cfg))
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "source_ref_moved")
+  assert_eq(decision.receipt, nil)
+  assert_eq(len(decision.cancellations), 2)
+}
+
+/** A certification branch that cannot be re-read still fails closed. */
+pipeline test_unreadable_remote_fails_closed(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: fn() { return Err({code: "remote_sha_failed", message: "ls-remote exploded"}) },
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "remote_reread_failed")
+  assert_eq(decision.receipt, nil)
+}
+
+pipeline test_missing_local_source_contract_fails_closed(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: fn() {
+      const result = base.source_lanes()
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      return Err({code: "missing", message: "contract missing"})
+    },
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "source_contract_invalid")
+  assert_eq(len(decision.cancellations), 2)
+}
+
+/**
+ * A lane that reaches a terminal failure stops its siblings from polling on.
+ *
+ * `parallel settle` never cancels, which is what the receipt needs -- every
+ * lane's outcome is recorded -- but before the cooperative abort a doomed run
+ * still paid for the slowest sibling to finish, up to 720 polls. The mock's
+ * `wait` is a no-op, so the poll count is the observable, not wall time.
+ */
+pipeline test_a_failed_lane_stops_its_sibling_from_polling_on(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  // The task bodies run in isolated interpreters, so a plain counter would not
+  // survive the boundary. The shared cell is both the counter here and the
+  // mechanism under test.
+  const polls = harness.runtime.shared_cell({scope: "process", key: "macos_poll_count", initial: 0})
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id == 6001 {
+        return Ok({...run, status: "completed", conclusion: "failure"})
+      }
+      harness.runtime.shared_set(polls, harness.runtime.shared_get(polls) + 1)
+      return Ok({...run, status: "in_progress", conclusion: nil})
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, false)
+  // The failing run, not the cooperatively abandoned sibling, remains the
+  // machine-readable cause regardless of how human-facing prose evolves.
+  assert_eq(decision.code, "lane_failed")
+  assert_eq(decision.cause?.category, "platform_proof")
+  assert_eq(decision.cause?.code, "run_unsuccessful")
+  // Without the abort this lane polls the full 720 times before giving up.
+  const observed = harness.runtime.shared_get(polls)
+  assert(observed < 100)
+  assert(observed > 0)
+}
+
+pipeline test_outer_abort_stops_hosted_polling_within_one_interval(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const run_reads = harness.runtime.atomic(0)
+  const waits = harness.runtime.atomic(0)
+  // A run that never leaves `in_progress`. Without an abort it polls its full
+  // 720-interval budget, which is the waste this test exists to bound.
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: fn(id) {
+      harness.runtime.atomic_add(run_reads, 1)
+      const observed = base.run(id)
+      if is_err(observed) {
+        return observed
+      }
+      return Ok({...unwrap(observed), status: "in_progress", conclusion: nil})
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: fn(ms) {
+      if ms == 10000 {
+        harness.runtime.atomic_add(waits, 1)
+      }
+      return nil
+    },
+  }
+  // The candidate layer publishes here when its binary-size gate fails. This
+  // module never writes to it; it only reads it between polls.
+  const outer_abort = harness.runtime.shared_cell(
+    {
+      scope: "task_group",
+      key: "outer-abort-probe-${harness.random.uuid_v7()}",
+      initial: {kind: "lane_failed", lane: "archive", cause: "terminal archive-and-size failure"},
+    },
+  )
+  const decision = resolve_platform_certification(
+    harness,
+    cfg,
+    BINARY_SHA,
+    adapter,
+    nil,
+    {cell: outer_abort},
+  )
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "lane_failed")
+  // Each hosted lane reads once, sees the outer abort in the poll gap, and
+  // abandons. 720 reads per lane is what this prevents.
+  assert_eq(harness.runtime.atomic_get(run_reads), 2)
+  // Abandoning must not burn the 10s inter-poll sleep on the way out.
+  assert_eq(harness.runtime.atomic_get(waits), 0)
+}
+
+/**
+ * A macOS lane that ends its first run with `conclusion` and succeeds if asked
+ * again, plus a reader for how many times the lane was acquired.
+ *
+ * The hosted run id stays fixed and the attempt advances, which is what a
+ * rerun actually produces: acquisition reruns the exact run rather than
+ * dispatching a new one.
+ */
+fn conclusion_then_success_lane(cfg: PlatformCertificationConfig, conclusion: string) {
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const adapter: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          run_attempt: acquires,
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id != 6002 {
+        return Ok(run)
+      }
+      return Ok(
+        {
+          ...run,
+          run_attempt: acquires,
+          conclusion: if acquires == 1 {
+            conclusion
+          } else {
+            "success"
+          },
+        },
+      )
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  return {adapter: adapter, acquires: fn() { return acquires }}
+}
+
+pipeline test_a_cancelled_certification_run_is_re_acquired_not_reported(
+  harness: Harness,
+  task: any,
+) {
+  // The v0.10.53 shape: the macOS lane was cancelled while still queued, after
+  // ~50 minutes of release work had already been paid for. A cancellation is
+  // not the lane's judgment of the candidate, so the release asks again.
+  const cfg = config()
+  const lane = conclusion_then_success_lane(cfg, "cancelled")
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, lane.adapter)
+  assert_eq(decision.success, true)
+  assert_eq(decision.code, "certified")
+  assert_eq(lane.acquires(), 2)
+  assert_eq(decision.receipt?.platforms[1]?.run.run_attempt, 2)
+}
+
+pipeline test_a_failed_certification_run_is_the_verdict_and_stands(harness: Harness, task: any) {
+  // The falsifier for the test above: `failure` is the lane reporting on the
+  // code. Re-acquiring there would spend a hosted run relitigating an answer
+  // the release already has, and could certify a candidate a lane rejected.
+  const cfg = config()
+  const lane = conclusion_then_success_lane(cfg, "failure")
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, lane.adapter)
+  assert_eq(decision.success, false)
+  assert_eq(decision.code, "lane_failed")
+  assert_eq(decision.cause?.code, "run_unsuccessful")
+  assert_eq(lane.acquires(), 1)
+}
+
+pipeline test_re_acquisition_is_bounded_and_reports_the_last_inconclusive_run(
+  harness: Harness,
+  task: any,
+) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const always_cancelled: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(id)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id != 6002 {
+        return Ok(run)
+      }
+      return Ok({...run, conclusion: "cancelled"})
+    },
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, always_cancelled)
+  assert_eq(decision.success, false)
+  assert_eq(decision.cause?.code, "run_inconclusive")
+  // One dispatch plus the bounded re-acquisitions, and no more.
+  assert_eq(acquires, 3)
+  assert(contains(decision.reason, "run reached no verdict"))
+}
+
+pipeline test_a_re_acquired_run_is_the_one_the_registry_can_cancel(harness: Harness, task: any) {
+  // The registry is how an outer lane cancels hosted work when it gives up. A
+  // lane that moved to a new run without saying so would leave that run
+  // billing until GitHub's own job timeout.
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  let acquires = 0
+  const moved: PlatformCertificationAdapter = {
+    acquire: fn(spec) {
+      const result = base.acquire(spec)
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const dispatch = unwrap(result)
+      if spec.platform != "macos" {
+        return Ok(dispatch)
+      }
+      acquires = acquires + 1
+      if acquires == 1 {
+        return Ok(dispatch)
+      }
+      return Ok(
+        {
+          ...dispatch,
+          run_id: 6042,
+          url: "https://github.com/burin-labs/harn/actions/runs/6042",
+          action: "rerun_failed",
+          selection_reason: "retryable_failed_run",
+          reused: true,
+        },
+      )
+    },
+    run: fn(id) {
+      const result = base.run(
+        if id == 6042 {
+          6002
+        } else {
+          id
+        },
+      )
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const run = unwrap(result)
+      if id == 6002 {
+        return Ok({...run, conclusion: "cancelled"})
+      }
+      if id == 6042 {
+        return Ok({...run, id: 6042, url: "https://github.com/burin-labs/harn/actions/runs/6042"})
+      }
+      return Ok(run)
+    },
+    jobs: fn(id) {
+      const result = base.jobs(
+        if id == 6042 {
+          6002
+        } else {
+          id
+        },
+      )
+      if is_err(result) {
+        return Err(unwrap_err(result))
+      }
+      const page = unwrap(result)
+      if id != 6042 {
+        return Ok(page)
+      }
+      return Ok(
+        {
+          ...page,
+          run_id: 6042,
+          jobs: (page.jobs ?? []).map({ job -> {...job, run_id: 6042} }).to_list(),
+        },
+      )
+    },
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+  }
+  const registry = platform_certification_dispatch_registry(
+    harness.runtime,
+    "re-acquired-${harness.random.uuid_v7()}",
+  )
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, moved, registry)
+  assert_eq(decision.success, true)
+  const receipts = cancel_recorded_platform_certification_runs(
+    harness,
+    "burin-labs/harn",
+    registry,
+    true,
+  )
+  assert_eq(receipts.map({ receipt -> receipt.run_id }).to_list().sort(), [6001, 6042])
+}
+
+/**
+ * The certification wait is the longest phase of a release and it used to print
+ * nothing at all. On v0.10.92 the operator saw one line at 04:13 and the next at
+ * 04:55: 42 minutes in which waiting and hung looked identical from the
+ * terminal. Every lane now names what it is waiting on, where to watch it, and
+ * how long it has been going.
+ */
+pipeline test_certification_wait_reports_progress_to_the_operator(harness: Harness, task: any) {
+  const cfg = config()
+  const base = mock_platform_certification_adapter(cfg)
+  const lines = harness.runtime.shared_map(
+    {scope: "task_group", key: "certification-progress-${harness.random.uuid_v7()}"},
+  )
+  const line_count = harness.runtime.atomic(0)
+  const adapter: PlatformCertificationAdapter = {
+    acquire: base.acquire,
+    run: base.run,
+    jobs: base.jobs,
+    cancel: base.cancel,
+    local_source: base.local_source,
+    source_lanes: base.source_lanes,
+    remote_sha: base.remote_sha,
+    now_ms: base.now_ms,
+    wait: base.wait,
+    log: fn(line) {
+      const index = harness.runtime.atomic_add(line_count, 1)
+      harness.runtime.shared_map_set(lines, to_string(index), line)
+    },
+  }
+  const decision = resolve_platform_certification(harness, cfg, BINARY_SHA, adapter)
+  assert_eq(decision.success, true)
+  const text = json_stringify(harness.runtime.shared_map_entries(lines))
+  // Both lanes announce themselves, so a two-lane wait is never one anonymous
+  // silence.
+  assert(contains(text, "windows certification"))
+  assert(contains(text, "macos certification"))
+  // The operator gets somewhere to look rather than a bare wait.
+  assert(contains(text, "Workspace nextest (windows-latest)"))
+  assert(contains(text, "https://github.com/${cfg.repo}/actions/runs/6001"))
+  // And an outcome with a duration, not just a disappearance.
+  assert(contains(text, "certification success"))
+}
+
+/** An adapter that wires no sink stays silent instead of failing. */
+pipeline test_certification_progress_is_optional(harness: Harness, task: any) {
+  const cfg = config()
+  const decision = resolve_platform_certification(
+    harness,
+    cfg,
+    BINARY_SHA,
+    mock_platform_certification_adapter(cfg),
+  )
+  assert_eq(decision.success, true)
+}

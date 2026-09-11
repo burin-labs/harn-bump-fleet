@@ -1,0 +1,665 @@
+/**
+ * Recover a release whose version bump merged without a tag.
+ *
+ * This is the state no other entry point admits. The release launcher's
+ * preflight refuses a fresh cut because main is no longer an `X.Y.Z-dev`
+ * workspace, and resuming the original watch receipt re-enters the tree gate
+ * that stopped the run in the first place. v0.10.128 sat here: main carried the
+ * bumped version, no tag existed, and the only way out was a hand-written
+ * revert plus a human-held freeze over the next cut.
+ *
+ * Tagging main where it stands is legitimate when main's tree carries only the
+ * certified candidate and admitted drift. Drift also runs the lanes that only
+ * a release runs before the tag. Anything unreadable, stale, or red refuses or
+ * unfolds the bump, because a tag minted over unproved code is the defect this
+ * whole gate exists to prevent.
+ */
+import { github_commit_pull_requests } from "./github_commits"
+import { admission_state_is_passing, admission_state_is_unfinished } from "./pr_admission"
+import { workspace_version_from_manifest } from "./release_analysis"
+import { execution_failed } from "./release_execution"
+import {
+  ReleaseMainDelta,
+  release_main_delta_decision,
+  release_main_delta_deferral_reason,
+} from "./release_main_delta"
+import { release_main_delta_dispatch } from "./release_main_delta_dispatch"
+import { release_main_drift_evidence } from "./release_main_drift"
+import {
+  release_certification_drift_from_gate,
+  release_certification_trees_agree,
+  release_main_delta_observation,
+  release_main_git_drift_observation,
+  release_open_unfold_pull_request,
+} from "./release_main_tag"
+import {
+  ReleaseMergeGateState,
+  ReleaseStrandedRecoveryState,
+  release_merge_gate_decision,
+  release_stranded_recovery_decision,
+} from "./release_merge_gate"
+import { remote_tag_target_sha } from "./release_repin"
+import { release_git_remote_refs, run_git } from "./release_runtime"
+import { ensure_release_tag_pushed_at } from "./release_tag"
+import { ReleaseUnfoldDecision } from "./release_unfold"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_record_certification_drift,
+  release_watch_receipt_record_main_delta,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+import { release_workflow_inventory_at_revision } from "./release_workflow_inventory"
+
+pub type ReleaseStrandedReceiptIdentity = {
+  candidate_commit: string,
+  pull_number: int,
+  pull_url: string,
+  merged_at: string,
+}
+
+pub type ReleaseStrandedReceiptRefresh = {
+  state: "ready" | "pending" | "failed",
+  reason: string,
+  receipt?: ReleaseWatchReceipt,
+}
+
+/**
+ * Recover the immutable candidate identity from the merge commit itself.
+ *
+ * GitHub retains the pull-request head behind `refs/pull/N/head` after the
+ * content-addressed release branch is deleted. Matching the exact merge SHA,
+ * title, base, head-ref convention, and candidate OID keeps this path from
+ * turning an arbitrary commit on main into a release candidate.
+ */
+pub fn release_stranded_receipt_identity(
+  tag: string,
+  target_commit: string,
+  pull_requests: list,
+) -> ReleaseStrandedReceiptIdentity? {
+  const target = lowercase(trim(target_commit))
+  const expected_title = "Release ${tag}"
+  let matches: list<ReleaseStrandedReceiptIdentity> = []
+  for pull in pull_requests {
+    const candidate = lowercase(trim(to_string(pull?.head?.sha ?? "")))
+    const expected_ref = "release-attempt/${tag}/${candidate}"
+    const merged = lowercase(trim(to_string(pull?.merge_commit_sha ?? "")))
+    if merged == target
+      && to_string(pull?.title ?? "") == expected_title
+      && to_string(pull?.base?.ref ?? "") == "main"
+      && to_string(pull?.state ?? "") == "closed"
+      && trim(to_string(pull?.merged_at ?? "")) != ""
+      && to_string(pull?.head?.ref ?? "") == expected_ref
+      && regex_match("^[0-9a-f]{40}$", candidate) != nil {
+      matches = matches
+        + [
+          {
+            candidate_commit: candidate,
+            pull_number: to_int(pull?.number ?? 0) ?? 0,
+            pull_url: trim(to_string(pull?.html_url ?? "")),
+            merged_at: trim(to_string(pull?.merged_at ?? "")),
+          },
+        ]
+    }
+  }
+  if len(matches) != 1 || to_int(matches[0]?.pull_number ?? 0) < 1
+    || !starts_with(to_string(matches[0]?.pull_url ?? ""), "https://github.com/") {
+    return nil
+  }
+  return matches[0]
+}
+
+fn pending_stranded_admission(gate: ReleaseMergeGateState) -> bool {
+  const evidence = gate.evidence
+  if evidence == nil {
+    return false
+  }
+  const candidate = evidence.commits.filter({ commit -> commit.sha == evidence.observed_main })
+    .to_list()
+  if len(candidate) != 1 {
+    return false
+  }
+  let unfinished = false
+  for check in candidate[0].checks.filter({ check -> !check.release_only }).to_list() {
+    if admission_state_is_passing(check.state) {
+      continue
+    }
+    if !admission_state_is_unfinished(check.state) {
+      return false
+    }
+    unfinished = true
+  }
+  return unfinished
+}
+
+/** Apply one freshly observed admission to the immutable stranded-release identity. */
+pub fn release_stranded_receipt_refresh(
+  tag: string,
+  identity: ReleaseStrandedReceiptIdentity,
+  pin_sha: string,
+  gate: ReleaseMergeGateState,
+  observed_at: string,
+  existing: ReleaseWatchReceipt? = nil,
+) -> ReleaseStrandedReceiptRefresh {
+  const expected_ref = "release-attempt/${tag}/${identity.candidate_commit}"
+  if existing != nil
+    && (existing.tag != tag
+      || existing.slug != "burin-labs/harn"
+      || existing.pin_sha != pin_sha
+      || existing.publication.head_oid != identity.candidate_commit
+      || existing.publication.remote_ref != expected_ref
+      || existing.pr_url != identity.pull_url) {
+    return {
+      state: "failed",
+      reason: "existing watch receipt does not match the exact stranded release identity",
+    }
+  }
+  const base = existing
+    ?? release_watch_receipt(
+      {
+        tag: tag,
+        slug: "burin-labs/harn",
+        pin_sha: pin_sha,
+        publication: {
+          version: tag.substring(1),
+          local_branch: "release/${tag}",
+          remote_ref: expected_ref,
+          head_oid: identity.candidate_commit,
+        },
+        pr_url: identity.pull_url,
+        created_at: identity.merged_at,
+      },
+    )
+  const decision = release_merge_gate_decision(gate)
+  if decision.action == "merge" {
+    return {
+      state: "ready",
+      reason: decision.reason,
+      receipt: release_watch_receipt_record_certification_drift(
+        base,
+        release_certification_drift_from_gate(gate),
+        observed_at,
+      ),
+    }
+  }
+  if decision.action == "defer" && pending_stranded_admission(gate) {
+    return {state: "pending", reason: decision.reason, receipt: base}
+  }
+  return {state: "failed", reason: decision.reason}
+}
+
+fn observe_release_stranded_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  target_commit: string,
+  existing: ReleaseWatchReceipt? = nil,
+) -> ReleaseStrandedReceiptRefresh {
+  const slug = "burin-labs/harn"
+  const pulls = github_commit_pull_requests(harness, slug, target_commit)
+  if is_err(pulls) {
+    throw "could not inspect the pull request for stranded release ${tag}: "
+      + to_string(unwrap_err(pulls))
+  }
+  const identity = release_stranded_receipt_identity(tag, target_commit, unwrap(pulls))
+  if identity == nil {
+    throw "could not prove one exact merged Release ${tag} pull request at ${target_commit}"
+  }
+  const git = {env: harness.env, process: harness.process}
+  const fetched = run_git(
+    git,
+    cfg,
+    ["fetch", "origin", "--quiet", "refs/pull/${identity.pull_number}/head"],
+  )
+  if !fetched.success {
+    throw "could not fetch retained head for release pull request #${identity.pull_number}"
+  }
+  const fetched_head = git_text(git, cfg, ["rev-parse", "--verify", "FETCH_HEAD"])
+  if lowercase(trim(fetched_head ?? "")) != identity.candidate_commit {
+    throw "release pull request #${identity.pull_number} retained head does not match its recorded candidate"
+  }
+  const pin = git_text(git, cfg, ["rev-parse", "--verify", "${identity.candidate_commit}^"])
+  if regex_match("^[0-9a-f]{40}$", lowercase(trim(pin ?? ""))) == nil {
+    throw "could not derive the frozen source pin from ${identity.candidate_commit}"
+  }
+  const merge_base = git_text(git, cfg, ["rev-parse", "--verify", "${target_commit}^"])
+  if regex_match("^[0-9a-f]{40}$", lowercase(trim(merge_base ?? ""))) == nil {
+    throw "could not derive the pre-merge main commit from ${target_commit}"
+  }
+  const certified_base = lowercase(trim(pin ?? ""))
+  const observed_main = lowercase(trim(merge_base ?? ""))
+  const drift = if certified_base == observed_main {
+    {
+      state: "measured",
+      paths: [],
+      failed_operation: "",
+      exit_code: 0,
+      detail: "the recovered merge base is the certified base; no drift comparison is needed",
+    }
+  } else {
+    release_main_git_drift_observation(
+      {env: harness.env, process: harness.process},
+      cfg,
+      certified_base,
+      observed_main,
+    )
+  }
+  if drift.state == "unreadable" {
+    throw drift.detail
+  }
+  const evidence = if certified_base == observed_main {
+    nil
+  } else {
+    release_main_drift_evidence(harness, cfg, slug, certified_base, observed_main)
+  }
+  const gate: ReleaseMergeGateState = {
+    certified_base: certified_base,
+    observed_main: observed_main,
+    mergeable_state: "clean",
+    mergeable_resolved: true,
+    drifted_paths: drift.paths,
+    path_observation: drift,
+    evidence: evidence,
+    release_only_checks: release_workflow_inventory_at_revision(
+      {env: harness.env, process: harness.process},
+      cfg,
+      target_commit,
+    ).release_only.checks,
+  }
+  return release_stranded_receipt_refresh(
+    tag,
+    identity,
+    lowercase(trim(pin ?? "")),
+    gate,
+    harness.clock.date_iso(),
+    existing,
+  )
+}
+
+/** Reobserve admission for the exact merged parent without trusting stale receipt drift. */
+pub fn refresh_release_stranded_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  target_commit: string,
+  existing: ReleaseWatchReceipt,
+) -> ReleaseStrandedReceiptRefresh {
+  return try {
+    observe_release_stranded_watch_receipt(harness, cfg, tag, target_commit, existing)
+  } catch (error) {
+    {state: "failed", reason: to_string(error)}
+  }
+}
+
+/** Rebuild a lost watch receipt from GitHub's immutable merged-PR evidence. */
+pub fn reconstruct_release_stranded_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  target_commit: string,
+  receipt_path: string,
+) -> ReleaseWatchReceipt {
+  const refreshed = observe_release_stranded_watch_receipt(harness, cfg, tag, target_commit)
+  if refreshed.state == "failed" || refreshed.receipt == nil {
+    throw "could not re-prove the main drift that ${tag} merged over: ${refreshed.reason}"
+  }
+  release_watch_receipt_write(
+    {fs: harness.fs, random: harness.random},
+    receipt_path,
+    refreshed.receipt,
+  )
+  return refreshed.receipt
+}
+
+pub type ReleaseStrandedRecoveryAdapter = {
+  /**
+   * Observe main, the tag, and both trees. Required, and nil-on-failure: a
+   * recovery that could not look must refuse rather than tag.
+   */
+  observe: fn() -> ReleaseStrandedRecoveryState?,
+  merged_main_ancestor: fn(string) -> bool,
+  main_delta: fn(string) -> ReleaseMainDelta,
+  dispatch_main_delta: fn(ReleaseMainDelta) -> bool,
+  unfold: fn(string) -> ReleaseUnfoldDecision,
+  push_tag: fn(string) -> list<dict>,
+  now: fn() -> string,
+  wait: fn(int) -> nil,
+}
+
+pub type ReleaseStrandedRecoveryResult = {
+  status: int,
+  action: string,
+  reason: string,
+  receipt: ReleaseWatchReceipt,
+  steps: list<dict>,
+}
+
+fn git_text(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  args: list<string>,
+) -> string? {
+  const result = run_git(git, cfg, args)
+  if !result.success {
+    return nil
+  }
+  return trim(result.stdout)
+}
+
+pub fn default_release_stranded_recovery_adapter(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  target_commit: string,
+) -> ReleaseStrandedRecoveryAdapter {
+  const git = {env: harness.env, process: harness.process}
+  return {
+    observe: fn() {
+      const fetched = run_git(git, cfg, ["fetch", "origin", "--quiet", "main"])
+      if !fetched.success {
+        return nil
+      }
+      const target = lowercase(trim(target_commit))
+      const target_tree = git_text(git, cfg, ["rev-parse", "--verify", "${target}^{tree}"])
+      const target_base = git_text(git, cfg, ["rev-parse", "--verify", "${target}^1"])
+      const candidate = lowercase(trim(receipt.publication.head_oid))
+      const certified_tree = git_text(git, cfg, ["rev-parse", "--verify", "${candidate}^{tree}"])
+      const manifest = git_text(git, cfg, ["show", "${target}:Cargo.toml"])
+      if target_tree == nil || target_base == nil || certified_tree == nil || manifest == nil {
+        return nil
+      }
+      const observed_tags = release_git_remote_refs(
+        harness.process,
+        cfg,
+        ["refs/tags/${receipt.tag}", "refs/tags/${receipt.tag}^{}"],
+      )
+      if !observed_tags.success {
+        return nil
+      }
+      const tag_target = remote_tag_target_sha(observed_tags.refs)
+      const drifted = git_text(git, cfg, ["diff", "--name-only", candidate, target])
+      if drifted == nil {
+        return nil
+      }
+      return {
+        tag: receipt.tag,
+        tag_exists: trim(tag_target) != "",
+        tag_target: tag_target,
+        target_commit: target,
+        target_base_commit: lowercase(target_base),
+        target_version: workspace_version_from_manifest(manifest),
+        certified_tree: lowercase(certified_tree),
+        target_tree: lowercase(target_tree),
+        drifted_paths: split(drifted, "\n").filter({ path -> trim(path) != "" }).to_list(),
+      }
+    },
+    merged_main_ancestor: fn(commit) { return run_git(
+      git,
+      cfg,
+      ["merge-base", "--is-ancestor", commit, "origin/main"],
+    ).success },
+    main_delta: fn(commit) { return release_main_delta_observation(harness, cfg, receipt, commit) },
+    dispatch_main_delta:
+      fn(delta) { return release_main_delta_dispatch(harness, cfg, receipt, delta) },
+    unfold: fn(commit) { return release_open_unfold_pull_request(harness, cfg, receipt, commit) },
+    push_tag: fn(commit) { return ensure_release_tag_pushed_at(
+      harness,
+      cfg,
+      receipt.tag.substring(1),
+      commit,
+      [],
+      "release-stranded-recovery-${receipt.tag}",
+      {candidate_oid: receipt.publication.head_oid},
+    ) },
+    now: fn() { return harness.clock.date_iso() },
+    wait: fn(ms) {
+      harness.clock.sleep_ms(ms)
+      return nil
+    },
+  }
+}
+
+fn release_stranded_recovery_poll(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  adapter: ReleaseStrandedRecoveryAdapter,
+) -> ReleaseStrandedRecoveryResult {
+  const observed = adapter.observe()
+  if observed == nil {
+    return {
+      status: 2,
+      action: "refuse",
+      reason: "could not observe the release commit, the tag, and both trees;"
+        + " refusing to tag without that proof",
+      receipt: receipt,
+      steps: [],
+    }
+  }
+  let decision = release_stranded_recovery_decision(observed)
+  if decision.action == "refuse" && decision.terminal_reason == "certification_does_not_transfer" {
+    const transfers = release_certification_trees_agree(
+      {
+        candidate_commit: receipt.publication.head_oid,
+        candidate_tree: observed.certified_tree,
+        merged_commit: observed.target_commit,
+        merged_base_commit: observed.target_base_commit,
+        merged_tree: observed.target_tree,
+        drifted_paths: observed.drifted_paths,
+      },
+      receipt.certification_drift,
+    )
+    if transfers {
+      decision = {
+        action: "tag",
+        reason:
+          "${observed.target_commit} carries the certified candidate plus re-proved green main drift",
+        terminal_reason: "",
+        merge_oid: observed.target_commit,
+        bearing_paths: [],
+      }
+    }
+  }
+  if decision.action == "refuse" {
+    return {status: 2, action: "refuse", reason: decision.reason, receipt: receipt, steps: []}
+  }
+  if !adapter.merged_main_ancestor(decision.merge_oid) {
+    return {
+      status: 2,
+      action: "refuse",
+      reason: "${decision.merge_oid} is not reachable from origin/main",
+      receipt: receipt,
+      steps: [],
+    }
+  }
+  let terminal_delta: ReleaseMainDelta? = nil
+  if decision.action == "tag" {
+    const delta = adapter.main_delta(decision.merge_oid)
+    const delta_decision = release_main_delta_decision(
+      delta,
+      decision.merge_oid,
+      observed.drifted_paths,
+    )
+    if delta_decision.action == "dispatch" {
+      if !adapter.dispatch_main_delta(delta) {
+        return {
+          status: 2,
+          action: "refuse",
+          reason:
+            "could not start the release-only lanes on the stranded main commit ${decision.merge_oid}",
+          receipt: receipt,
+          steps: [],
+        }
+      }
+      return {
+        status: 3,
+        action: "certify_main",
+        reason: delta_decision.reason,
+        receipt: receipt,
+        steps: [],
+      }
+    }
+    if delta_decision.action == "wait" {
+      return {status: 3, action: "wait", reason: delta_decision.reason, receipt: receipt, steps: []}
+    }
+    if delta_decision.action == "unfold" {
+      const unfolded = adapter.unfold(decision.merge_oid)
+      const recorded = release_watch_receipt_record_main_delta(receipt, delta, adapter.now())
+      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, recorded)
+      const drifted = recorded.certification_drift.commits.map({ commit -> commit.sha }).join(", ")
+      return {
+        status: 2,
+        action: "unfold",
+        reason: release_main_delta_deferral_reason(recorded.tag, delta, drifted)
+          + " ${unfolded.reason}.",
+        receipt: recorded,
+        steps: [],
+      }
+    }
+    if delta_decision.action == "abort" {
+      return {
+        status: 2,
+        action: "refuse",
+        reason: delta_decision.reason,
+        receipt: receipt,
+        steps: [],
+      }
+    }
+    terminal_delta = delta
+  }
+  const steps = if decision.action == "tag" {
+    adapter.push_tag(decision.merge_oid)
+  } else {
+    []
+  }
+  if execution_failed(steps) {
+    return {
+      status: 2,
+      action: decision.action,
+      reason: "stranded release tag push failed",
+      receipt: receipt,
+      steps: steps,
+    }
+  }
+  const terminal_receipt = if terminal_delta == nil {
+    receipt
+  } else {
+    release_watch_receipt_record_main_delta(receipt, terminal_delta, adapter.now())
+  }
+  const bound = release_watch_receipt_bind_main_commit(
+    terminal_receipt,
+    decision.merge_oid,
+    adapter.now(),
+  )
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, bound)
+  return {status: 0, action: decision.action, reason: decision.reason, receipt: bound, steps: steps}
+}
+
+/** Tag a stranded release where it stands, or refuse and say what to do instead. */
+pub fn run_release_stranded_recovery(
+  harness: Harness,
+  cfg: dict,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  target_commit: string,
+  injected_adapter: ReleaseStrandedRecoveryAdapter? = nil,
+  options: {
+    max_polls: int,
+    interval_ms: int,
+    refresh?: fn(ReleaseWatchReceipt) -> ReleaseStrandedReceiptRefresh,
+  } = {max_polls: 1, interval_ms: 0},
+) -> ReleaseStrandedRecoveryResult {
+  if options.max_polls < 1 {
+    return {
+      status: 2,
+      action: "refuse",
+      reason: "stranded release recovery needs at least one bounded poll",
+      receipt: receipt,
+      steps: [],
+    }
+  }
+  const receipt_io = {fs: harness.fs, random: harness.random}
+  let active_receipt = receipt
+  let result: ReleaseStrandedRecoveryResult? = nil
+  let poll = 0
+  while poll < options.max_polls {
+    let adapter = injected_adapter
+    let admission_ready = true
+    if adapter == nil || options.refresh != nil {
+      const refreshed = if options.refresh != nil {
+        options.refresh(active_receipt)
+      } else {
+        refresh_release_stranded_watch_receipt(
+          harness,
+          cfg,
+          receipt.tag,
+          target_commit,
+          active_receipt,
+        )
+      }
+      if refreshed.state == "failed" {
+        return {
+          status: 2,
+          action: "refuse",
+          reason: refreshed.reason,
+          receipt: active_receipt,
+          steps: [],
+        }
+      }
+      if refreshed.state == "pending" {
+        admission_ready = false
+        result = {
+          status: 3,
+          action: "wait",
+          reason: refreshed.reason,
+          receipt: active_receipt,
+          steps: [],
+        }
+      } else {
+        if refreshed.receipt == nil {
+          return {
+            status: 2,
+            action: "refuse",
+            reason: "fresh stranded-release admission returned no receipt",
+            receipt: active_receipt,
+            steps: [],
+          }
+        }
+        active_receipt = refreshed.receipt
+        release_watch_receipt_write(receipt_io, receipt_path, active_receipt)
+        if adapter == nil {
+          adapter = default_release_stranded_recovery_adapter(
+            harness,
+            cfg,
+            active_receipt,
+            target_commit,
+          )
+        }
+      }
+    }
+    if admission_ready && adapter != nil {
+      result = release_stranded_recovery_poll(receipt_io, active_receipt, receipt_path, adapter)
+      active_receipt = result.receipt
+    }
+    poll = poll + 1
+    if result?.status != 3 || poll >= options.max_polls {
+      break
+    }
+    if options.interval_ms > 0 {
+      if adapter != nil {
+        adapter.wait(options.interval_ms)
+      } else {
+        harness.clock.sleep_ms(options.interval_ms)
+      }
+    }
+  }
+  return result
+    ?? {
+      status: 2,
+      action: "refuse",
+      reason: "stranded release recovery produced no observation",
+      receipt: active_receipt,
+      steps: [],
+    }
+}
