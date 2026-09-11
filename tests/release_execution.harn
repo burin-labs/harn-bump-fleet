@@ -1,0 +1,454 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { EMPTY_AUDIT_FINDING, NO_VISIBLE_AUDIT_FINDING } from "../lib/release_audit"
+import {
+  decisive_failed_step,
+  execution_failed,
+  markdownlint_source_context,
+  markdownlint_violations_from_text,
+  mock_release_tag_command,
+  pre_tag_binary_size_gate_config,
+  pre_tag_binary_size_gate_missing_steps,
+  pre_tag_binary_size_gate_step_contract,
+  pre_tag_binary_size_gate_workflow_path,
+  push_hook_budget_exceeded,
+  recorded_step,
+  recovery_step_ref,
+  release_candidate_archive_gate_config,
+  release_candidate_pre_tag_binary_size_gate_config,
+  release_commit_verify_args,
+  release_failure_explanation,
+  release_recorded_steps,
+  release_tag_create_args,
+  release_tag_push_args,
+  release_tag_verify_args,
+  release_tag_verify_git_args,
+} from "../lib/release_execution"
+
+pipeline test_release_failure_explanation(task: any) {
+  // The cryptic `agent-review-validation` step gets a plain-language headline
+  // that answers "what is this" without leaking the internal step id.
+  const agent = release_failure_explanation(
+    recorded_step(
+      "agent-review-validation",
+      "validate local-model release audit",
+      command_result_fail(2, "agent review failed validation:\n" + NO_VISIBLE_AUDIT_FINDING),
+    ),
+  )
+  assert_eq(contains(agent.headline, "release-readiness review"), true)
+  assert_eq(contains(agent.headline, "agent-review"), false)
+  assert_eq(contains(agent.next, "scripts/run_harn_release.sh"), true)
+  assert(contains(agent.next, "required key"))
+  // prepare failures point at the live log.
+  const prep = release_failure_explanation(
+    recorded_step("prepare", "./scripts/release_ship.sh --prepare", command_result_fail(1, "boom")),
+  )
+  assert_eq(contains(prep.headline, "prepare step"), true)
+  assert_eq(contains(prep.next, "live log"), true)
+  // A raw shell command never leaks into the headline; fall back to the name.
+  const raw = release_failure_explanation(
+    recorded_step("create-release-tag", "git rev-parse HEAD", command_result_fail(1, "x")),
+  )
+  assert_eq(contains(raw.headline, "git "), false)
+  assert_eq(contains(raw.headline, "signed release tag"), true)
+  assert_eq(contains(raw.next, "not pushed"), true)
+  const untrusted = release_failure_explanation(
+    recorded_step(
+      "verify-release-tag-github-trust",
+      "verify GitHub signer",
+      command_result_fail(2, "unknown key"),
+    ),
+  )
+  assert(contains(untrusted.headline, "cannot attribute"))
+  assert(contains(untrusted.next, "--show-origin --show-scope"))
+  assert(contains(untrusted.next, "tag was not pushed"))
+}
+
+pipeline test_decisive_failed_step_skips_candidate_join_bookkeeping(task: any) {
+  const lane = recorded_step(
+    "hosted-platform-certification",
+    "certify the candidate on supported platforms",
+    command_result_fail(2, "harn conformance failed"),
+  )
+  const cancelled = recorded_step(
+    "candidate-certification-lane-cancelled",
+    "cancel a sibling after a lane failure",
+    command_result_fail(130, "platform certification failed"),
+  )
+  const join = recorded_step(
+    "candidate-certification-join",
+    "join exact-candidate certification lanes",
+    command_result_fail(2, "one or more lanes failed"),
+  )
+  assert_eq(decisive_failed_step([lane, cancelled, join])?.name, lane.name)
+  assert_eq(decisive_failed_step([join])?.name, join.name)
+  assert_eq(decisive_failed_step([]), nil)
+}
+
+pipeline test_release_execution(harness: Harness, task: any) {
+  const numeric_success = recorded_step(
+    "numeric-success",
+    "external command",
+    command_result_ok(""),
+  )
+  const numeric_failure = recorded_step(
+    "numeric-failure",
+    "external command",
+    command_result_fail(7, "failed"),
+  )
+  assert_eq(numeric_success.status, "completed")
+  assert_eq(numeric_failure.status, "failed")
+  assert_eq(numeric_success.cwd, "")
+  const typed_steps = release_recorded_steps([numeric_success])
+  assert_eq(typed_steps[0]?.name, "numeric-success")
+  const malformed_step = try {
+    release_recorded_steps([numeric_success + {exit_code: "zero"}])
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(malformed_step, "success and exit_code must be typed"))
+  // Release tags are signed and verified before the independent push step.
+  assert_eq(
+    release_tag_create_args(
+      {
+        tag: "v1.2.3",
+        version: "1.2.3",
+        target_oid: "0123456789abcdef0123456789abcdef01234567",
+        candidate_oid: "89ABCDEF0123456789ABCDEF0123456789ABCDEF",
+      },
+    ),
+    [
+      "git",
+      "tag",
+      "-s",
+      "v1.2.3",
+      "-m",
+      "Release v1.2.3\n\nHarn-Release-Candidate: 89abcdef0123456789abcdef0123456789abcdef",
+      "0123456789abcdef0123456789abcdef01234567",
+    ],
+  )
+  assert_eq(
+    release_tag_verify_git_args("v1.2.3"),
+    [
+      "-c",
+      "gpg.ssh.allowedSignersFile=.github/release-bot-allowed-signers",
+      "verify-tag",
+      "--raw",
+      "v1.2.3",
+    ],
+  )
+  assert_eq(release_tag_verify_args("v1.2.3"), ["git"] + release_tag_verify_git_args("v1.2.3"))
+  assert_eq(
+    release_tag_push_args("v1.2.3", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    ["git", "push", "origin", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/tags/v1.2.3"],
+  )
+  assert_eq(
+    release_commit_verify_args("0123456789abcdef0123456789abcdef01234567"),
+    ["git", "verify-commit", "--raw", "0123456789abcdef0123456789abcdef01234567"],
+  )
+  assert_eq(mock_release_tag_command("git tag -s v1.2.3", false).success, true)
+  const verify_command = release_tag_verify_args("v1.2.3").join(" ")
+  assert_eq(mock_release_tag_command(verify_command, false).success, true)
+  const rejected = mock_release_tag_command(verify_command, true)
+  assert_eq(rejected.success, false)
+  assert_eq(rejected.status, "failed")
+  assert_eq(rejected.exit_code, 1)
+  assert_eq(
+    mock_release_tag_command(
+      "git push origin aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/tags/v1.2.3",
+      false,
+    ),
+    nil,
+  )
+  const green_timeout = command_result_fail(
+    1,
+    "pre-push hook: make test passed (3187/3187) but exceeded budget",
+  )
+  assert_eq(push_hook_budget_exceeded("git push -u origin release/v1.2.3", green_timeout), true)
+  const push_step = recorded_step("push", "git push -u origin release/v1.2.3", green_timeout)
+  assert_eq(push_step.classification, "push_hook_budget_exceeded_after_green_tests")
+  assert_eq(execution_failed([push_step]), true)
+  assert_eq(
+    execution_failed(
+      [
+        push_step,
+        recorded_step(
+          "push-no-verify-after-green-hook-budget",
+          "git push --no-verify",
+          command_result_ok(""),
+        ),
+      ],
+    ),
+    false,
+  )
+  const lint_step = recorded_step(
+    "release-markdown-lint",
+    "make -s lint-md",
+    command_result_fail(1, "MD013"),
+  )
+  assert_eq(lint_step.classification, "generated_markdown_lint_failed")
+  assert_eq(
+    execution_failed(
+      [
+        lint_step,
+        recorded_step(
+          "release-markdown-lint-after-agent-repair",
+          "make -s lint-md",
+          command_result_ok(""),
+        ),
+      ],
+    ),
+    false,
+  )
+  const stale_aot = recorded_step(
+    "release-cli-aot",
+    "make check-cli-aot",
+    command_result_fail(
+      1,
+      "CLI AOT artifacts target Harn 0.10.20; expected 0.10.21; run `make gen-cli-aot`",
+    ),
+  )
+  assert_eq(stale_aot.classification, "generated_cli_aot_failed")
+  assert(contains(stale_aot.recovery_hint, "make gen-cli-aot"))
+  const aot_failure = release_failure_explanation(stale_aot)
+  assert(contains(aot_failure.headline, "generated CLI bytecode"))
+  assert(contains(aot_failure.next, "make gen-cli-aot"))
+  assert_eq(
+    execution_failed(
+      [
+        stale_aot,
+        recorded_step(
+          "release-cli-aot-after-agent-repair",
+          "make check-cli-aot",
+          command_result_ok(""),
+        ),
+      ],
+    ),
+    false,
+  )
+  const ref = recovery_step_ref({...lint_step, live_log: "/tmp/log"})
+  assert_eq(ref.stdout, "(full output is in live_log)")
+  const lint_log =
+    "Summary: 2 error(s)\nCHANGELOG.md:13:121 error MD013/line-length Line length [Expected: 120; Actual: 260]\ndocs/release.md:4:1 error MD041/first-line-heading/first-line-h1 First line in a file should be a top-level heading\n"
+  const violations = markdownlint_violations_from_text(lint_log)
+  assert_eq(len(violations), 2)
+  assert_eq(violations[0]?.path, "CHANGELOG.md")
+  assert_eq(violations[0]?.line, 13)
+  assert_eq(violations[0]?.column, 121)
+  assert_eq(violations[0]?.rule, "MD013")
+  assert_eq(violations[0]?.rule_name, "line-length")
+  const files = {
+    "CHANGELOG.md": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\nproblem line\n14\n15\n",
+    "docs/release.md": "intro\nbody\nmore\nnot heading\n",
+  }
+  const source_context = markdownlint_source_context(violations, files, 1)
+  assert_eq(len(source_context), 2)
+  assert_eq(source_context[0]?.path, "CHANGELOG.md")
+  assert_eq(source_context[0]?.context?.map({ line -> line.line }), [12, 13, 14])
+  assert_eq(source_context[0]?.context?.[1]?.text, "problem line")
+  const prompt = harness.fs.render_prompt(
+    "@prompts/release_recovery_prompt.harn.prompt",
+    {
+      failure_context_json: json_stringify(
+        {
+          live_log_excerpt: {
+            markdownlint: {
+              violations: violations,
+              source_context: source_context,
+              preferred_edit_tool: "release_replace_file",
+              bounded_verification: ["make -s lint-md"],
+              repeated_read_guidance: "state why another release_read is needed",
+            },
+          },
+        },
+      ),
+    },
+  )
+  assert(contains(prompt, "\"violations\""))
+  assert(contains(prompt, "release_replace_file"))
+  assert(contains(prompt, "make -s lint-md"))
+  assert(contains(prompt, "additional reads"))
+}
+
+pipeline test_pre_tag_binary_size_gate_policy(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  assert_eq(config.workflow, "build-release-binaries.yml")
+  assert_eq(config.policy_ref, "main")
+  assert_eq(config.expected_policy_sha, sha)
+  assert_eq(config.source_ref, "release/v1.2.3")
+  assert_eq(config.expected_source_sha, sha)
+  assert_eq(config.benchmark_only, true)
+  assert_eq(config.targets, "x86_64-unknown-linux-gnu")
+  assert_eq(config.target_job, "Build x86_64-unknown-linux-gnu")
+  assert_eq(config.required_source_step, "Verify benchmark source revision")
+  assert_eq(config.required_size_step, "Evaluate the binary-size growth signal")
+  assert_eq(config.required_fuse_step, "Check the distribution fuse")
+  assert_eq(config.runner_profile, "standard")
+  assert_eq(config.completion_timeout_ms, 5400000)
+  assert_eq(config.completion_interval_ms, 120000)
+  assert_eq(config.transient_view_retry_max_attempts, 3)
+  assert_eq(config.transient_view_retry_base_ms, 1000)
+  assert_eq(config.transient_view_retry_cap_ms, 5000)
+}
+
+pipeline test_candidate_archive_gate_owns_linux_size_policy(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = release_candidate_archive_gate_config("main", sha, "release-certify/" + sha, sha)
+  assert_eq(config.target_job, "Build x86_64-unknown-linux-gnu")
+  assert_eq(config.required_source_step, "Verify candidate source revision")
+  assert_eq(config.required_fuse_step, "Check the distribution fuse")
+  assert_eq(config.required_size_step, "Evaluate the binary-size growth signal")
+  const missing_source = "jobs:\n  build:\n    steps:\n"
+    + "      - name: Check the distribution fuse\n        run: true\n"
+    + "      - name: Evaluate the binary-size growth signal\n        run: true\n"
+  const verdict = pre_tag_binary_size_gate_step_contract(false, true, missing_source, config)
+  assert_eq(verdict.ok, false)
+  assert_eq(verdict.unreadable, false)
+  assert_eq(verdict.missing, ["Verify candidate source revision"])
+}
+
+/**
+ * harn#6226 renamed `Check binary size budget` to `Evaluate the binary-size
+ * growth signal`. The step still ran and still passed; only this repo's copy of
+ * its name went stale, and the gate reported the passing step as unexecuted
+ * after a full ~45-minute build. These assert the drift is detectable from the
+ * workflow source alone, before anything is dispatched.
+ */
+pipeline test_pre_tag_size_gate_accepts_a_workflow_defining_both_steps(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  const source = "jobs:\n  build:\n    steps:\n"
+    + "      - name: Verify benchmark source revision\n        run: true\n"
+    + "      - name: Check the distribution fuse\n        run: true\n"
+    + "      - name: Evaluate the binary-size growth signal\n        run: true\n"
+  assert_eq(pre_tag_binary_size_gate_missing_steps(source, config), [])
+}
+
+pipeline test_pre_tag_size_gate_names_every_renamed_step(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  // The exact pre-#6226 spelling, which is what a stale constant would carry.
+  const source = "jobs:\n  build:\n    steps:\n"
+    + "      - name: Check binary size budget\n        run: true\n"
+  assert_eq(
+    pre_tag_binary_size_gate_missing_steps(source, config),
+    [
+      "Verify benchmark source revision",
+      "Check the distribution fuse",
+      "Evaluate the binary-size growth signal",
+    ],
+  )
+}
+
+/**
+ * An unreadable workflow must NOT report "nothing missing".
+ *
+ * The first cut of this check returned an empty `missing` list when `git show`
+ * failed, which made "the contract holds" and "the contract was never checked"
+ * the same verdict — so the release would spend ~45 minutes on the strength of
+ * a check that did not run. That is the same mistake as the one the whole gate
+ * exists to catch: inferring an answer rather than reading a declaration.
+ */
+pipeline test_pre_tag_size_gate_fails_closed_on_an_unreadable_workflow(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  const failed_read = pre_tag_binary_size_gate_step_contract(false, false, "", config)
+  assert_eq(failed_read.ok, false)
+  assert_eq(failed_read.unreadable, true)
+  // An empty read that "succeeded" is the same non-answer and must not pass.
+  const empty_read = pre_tag_binary_size_gate_step_contract(false, true, "   \n", config)
+  assert_eq(empty_read.ok, false)
+  assert_eq(empty_read.unreadable, true)
+}
+
+pipeline test_pre_tag_size_gate_contract_separates_missing_from_unreadable(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  const good = "      - name: Verify benchmark source revision\n"
+    + "      - name: Check the distribution fuse\n"
+    + "      - name: Evaluate the binary-size growth signal\n"
+  const ok = pre_tag_binary_size_gate_step_contract(false, true, good, config)
+  assert_eq(ok.ok, true)
+  assert_eq(ok.unreadable, false)
+  assert_eq(ok.missing, [])
+  // A readable workflow missing a name is a DIFFERENT verdict from an
+  // unreadable one: the operator fixes a constant, not a checkout.
+  const renamed = pre_tag_binary_size_gate_step_contract(
+    false,
+    true,
+    "      - name: Check binary size budget\n",
+    config,
+  )
+  assert_eq(renamed.ok, false)
+  assert_eq(renamed.unreadable, false)
+  assert_eq(
+    renamed.missing,
+    [
+      "Verify benchmark source revision",
+      "Check the distribution fuse",
+      "Evaluate the binary-size growth signal",
+    ],
+  )
+  // Mock releases do no I/O and must not be blocked by a check they cannot run.
+  const mocked = pre_tag_binary_size_gate_step_contract(true, false, "", config)
+  assert_eq(mocked.ok, true)
+  assert_eq(mocked.unreadable, false)
+}
+
+pipeline test_pre_tag_size_gate_workflow_path_is_the_dispatched_workflow(task: any) {
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const config = pre_tag_binary_size_gate_config("main", sha, "release/v1.2.3", sha)
+  // The path is read with `git show`, the workflow is dispatched by basename.
+  // If these drift apart the check silently proves a different file.
+  assert_eq(pre_tag_binary_size_gate_workflow_path().ends_with("/" + config.workflow), true)
+}
+
+pipeline test_release_candidate_size_gate_binds_policy_and_source(task: any) {
+  const policy_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const candidate_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const candidate = "release-attempt/v1.2.3/" + candidate_sha
+  const config = release_candidate_pre_tag_binary_size_gate_config(
+    "main",
+    policy_sha,
+    candidate,
+    candidate_sha,
+  )
+  assert_eq(config.policy_ref, "main")
+  assert_eq(config.expected_policy_sha, policy_sha)
+  assert_eq(config.source_ref, candidate)
+  assert_eq(config.expected_source_sha, candidate_sha)
+}
+
+/**
+ * The `agent-review-validation` step fails for two opposite reasons, and the
+ * remediation must not send an operator to the credential store when the model
+ * answered fine and the audit merely failed a content check.
+ */
+pipeline test_agent_review_remediation_distinguishes_no_text_from_rejected_audit(task: any) {
+  const rejected = release_failure_explanation(
+    recorded_step(
+      "agent-review-validation",
+      "validate local-model release audit",
+      command_result_fail(
+        2,
+        "agent review failed validation:\nagent draft changelog contains an `## Unreleased` heading",
+      ),
+    ),
+  )
+  assert(contains(rejected.headline, "failed validation"))
+  assert(contains(rejected.next, "validation findings printed above"))
+  // The falsifier: the old message blamed provider credentials for every
+  // failure at this step, including this one.
+  assert_eq(contains(rejected.next, "required key"), false)
+  assert_eq(contains(rejected.next, "auth/rate-limit"), false)
+  const empty = release_failure_explanation(
+    recorded_step(
+      "agent-review-validation",
+      "validate local-model release audit",
+      command_result_fail(2, "agent review failed validation:\n" + EMPTY_AUDIT_FINDING),
+    ),
+  )
+  assert(contains(empty.headline, "never produced a usable audit"))
+  assert(contains(empty.next, "auth/rate-limit"))
+}

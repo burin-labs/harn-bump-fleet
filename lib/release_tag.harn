@@ -1,0 +1,1061 @@
+import { command_output_text, command_result_fail, command_result_ok } from "std/command"
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import {
+  GithubConnectorError,
+  github_actions_run,
+  github_actions_run_jobs,
+  github_workflow_dispatch,
+} from "./github"
+import {
+  mock_pre_tag_size_gate_adapter,
+  pre_tag_size_gate_command_result,
+  pre_tag_size_gate_event,
+  pre_tag_size_gate_failure,
+  run_pre_tag_size_gate,
+} from "./pretag_size_gate"
+import {
+  pretag_size_gate_receipt_matches,
+  pretag_size_gate_receipt_path,
+  pretag_size_gate_receipt_read,
+  pretag_size_gate_receipt_write,
+} from "./pretag_size_gate_receipt"
+import {
+  pre_tag_binary_size_gate_step_contract,
+  pre_tag_binary_size_gate_workflow_path,
+  pre_tag_binary_size_report_artifact,
+  recorded_step,
+  release_candidate_pre_tag_binary_size_gate_config,
+  release_tag_create_args,
+  release_tag_push_args,
+  release_tag_verify_args,
+} from "./release_execution"
+import { ReleasePublication } from "./release_publication"
+import { missing_release_assets } from "./release_readiness"
+import {
+  local_release_tag_decision,
+  release_cutoff_decision,
+  release_cutoff_probe,
+  release_tag_push_reconciliation,
+  remote_release_tag_decision,
+  remote_tag_sha,
+  remote_tag_target_sha,
+} from "./release_repin"
+import { release_tag_github_trust, release_tag_identity_verification } from "./release_tag_identity"
+import { PreTagBinaryGateConfig } from "./workflow_runs"
+import { logged_command_step } from "release_agent"
+import {
+  log_step_finished,
+  log_step_started,
+  recorded_remote_refs_step,
+  release_git_remote_refs,
+  release_github_release,
+  release_github_ssh_signing_keys,
+  release_log_event,
+  release_repo_slug,
+  release_run_root,
+  run_git,
+} from "release_runtime"
+
+pub type ReleaseCutoffGateResult = {steps: list<dict>, proceed: bool}
+
+pub type ReleaseBinarySizeGateResult = {steps: list<dict>, success: bool}
+
+const RELEASE_POLICY_BRANCH = "main"
+
+pub type ReleaseAssetSnapshot = {
+  assets: list<string>,
+  missing_assets: list<string>,
+  ready: bool,
+  found: bool,
+  error: GithubConnectorError?,
+}
+
+fn release_policy_head(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+) -> Result<string, string> {
+  if cfg.mock {
+    return Ok(cfg.pin_sha)
+  }
+  const fetched = run_git(harness, cfg, ["fetch", "origin", "--quiet", RELEASE_POLICY_BRANCH])
+  if !fetched.success {
+    return Err(
+      "could not fetch current release policy from origin/${RELEASE_POLICY_BRANCH}: "
+        + trim(command_output_text(fetched)),
+    )
+  }
+  const resolved = run_git(harness, cfg, ["rev-parse", "origin/${RELEASE_POLICY_BRANCH}^{commit}"])
+  if !resolved.success {
+    return Err(
+      "could not resolve current release policy at origin/${RELEASE_POLICY_BRANCH}: "
+        + trim(command_output_text(resolved)),
+    )
+  }
+  const sha = lowercase(trim(resolved.stdout ?? ""))
+  if regex_match("^[0-9a-f]{40}$", sha) == nil {
+    return Err("origin/${RELEASE_POLICY_BRANCH} resolved to an invalid commit: ${sha}")
+  }
+  return Ok(sha)
+}
+
+/**
+ * Prove the frozen release cutoff remains in `origin/<base>` ancestry before
+ * candidate certification or branch mutation. Normal descendant commits belong
+ * to the next release; divergence or an unprovable cutoff fails closed.
+ *
+ * The pure `release_cutoff_decision` owns the policy; this only gathers the fresh
+ * probe. Repin mode, explicit `--at-sha`, and `--allow-base-drift` short-circuit
+ * (their drift is intended or already gated); mock skips the live probe.
+ */
+fn release_cutoff_gate(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  phase: string,
+  steps: list<dict>,
+  run_id: string,
+) -> ReleaseCutoffGateResult {
+  const explicit_pin = trim(cfg.pin_sha_input ?? "") != ""
+  if cfg.mock || explicit_pin || (cfg.allow_base_drift ?? false) {
+    return {steps: steps, proceed: true}
+  }
+  const step = "pre-${phase}-cutoff-check"
+  const action = if phase == "certification" {
+    "certifying"
+  } else {
+    "preparing"
+  }
+  release_log_event({clock: harness.clock, fs: harness.fs}, run_id, "step_started", {step: step})
+  const fetch = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["fetch", "origin", "--quiet", cfg.base],
+  )
+  if !fetch.success {
+    const fetch_stderr = trim(fetch.stderr ?? "")
+    const recorded = recorded_step(
+      step,
+      "git fetch origin ${cfg.base}",
+      command_result_fail(
+        2,
+        "${step} could not fetch origin/${cfg.base} before ${action} ${tag}: ${fetch_stderr}",
+      ),
+    )
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_finished",
+      {step: step, success: false},
+    )
+    return {steps: steps + [recorded], proceed: false}
+  }
+  const cutoff = release_cutoff_probe(
+    harness.tools,
+    { args ->
+      const result = run_git({env: harness.env, process: harness.process}, cfg, args)
+      return {success: result.success, stdout: result.stdout}
+    },
+    cfg,
+  )
+  const decision = release_cutoff_decision(
+    {
+      pin_sha: cfg.pin_sha,
+      base_head_sha: cutoff.base_head_sha,
+      pin_is_base_ancestor: cutoff.pin_is_base_ancestor,
+      base: cfg.base,
+      tag: tag,
+      explicit_pin: false,
+      allow_drift: false,
+    },
+  )
+  if decision.action == "abort" {
+    const recorded = recorded_step(
+      step,
+      "prove release cutoff is in origin/${cfg.base} ancestry",
+      command_result_fail(2, decision.reason),
+    )
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_finished",
+      {step: step, success: false, reason: decision.reason},
+    )
+    return {steps: steps + [recorded], proceed: false}
+  }
+  const recorded = recorded_step(
+    step,
+    "prove release cutoff is in origin/${cfg.base} ancestry",
+    command_result_ok(
+      "cutoff ${cfg.pin_sha} remains in origin/${cfg.base} ancestry at ${cutoff.base_head_sha}; later base commits belong to the next release; safe to ${phase} ${tag}\n",
+    ),
+  )
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_finished",
+    {step: step, success: true},
+  )
+  return {steps: steps + [recorded], proceed: true}
+}
+
+pub fn pre_certification_cutoff_gate(
+  harness: Harness,
+  cfg: dict,
+  version: string,
+  steps: list<dict>,
+  run_id: string,
+) -> ReleaseCutoffGateResult {
+  return release_cutoff_gate(harness, cfg, "v${version}", "certification", steps, run_id)
+}
+
+/**
+ * Prove the frozen cutoff is still in base ancestry before branch mutation.
+ * Normal base advancement does not invalidate prepared evidence; divergence
+ * fails before the expensive prepare phase and branch push.
+ */
+pub fn pre_prepare_cutoff_gate(
+  harness: Harness,
+  cfg: dict,
+  analysis: dict,
+  steps: list<dict>,
+  run_id: string,
+) -> ReleaseCutoffGateResult {
+  const version = trim(analysis.next_version ?? "")
+  const tag = if version == "" {
+    "v<unknown>"
+  } else {
+    "v${version}"
+  }
+  return release_cutoff_gate(harness, cfg, tag, "prepare", steps, run_id)
+}
+
+/**
+ * Find the workflow run that already measured one exact source revision.
+ *
+ * The local receipt beside it answers the same question for a repeated attempt
+ * on the same machine. It cannot answer it for the hosted release, whose retry
+ * starts in a fresh container with no `.harn-runs/` — which is exactly how the
+ * v0.10.126 cut spent two ~40-minute Linux builds on one commit. GitHub keeps
+ * the answer either way, in the source-qualified size artifact that build
+ * uploads.
+ *
+ * `gh` rather than the typed connector because the connector has no artifacts
+ * operation. The typed record still comes from the connector: this resolves an
+ * id, and `github_actions_run` says what that run concluded.
+ *
+ * Every failure is an Err. A lookup that could not answer must never return
+ * "nothing found", because that reads as "dispatch" and reintroduces the
+ * duplicate build this removes.
+ */
+fn find_measured_run(harness: Harness, cfg: dict, slug: string, gate: PreTagBinaryGateConfig) {
+  const artifact = pre_tag_binary_size_report_artifact(gate.expected_source_sha)
+  // Filtered by exact name at the API rather than by paging the whole artifact
+  // list. `--paginate` with `--jq` applies the filter per page and prints one
+  // result per page, so an aggregating expression over a paginated read emits
+  // several lines and parses as none — reuse would silently never happen and
+  // the only symptom would be a build nobody knew was redundant.
+  const listed = harness.process.run(
+    {
+      program: "gh",
+      args: [
+        "api",
+        "repos/${slug}/actions/artifacts?per_page=100&name=${artifact}",
+        "--jq",
+        "[.artifacts[] | select(.expired == false)] | sort_by(.workflow_run.id) | reverse | .[0].workflow_run.id // empty",
+      ],
+      cwd: cfg.repo,
+    },
+  )
+  if !listed.success {
+    return Err(
+      {
+        code: "artifact_lookup_failed",
+        message: "could not list ${slug} artifacts for ${artifact}: " + trim(listed.stderr ?? ""),
+      },
+    )
+  }
+  const run_id = to_int(trim(listed.stdout ?? ""))
+  if run_id == nil || run_id <= 0 {
+    return Ok(nil)
+  }
+  const run = github_actions_run(harness, slug, run_id)
+  if is_err(run) {
+    return Err(
+      {
+        code: "measured_run_unreadable",
+        message: "artifact ${artifact} names run ${run_id}, which could not be read: "
+          + to_string(unwrap_err(run)),
+      },
+    )
+  }
+  return Ok(unwrap(run))
+}
+
+pub fn run_pre_tag_binary_size_gate(
+  harness: Harness,
+  cfg: dict,
+  publication: ReleasePublication,
+  steps: list<dict>,
+  run_id: string,
+) -> ReleaseBinarySizeGateResult {
+  const slug = if cfg.mock {
+    "burin-labs/harn"
+  } else {
+    release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  }
+  const result = if slug == "" {
+    pre_tag_size_gate_failure("could not resolve the GitHub repository slug")
+  } else {
+    const policy_head = release_policy_head({env: harness.env, process: harness.process}, cfg)
+    if is_err(policy_head) {
+      const failure = pre_tag_size_gate_failure(unwrap_err(policy_head))
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "pre_tag_binary_size_gate",
+        pre_tag_size_gate_event(failure),
+      )
+      return {
+        steps: steps
+          + [
+            recorded_step(
+              "pre-tag-linux-binary-size-gate",
+              "require SHA-matched Linux size workflow",
+              pre_tag_size_gate_command_result(failure),
+            ),
+          ],
+        success: false,
+      }
+    }
+    const config = release_candidate_pre_tag_binary_size_gate_config(
+      RELEASE_POLICY_BRANCH,
+      unwrap(policy_head),
+      publication.remote_ref,
+      publication.head_oid,
+    )
+    // Prove the step names still resolve in the workflow this gate is about to
+    // dispatch, at that exact revision. Read at the policy SHA rather than the
+    // working tree: the dispatch uses the policy ref, so the working tree could
+    // agree while the dispatched revision does not.
+    //
+    // An unreadable workflow fails CLOSED. Returning "no names are missing"
+    // because the file could not be read is the vacuous-skip shape: the gate
+    // would report the same silence whether the contract held or was never
+    // checked, and the release would then spend ~45 minutes on the strength of
+    // a check that did not run. `harn fix` narrowing a host entry (harn#6193)
+    // and this both come from the same mistake — inferring an answer instead of
+    // reading a declaration.
+    const shown = if cfg.mock {
+      {success: true, stdout: ""}
+    } else {
+      run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["show", "${unwrap(policy_head)}:${pre_tag_binary_size_gate_workflow_path()}"],
+      )
+    }
+    const contract = pre_tag_binary_size_gate_step_contract(
+      cfg.mock,
+      shown.success,
+      shown.stdout ?? "",
+      config,
+    )
+    if !contract.ok {
+      const failure = pre_tag_size_gate_failure(
+        if contract.unreadable {
+          "could not read ${pre_tag_binary_size_gate_workflow_path()} at "
+            + "${unwrap(policy_head)}, so the step names this gate matches could not be "
+            + "proved before dispatch; refusing to spend a full release build on an "
+            + "unverified contract"
+        } else {
+          "${pre_tag_binary_size_gate_workflow_path()} at ${unwrap(policy_head)} does not define "
+            + "the step(s) this gate matches by name: "
+            + join(contract.missing, ", ")
+            + ". A rename there is invisible here until the gate reports a step that "
+            + "ran successfully as unexecuted — fix the constant in "
+            + "lib/release_execution.harn rather than retrying."
+        },
+      )
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "pre_tag_binary_size_gate",
+        pre_tag_size_gate_event(failure),
+      )
+      return {
+        steps: steps
+          + [
+            recorded_step(
+              "pre-tag-linux-binary-size-gate",
+              "require SHA-matched Linux size workflow",
+              pre_tag_size_gate_command_result(failure),
+            ),
+          ],
+        success: false,
+      }
+    }
+    const adapter = if cfg.mock {
+      mock_pre_tag_size_gate_adapter(config)
+    } else {
+      const receipt_path = pretag_size_gate_receipt_path(
+        release_run_root(harness.fs),
+        publication.head_oid,
+      )
+      {
+        find_existing: fn(gate) { return find_measured_run(harness, cfg, slug, gate) },
+        dispatch: fn(gate) {
+          const prior = pretag_size_gate_receipt_read(harness.fs, receipt_path)
+          if prior != nil && pretag_size_gate_receipt_matches(prior, slug, gate) {
+            return {
+              accepted: true,
+              run_id: prior.run_id,
+              url: prior.run_url,
+              event: prior.observed_event,
+              head_branch: prior.observed_head_branch,
+              head_sha: prior.observed_head_sha,
+              reused: true,
+            }
+          }
+          const dispatched = github_workflow_dispatch(
+            harness,
+            slug,
+            gate.workflow,
+            {
+              benchmark_only: gate.benchmark_only,
+              benchmark_source_ref: gate.source_ref,
+              benchmark_source_sha: gate.expected_source_sha,
+              runner_profile: gate.runner_profile,
+              targets: gate.targets,
+            },
+            gate.policy_ref,
+          )
+          return if is_err(dispatched) {
+            dispatched
+          } else {
+            unwrap(dispatched) + {reused: false}
+          }
+        },
+        view_run: fn(action_run_id) {
+          const run = github_actions_run(harness, slug, action_run_id)
+          if is_err(run) {
+            return run
+          }
+          const observed_run = unwrap(run)
+          const jobs = github_actions_run_jobs(harness, slug, action_run_id)
+          if is_err(jobs) {
+            return jobs
+          }
+          const observed_jobs = unwrap(jobs)
+          return {
+            run: observed_run,
+            jobs: observed_jobs.jobs.map(
+              { job ->
+                return {
+                  name: job.name,
+                  status: job.status,
+                  conclusion: job.conclusion ?? "",
+                  steps: job.steps.map(
+                    { step ->
+                      return {
+                        name: step.name,
+                        status: step.status,
+                        conclusion: step.conclusion ?? "",
+                      }
+                    },
+                  )
+                    .to_list(),
+                }
+              },
+            )
+              .to_list(),
+          }
+        },
+        wait: fn(ms) { harness.clock.sleep_ms(ms) },
+      }
+    }
+    run_pre_tag_size_gate(
+      config,
+      adapter,
+      { started ->
+        let event = started
+        if !cfg.mock {
+          const receipt_path = pretag_size_gate_receipt_path(
+            release_run_root(harness.fs),
+            publication.head_oid,
+          )
+          pretag_size_gate_receipt_write(
+            {fs: harness.fs, random: harness.random},
+            receipt_path,
+            slug,
+            started,
+            harness.clock.date_iso(),
+          )
+          event = started + {receipt_path: receipt_path}
+          harness.stdio.println("   pre-tag size receipt: ${receipt_path}")
+        }
+        release_log_event(
+          {clock: harness.clock, fs: harness.fs},
+          run_id,
+          "pre_tag_binary_size_gate_started",
+          event,
+        )
+        return nil
+      },
+    )
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "pre_tag_binary_size_gate",
+    pre_tag_size_gate_event(result),
+  )
+  return {
+    steps: steps
+      + [
+        recorded_step(
+          "pre-tag-linux-binary-size-gate",
+          "require SHA-matched Linux size workflow",
+          pre_tag_size_gate_command_result(result),
+        ),
+      ],
+    success: result.success,
+  }
+}
+
+/**
+ * Tag one verified merged-main commit as `vX.Y.Z` and push the tag.
+ *
+ * The tag is the durable source of truth for what gets published: Harn's
+ * publish-release workflow fires on tag push and ships from that tag. New tags
+ * record the certified candidate OID in their signed message so post-tag work
+ * can distinguish deferred fragments after transient attempt refs are cleaned.
+ * The operation is idempotent for a tag already at the merged-main OID and
+ * fails rather than silently overwriting a tag that points elsewhere.
+ *
+ * In post-publish fixup mode (`cfg.skip_tag`), the original tag already
+ * published the artifact. This fixup only lands Cargo/CHANGELOG paperwork on
+ * `<base>`, so it must not re-tag or trigger the publish workflow again.
+ */
+pub fn ensure_release_tag_pushed_at(
+  harness: Harness,
+  cfg: dict,
+  version: string,
+  target_sha: string,
+  steps: list<dict>,
+  run_id: string,
+  metadata: {candidate_oid: string} = {candidate_oid: ""},
+) -> list<dict> {
+  const tag = "v${version}"
+  if cfg.skip_tag ?? false {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_started",
+      {step: "ensure-release-tag-pushed-skipped", reason: "fixup_mode"},
+    )
+    const skip_step = recorded_step(
+      "ensure-release-tag-pushed-skipped",
+      "fixup mode: tag ${tag} was pushed during the original publish",
+      command_result_ok(
+        "idempotent skip: ${tag} was pushed during the original publish-release.yml run; this rerun is post-publish paperwork and must not re-tag\n",
+      ),
+    )
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_finished",
+      {step: "ensure-release-tag-pushed-skipped", success: true, status: "completed", exit_code: 0},
+    )
+    return steps + [skip_step]
+  }
+  const head = lowercase(trim(target_sha))
+  if regex_match("^[0-9a-f]{40}$", head) == nil {
+    return steps
+      + [
+        recorded_step(
+          "verify-release-tag-target",
+          "verify exact merged-main tag target",
+          command_result_fail(2, "release tag target is not an exact commit SHA"),
+        ),
+      ]
+  }
+  let pre_steps = steps
+  const remote_tag_probe = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"],
+  )
+  if !remote_tag_probe.success {
+    return pre_steps
+      + [
+        recorded_remote_refs_step(
+          "probe-release-tag",
+          "std/git::git_ls_remote refs/tags/" + tag,
+          remote_tag_probe,
+        ),
+      ]
+  }
+  const remote_target = remote_tag_target_sha(remote_tag_probe.refs)
+  const remote_decision = remote_release_tag_decision(
+    {tag: tag, head_sha: head, remote_target_sha: remote_target},
+  )
+  if remote_decision.action == "reuse" {
+    return verify_existing_remote_release_tag(
+      harness,
+      cfg,
+      pre_steps,
+      tag,
+      head,
+      remote_tag_probe.refs,
+      run_id,
+    ).steps
+  }
+  if remote_decision.action == "abort" {
+    return pre_steps
+      + [
+        recorded_step(
+          "push-release-tag",
+          "std/git::git_ls_remote refs/tags/" + tag,
+          command_result_fail(2, remote_decision.reason),
+        ),
+      ]
+  }
+  const local_tag_probe = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["rev-parse", "-q", "--verify", "refs/tags/" + tag],
+  )
+  const local_exists = local_tag_probe.success
+  let local_target = ""
+  if local_tag_probe.success {
+    const tag_commit_probe = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["rev-list", "-n", "1", tag],
+    )
+    local_target = if tag_commit_probe.success {
+      trim(tag_commit_probe.stdout)
+    } else {
+      ""
+    }
+  }
+  const local_decision = local_release_tag_decision(
+    {
+      tag: tag,
+      head_sha: head,
+      local_exists: local_exists,
+      local_target_sha: local_target,
+      remote_target_sha: remote_target,
+    },
+  )
+  if local_decision.action == "abort" {
+    return pre_steps
+      + [
+        recorded_step(
+          "create-release-tag",
+          "git rev-list -n 1 " + tag,
+          command_result_fail(2, local_decision.reason),
+        ),
+      ]
+  }
+  if local_decision.action == "refresh" {
+    const delete = logged_command_step(
+      harness,
+      cfg,
+      pre_steps,
+      "refresh-local-release-tag",
+      ["git", "tag", "-d", tag],
+      run_id,
+    )
+    pre_steps = delete.steps
+    if !delete.success {
+      return pre_steps
+    }
+  }
+  if local_decision.action == "reuse" {
+    pre_steps = pre_steps
+      + [
+        recorded_step(
+          "create-release-tag",
+          "tag ${tag} already pinned at HEAD",
+          command_result_ok("idempotent reuse: ${local_decision.reason}\n"),
+        ),
+      ]
+  } else {
+    const candidate = lowercase(trim(metadata.candidate_oid))
+    if candidate != "" && regex_match("^[0-9a-f]{40}$", candidate) == nil {
+      return pre_steps
+        + [
+          recorded_step(
+            "create-release-tag",
+            "validate immutable release candidate identity",
+            command_result_fail(2, "release candidate identity is not an exact commit SHA"),
+          ),
+        ]
+    }
+    const create_argv = release_tag_create_args(
+      {tag: tag, version: version, target_oid: head, candidate_oid: candidate},
+    )
+    const create = logged_command_step(
+      harness,
+      cfg,
+      pre_steps,
+      "create-release-tag",
+      create_argv,
+      run_id,
+    )
+    pre_steps = create.steps
+    if !create.success {
+      return pre_steps
+    }
+  }
+  const tag_object = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "resolve-release-tag-object",
+    ["git", "rev-parse", "refs/tags/${tag}"],
+    run_id,
+  )
+  pre_steps = tag_object.steps
+  if !tag_object.success {
+    return pre_steps
+  }
+  const tag_oid = lowercase(trim(tag_object.stdout ?? ""))
+  // Verify the captured tag object, never the mutable local tag name.
+  const verify_tag = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "verify-release-tag-signature",
+    release_tag_verify_args(tag_oid),
+    run_id,
+  )
+  pre_steps = verify_tag.steps
+  const tag_target = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "resolve-release-tag-target",
+    ["git", "rev-parse", "${tag_oid}^{}"],
+    run_id,
+  )
+  pre_steps = tag_target.steps
+  if !tag_target.success {
+    return pre_steps
+  }
+  const tag_contents = logged_command_step(
+    harness,
+    cfg,
+    pre_steps,
+    "inspect-release-tag-identity",
+    ["git", "cat-file", "tag", tag_oid],
+    run_id,
+  )
+  pre_steps = tag_contents.steps
+  if !tag_contents.success {
+    return pre_steps
+  }
+  const identity = release_tag_identity_verification(
+    tag,
+    tag_oid,
+    head,
+    tag_oid,
+    tag_target.stdout ?? "",
+    tag_contents.stdout ?? "",
+    verify_tag.success,
+  )
+  if !identity.success {
+    return pre_steps
+      + [
+        recorded_step(
+          "verify-release-tag-identity",
+          "verify captured tag identity",
+          command_result_fail(2, identity.reason),
+        ),
+      ]
+  }
+  if cfg.github_signed_commit ?? false {
+    return reconciled_release_tag_push(
+      harness,
+      cfg,
+      pre_steps
+        + [
+          recorded_step(
+            "verify-release-tag-github-trust-skipped",
+            "hosted App-bot signer is verified by Harn's artifact-policy trust root",
+            command_result_ok(
+              "GitHub Apps cannot own GitHub signing keys; the hosted lane uses the Harn-owned allowed-signers policy\n",
+            ),
+          ),
+        ],
+      tag,
+      tag_oid,
+      head,
+      run_id,
+    )
+  }
+  const trust_source = release_github_ssh_signing_keys(harness, cfg)
+  if !(trust_source.success ?? false) {
+    return pre_steps
+      + [
+        recorded_step(
+          "verify-release-tag-github-trust",
+          "read authenticated operator's public GitHub SSH signing keys",
+          command_result_fail(
+            2,
+            "could not prove GitHub signing-key trust before tag push: "
+              + to_string(trust_source.error ?? "unknown GitHub error"),
+          ),
+        ),
+      ]
+  }
+  const trust = release_tag_github_trust(
+    (verify_tag.stdout ?? "") + "\n" + (verify_tag.stderr ?? ""),
+    trust_source.keys ?? [],
+  )
+  if !trust.success {
+    const config = logged_command_step(
+      harness,
+      cfg,
+      pre_steps,
+      "inspect-release-tag-signing-config",
+      ["git", "config", "--show-origin", "--show-scope", "--get-all", "user.signingkey"],
+      run_id,
+    )
+    pre_steps = config.steps
+  }
+  pre_steps = pre_steps
+    + [
+      recorded_step(
+        "verify-release-tag-github-trust",
+        "verify GitHub recognizes release tag signer " + trust.fingerprint,
+        if trust.success {
+          command_result_ok(trust.reason + "\n")
+        } else {
+          command_result_fail(
+            2,
+            trust.reason + "; GitHub-registered fingerprints: "
+              + join(trust.registered_fingerprints, ", ")
+              + "\n",
+          )
+        },
+      ),
+    ]
+  if !trust.success {
+    return pre_steps
+  }
+  return reconciled_release_tag_push(harness, cfg, pre_steps, tag, tag_oid, head, run_id)
+}
+
+pub fn verify_existing_remote_release_tag(
+  harness: Harness,
+  cfg: dict,
+  steps: list<dict>,
+  tag: string,
+  expected_target_sha: string,
+  remote_refs: list<GitRemoteRef>,
+  run_id: string,
+) -> {steps: list<dict>, success: bool} {
+  let out = steps
+  const fetched = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "fetch-existing-release-tag",
+    ["git", "fetch", "--quiet", "origin", "refs/tags/${tag}"],
+    run_id,
+  )
+  out = fetched.steps
+  if !fetched.success {
+    return {steps: out, success: false}
+  }
+  const tag_object = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "resolve-existing-release-tag-object",
+    ["git", "rev-parse", "FETCH_HEAD"],
+    run_id,
+  )
+  out = tag_object.steps
+  if !tag_object.success {
+    return {steps: out, success: false}
+  }
+  const tag_oid = lowercase(trim(tag_object.stdout ?? ""))
+  const verified = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "verify-existing-release-tag-signature",
+    release_tag_verify_args(tag_oid),
+    run_id,
+  )
+  out = verified.steps
+  const target = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "resolve-existing-release-tag-target",
+    ["git", "rev-parse", "${tag_oid}^{}"],
+    run_id,
+  )
+  out = target.steps
+  if !target.success {
+    return {steps: out, success: false}
+  }
+  const tag_contents = logged_command_step(
+    harness,
+    cfg,
+    out,
+    "inspect-existing-release-tag-identity",
+    ["git", "cat-file", "tag", tag_oid],
+    run_id,
+  )
+  out = tag_contents.steps
+  if !tag_contents.success {
+    return {steps: out, success: false}
+  }
+  const expected_tag_oid = lowercase(trim(remote_tag_sha(remote_refs)))
+  const identity = release_tag_identity_verification(
+    tag,
+    expected_tag_oid,
+    expected_target_sha,
+    tag_oid,
+    target.stdout ?? "",
+    tag_contents.stdout ?? "",
+    verified.success,
+  )
+  if !identity.success {
+    return {
+      steps: out
+        + [
+          recorded_step(
+            "verify-existing-release-tag",
+            "verify remote signed tag identity",
+            command_result_fail(2, identity.reason),
+          ),
+        ],
+      success: false,
+    }
+  }
+  return {
+    steps: out
+      + [
+        recorded_step(
+          "push-release-tag",
+          "remote tag ${tag} already contains exact verified release object",
+          command_result_ok("idempotent remote tag reuse: ${identity.reason}\n"),
+        ),
+      ],
+    success: true,
+  }
+}
+
+fn reconciled_release_tag_push(
+  harness: Harness,
+  cfg: dict,
+  steps: any,
+  tag: string,
+  tag_oid: string,
+  head: string,
+  run_id: string,
+) {
+  const command = release_tag_push_args(tag, tag_oid)
+  log_step_started({clock: harness.clock, fs: harness.fs}, run_id, "push-release-tag", command)
+  const pushed = run_git({env: harness.env, process: harness.process}, cfg, command[1:len(command)])
+  const push_result = if pushed.success {
+    command_result_ok(pushed.stdout)
+  } else {
+    command_result_fail(pushed.exit_code ?? 1, pushed.stderr)
+  }
+  if cfg.mock {
+    const evidence = {
+      reconciliation_action: "mock_exact_publication",
+      remote_tag_oid: tag_oid,
+      remote_target_sha: head,
+      push_git_receipt: pushed,
+      remote_git_receipt: nil,
+      remote_refs: [],
+    }
+    log_step_finished(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "push-release-tag",
+      {success: push_result.success, status: push_result.status, exit_code: push_result.exit_code},
+      evidence,
+    )
+    return steps + [{...recorded_step("push-release-tag", command, push_result), ...evidence}]
+  }
+  const remote = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"],
+  )
+  const decision = release_tag_push_reconciliation(
+    {
+      tag: tag,
+      tag_oid: tag_oid,
+      head_sha: head,
+      remote_probe_success: remote.success,
+      remote_probe_error: remote.stderr,
+      remote_refs: remote.refs,
+    },
+  )
+  const original_output = command_output_text(pushed)
+  const failure_status = if pushed.success {
+    2
+  } else {
+    pushed.exit_code ?? 1
+  }
+  const result = if decision.success {
+    command_result_ok(decision.reason + "\n\ngit push output:\n" + original_output + "\n")
+  } else {
+    command_result_fail(
+      failure_status,
+      decision.reason + "\n\ngit push output:\n" + original_output + "\n",
+    )
+  }
+  const evidence = {
+    reconciliation_action: decision.action,
+    remote_tag_oid: decision.remote_tag_oid,
+    remote_target_sha: decision.remote_target_sha,
+    push_git_receipt: pushed,
+    remote_git_receipt: remote.receipt,
+    remote_refs: remote.refs,
+  }
+  log_step_finished(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "push-release-tag",
+    {success: result.success, status: result.status, exit_code: result.exit_code},
+    evidence,
+  )
+  return steps + [{...recorded_step("push-release-tag", command, result), ...evidence}]
+}
+
+pub fn release_asset_snapshot(harness: Harness, cfg: dict, tag: string) -> ReleaseAssetSnapshot {
+  const lookup = release_github_release(harness, cfg, tag)
+  if is_err(lookup) {
+    return {
+      assets: [],
+      missing_assets: missing_release_assets([]),
+      ready: false,
+      found: false,
+      error: unwrap_err(lookup),
+    }
+  }
+  const assets = if lookup.found {
+    lookup.release.assets.map({ asset -> asset.name })
+  } else {
+    []
+  }
+  const missing = missing_release_assets(assets)
+  return {
+    assets: assets,
+    missing_assets: missing,
+    ready: lookup.found && len(missing) == 0,
+    found: lookup.found,
+    error: nil,
+  }
+}

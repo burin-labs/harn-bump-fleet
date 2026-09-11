@@ -1,0 +1,1 @@
+Select the certified candidate archive from the certification's durable receipt, refusing an operator-pinned archive run that disagrees with it or that has no receipt to check it against, because two archives of one candidate are not interchangeable.

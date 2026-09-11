@@ -1,0 +1,928 @@
+import { CommandResult, command_result_fail, command_result_ok, command_run } from "std/command"
+import { strip_v } from "std/semver"
+
+const RUN_VIEW_SCHEMA = "harn.run_view.v1"
+
+const SESSION_VIEW_SCHEMA = "harn.session_view.v1"
+
+const RUN_VIEW_CHECK_TARGET = "check-run-view-fixtures"
+
+const CONTRACT_PATH_MARKERS = [
+  "crates/harn-vm/src/orchestration/records/view.rs",
+  "crates/harn-vm/tests/run_view_fixtures.rs",
+  "spec/run-view-fixtures/",
+]
+
+const NOTE_MARKERS = [
+  "run/session view",
+  "run view",
+  "session view",
+  "run-view",
+  "session-view",
+  "run_view",
+  "session_view",
+  "view schema",
+  "schema_version",
+  "run-view-fixtures",
+  "compatibility fixture",
+]
+
+pub type RunSessionViewSnapshot = {path: string, text: string}
+
+pub type RunSessionViewParseError = {path: string, error: string}
+
+pub type RunSessionViewSchemaKind = "run" | "session" | "unknown"
+
+pub type RunSessionViewSchemaSummaryEntry = {
+  schema: string,
+  schema_version: int,
+  kind: RunSessionViewSchemaKind,
+  snapshot_count: int,
+  paths: list<string>,
+}
+
+pub type RunSessionViewSchemaSummary = {
+  expected_json_count: int,
+  parse_errors: list<RunSessionViewParseError>,
+  schemas: list<RunSessionViewSchemaSummaryEntry>,
+}
+
+pub type RunSessionViewCommandEnv = {
+  CARGO_BUILD_RUSTC_WRAPPER: string,
+  CARGO_INCREMENTAL: string,
+  HARN_BIN: string,
+  HARN_BIN_NO_BUILD: string,
+  PATH: string,
+  RUSTC_WRAPPER: string,
+  SCCACHE_DISABLE: string,
+  CARGO_TARGET_DIR: string,
+  CARGO_BUILD_BUILD_DIR: string,
+}
+
+pub type RunSessionViewCommandEnvInput = {
+  CARGO_TARGET_DIR?: string,
+  HARN_BIN?: string,
+  HARN_BIN_NO_BUILD?: string,
+}
+
+pub type RunSessionViewCommandSpec = {
+  argv: list<string>,
+  repo?: string,
+  env?: RunSessionViewCommandEnvInput?,
+}
+
+pub type RunSessionViewCommandResult = CommandResult
+
+pub type RunSessionViewRunner = fn(RunSessionViewCommandSpec) -> RunSessionViewCommandResult
+
+pub type RunSessionViewCheck = {
+  name: string,
+  command: string,
+  success: bool,
+  ok: bool,
+  status: string,
+  exit_code: int?,
+  stdout: string,
+  stderr: string,
+}
+
+pub type RunSessionViewTargetChange = {
+  known: bool,
+  changed: bool,
+  base_tag: string,
+  target_tag: string,
+  paths: list<string>,
+  detail: string,
+}
+
+pub type RunSessionViewGate = {
+  ok: bool,
+  check: RunSessionViewCheck,
+  cargo_target_dir: string,
+  metadata_ok: bool,
+  expected_json_count: int,
+  parse_errors: list<RunSessionViewParseError>,
+  schemas: list<RunSessionViewSchemaSummaryEntry>,
+  summary_line: string,
+  mock?: bool,
+}
+
+pub type RunSessionViewCleanup = {success: bool, status: string, exit_code: int?, stderr: string}
+
+pub type RunSessionViewFleetGate = RunSessionViewGate \
+  & {
+  skipped?: bool,
+  repo_version: string,
+  target_version: string,
+  target_change: RunSessionViewTargetChange,
+  source_repo?: string,
+  checked_repo?: string,
+  cleanup?: RunSessionViewCleanup,
+}
+
+pub type RunSessionViewReleaseAnalysis = {
+  diff_names: string,
+  commit_file_changes_since_latest_tag: string,
+  commit_stats_since_latest_tag: string,
+  changelog_section: string,
+  changelog_unreleased_section: string,
+}
+
+pub type RunSessionViewReleaseNoteStatus = {
+  changed: bool,
+  paths: list<string>,
+  required: bool,
+  present: bool,
+  ok: bool,
+}
+
+pub type RunSessionViewMarkdownTargetChange = {
+  known: bool,
+  changed?: bool,
+  paths?: list<string>,
+  detail?: string,
+}
+
+pub type RunSessionViewMarkdownGate = {
+  check?: {success: bool},
+  summary_line?: string,
+  target_change?: RunSessionViewMarkdownTargetChange,
+}
+
+fn norm_path(path: string?) {
+  return replace(path ?? "", "\\", "/")
+}
+
+fn normalize_target_tag(target: string?) {
+  const normalized_target = to_string(target ?? "")
+  return if starts_with(normalized_target, "v") {
+    normalized_target
+  } else {
+    "v" + normalized_target
+  }
+}
+
+fn rel_path(root: string?, path: string?) {
+  const base = norm_path(root)
+  const p = norm_path(path)
+  const prefix = if ends_with(base, "/") {
+    base
+  } else {
+    base + "/"
+  }
+  if starts_with(p, prefix) {
+    return p.substring(len(prefix))
+  }
+  return p
+}
+
+fn absolute_path(path: string?) {
+  const p = to_string(path ?? "")
+  return starts_with(p, "/") || starts_with(p, "\\\\")
+    || len(regex_captures("^[A-Za-z]:[\\\\/]", p))
+      > 0
+}
+
+fn resolve_path(base: string, path: string?) {
+  const p = trim(to_string(path ?? ""))
+  if p == "" || absolute_path(p) {
+    return p
+  }
+  return path_join(base, p)
+}
+
+fn path_list_separator(system: HarnessSystem) {
+  return if system.platform().os == "windows" {
+    ";"
+  } else {
+    ":"
+  }
+}
+
+fn prepend_path_entries(system: HarnessSystem, existing: string?, entries: list) {
+  const sep = path_list_separator(system)
+  let out = []
+  for entry in entries {
+    out = unique_push(out, entry)
+  }
+  for entry in to_string(existing ?? "").split(sep) {
+    out = unique_push(out, trim(entry))
+  }
+  return join(out, sep)
+}
+
+fn schema_kind(schema: any) {
+  if schema == RUN_VIEW_SCHEMA {
+    return "run"
+  }
+  if schema == SESSION_VIEW_SCHEMA {
+    return "session"
+  }
+  return "unknown"
+}
+
+fn fixture_expected_root(harn_repo: string) {
+  return path_join(harn_repo, "spec/run-view-fixtures/cases")
+}
+
+fn list_json_files_recursive(harness: Harness, dir: string) {
+  if !harness.fs.exists(dir) {
+    return []
+  }
+  let out = []
+  for name in harness.fs.list_dir(dir).sort() {
+    const full = path_join(dir, name)
+    const stat = harness.fs.stat(full)
+    if stat.is_dir {
+      out = out + list_json_files_recursive(harness, full)
+    } else if stat.is_file && ends_with(name, ".json") {
+      out = out + [full]
+    }
+  }
+  return out.sort()
+}
+
+fn run_session_view_fixture_paths(harness: Harness, harn_repo: string) {
+  const cases_root = fixture_expected_root(harn_repo)
+  if !harness.fs.exists(cases_root) {
+    return []
+  }
+  let out = []
+  for case_name in harness.fs.list_dir(cases_root).sort() {
+    const expected = path_join(cases_root, case_name, "expected")
+    out = out + list_json_files_recursive(harness, expected)
+  }
+  return out.sort()
+}
+
+fn schema_record_from_value(path: any, value: dict) {
+  const schema = value?.schema ?? ""
+  const version = value?.schema_version
+  if schema == "" || version == nil {
+    return nil
+  }
+  return {path: path, schema: schema, schema_version: version, kind: schema_kind(schema)}
+}
+
+fn parse_json_or_nil(text: string?) {
+  return try {
+    json_parse(text ?? "")
+  } catch (_e) {
+    nil
+  }
+}
+
+fn add_schema_summary(by_key: dict, record: dict) {
+  const key = record.schema + "@" + to_string(record.schema_version)
+  const existing = by_key[key]
+  if existing == nil {
+    return by_key
+      + {
+        [key]: {
+          schema: record.schema,
+          schema_version: record.schema_version,
+          kind: record.kind,
+          snapshot_count: 1,
+          paths: [record.path],
+        },
+      }
+  }
+  return by_key
+    + {
+      [key]: {
+        ...existing,
+        snapshot_count: existing.snapshot_count + 1,
+        paths: existing.paths + [record.path],
+      },
+    }
+}
+
+pub fn run_session_view_schema_summary_from_snapshots(
+  snapshots: list<RunSessionViewSnapshot>,
+) -> RunSessionViewSchemaSummary {
+  let by_key = {}
+  let parse_errors = []
+  for snapshot in snapshots {
+    const parsed = parse_json_or_nil(snapshot.text ?? "")
+    if parsed == nil {
+      parse_errors = parse_errors + [{path: snapshot.path, error: "invalid JSON"}]
+      continue
+    }
+    const raw_schema = parsed?.schema
+    const raw_version = parsed?.schema_version
+    if (raw_schema != nil || raw_version != nil)
+      && (type_of(raw_schema) != "string"
+        || type_of(raw_version)
+          != "int") {
+      parse_errors = parse_errors + [{path: snapshot.path, error: "invalid schema metadata"}]
+      continue
+    }
+    const record = schema_record_from_value(snapshot.path, parsed)
+    if record == nil {
+      continue
+    }
+    by_key = add_schema_summary(by_key, record)
+  }
+  const keys = by_key.keys().sort()
+  let schemas: list<RunSessionViewSchemaSummaryEntry> = []
+  for key in keys {
+    const schema = by_key[key]
+    if schema != nil {
+      schemas = schemas + [schema]
+    }
+  }
+  return {expected_json_count: len(snapshots), parse_errors: parse_errors, schemas: schemas}
+}
+
+pub fn run_session_view_schema_summary(
+  harness: Harness,
+  harn_repo: string,
+) -> RunSessionViewSchemaSummary {
+  let paths = run_session_view_fixture_paths(harness, harn_repo)
+  const snapshots = paths.map(
+    { path -> {path: rel_path(harn_repo, path), text: harness.fs.read_text(path)} },
+  )
+  return run_session_view_schema_summary_from_snapshots(snapshots)
+}
+
+fn run_session_view_schema_summary_line(summary: dict) {
+  const schemas = summary?.schemas ?? []
+  if len(schemas) == 0 {
+    return "no run/session view schema snapshots found"
+  }
+  return join(
+    schemas.map(
+      { s ->
+        return s.schema + "@" + to_string(s.schema_version) + " (" + to_string(s.snapshot_count)
+          + " snapshot(s))"
+      },
+    ),
+    ", ",
+  )
+}
+
+fn has_schema(summary: dict, schema: any) {
+  for s in summary?.schemas ?? [] {
+    if s.schema == schema {
+      return true
+    }
+  }
+  return false
+}
+
+fn run_session_view_metadata_ok(summary: dict) {
+  return len(summary?.parse_errors ?? []) == 0 && has_schema(summary, RUN_VIEW_SCHEMA)
+    && has_schema(summary, SESSION_VIEW_SCHEMA)
+}
+
+fn default_fixture_runner(
+  tools: HarnessTools,
+  repo: string,
+  command_env: RunSessionViewCommandEnvInput? = nil,
+) {
+  return command_run(
+    tools,
+    {argv: ["make", RUN_VIEW_CHECK_TARGET], cwd: repo, env: command_env},
+    {capture: {max_inline_bytes: 20000}},
+  )
+}
+
+fn named_fixture_check(result: RunSessionViewCommandResult) -> RunSessionViewCheck {
+  return {
+    name: RUN_VIEW_CHECK_TARGET,
+    command: "make " + RUN_VIEW_CHECK_TARGET,
+    success: result.success,
+    ok: result.success,
+    status: result.status,
+    exit_code: result.exit_code,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  }
+}
+
+fn run_session_view_check(
+  tools: HarnessTools,
+  harn_repo: string,
+  runner: RunSessionViewRunner? = nil,
+  command_env: RunSessionViewCommandEnvInput? = nil,
+) -> RunSessionViewCheck {
+  const r = if runner == nil {
+    default_fixture_runner(tools, harn_repo, command_env)
+  } else {
+    runner({repo: harn_repo, argv: ["make", RUN_VIEW_CHECK_TARGET], env: command_env})
+  }
+  return named_fixture_check(r)
+}
+
+pub fn run_session_view_gate(
+  harness: Harness,
+  harn_repo: string,
+  runner: RunSessionViewRunner? = nil,
+  command_env: RunSessionViewCommandEnvInput? = nil,
+) -> RunSessionViewGate {
+  const summary = run_session_view_schema_summary(harness, harn_repo)
+  const check = run_session_view_check(harness.tools, harn_repo, runner, command_env)
+  const metadata_ok = run_session_view_metadata_ok(summary)
+  return {
+    ok: check.success && metadata_ok,
+    check: check,
+    cargo_target_dir: command_env?.CARGO_TARGET_DIR ?? "",
+    metadata_ok: metadata_ok,
+    expected_json_count: summary.expected_json_count,
+    parse_errors: summary.parse_errors,
+    schemas: summary.schemas,
+    summary_line: run_session_view_schema_summary_line(summary),
+  }
+}
+
+pub fn run_session_view_mock_gate() -> RunSessionViewGate {
+  const summary = run_session_view_schema_summary_from_snapshots(
+    [
+      {
+        path: "spec/run-view-fixtures/cases/mock/expected/runs/run.run_view.json",
+        text: json_stringify({schema: RUN_VIEW_SCHEMA, schema_version: 1}),
+      },
+      {
+        path: "spec/run-view-fixtures/cases/mock/expected/session_view.json",
+        text: json_stringify({schema: SESSION_VIEW_SCHEMA, schema_version: 1}),
+      },
+    ],
+  )
+  const check = named_fixture_check(command_result_ok("mocked run/session view fixture check\n"))
+  return {
+    ok: true,
+    check: check,
+    cargo_target_dir: "",
+    metadata_ok: true,
+    expected_json_count: summary.expected_json_count,
+    parse_errors: summary.parse_errors,
+    schemas: summary.schemas,
+    summary_line: run_session_view_schema_summary_line(summary),
+    mock: true,
+  }
+}
+
+pub fn harn_repo_version(fs: HarnessFs, harn_repo: string) -> string {
+  const cargo = path_join(harn_repo, "Cargo.toml")
+  if !fs.exists(cargo) {
+    return ""
+  }
+  const matches = regex_captures("(?m)^version\\s*=\\s*\"([^\"]+)\"", fs.read_text(cargo))
+  if len(matches) == 0 {
+    return ""
+  }
+  return matches[0].groups[0]
+}
+
+pub fn run_session_view_cargo_target_dir_from_config(fs: HarnessFs, harn_repo: string) -> string {
+  const config = path_join(harn_repo, ".cargo/config.toml")
+  if !fs.exists(config) {
+    return ""
+  }
+  const matches = regex_captures("(?m)^\\s*target-dir\\s*=\\s*\"([^\"]+)\"", fs.read_text(config))
+  if len(matches) == 0 {
+    return ""
+  }
+  return resolve_path(harn_repo, matches[0].groups[0])
+}
+
+fn run_session_view_cargo_target_dir(harness: {fs: HarnessFs, env: HarnessEnv}, harn_repo: string) {
+  const env_target = trim(harness.env.get_or("CARGO_TARGET_DIR", ""))
+  if env_target != "" {
+    return resolve_path(harness.fs.cwd(), env_target)
+  }
+  const configured = run_session_view_cargo_target_dir_from_config(harness.fs, harn_repo)
+  if configured != "" {
+    return configured
+  }
+  return path_join(harness.fs.cwd(), ".harn-runs/run-session-view-cargo-target")
+}
+
+fn run_session_view_cargo_build_dir(cargo_target_dir: string?) {
+  const target = trim(cargo_target_dir ?? "")
+  if target == "" {
+    return ""
+  }
+  return path_join(target, "build")
+}
+
+fn run_session_view_base_command_env(harness: {env: HarnessEnv, system: HarnessSystem}) {
+  const home = harness.env.get_or("HOME", harness.env.get_or("USERPROFILE", ""))
+  const tool_paths = if home == "" {
+    []
+  } else {
+    [
+      path_join(home, ".cargo/bin"),
+      path_join(home, ".local/share/mise/shims"),
+      path_join(home, ".local/bin"),
+    ]
+  }
+  const platform_paths = if harness.system.platform().os == "windows" {
+    []
+  } else {
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+  }
+  return {
+    CARGO_BUILD_RUSTC_WRAPPER: "",
+    CARGO_INCREMENTAL: "0",
+    // A hosted release is launched by the previously published Harn binary,
+    // but view fixtures describe the candidate source contract. Force this
+    // gate through the checkout's harn_bin.sh so schema evolution is checked
+    // by the binary that defines it rather than by the prior release.
+    HARN_BIN: "",
+    HARN_BIN_NO_BUILD: "",
+    PATH: prepend_path_entries(
+      harness.system,
+      harness.env.get_or("PATH", ""),
+      tool_paths + platform_paths,
+    ),
+    RUSTC_WRAPPER: "",
+    SCCACHE_DISABLE: "1",
+  }
+}
+
+fn run_session_view_command_env_for_target(
+  harness: {env: HarnessEnv, system: HarnessSystem},
+  cargo_target_dir: string?,
+) {
+  const target = trim(cargo_target_dir ?? "")
+  return run_session_view_base_command_env({env: harness.env, system: harness.system})
+    + {CARGO_TARGET_DIR: target, CARGO_BUILD_BUILD_DIR: run_session_view_cargo_build_dir(target)}
+}
+
+pub fn run_session_view_command_env(
+  harness: Harness,
+  harn_repo: string,
+) -> RunSessionViewCommandEnv {
+  return run_session_view_command_env_for_target(
+    {env: harness.env, system: harness.system},
+    run_session_view_cargo_target_dir({fs: harness.fs, env: harness.env}, harn_repo),
+  )
+}
+
+pub fn run_session_view_fleet_command_env(
+  harness: {env: HarnessEnv, system: HarnessSystem},
+  harn_checkout: string,
+) -> RunSessionViewCommandEnv {
+  return run_session_view_command_env_for_target(
+    {env: harness.env, system: harness.system},
+    path_join(harn_checkout, ".target/run-session-view-gate"),
+  )
+}
+
+pub fn run_session_view_release_command_env(
+  harness: Harness,
+  harn_checkout: string,
+  release_cargo_target_dir: string,
+) -> RunSessionViewCommandEnv {
+  const base = run_session_view_command_env(harness, harn_checkout)
+  const target = trim(release_cargo_target_dir ?? "")
+  if target == "" {
+    return base
+  }
+  return run_session_view_command_env_for_target({env: harness.env, system: harness.system}, target)
+}
+
+fn unique_push(values: string | list, value: string) {
+  if value == "" || contains(values, value) {
+    return values
+  }
+  return values + [value]
+}
+
+pub fn run_session_view_contract_paths_from_text(text: string) -> list<string> {
+  let paths = []
+  const body = norm_path(text ?? "")
+  for marker in CONTRACT_PATH_MARKERS {
+    if contains(body, marker) {
+      paths = unique_push(paths, marker)
+    }
+  }
+  return paths.sort()
+}
+
+fn run_session_view_contract_change(analysis: RunSessionViewReleaseAnalysis) {
+  const evidence = join(
+    [
+      analysis.diff_names ?? "",
+      analysis.commit_file_changes_since_latest_tag ?? "",
+      analysis.commit_stats_since_latest_tag ?? "",
+    ],
+    "\n",
+  )
+  let paths = run_session_view_contract_paths_from_text(evidence)
+  return {changed: len(paths) > 0, paths: paths}
+}
+
+fn note_text_mentions_view_schema(text: string?) {
+  const lower = lowercase(text ?? "")
+  for marker in NOTE_MARKERS {
+    if contains(lower, marker) {
+      return true
+    }
+  }
+  return false
+}
+
+fn changelog_fragment_text(fs: HarnessFs, harn_repo: string) {
+  const dir = path_join(harn_repo, "changelog.d")
+  if !fs.exists(dir) {
+    return ""
+  }
+  let parts = []
+  for name in fs.list_dir(dir).sort() {
+    if !ends_with(name, ".md") {
+      continue
+    }
+    const full = path_join(dir, name)
+    if fs.stat(full).is_file {
+      parts = parts + [fs.read_text(full)]
+    }
+  }
+  return join(parts, "\n")
+}
+
+pub fn run_session_view_release_note_status(
+  fs: HarnessFs,
+  harn_repo: string,
+  analysis: RunSessionViewReleaseAnalysis,
+) -> RunSessionViewReleaseNoteStatus {
+  const change = run_session_view_contract_change(analysis)
+  const note_text = join(
+    [
+      analysis.changelog_section,
+      analysis.changelog_unreleased_section,
+      changelog_fragment_text(fs, harn_repo),
+    ],
+    "\n",
+  )
+  const present = note_text_mentions_view_schema(note_text)
+  return {
+    changed: change.changed,
+    paths: change.paths,
+    required: change.changed,
+    present: present,
+    ok: !change.changed || present,
+  }
+}
+
+pub fn run_session_view_target_change_probe(
+  tools: HarnessTools,
+  harn_repo: string,
+  target: string,
+  runner: RunSessionViewRunner? = nil,
+) -> RunSessionViewTargetChange {
+  const run = if runner == nil {
+    { spec -> command_run(tools, spec, {cwd: harn_repo, capture: {max_inline_bytes: 12000}}) }
+  } else {
+    runner
+  }
+  const target_tag = normalize_target_tag(target)
+  const previous = run({argv: ["git", "describe", "--tags", "--abbrev=0", target_tag + "^"]})
+  if !previous.success || trim(previous.stdout ?? "") == "" {
+    return {
+      known: false,
+      changed: false,
+      base_tag: "",
+      target_tag: target_tag,
+      paths: [],
+      detail: trim(previous.stderr ?? "could not resolve previous release tag"),
+    }
+  }
+  const base_tag = trim(previous.stdout)
+  const diff = run({argv: ["git", "diff", "--name-only", base_tag + ".." + target_tag]})
+  if !diff.success {
+    return {
+      known: false,
+      changed: false,
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: [],
+      detail: trim(diff.stderr ?? "could not diff release range"),
+    }
+  }
+  let paths = run_session_view_contract_paths_from_text(diff.stdout ?? "")
+  return {
+    known: true,
+    changed: len(paths) > 0,
+    base_tag: base_tag,
+    target_tag: target_tag,
+    paths: paths,
+    detail: if len(paths) == 0 {
+      "no run/session view contract files changed from ${base_tag} to ${target_tag}"
+    } else {
+      "run/session view contract files changed from ${base_tag} to ${target_tag}: "
+        + join(paths, ", ")
+    },
+  }
+}
+
+fn gate_failure_from_checkout(
+  harness: Harness,
+  harn_repo: string,
+  target: string,
+  stderr: string,
+  target_change_detail: string = "",
+) -> RunSessionViewFleetGate {
+  const wanted = strip_v(target ?? "")
+  const have = harn_repo_version(harness.fs, harn_repo)
+  const summary = run_session_view_schema_summary(harness, harn_repo)
+  const check = named_fixture_check(command_result_fail(2, stderr))
+  return {
+    ok: false,
+    check: check,
+    cargo_target_dir: "",
+    metadata_ok: run_session_view_metadata_ok(summary),
+    expected_json_count: summary.expected_json_count,
+    parse_errors: summary.parse_errors,
+    schemas: summary.schemas,
+    summary_line: run_session_view_schema_summary_line(summary),
+    repo_version: have,
+    target_version: wanted,
+    target_change: {
+      known: false,
+      changed: false,
+      base_tag: "",
+      target_tag: normalize_target_tag(target),
+      paths: [],
+      detail: if target_change_detail == "" {
+        stderr
+      } else {
+        target_change_detail
+      },
+    },
+  }
+}
+
+fn run_session_view_fleet_checkout_gate(
+  harness: Harness,
+  harn_repo: string,
+  target: string,
+  runner: RunSessionViewRunner? = nil,
+  change_runner: RunSessionViewRunner? = nil,
+  command_env: RunSessionViewCommandEnvInput? = nil,
+) -> RunSessionViewFleetGate {
+  const wanted = strip_v(target ?? "")
+  const have = harn_repo_version(harness.fs, harn_repo)
+  if have == "" {
+    return gate_failure_from_checkout(
+      harness,
+      harn_repo,
+      target,
+      "could not read Harn version from ${harn_repo}/Cargo.toml",
+      "version unavailable",
+    )
+  }
+  if have != wanted {
+    return gate_failure_from_checkout(
+      harness,
+      harn_repo,
+      target,
+      "Harn checkout at ${harn_repo} is version ${have}, but fleet target is ${wanted}; the gate must run against the exact release tag before bumping",
+      "version mismatch",
+    )
+  }
+  const gate = run_session_view_gate(harness, harn_repo, runner, command_env)
+  const target_change = run_session_view_target_change_probe(
+    harness.tools,
+    harn_repo,
+    target,
+    change_runner,
+  )
+  return {
+    ok: gate.ok && target_change.known,
+    check: gate.check,
+    cargo_target_dir: gate.cargo_target_dir,
+    metadata_ok: gate.metadata_ok,
+    expected_json_count: gate.expected_json_count,
+    parse_errors: gate.parse_errors,
+    schemas: gate.schemas,
+    summary_line: gate.summary_line,
+    repo_version: have,
+    target_version: wanted,
+    target_change: target_change,
+  }
+}
+
+fn git_in_repo(tools: HarnessTools, repo: string, argv: list) {
+  return command_run(tools, {argv: argv, cwd: repo}, {capture: {max_inline_bytes: 20000}})
+}
+
+pub fn run_session_view_fleet_gate(
+  harness: Harness,
+  harn_repo: string,
+  target: string,
+  runner: RunSessionViewRunner? = nil,
+  change_runner: RunSessionViewRunner? = nil,
+) -> RunSessionViewFleetGate {
+  if runner != nil || change_runner != nil {
+    return run_session_view_fleet_checkout_gate(harness, harn_repo, target, runner, change_runner)
+  }
+  const target_tag = normalize_target_tag(target)
+  const fetch = git_in_repo(
+    harness.tools,
+    harn_repo,
+    ["git", "fetch", "--tags", "--quiet", "origin"],
+  )
+  if !fetch.success {
+    return gate_failure_from_checkout(
+      harness,
+      harn_repo,
+      target,
+      "could not fetch Harn tags before run/session view gate: " + trim(fetch.stderr ?? ""),
+      "tag fetch failed",
+    )
+  }
+  const worktree = path_join(
+    harness.fs.temp_dir(),
+    "harn-run-view-gate-" + harness.random.uuid_v7(),
+  )
+  const add = git_in_repo(
+    harness.tools,
+    harn_repo,
+    ["git", "worktree", "add", "--detach", worktree, target_tag],
+  )
+  if !add.success {
+    return gate_failure_from_checkout(
+      harness,
+      harn_repo,
+      target,
+      "could not create temporary Harn worktree for ${target_tag}: " + trim(add.stderr ?? ""),
+      "target tag checkout failed",
+    )
+  }
+  const command_env = run_session_view_fleet_command_env(
+    {env: harness.env, system: harness.system},
+    worktree,
+  )
+  const gate = run_session_view_fleet_checkout_gate(
+    harness,
+    worktree,
+    target,
+    nil,
+    nil,
+    command_env,
+  )
+  const cleanup = git_in_repo(
+    harness.tools,
+    harn_repo,
+    ["git", "worktree", "remove", "--force", worktree],
+  )
+  return {
+    ok: gate.ok,
+    check: gate.check,
+    cargo_target_dir: gate.cargo_target_dir,
+    metadata_ok: gate.metadata_ok,
+    expected_json_count: gate.expected_json_count,
+    parse_errors: gate.parse_errors,
+    schemas: gate.schemas,
+    summary_line: gate.summary_line,
+    repo_version: gate.repo_version,
+    target_version: gate.target_version,
+    target_change: gate.target_change,
+    source_repo: harn_repo,
+    checked_repo: worktree,
+    cleanup: {
+      success: cleanup.success,
+      status: cleanup.status,
+      exit_code: cleanup.exit_code,
+      stderr: trim(cleanup.stderr ?? ""),
+    },
+  }
+}
+
+pub fn run_session_view_downstream_markdown(
+  target: string,
+  gate: RunSessionViewMarkdownGate,
+) -> string {
+  const change = gate.target_change
+    ?? {known: false, changed: false, paths: [], detail: "not checked"}
+  const change_line = if change.known {
+    if change.changed {
+      "yes — " + join(change.paths ?? [], ", ")
+    } else {
+      "no"
+    }
+  } else {
+    "unknown — " + to_string(change.detail ?? "change probe did not complete")
+  }
+  return join(
+    [
+      "## Harn run/session view compatibility",
+      "",
+      "- Target Harn version: `${target}`.",
+      "- Fixture gate: `make check-run-view-fixtures` "
+        + if gate.check?.success ?? false {
+          "passed"
+        } else {
+          "failed"
+        }
+        + ".",
+      "- Tested schemas: " + to_string(gate.summary_line ?? "unknown") + ".",
+      "- View-schema or fixture change in this bump: " + change_line + ".",
+      "",
+      "This metadata is generated by `harn-bump-fleet` before auto-merge so downstream repos can see whether adopting this Harn bump carries a run/session view contract change.",
+    ],
+    "\n",
+  )
+}

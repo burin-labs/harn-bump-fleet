@@ -1,0 +1,398 @@
+# AGENTS.md
+
+## Repo shape
+
+This is a Harn-only operations repo. There is no Python or shell glue in the
+harnesses themselves.
+
+The entry points are:
+
+- `bump_fleet.harn`: finds local `~/projects/{*harn*,*burin*}` repos with
+  `.github/workflows/bump-harn.yml`, dispatches Harn runtime bump workflows,
+  polls them, and enables auto-merge on the resulting PRs.
+- `release_harn.harn`: mirrors the human `/release-harn` flow for
+  `~/projects/harn`. The launcher dispatches its default read-only audit to the
+  same hosted workflow as a live release. `--local-audit` is diagnosis only.
+  Live prepare/ship-pr requires `--yes-live-release`.
+- `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
+  written after certification by `release_harn`. It signs and pushes the
+  immutable candidate tag, arms the release pull request under its exact head
+  lease, then monitors publication and the independent PR merge
+  without repeating preparation. `--tag-stranded-main <sha>` recovers a release
+  whose bump merged without a tag; `--unfold-merged-bump <sha>` opens the revert
+  for a bump that merged and must not be published.
+- `sweep_release_refs.harn`: inventories historical local and remote release
+  refs. It is dry-run-first and applies only exact, tag-backed deletions.
+- `reap_chain_refs.harn`: clears `harn-update-chain/<chain id>` leases whose
+  every owning run reached a terminal conclusion, so a round that died before it
+  could release its own lease does not force the next release to start a fresh
+  chain around the dead one. Dry-run-first. It refuses a chain with a live run,
+  an unreadable run list, or no resolvable run, and its receipt distinguishes
+  reading zero refs from failing to read.
+- `abandon_release_attempts.harn`: frees a version wedged by leftover
+  `release-attempt/vX.Y.Z/` refs by renaming each unclaimed attempt into
+  `release-failed/vX.Y.Z/<oid>-abandoned`. Dry-run-first, and it refuses when a
+  tag, a published release, or an open PR still claims an attempt. Both modes
+  hold the `release-owner` lease and refuse while a live release owns it.
+- `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
+  artifacts. It is not CI and should stay out of the main release/bump path.
+- `report_failed_hosted_release.harn`: the terminal finalizer for a failed
+  hosted release. It reads the run's failing step and the inputs the run
+  recorded when it started, then writes one typed receipt naming the
+  precondition that failed and the exact re-dispatch that would retry it. It
+  never dispatches anything. `lib/hosted_release_failure.harn` owns the step
+  registry that decides what each failure means and whether a re-dispatch is a
+  sane repair at all; a step the registry does not name escalates rather than
+  defaulting to a retry, and `check_hosted_release_failure_coverage.harn` keeps
+  the registry and the workflow in step in both directions. Whether a step runs
+  before or after the release is irreversible is never registered by hand: it is
+  read from the step's position relative to `Run release harness`, and a failure
+  on the far side of that boundary is routed to recovery rather than to any
+  dispatch of the release workflow.
+- `lib/release_chain_driver.harn`: the one thing that moves a release chain and
+  the only thing that applies an effect. Every side effect goes through its
+  adapter's `apply_effect`, called from the planned-repair arm alone, and
+  control events are read before a stage is observed so a stand-down abandons
+  the remaining stages instead of only stopping the reporting. Its run receipt
+  names the proven, pending, and abandoned stages rather than reporting a
+  count. `release_chain.harn --plan` drives a journal read-only: its effect door
+  refuses, so a chain needing a repair says so instead of taking it.
+- `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
+  agent contract and `CLAUDE.md` projection without replacing local rules.
+- `sync_package_ci.harn`: checks or applies package CI for repositories that
+  delegate ownership in `fleet.toml`. `package_ci_ownership = "fleet"` owns the
+  whole `ci.yml`. `"pin"` owns only the canonical package job's `uses:` line.
+  Use `"pin"` for a repository whose CI is a superset of that job, and whose
+  other jobs are its own.
+- `sync_bump_workflows.harn`: checks or applies exact runtime-bump adapters for
+  every repository that delegates bump workflow ownership in `fleet.toml`.
+- `sync_connector_secrets.harn`: checks or applies the manifest-owned
+  `[providers.setup].required_secrets` projection for every first-party
+  connector. `policy.connector_secret_schema` keeps the output compatible with
+  the released Harn manifest schema until the fleet can move as one.
+- `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
+  harnesses. It reads every fleet-owned projection from its target's default
+  branch and proposes the repair as a pull request, so drift converges without a
+  machine holding all twenty-six checkouts. Pin-only package CI is derived from
+  current default-branch bytes and preserves repository-owned jobs. Dry-run
+  first; `--apply` writes.
+  `--apply` also arms auto-merge, leased to the commit it published, so each
+  repair lands once that repository's own checks pass. `--no-auto-merge` holds
+  arming; it never merges anything itself.
+
+Shared code belongs in `lib/*.harn`. Every shared module should have focused
+coverage in `tests/*.harn`.
+
+`release_harn.harn` is the thin orchestration entrypoint and public facade.
+Release implementation changes belong in the stage that owns the behavior:
+
+- `release_runtime`: CLI/config, harness paths, typed git/GitHub adapters,
+  mock commands, run events, and timing
+- `release_analysis`: release facts, commit/PR evidence, and deterministic
+  analysis prompts
+- `release_agent_tools` / `release_agent`: agent tool boundaries, review,
+  validation, artifacts, and recovery
+- `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
+  reconciliation, branch setup, and checkout state
+- `release_note_fold` / `release_notes`: candidate-tree folding, release notes,
+  and fixup/drift state
+- `release_reporting`: PR rendering and execution summaries
+- `release_crystallization`: deterministic, agent, and tool fixture streams
+  plus their manifest and artifact writer
+- `release_modes`: prepare execution, thin ship-phase composition, and cleanup
+- `release_ship_prepare`: prepared commit and immutable attempt publication
+- `release_ship_certify`: cutoff and exact-candidate certification gates
+- `release_ship_pr`: PR publication and watch-receipt handoff
+- `release_candidate_tag`: certified-candidate tagging and write-once receipt binding
+- `release_main_tag`: historical merged-main recovery and bump reversal
+- `release_main_drift`: the drift reading those recoveries decide on, and
+  the union of ruleset-required and repository-declared release contexts
+- `release_preflight`: interactive flags, planner/fleet/sccache checks, and
+  build-lock lifecycle
+
+Do not put stage policy back in the entrypoint or add a second implementation
+behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line
+ceiling for every maintained handwritten source file.
+
+`check_regex_captures_coverage.harn` parses every tracked module, finds every
+`regex_captures` call site, and refuses one that no test pipeline reaches.
+`regex_captures` returns match objects rather than capture strings, and a
+caller that misreads that shape behaves exactly like a no-match, which neither
+the type checker nor a test that stubs the function can catch. Cover a new call
+site by putting it in a function a test calls, or record it by name with a
+reason in `regex-captures-coverage-baseline.json`; the baseline is exact in
+both directions, so a site it lists that is now covered is also a failure.
+
+Every pull request this repository opens gets its title from
+`lib/pr_title_convention.harn`, never from a literal at the call site.
+`burin-labs/harn` runs a required title gate that refuses a subject without a
+leading `[Area]` from its own area list, and a bot pull request is not exempt.
+`check_pr_title_convention.harn` refuses a registered title that gate would
+reject, and refuses a pull-request call site the module does not name, so a new
+opener cannot ship an unowned title.
+
+## Commands
+
+Use the pinned Harn version from `.harn-version`.
+
+```sh
+scripts/install_harn.sh
+.harn/bin/harn install --locked
+scripts/harn-project.sh verify
+scripts/harn-project.sh test
+.harn/bin/harn test tests-risky/release_ref_cleanup_git_push.harn --approve-risky git.push --verbose
+```
+
+`scripts/harn-project.sh verify` includes tracked and non-ignored untracked Harn
+sources with filename-safe argument handling. Use `scripts/harn-project.sh
+format` for formatting fixes. CI passes `--tracked-only` to verify the exact
+committed tree.
+
+Common harness runs:
+
+```sh
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
+scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
+scripts/run_harn_release.sh
+scripts/run_harn_release.sh --mock --agent --mode ship-pr
+scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
+scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
+scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
+scripts/with_env.sh harn run --no-sandbox sync_connector_secrets.harn -- --check
+scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --check
+```
+
+Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
+are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
+another session may replace the `harn` binary while the process is running.
+Release and watch runs use `scripts/run_harn_release.sh` and
+`scripts/watch_harn_release.sh`. Those launchers retain Harn's worktree sandbox
+and grant the selected Harn checkout, its dedicated sibling release-workspace
+root, shared leases, toolchain caches, network, and the existing `gh` login at
+one audited boundary. Other fleet operations
+still need `--no-sandbox` until they have an equivalent typed root inventory.
+
+Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
+installs the pinned CLI into this repo's ignored `.harn/bin`.
+`scripts/with_env.sh` and `scripts/harn_shielded.sh` prefer that binary over a
+stale global `harn` on `PATH`.
+
+Use the release/watch launchers for their entrypoints and
+`scripts/with_env.sh harn ...` for other documented harness invocations. They
+install and select the repo-pinned runtime before Harn parses the program and
+load the provider environment without putting secrets on the command line.
+Direct ambient `harn` invocations are not a supported release path. Hosted and
+local releases are alternative owners of the same lane, not parallel fallbacks:
+do not start one while the other is active. Run only one live release watcher;
+the watcher host lease refuses a second local receipt writer. Always start that
+watcher through `scripts/watch_harn_release.sh`; it selects and shields the
+repo-pinned runtime and supplies the exact `git.push` operator grant required by
+terminal leased-ref cleanup.
+
+## Implementation rules
+
+Keep GitHub side effects deterministic. Production GitHub reads and writes go
+through typed connector contracts, and every head-sensitive mutation carries
+the observed PR-head lease. `gh` is limited to read-only diagnostic agent
+allowlists and explicit manual-recovery instructions. Model output may
+summarize, audit, or draft text. Deterministic code must validate or parse that
+output before it affects files, PRs, tags, dispatches, or merge settings.
+
+An out-of-band harness that rewrites shared release refs must serialize on the
+`release-owner` host lease, the same lane `release_harn` takes. Terminal
+evidence — a tag, a published release, an open PR — cannot substitute for it.
+A release that has not tagged yet has none of those. Its in-flight candidate is
+therefore indistinguishable from abandoned state.
+`abandon_release_attempts.harn` holds the lane in both modes for exactly this
+reason.
+
+`sweep_release_refs.harn` does not need the lease. Every deletion it applies is
+gated on positive proof that a published tag recovers the exact OID, and an
+in-flight candidate can never satisfy that. Adding a new mutation path means
+deciding which of those two shapes it has, and saying so.
+
+Route model defaults through `lib/llm_defaults`:
+
+- Use `planner_defaults("HARN_<ROLE>")` for new planner calls.
+- Use `install_binder(tools)` for every tool-using agent loop. It is a no-op
+  when disabled.
+- Print `planner_audit_line` and `binder_audit_line` where a harness already
+  reports model routing.
+
+Prefer the Harn stdlib over local helpers:
+
+- `std/cli::parse_args` for argv parsing.
+- `std/command` for long-running side effects and reusable output artifacts.
+- `std/git` for checkout cleanup and base-branch sync.
+- `std/poll`, `std/settled`, `std/jsonl`, and `std/config` for polling,
+  settled-result handling, JSONL, and env parsing.
+- `std/agent/loop::agent_loop` for each model turn. Fleet's
+  `lib/interactive_agent_chat.harn` owns TTY input, slash commands, and
+  presentation; do not rebuild an orchestration plane around it.
+
+When adding a prompt or run artifact, keep deterministic facts separate from
+model-authored text. Generated artifacts under `.harn-runs/` and `.harn/` stay
+ignored and must not be committed.
+
+## Release policy
+
+`release_harn.harn` pins each live release at startup from `--at-sha`,
+`HARN_EXT_RELEASE_PIN_SHA`, or `origin/<base>`. The local `release/vX.Y.Z` branch is
+parented at that pin and is never published. Canonical ship mode materializes
+and signs the versioned candidate, publishes one OID-qualified immutable
+`release-attempt/...` ref, then certifies that prepared OID rather than the
+pre-bump parent. Hosted Windows/macOS and local source proof runs concurrently
+with the Linux release-size gate; residual generated-content proof follows the
+join. A write-once `release-certify/<candidate-oid>` branch lets GitHub dispatch
+the exact commit while `main` keeps merging. Any missing, stale, moved, or red
+lane blocks the release PR. The startup pin identifies the candidate's parent
+and prevents preparation from silently advancing to newer main content.
+The release pull request opens unarmed after certification succeeds. The watcher
+verifies the candidate's pinned parent and immutable certification ref, signs
+`vX.Y.Z` at that exact candidate, and binds the receipt to it once. Main may
+continue changing throughout this process; those changes cannot enter the tag.
+After tagging, the watcher arms the release PR and independently monitors its
+merge, publication, assets, and cache warm. Publish/build workflows derive from
+the immutable tag; no candidate archive is promoted as the release artifact.
+If the release PR conflicts with main, the watcher stops with a conflict result
+and preserves its receipt and refs. Post-publish fixup owns that repair.
+
+`preflight_package_test_compatibility.harn` runs package test discovery for
+every managed package under the candidate runtime before a cut, without
+mutating any repository. A package whose test files discover no tests is a named
+compatibility failure carrying the files and the migration, never a green count:
+that is the shape this gate exists for, because package verification used to
+pass while running nothing. A receipt that is absent, malformed, or missing its
+counts is recorded as unmeasured rather than as a pass, and a run whose
+inventory mutated the checkout fails outright. The fleet's pinned runtime in
+`.harn-version` must be a release whose `harn package test-inventory` can
+perform the inventory; an older pin makes every row unmeasured, which the gate
+reports rather than hides.
+
+A consumer pre-tag gate retries a dispatch the network dropped. Transport
+failures and 5xx responses are sent again with bounded backoff, five sends over
+about two minutes, because a request that was dropped in transit may never have
+arrived and sending it again is the only way to find out. A refusal the remote
+actually answered is not retried: it is a fact about that request and repeating
+it only delays a real answer. Every send is recorded on the gate receipt, so a
+retry that ran can be told from one that did not, and an exhausted bound reports
+`consumer_dispatch_unreachable` naming the last error rather than a bare
+unreadable. Whether a failure is transient is decided by
+`fleet_observation_class`, which owns that question for every connector error
+here, so the two answers cannot drift apart.
+A failed stage repairs itself only through `lib/release_chain_effect_door.harn`,
+the single place where a planned effect becomes an action. Its allowlist names
+every effect a repair may perform, and no entry dispatches the release workflow,
+so a repair can never produce a second cut of a published version. A repair runs
+at most once: the caller supplies the idempotency keys the chain has already
+spent and a repeat is refused, so a replayed chain refuses for the same reason a
+live one does. An effect counts as done only on evidence it read back; an empty,
+missing, or unattributed read-back escalates, because a door that accepted
+silence would report every unreachable dispatch as a successful repair. An
+unmapped cause, an unmapped effect kind, and an exhausted bound all stop with a
+typed reason rather than falling through to a retry.
+
+A release whose bump merged without a tag is recovered by
+`recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
+cut the release preflight refuses. That mode tags the stranded merge commit only
+after it re-proves admitted drift and runs any release-only lanes on the exact
+commit. Unreadable or stale proof refuses the tag, and a red lane unfolds the
+bump.
+
+The opposite recovery is `unfold-merged-bump`, for a bump that merged and must
+not be published. It opens the revert that returns main to its development
+version and restores the folded changelog fragments, and refuses once the tag is
+public, because reverting a commit a tag names does not unpublish the tag. The
+release opens that revert itself when the post-merge lanes fail; the mode exists
+for a watch that died between the merge and the verdict.
+
+A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
+rebuilds that candidate on fresh base, the fresh base is part of the artifact.
+Fold its current `## Unreleased` body and every parseable fragment into the
+candidate release section before certification. Only an already-tagged fixup
+may preserve newer notes for the following release.
+
+If release assets already exist and an open `release/vX.Y.Z` PR remains,
+post-publish fixup mode is paperwork only. It does the following:
+
+- recreates the branch on fresh base;
+- preserves the shipped release body from the tag;
+- leaves post-publish `## Unreleased` entries in place;
+- skips retagging, and refreshes the PR.
+
+Changed prepared content creates a new immutable attempt ref and PR. A retry
+resumes only when the recorded ref still resolves to the exact prepared OID.
+
+## Repo hygiene
+
+This repo is public. Do not commit private repo details, customer data, secrets,
+local paths from private investigations, or inside-baseball notes from private
+Burin repositories.
+
+Keep agent-facing docs short. Put durable reference material in `README.md` or
+code comments near the relevant logic. Avoid time-sensitive comments that
+compare against older implementations; explain the current invariant and why it
+exists.
+
+Documentation should read plainly: no emoji, no title-case section headings, no
+marketing phrasing, no vague claims, and no filler endings. Use bullets only
+where they make scanning easier.
+
+Before opening a PR, rebase on the latest `origin/main` and run the checks
+above. Review your own diff for stale comments and duplicated abstractions.
+Then push a branch, and enable auto-merge when CI is green.
+
+## Pull requests
+
+Title every pull request `[Area] Sentence case description`. Capitalize the
+first word of the description and proper nouns only, and leave the trailing
+period off.
+
+`Area` is one of these, chosen from this repository's directory map:
+
+| Area | Covers |
+| --- | --- |
+| `Release` | `release_*.harn`, `release_harn.harn`, the watchers, and publication proof |
+| `Fleet` | `fleet.toml` membership and policy, dispatch, and repair |
+| `Bump` | Runtime bump orchestration, `.harn-version` pins, and bump adapters |
+| `Projections` | Fleet-owned file projections, drift checks, and convergence |
+| `CI` | This repository's own workflows and required checks |
+| `Scripts` | Launchers and wrappers under `scripts/` |
+| `Docs` | `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and `docs/` |
+| `Tests` | `tests/` and `tests-risky/` coverage |
+
+Pick the area that owns the behavior you changed, not the file you touched most.
+A change to `lib/release_ship_pr.harn` is `[Release]` even though it lives under
+`lib/`. If two areas fit, the pull request is probably two pull requests.
+
+Keep the description to 3-5 sentences: what changed, why, the one risk, and how
+you verified it. Do not list test commands. `.github/pull_request_template.md`
+carries a worked example.
+
+The same words are the `area/*` labels in `.github/labels.yml`, so a title and a
+label agree.
+
+Use `Closes #N` only when the pull request lands every enumerated sub-ask in
+that issue. A partial resolution uses `Partial: #N items: 1, 3` or `Refs #N`;
+adding an item suffix after `Closes #N` does not stop GitHub from closing the
+whole issue. Use `Single-ask: #N` only when the issue has no enumerated
+sub-asks and the pull request resolves it completely.
+
+<!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->
+
+## Ecosystem working agreement
+
+- Pursue the ambitious product outcome; make the seams boring with small typed
+  interfaces, explicit invariants, and deterministic projections.
+- Give each behavior one semantic owner. Generate or parity-test other surfaces
+  instead of maintaining competing implementations.
+- Work autonomously inside approved scope. Pause for destructive, production,
+  high-spend, ambiguous, or authority-expanding actions—not routine reversible work.
+- Treat stop, wait, stand down, and pivot as control events for long-lived work.
+- Match evidence to the claim: exercise the canonical user path, state the
+  falsifier, verify liveness and recovery, and record residual blind spots.
+- "Ship" means landed on main with required deploy and post-merge checks complete.
+
+<!-- END HARN SHARED AGENT CONTRACT -->

@@ -1,0 +1,1 @@
+Fleet convergence observes an accepted dispatch through the hydrated repository list, so a consumer-owned repository no longer aborts the round, and an unreadable proof receipt now schedules a successor instead of refusing to read.

@@ -1,0 +1,1 @@
+Removed the mock release-rehearsal matrix and its `--rehearsal` flag. Its only substantive leg already runs as the required `Release harness integration` CI job, which now also repeats under a poisoned operator environment and TMPDIR pressure.

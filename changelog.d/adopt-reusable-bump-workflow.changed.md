@@ -1,0 +1,1 @@
+- Replaced the hand-rolled `bump-harn.yml` state machine with a thin caller of Harn's reusable bump workflow, moved the validation gate to match `harn-static.yml` (`--strict-types`, `--strict`, source-length budget, tests), and switched `.harn-version` to the bare-semver form the reusable workflow writes.

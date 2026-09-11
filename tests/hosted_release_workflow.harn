@@ -1,0 +1,946 @@
+import { shell_quote } from "std/runtime"
+import { with_temp_dir } from "std/testing"
+import { decode_github_workflow } from "../lib/github_workflow"
+import { undeclared_job_variables } from "../lib/workflow_step_environment"
+
+fn hosted_release_workflow(fs: HarnessFs) -> string {
+  return fs.read_text(path_join(dirname(fs.cwd()), ".github", "workflows", "hosted-release.yml"))
+}
+
+fn canceled_lane_cleanup_workflow(fs: HarnessFs) -> string {
+  return fs.read_text(
+    path_join(dirname(fs.cwd()), ".github", "workflows", "cleanup-cancelled-hosted-release.yml"),
+  )
+}
+
+fn recovery_release_workflow(fs: HarnessFs) -> string {
+  return fs.read_text(
+    path_join(dirname(fs.cwd()), ".github", "workflows", "recover-release-publication.yml"),
+  )
+}
+
+fn recovery_artifact_upload_preserves_hidden_receipts(upload: any) -> bool {
+  return upload.with?.get("path") == "harn-bump-fleet/.harn-runs/**"
+    && upload.with?.get("include-hidden-files") == true
+    && upload.with?.get("if-no-files-found") == "error"
+}
+
+fn recovery_fixture_shell(process: HarnessProcess, command: string) {
+  const result = process.shell(command)
+  if !result.success {
+    throw "recovery fixture command failed: ${command}\n${result.combined}"
+  }
+  return result
+}
+
+fn matching_tag_resumes_publication(steps: list<any>) -> bool {
+  const resume = steps.find({ step -> step.name == "Resume publication from the durable receipt" })
+  return resume != nil
+    && resume?.get("if") == nil
+    && contains(resume?.run ?? "", "./scripts/watch_hosted_harn_release.sh")
+    && contains(resume?.run ?? "", "| tee .harn-runs/recover-release-watch.json")
+}
+
+fn run_recovery_identity_guard(
+  process: HarnessProcess,
+  repo: string,
+  output: string,
+  guard_run: string,
+  tag: string,
+  merge_oid: string,
+) {
+  return process.shell(
+    "cd "
+      + shell_quote(repo)
+      + " && TAG="
+      + shell_quote(tag)
+      + " MERGE_OID="
+      + shell_quote(merge_oid)
+      + " GITHUB_OUTPUT="
+      + shell_quote(output)
+      + " bash -c "
+      + shell_quote(guard_run),
+  )
+}
+
+/**
+ * Workflow-owned output must exist before Harn's fleet freshness check runs,
+ * but it must not make the checkout dirty. A release can wait for environment
+ * approval while main advances; a dirty checkout turns that ordinary race into
+ * a failed release instead of the supported fast-forward-and-restart path.
+ */
+pipeline test_hosted_release_transcript_lives_in_ignored_run_root(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(contains(source, "mkdir -p .harn-runs"))
+  assert(contains(source, "./scripts/with_env.sh harn run --no-sandbox --emit-summary-json"))
+  assert(contains(source, "--summary-file .harn-runs/runtime-usage/release.json"))
+  assert(contains(source, "| tee .harn-runs/hosted-release.md"))
+  assert(contains(source, "cat .harn-runs/hosted-release.md"))
+  assert_eq(contains(source, "tee hosted-release.md"), false)
+  assert_eq(contains(source, "harn-bump-fleet/hosted-release.md"), false)
+  const ignored = harness.fs.read_text(path_join(dirname(harness.fs.cwd()), ".gitignore"))
+  assert(ignored.split("\n").contains(".harn-runs/"))
+}
+
+pipeline test_terminal_cancellation_owner_requires_exact_run_claim_and_live_acknowledgement(
+  harness: Harness,
+  task: any,
+) {
+  const release = hosted_release_workflow(harness.fs)
+  const cleanup = canceled_lane_cleanup_workflow(harness.fs)
+  assert(contains(release, "name: release-lane-claim-" + "$" + "{{ github.run_id }}"))
+  assert(contains(release, ".harn-runs/hosted-release-lane-claim.json"))
+  assert(contains(cleanup, "workflow_run:"))
+  assert(contains(cleanup, "workflows: [Hosted harn release]"))
+  assert(contains(cleanup, "types: [completed]"))
+  assert(contains(cleanup, "github.event.workflow_run.conclusion == 'cancelled'"))
+  assert(contains(cleanup, "continue-on-error: true"))
+  assert(contains(cleanup, "LANE_CLAIM_OUTCOME: " + "$" + "{{ steps.lane-claim.outcome }}"))
+  assert(contains(cleanup, "HOSTED_RUN_ID: " + "$" + "{{ github.event.workflow_run.id }}"))
+  assert(
+    contains(cleanup, "HOSTED_RUN_ATTEMPT: " + "$" + "{{ github.event.workflow_run.run_attempt }}"),
+  )
+  assert(contains(cleanup, "HOSTED_HEAD_SHA: " + "$" + "{{ github.event.workflow_run.head_sha }}"))
+  assert(contains(cleanup, "cleanup_cancelled_hosted_release.harn"))
+  assert(contains(cleanup, "--apply --yes-live-release"))
+  assert(contains(cleanup, "permission-contents: write"))
+  assert(contains(cleanup, "repositories: harn"))
+  assert(contains(cleanup, "if-no-files-found: error"))
+  const release_steps = decode_github_workflow(release).jobs.get("release")?.steps ?? []
+  const claim_uploads = release_steps.filter(
+    { step -> step.name == "Upload exact release lane claim" },
+  )
+    .to_list()
+  assert_eq(len(claim_uploads), 1)
+  assert_eq(claim_uploads[0].with?.get("include-hidden-files"), true)
+  const cleanup_steps = decode_github_workflow(cleanup).jobs.get("cleanup")?.steps ?? []
+  const receipt_uploads = cleanup_steps.filter(
+    { step -> step.name == "Upload terminal lane cleanup receipt" },
+  )
+    .to_list()
+  assert_eq(len(receipt_uploads), 1)
+  assert_eq(receipt_uploads[0].with?.get("include-hidden-files"), true)
+}
+
+/**
+ * Recovery run 33949302066 emitted its durable watch receipt under
+ * `.harn-runs/`, then cancellation reached an upload configured with the
+ * action defaults `include-hidden-files: false` and `if-no-files-found:
+ * ignore`. The step reported success while publishing no artifact.
+ */
+pipeline test_recovery_upload_cannot_succeed_without_its_hidden_source_receipts(
+  harness: Harness,
+  task: any,
+) {
+  const steps = decode_github_workflow(recovery_release_workflow(harness.fs)).jobs.get("recover")
+    ?.steps
+    ?? []
+  const uploads = steps.filter({ step -> step.name == "Upload recovery artifacts" }).to_list()
+  assert_eq(len(uploads), 1)
+  const upload = uploads[0]
+  assert_eq(upload.if, "always()")
+  assert(recovery_artifact_upload_preserves_hidden_receipts(upload))
+  assert_eq(
+    recovery_artifact_upload_preserves_hidden_receipts(
+      upload + {with: upload.with + {"include-hidden-files": false}},
+    ),
+    false,
+    "the action default that excluded `.harn-runs` must fire the control",
+  )
+  assert_eq(
+    recovery_artifact_upload_preserves_hidden_receipts(
+      upload + {with: upload.with + {"if-no-files-found": "ignore"}},
+    ),
+    false,
+    "an empty successful upload must fire the control",
+  )
+}
+
+/**
+ * An exact tag proves identity, not complete release publication. The recovery
+ * watcher must still observe and repair missing assets and write its durable
+ * receipt. A mismatched tag remains a hard refusal before that path starts.
+ */
+pipeline test_matching_tag_resumes_publication_while_mismatch_still_refuses(
+  harness: Harness,
+  task: any,
+) {
+  const steps = decode_github_workflow(recovery_release_workflow(harness.fs)).jobs.get("recover")
+    ?.steps
+    ?? []
+  assert(
+    matching_tag_resumes_publication(steps),
+    "an exact existing tag must not skip publication proof and its receipt",
+  )
+  const resume = steps.find({ step -> step.name == "Resume publication from the durable receipt" })
+  assert_eq(
+    matching_tag_resumes_publication(
+      steps.map(
+        { step ->
+          if step.name == resume?.name {
+            step + {if: "steps.guard.outputs.already_published != 'true'"}
+          } else {
+            step
+          }
+        },
+      ),
+    ),
+    false,
+    "the retired matching-tag skip must fire the negative control",
+  )
+  const identity_step = steps.find(
+    { step -> step.name == "Verify exact release recovery identity" },
+  )
+  assert(identity_step != nil)
+  assert(contains(identity_step?.run ?? "", "scripts/verify_release_recovery_identity.sh"))
+  assert(contains(identity_step?.run ?? "", ".harn-runs/release-harn/watches/"))
+  const importer = steps.find({ step -> step.name == "Import the durable release landing owner" })
+  assert(importer != nil)
+  assert(contains(importer?.run ?? "", "--import-hosted-receipt-only"))
+  const guard_step = steps.find({ step -> step.name == "Verify exact release recovery tag" })
+  assert(guard_step != nil)
+  with_temp_dir(
+    harness.fs,
+    { root ->
+      const origin = path_join(root, "origin.git")
+      const repo = path_join(root, "repo")
+      const output = path_join(root, "guard-output")
+      recovery_fixture_shell(harness.process, "git init --bare -q " + shell_quote(origin))
+      recovery_fixture_shell(harness.process, "git init -q " + shell_quote(repo))
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config user.email test@example.com",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config user.name test",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " config tag.gpgSign false",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " checkout -q -b main",
+      )
+      harness.fs.write_text(path_join(repo, "release.txt"), "first\n")
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " add release.txt && git -C " + shell_quote(repo)
+          + " -c commit.gpgsign=false commit -q -m first",
+      )
+      const wrong_oid = trim(
+        recovery_fixture_shell(harness.process, "git -C " + shell_quote(repo) + " rev-parse HEAD")
+          .stdout,
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " tag v1.2.3 " + shell_quote(wrong_oid),
+      )
+      harness.fs.write_text(path_join(repo, "release.txt"), "second\n")
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " -c commit.gpgsign=false commit -q -am second",
+      )
+      const merge_oid = trim(
+        recovery_fixture_shell(harness.process, "git -C " + shell_quote(repo) + " rev-parse HEAD")
+          .stdout,
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " remote add origin " + shell_quote(origin),
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git -C " + shell_quote(repo) + " push -q -u origin main refs/tags/v1.2.3",
+      )
+      recovery_fixture_shell(
+        harness.process,
+        "git --git-dir=" + shell_quote(origin) + " symbolic-ref HEAD refs/heads/main",
+      )
+      const mismatch = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.3",
+        merge_oid,
+      )
+      assert_eq(mismatch.success, false)
+      assert(contains(mismatch.combined, "not ${merge_oid}; refusing"), mismatch.combined)
+      const absent = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.5",
+        merge_oid,
+      )
+      assert(absent.success, absent.combined)
+      assert(contains(absent.combined, "v1.2.5 does not exist yet"), absent.combined)
+      recovery_fixture_shell(
+        harness.process,
+        "git -C "
+          + shell_quote(repo)
+          + " tag v1.2.4 "
+          + shell_quote(merge_oid)
+          + " && git -C "
+          + shell_quote(repo)
+          + " push -q origin refs/tags/v1.2.4",
+      )
+      const matching = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.4",
+        merge_oid,
+      )
+      assert(matching.success, matching.combined)
+      assert(contains(matching.combined, "resume publication"), matching.combined)
+      recovery_fixture_shell(
+        harness.process,
+        "git -C "
+          + shell_quote(repo)
+          + " tag -a -m release v1.2.6 "
+          + shell_quote(merge_oid)
+          + " && git -C "
+          + shell_quote(repo)
+          + " push -q origin refs/tags/v1.2.6",
+      )
+      const annotated = run_recovery_identity_guard(
+        harness.process,
+        repo,
+        output,
+        guard_step?.run ?? "",
+        "v1.2.6",
+        merge_oid,
+      )
+      assert(annotated.success, annotated.combined)
+      assert(contains(annotated.combined, "resume publication"), annotated.combined)
+    },
+  )
+}
+
+pipeline test_hosted_release_persists_fail_closed_runtime_cost(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(contains(source, "Persist exact release runtime cost receipt"))
+  assert(contains(source, "harn_bump_fleet.hosted_release_runtime_cost.v1"))
+  assert(contains(source, "scripts/write_harn_cost_receipt.sh"))
+  assert(contains(source, "hosted-release-runtime-cost-receipt.json"))
+}
+
+pipeline test_release_artifact_identity_follows_its_producer(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(
+    contains(source, "release_artifact_name: " + "$" + "{{ steps.release-artifact.outputs.name }}"),
+  )
+  assert(contains(source, "name=release-run-%s-attempt-%s"))
+  assert(contains(source, "name: " + "$" + "{{ steps.release-artifact.outputs.name }}"))
+  assert(contains(source, "name: " + "$" + "{{ needs.release.outputs.release_artifact_name }}"))
+}
+
+pipeline test_release_stderr_is_preserved_in_the_hosted_run_log(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(contains(source, "2>&1 | tee .harn-runs/hosted-release.md"))
+}
+
+pipeline test_consumer_projection_drift_blocks_publication_before_release_work(harness: Harness) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const token_index = steps.find_index({ step -> step.name == "Mint fleet policy read token" })
+  const policy_index = steps.find_index({ step -> step.name == "Run the release launch preflight" })
+  const release_index = steps.find_index({ step -> step.name == "Run release harness" })
+  const rust_index = steps.find_index({ step -> contains(step.uses ?? "", "/rust-toolchain@") })
+  const cache_index = steps.find_index({ step -> contains(step.uses ?? "", "/rust-cache@") })
+  assert(token_index >= 0)
+  assert(policy_index > token_index)
+  assert(rust_index > policy_index)
+  assert(cache_index > policy_index)
+  assert(release_index > policy_index)
+  const token = steps[token_index]
+  assert_eq(token?.if, "inputs.mode == 'ship-pr'")
+  assert_eq(token.with?.get("owner"), "burin-labs")
+  assert_eq(token.with?.get("permission-contents"), "read")
+  assert_eq(token.with?.get("repositories"), nil)
+  assert_eq(token.with?.get("permission-actions"), nil)
+  assert_eq(token.with?.get("permission-pull-requests"), nil)
+  const policy = steps[policy_index]
+  // The preflight runs in every mode. The consumer contract it carries still
+  // gates publication only, and says so in its own receipt rather than by
+  // being skipped -- a step that did not run and a step that ran and liked the
+  // answer must not read the same.
+  assert_eq(policy?.if, nil)
+  const token_ref = "$" + "{{ steps.fleet-policy-token.outputs.token }}"
+  assert_eq(policy?.env?.get("GH_TOKEN"), token_ref)
+  assert_eq(policy?.env?.get("GITHUB_TOKEN"), token_ref)
+  assert(contains(policy?.run ?? "", "scripts/preflight_release_launch.sh"))
+  assert(contains(policy?.run ?? "", "release-launch-preflight.json"))
+  // The gate's own document survives the step it moved out of; the preflight
+  // writes it, so the forensic detail behind a refusal is still uploaded.
+  assert(
+    contains(
+      harness.fs.read_text(path_join(dirname(harness.fs.cwd()), "preflight_release_launch.harn")),
+      "prepublication-fleet-policy.json",
+    ),
+  )
+}
+
+/**
+ * Exact-candidate source certification runs Rust, Harn, and package audit as
+ * independent heavy pools. Below six CPUs the owning release scheduler must
+ * serialize them, which made the source proof the release critical path even
+ * though the hosted platform lanes had already completed.
+ */
+pipeline test_hosted_release_capacity_can_overlap_every_source_lane(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(contains(source, "vars.HARN_CI_DISABLE_BLACKSMITH_LINUX == 'true'"))
+  assert(contains(source, "'ubuntu-latest' || 'blacksmith-8vcpu-ubuntu-2404'"))
+  assert(contains(source, "'github-hosted' || 'blacksmith'"))
+  assert_eq(source.split("vars.HARN_CI_DISABLE_BLACKSMITH_LINUX == 'true'").count(), 3)
+}
+
+pipeline test_release_inputs_reach_the_canonical_parser_before_credentials_and_build_setup(
+  harness: Harness,
+  task: any,
+) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const dependencies = steps.find_index({ step -> step.name == "Install Harn dependencies" })
+  const validate = steps.find_index({ step -> step.name == "Validate release inputs" })
+  assert(dependencies >= 0)
+  assert(validate > dependencies)
+  const later_boundaries = [
+    "Mint scoped release token",
+    "Check out harn",
+    "Arm git push credentials",
+    "Arm gh auth for API calls",
+    "Identify and arm the release signer",
+    "Mint fleet policy read token",
+    "Install cargo-nextest",
+    "Run release harness",
+  ]
+  for name in later_boundaries {
+    assert(steps.find_index({ step -> step.name == name }) > validate)
+  }
+  const preflight = steps[validate].run ?? ""
+  assert(contains(preflight, "! \"" + "$" + "{RELEASE_AT_SHA}\" =~ ^[0-9a-f]{40}$"))
+  assert_eq(contains(preflight, "grep -Eq"), false)
+  assert(contains(preflight, "release_harn.harn --"))
+  assert(contains(preflight, "args=(--help"))
+  assert(contains(preflight, "--bump"))
+  assert(contains(preflight, "--mode"))
+  assert(contains(preflight, "--preid"))
+  assert(contains(preflight, "--at-sha"))
+  assert(contains(preflight, "--expect-pr"))
+  assert(contains(preflight, "--resume-tagged-release"))
+  assert(contains(preflight, "--consumer-proof-runs-json"))
+  const env = steps[validate].env ?? {}
+  assert_eq(env.get("RELEASE_BUMP"), "$" + "{{ inputs.bump }}")
+  assert_eq(env.get("RELEASE_PREID"), "$" + "{{ inputs.prerelease_identifier }}")
+  assert_eq(env.get("RELEASE_MODE"), "$" + "{{ inputs.mode }}")
+  assert_eq(env.get("RELEASE_AT_SHA"), "$" + "{{ inputs.at_sha }}")
+  assert_eq(env.get("RELEASE_EXPECT_PRS"), "$" + "{{ inputs.expected_prs }}")
+  assert_eq(env.get("RELEASE_RESUME_TAGGED"), "$" + "{{ inputs.resume_tagged_release }}")
+  assert_eq(
+    env.get("RELEASE_CONSUMER_PROOF_RUNS_JSON"),
+    "$" + "{{ inputs.consumer_proof_runs_json }}",
+  )
+  const root = dirname(harness.fs.cwd())
+  const prefix = "cd " + shell_quote(root) + " && harn run release_harn.harn -- --help"
+  const malformed = harness.process.shell(
+    prefix + " --bump patch --mode ship-pr --expect-pr '[7922,8146]'",
+  )
+  assert_eq(malformed.success, false)
+  assert(contains(malformed.stderr, "invalid expected_prs value: [7922"), malformed.stderr)
+  assert(
+    contains(
+      malformed.stderr,
+      "expected blank or comma-separated positive pull request numbers, each optionally prefixed with #; for example 7922,#8146",
+    ),
+    malformed.stderr,
+  )
+  const valid = harness.process.shell(
+    prefix + " --bump patch --mode ship-pr --expect-pr '7922,8146'",
+  )
+  assert(valid.success)
+}
+
+pipeline test_consumer_scope_is_validated_before_any_credential_boundary(
+  harness: Harness,
+  task: any,
+) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const validate = steps.find_index({ step -> step.name == "Validate release inputs" })
+  const scope = steps.find_index(
+    { step -> step.name == "Validate and normalize the post-publication consumer scope" },
+  )
+  assert(scope > validate)
+  const credential_boundaries = [
+    "Mint scoped release token",
+    "Arm git push credentials",
+    "Arm gh auth for API calls",
+    "Identify and arm the release signer",
+    "Mint fleet policy read token",
+  ]
+  for name in credential_boundaries {
+    assert(steps.find_index({ step -> step.name == name }) > scope)
+  }
+  const env = steps[scope].env ?? {}
+  assert_eq(env.get("RELEASE_REPOSITORIES_JSON"), "$" + "{{ inputs.repositories_json }}")
+  assert_eq(env.get("RELEASE_SKIP_CONSUMERS"), "$" + "{{ inputs.skip_consumers }}")
+  const run = steps[scope].run ?? ""
+  assert(contains(run, "validate_fleet_scope.harn"))
+  assert(contains(run, "--repositories-json"))
+  assert(contains(run, "--skip-consumers-json"))
+  const root = dirname(harness.fs.cwd())
+  const prefix = "cd "
+    + shell_quote(root)
+    + " && harn run --no-sandbox validate_fleet_scope.harn -- --require-controller"
+  const blank = harness.process.shell(prefix)
+  assert(blank.success, blank.stderr)
+  const explicit_empty = harness.process.shell(prefix + " --skip-consumers-json '[]'")
+  assert_eq(explicit_empty.success, false)
+  assert(contains(explicit_empty.stderr, "explicit repository scope cannot be empty"))
+}
+
+/**
+ * Release bootstrap must not depend on a mutable OS package mirror for the
+ * one binary the gate needs. A mirror stall previously consumed the whole
+ * step budget before the release harness started.
+ */
+pipeline test_release_gate_ripgrep_is_pinned_and_installed_without_apt(
+  harness: Harness,
+  task: any,
+) {
+  const source = hosted_release_workflow(harness.fs)
+  const workflow = decode_github_workflow(source)
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const matches = steps.filter({ step -> step.name == "Install pinned release-gate ripgrep" })
+    .to_list()
+  assert_eq(len(matches), 1)
+  const install = matches[0]
+  assert_eq(install.get("timeout-minutes"), 3)
+  const run = install.run ?? ""
+  const version_ref = "$" + "{version}"
+  const target_ref = "$" + "{target}"
+  assert(
+    contains(
+      run,
+      "releases/download/"
+        + version_ref
+        + "/ripgrep-"
+        + version_ref
+        + "-"
+        + target_ref
+        + ".tar.gz",
+    ),
+  )
+  assert(contains(run, "version=15.2.0"))
+  assert(contains(run, "X64)"))
+  assert(contains(run, "ARM64)"))
+  assert(contains(run, "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c"))
+  assert(contains(run, "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915"))
+  assert(contains(run, "--location"))
+  assert(contains(run, "--retry-all-errors"))
+  assert(contains(run, "sha256sum --check --strict"))
+  assert(
+    contains(run, "--strip-components=1 \"ripgrep-" + version_ref + "-" + target_ref + "/rg\""),
+  )
+  assert(contains(run, "GITHUB_PATH"))
+  assert(contains(run, "\"$bin_dir/rg\" --version"))
+  assert_eq(contains(source, "/apt-install@"), false)
+  assert_eq(contains(source, "packages: ripgrep"), false)
+  const install_index = steps.find_index(
+    { step -> step.name == "Install pinned release-gate ripgrep" },
+  )
+  const release_index = steps.find_index({ step -> step.name == "Run release harness" })
+  assert(install_index >= 0)
+  assert(release_index > install_index)
+}
+
+pipeline test_ship_pr_can_continue_through_fleet_convergence(harness: Harness, task: any) {
+  const source = hosted_release_workflow(harness.fs)
+  assert(contains(source, "converge_fleet:"))
+  assert(contains(source, "repositories_json:"))
+  assert(contains(source, "expected_prs:"))
+  assert(contains(source, "consumer_proof_runs_json:"))
+  assert_eq(contains(source, "candidate_archive_run_id:"), false)
+  assert_eq(contains(source, "candidate_archive_receipt_run_id:"), false)
+  assert(contains(source, "args+=(--expect-pr \"" + "$" + "{RELEASE_EXPECT_PRS}\")"))
+  assert(contains(source, "--agent --no-chat --github-signed-commit"))
+  assert(contains(source, "./scripts/watch_hosted_harn_release.sh"))
+  const tail = source.index_of("release_chain.harn --")
+  const watch = source.index_of("watch_fleet_convergence_run.harn")
+  assert(tail >= 0)
+  assert(watch > tail)
+  assert(contains(source, "RELEASE_APP_TOKEN_PROFILE: fleet-orchestration"))
+  assert(contains(source, "while sleep 2700"))
+  assert(contains(source, "./scripts/refresh_hosted_release_credentials.sh"))
+  assert(contains(source, "--yes-live-release --no-wait"))
+  assert(contains(source, "watch_fleet_convergence_run.harn"))
+  assert(contains(source, "--chain-id \"$RELEASE_CHAIN_ID\""))
+  assert(contains(source, "permission-actions: read"))
+  assert(contains(source, "--resume-published --reconcile-only"))
+}
+
+pipeline test_hosted_recovery_has_no_parallel_candidate_archive_selector(
+  harness: Harness,
+  task: any,
+) {
+  const source = hosted_release_workflow(harness.fs)
+  const workflow = decode_github_workflow(source)
+  assert(contains(source, "permissions:\n  actions: read\n  contents: read"))
+  assert_eq(workflow.workflow_dispatch?.inputs?.get("candidate_archive_run_id"), nil)
+  assert_eq(workflow.workflow_dispatch?.inputs?.get("candidate_archive_receipt_run_id"), nil)
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const restore = steps.find({ step -> step.name == "Restore candidate archive receipt" })
+  assert_eq(restore, nil)
+  const execute = steps.find({ step -> step.name == "Run release harness" })
+  assert_eq(execute?.env?.get("RELEASE_CANDIDATE_ARCHIVE_RECEIPT"), nil)
+  assert_eq(contains(execute?.run ?? "", "--candidate-archive-receipt"), false)
+}
+
+pipeline test_hosted_release_forwards_one_repository_scope_only_after_publication(
+  harness: Harness,
+  task: any,
+) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const input = workflow.workflow_dispatch?.inputs?.get("repositories_json")
+  assert_eq(input?.type, "string")
+  assert_eq(input?.default, "")
+  const skip = workflow.workflow_dispatch?.inputs?.get("skip_consumers")
+  assert_eq(skip?.type, "string")
+  assert_eq(skip?.default, "")
+  assert(contains(skip?.description ?? "", "Blank means no exclusions"))
+  assert(contains(skip?.description ?? "", "Do not enter []"))
+  const release_steps = workflow.jobs.get("release")?.steps ?? []
+  const preflight = release_steps.find(
+    { step -> step.name == "Validate and normalize the post-publication consumer scope" },
+  )
+  const policy = release_steps.find({ step -> step.name == "Run the release launch preflight" })
+  const release = release_steps.find({ step -> step.name == "Run release harness" })
+  const tail = release_steps.find(
+    { step -> step.name == "Reconcile published release and hand off fleet update" },
+  )
+  for step in [policy, release] {
+    assert_eq(
+      contains(step?.run ?? "", "--repositories-json"),
+      false,
+      "mandatory pre-publication checks retain their all-consumer scope",
+    )
+    assert_eq(
+      contains(step?.run ?? "", "--skip-consumers-json"),
+      false,
+      "consumer exclusions apply only after publication",
+    )
+  }
+  assert_eq(
+    preflight?.env?.get("RELEASE_REPOSITORIES_JSON"),
+    "$" + "{{ inputs.repositories_json }}",
+  )
+  assert_eq(preflight?.env?.get("RELEASE_SKIP_CONSUMERS"), "$" + "{{ inputs.skip_consumers }}")
+  assert(contains(preflight?.run ?? "", "validate_fleet_scope.harn"))
+  assert(contains(preflight?.run ?? "", "--require-controller"))
+  assert(
+    contains(preflight?.run ?? "", "args+=(--skip-consumers-json \"$RELEASE_SKIP_CONSUMERS\")"),
+  )
+  assert_eq(
+    tail?.env?.get("RELEASE_REPOSITORIES_JSON"),
+    "$" + "{{ steps.release-scope.outputs.repositories_json }}",
+  )
+  assert(contains(tail?.run ?? "", "args+=(--repositories-json \"$RELEASE_REPOSITORIES_JSON\")"))
+  const fleet_steps = workflow.jobs.get("fleet")?.steps ?? []
+  const watch = fleet_steps.find({ step -> step.name == "Prove exact fleet convergence run" })
+  const reconcile = fleet_steps.find(
+    { step -> step.name == "Reconcile terminal published-tail journal from consumer main" },
+  )
+  for step in [watch, reconcile] {
+    assert_eq(
+      step?.env?.get("RELEASE_REPOSITORIES_JSON"),
+      "$" + "{{ needs.release.outputs.repositories_json }}",
+    )
+    assert(contains(step?.run ?? "", "args+=(--repositories-json \"$RELEASE_REPOSITORIES_JSON\")"))
+    assert_eq(contains(step?.run ?? "", "--skip-consumers-json"), false)
+  }
+}
+
+pipeline test_hosted_promotion_propagates_terminal_prerequisite_failure(
+  harness: Harness,
+  task: any,
+) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const promotions = steps.filter(
+    { step -> step.name == "Reconcile published release and hand off fleet update" },
+  )
+    .to_list()
+  assert_eq(len(promotions), 1)
+  const promotion = promotions[0]
+  assert_eq(promotion.get("continue-on-error"), nil)
+  assert(contains(promotion.run ?? "", "set -euo pipefail"))
+  assert(contains(promotion.run ?? "", "release_chain.harn"))
+  assert(contains(promotion.run ?? "", "| tee .harn-runs/hosted-published-tail.json"))
+}
+
+/**
+ * App-token refresh is a deep boundary: the script owns minting and installing
+ * a short-lived credential, while each workflow step must project both secret
+ * inputs into its process. Keep that contract structural so a new call site
+ * cannot pass review while omitting one half of the credential pair.
+ */
+pipeline test_every_hosted_token_refresh_has_app_credential_inputs(harness: Harness, task: any) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  let refresh_steps = 0
+  for job in workflow.jobs {
+    for step in job.value.steps ?? [] {
+      const run = step.run ?? ""
+      if !contains(run, "./scripts/refresh_hosted_release_credentials.sh")
+        && !contains(run, "./scripts/watch_hosted_harn_release.sh") {
+        continue
+      }
+      refresh_steps = refresh_steps + 1
+      assert_eq(
+        step.env?.get("RELEASE_APP_CLIENT_ID"),
+        "$" + "{{ secrets.RELEASE_APP_CLIENT_ID }}",
+        step.name ?? job.key,
+      )
+      assert_eq(
+        step.env?.get("RELEASE_APP_PRIVATE_KEY"),
+        "$" + "{{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+        step.name ?? job.key,
+      )
+    }
+  }
+  assert_eq(refresh_steps, 3)
+}
+
+/**
+ * The connector pins its gh-auth fallback for one process. The hosted wrapper
+ * must therefore resume the durable receipt in bounded fresh processes rather
+ * than pretending a background credential-store rewrite changes that bearer.
+ */
+pipeline test_hosted_release_watch_is_segmented_below_token_lifetime(harness: Harness, task: any) {
+  const root = dirname(harness.fs.cwd())
+  const script = harness.fs.read_text(path_join(root, "scripts", "watch_hosted_harn_release.sh"))
+  assert(contains(script, "max_segment_seconds=2700"))
+  assert(contains(script, "HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS:-60"))
+  assert(contains(script, "HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS:-30"))
+  assert(contains(script, "3)"), "pending status must be distinguished")
+  assert(contains(script, "exit \"$status\""), "terminal failures must propagate")
+  assert_eq(contains(script, "sleep 2400"), false)
+  const temp = harness.fs.workspace_temp_dir()
+  const refresh = path_join(temp, "refresh.sh")
+  const watch = path_join(temp, "watch.sh")
+  const refresh_count = path_join(temp, "refresh-count")
+  const watch_count = path_join(temp, "watch-count")
+  const argv_log = path_join(temp, "watch-argv")
+  const gh_config_log = path_join(temp, "gh-config-log")
+  harness.fs.write_text(refresh_count, "0\n")
+  harness.fs.write_text(watch_count, "0\n")
+  harness.fs.write_text(argv_log, "")
+  harness.fs.write_text(
+    refresh,
+    "#!/usr/bin/env bash\nset -euo pipefail\ncount=0\n[[ -f \"$HARN_TEST_REFRESH_COUNT\" ]] && count=\"$(cat \"$HARN_TEST_REFRESH_COUNT\")\"\nprintf '%s\\n' \"$((count + 1))\" > \"$HARN_TEST_REFRESH_COUNT\"\nprintf '%s\\n' \"$"
+      + "{GH_CONFIG_DIR:-}\" > \"$HARN_TEST_GH_CONFIG_LOG\"\n",
+  )
+  harness.fs.write_text(
+    watch,
+    "#!/usr/bin/env bash\nset -euo pipefail\ncount=0\n[[ -f \"$HARN_TEST_WATCH_COUNT\" ]] && count=\"$(cat \"$HARN_TEST_WATCH_COUNT\")\"\ncount=\"$((count + 1))\"\nprintf '%s\\n' \"$count\" > \"$HARN_TEST_WATCH_COUNT\"\nprintf '%s\\0' \"$@\" >> \"$HARN_TEST_ARGV_LOG\"\nprintf '\\n' >> \"$HARN_TEST_ARGV_LOG\"\nif (( count < 3 )); then exit 3; fi\n",
+  )
+  const chmod = harness.process.shell("chmod +x " + shell_quote(refresh) + " " + shell_quote(watch))
+  assert(chmod.success, chmod.combined)
+  const command = "unset GH_CONFIG_DIR; HARN_EXT_HOSTED_RELEASE_REFRESH_SCRIPT="
+    + shell_quote(refresh)
+    + " HARN_EXT_HOSTED_RELEASE_WATCH_SCRIPT="
+    + shell_quote(watch)
+    + " HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS=2 HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS=0"
+    + " HARN_TEST_REFRESH_COUNT="
+    + shell_quote(refresh_count)
+    + " HARN_TEST_WATCH_COUNT="
+    + shell_quote(watch_count)
+    + " HARN_TEST_ARGV_LOG="
+    + shell_quote(argv_log)
+    + " HARN_TEST_GH_CONFIG_LOG="
+    + shell_quote(gh_config_log)
+    + " RUNNER_TEMP="
+    + shell_quote(temp)
+    + " "
+    + shell_quote(path_join(root, "scripts", "watch_hosted_harn_release.sh"))
+    + " --tag v0.10.115"
+  const result = harness.process.shell(command)
+  assert(result.success, result.combined)
+  assert_eq(trim(harness.fs.read_text(refresh_count)), "3")
+  assert_eq(trim(harness.fs.read_text(watch_count)), "3")
+  assert_eq(trim(harness.fs.read_text(gh_config_log)), path_join(temp, "gh-config"))
+  const calls = harness.fs.read_text(argv_log).split("\n").filter({ line -> return line != "" })
+  assert_eq(len(calls), 3)
+  for call in calls {
+    const args = call.split("\0")
+    assert(contains(args, "--tag"))
+    assert(contains(args, "v0.10.115"))
+    assert(contains(args, "--max-polls"))
+    assert(contains(args, "2"))
+    assert(contains(args, "--interval-seconds"))
+    assert(contains(args, "0"))
+  }
+}
+
+/**
+ * The post-publication tail keys on the release's own proven state, not on the
+ * publication prover step's conclusion.
+ *
+ * A prover that fails has not observed a missing release; it has failed to
+ * confirm one. When the tail's conditions read that step's conclusion, one such
+ * failure skipped every step after it — including the orchestration anchor's
+ * only writer — while the release itself was fully published. Both halves are
+ * structural here: `!cancelled()` lets the shared tail run after a red prover.
+ * The tail's executable regressions prove its publication gate blocks effects.
+ */
+pipeline test_post_publication_tail_keys_on_the_release_not_the_prover(
+  harness: Harness,
+  task: any,
+) {
+  const source = hosted_release_workflow(harness.fs)
+  // `prove_release_published.harn` is not dead: `lib/release_published_tail_live`
+  // imports its `observe_release_publication` as the shared publication read.
+  // What must stay absent is a *workflow step* running it as a CLI gate, which
+  // is the shape whose red conclusion once skipped the tail.
+  assert(!contains(source, "prove_release_published.harn --"))
+  assert(contains(source, "id: published-tail"))
+  assert(contains(source, "id: publish-prover"))
+  assert(contains(source, "steps.shipped-release.outputs.tag != ''"))
+  assert_eq(
+    source.split("release_chain.harn --").count(),
+    3,
+    "the handoff and terminal reconciliation use the same owning entrypoint",
+  )
+  assert_eq(
+    source.split("!cancelled() && inputs.mode == 'ship-pr' && inputs.converge_fleet").count(),
+    4,
+    "every tail step and its terminal job survive a red prover",
+  )
+  assert(contains(source, "TAIL_OUTCOME: $" + "{{ steps.published-tail.outcome }}"))
+  // The step's own conclusion is no longer the verdict. The recovery
+  // supervisor's durable per-tag receipt is, and an absent one fails.
+  assert(!contains(source, "test \"$TAIL_OUTCOME\" = success"))
+  assert(contains(source, ".harn-runs/release-tail-recovery/$" + "{RELEASE_TAG}.json"))
+  assert(contains(source, "test -f \"$recovery\""))
+  assert(!contains(source, "refresh_release_binary_size_baseline.harn --"))
+  assert(!contains(source, "promote_bump_workflow.harn --"))
+  assert(!contains(source, "dispatch_fleet_convergence.harn --"))
+  assert(contains(source, "--yes-live-release --no-wait"))
+  assert(contains(source, "--resume-published --reconcile-only --tag"))
+  assert(contains(source, "hosted-cost-receipts/release/release-chain/**"))
+  const tail = source.index_of("release_chain.harn --")
+  const report = source.index_of("Report published release tail handoff")
+  assert(tail >= 0)
+  assert(report > tail)
+}
+
+/** An accepted handoff must retain its waiting owner even when release reporting failed. */
+pipeline test_fleet_job_uses_accepted_identity_not_release_success(harness: Harness) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const release = workflow.jobs.get("release")
+  const fleet = workflow.jobs.get("fleet")
+  assert_eq(fleet?.name, "Prove Harn repository updates")
+  assert_eq(fleet?.needs, "release")
+  assert_eq(
+    release?.outputs?.get("fleet_run_id"),
+    "$" + "{{ steps.published-tail.outputs.run_id }}",
+  )
+  assert_eq(
+    release?.outputs?.get("fleet_run_url"),
+    "$" + "{{ steps.published-tail.outputs.run_url }}",
+  )
+  assert_eq(
+    fleet?.get("if"),
+    "$" + "{{ !cancelled() && inputs.mode == 'ship-pr' && inputs.converge_fleet"
+      + " && needs.release.outputs.tag != '' && needs.release.outputs.fleet_run_id > 0"
+      + " && needs.release.outputs.fleet_run_url != '' }}",
+    "failed release jobs retain accepted fleet work; absent or zero dispatches do not start a waiter",
+  )
+}
+
+/**
+ * Every input `hosted-release.yml` declares must be reachable from the fleet's
+ * own dispatcher. An input the workflow accepts but `dispatch_hosted_release`
+ * never sends is settable only by hand-driving `gh workflow run`, which for
+ * anyone working through the canonical path is indistinguishable from the
+ * input not existing at all.
+ */
+pipeline test_every_hosted_release_input_is_reachable_from_the_dispatcher(
+  harness: Harness,
+  task: any,
+) {
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const declared = (workflow.workflow_dispatch?.inputs ?? {}).keys().sort()
+  // A measured zero here would otherwise mean the decoder found no inputs.
+  assert(len(declared) >= 7, "the hosted release workflow declares its inputs")
+  const dispatcher = harness.fs.read_text(
+    path_join(dirname(harness.fs.cwd()), "dispatch_hosted_release.harn"),
+  )
+  const start = dispatcher.index_of("fn hosted_release_adapter(")
+  assert(start >= 0, "the dispatcher defines its hosted workflow adapter")
+  const stop = dispatcher.index_of("fn default_receipt_path(")
+  assert(stop > start, "the dispatch payload ends before the run adapter")
+  const payload = dispatcher.slice(start, stop)
+  assert(
+    contains(payload, "skip_consumers: \"\""),
+    "the dispatcher uses blank as the one no-exclusion spelling",
+  )
+  const unreachable = declared.filter(
+    { name ->
+      !contains(payload, name + ":")
+        && !contains(payload, "fields." + name + " =")
+    },
+  )
+    .to_list()
+  assert_eq(unreachable, [], "every declared hosted release input is sent by the dispatcher")
+}
+
+pipeline test_input_validation_widens_a_short_pin_and_exports_the_exact_commit(harness: Harness) {
+  // Operators type seven characters; the dispatch receipt, the certification
+  // branch, and the tag all require forty, and a live cut was refused for that
+  // mismatch. The widening happens once, in the first step that reads the
+  // input, and every later step reads the exported result.
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  const steps = workflow.jobs.get("release")?.steps ?? []
+  const validate = steps.find({ step -> step.name == "Validate release inputs" })
+  assert(validate != nil)
+  const run = validate?.run ?? ""
+  assert(contains(run, "--resolve-only"), run)
+  assert(contains(run, "RELEASE_AT_SHA=" + "\${RELEASE_AT_SHA}"), run)
+  assert(contains(run, ">> \"$GITHUB_ENV\""), run)
+  // An empty or malformed resolution must not be exported as the pin.
+  assert(contains(run, "not a full commit SHA"), run)
+  assert_eq(validate?.env?.get("RELEASE_AT_SHA"), "$" + "{{ inputs.at_sha }}")
+  // Every later consumer reads the exported commit, never the raw input, or
+  // the widening would be undone by whichever step re-read the abbreviation.
+  for later in ["Run the release launch preflight", "Run release harness"] {
+    const step = steps.find({ entry -> entry.name == later })
+    assert(step != nil, later)
+    assert(contains(step?.run ?? "", "RELEASE_AT_SHA"), later)
+    assert_eq(step?.env?.get("RELEASE_AT_SHA"), nil, later)
+  }
+}
+
+pipeline test_every_variable_the_hosted_release_reads_is_declared_before_it(harness: Harness) {
+  /**
+   * Every shell step in this workflow runs under `set -u`, so a read of a name
+   * nothing declared aborts the step. One edit dropped `RELEASE_MODE` from the
+   * release step's `env:` block while leaving two reads of it in the body, and
+   * every hosted cut would have died about ten minutes in, past the checkout,
+   * the mint, and the harness build. Nothing else in this repository would have
+   * noticed: the workflow parses and the expression syntax is valid.
+   */
+  const workflow = decode_github_workflow(hosted_release_workflow(harness.fs))
+  let findings: list<string> = []
+  for named in workflow.jobs.entries() {
+    for finding in undeclared_job_variables(named.value) {
+      findings = findings + ["${named.key}: ${finding.step} reads ${finding.variable}"]
+    }
+  }
+  assert_eq(findings, [])
+}

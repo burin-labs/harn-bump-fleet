@@ -1,0 +1,1167 @@
+#!/usr/bin/env harn
+import { command_result_fail } from "std/command"
+//
+// release_harn.harn — Harn-native harness for the human-owned `/release-harn`
+// workflow in ~/projects/harn.
+//
+// Defaults to audit-only. Live mutation requires --yes-live-release.
+// Use --mock to exercise the end-to-end flow without touching the real repo.
+import { start_timing, timed } from "std/timing"
+import { changelog_bullet_count } from "lib/changelog"
+import { chat_enabled } from "lib/chat_runs"
+import {
+  binder_audit_line,
+  cost_budget_audit_line,
+  install_binder,
+  install_cost_budget,
+  planner_audit_line,
+} from "lib/llm_defaults"
+import { run_chat_loop } from "lib/post_run_chat"
+import { agent_review } from "lib/release_agent"
+pub import { prepare_repair_changed } from "lib/release_agent"
+import { agent_artifact_paths, release_repair_tools } from "lib/release_agent_tools"
+pub import { agent_review_attempt_selection } from "lib/release_agent_tools"
+import { analyze_release, release_body_gate_version } from "lib/release_analysis"
+import {
+  audit_findings_are_availability_only,
+  audit_findings_are_loop_status_only,
+} from "lib/release_audit"
+import { release_body_integrity_gate } from "lib/release_body_integrity"
+import { write_crystallization_fixture } from "lib/release_crystallization"
+import {
+  decisive_failed_step,
+  execution_failed,
+  recorded_step,
+  release_failure_explanation,
+  release_recorded_steps,
+} from "lib/release_execution"
+import {
+  analysis_with_fixup_state,
+  release_checkpoint_resume_block,
+  release_checkpoint_supersede_advisory,
+  with_fixup_state,
+} from "lib/release_fixup"
+import { pre_release_gate } from "lib/release_gate_chat"
+import { execute_prepare, execute_ship_pr, write_report } from "lib/release_modes"
+import {
+  detect_fixup_state,
+  detect_post_merge_drift,
+  deterministic_release_notes_available,
+  live_release_notes_blocker,
+  post_merge_drift_deterministic_findings,
+  release_run_session_view_gate,
+  run_post_merge_paperwork_pr,
+  run_session_view_release_blocker,
+} from "lib/release_notes"
+import {
+  owner_reclaimed_dead_for_version,
+  release_owner_guard_acquire,
+  release_owner_guard_finish,
+  release_owner_guard_update,
+} from "lib/release_owner_guard"
+import {
+  FLEET_SELF_RESTART_EXIT_CODE,
+  preflight_release_planner,
+  release_chat_only,
+  release_fleet_self_check,
+  release_lane_finish,
+  release_lane_preflight,
+  release_preflight_autoremediate,
+  release_prior_fold_preflight,
+  release_sccache_preflight,
+  release_with_build_lease,
+  resolve_release_flags_interactively,
+} from "lib/release_preflight"
+pub import { release_prepare_audit_plan } from "lib/release_prepare"
+import { with_derived_release_options } from "lib/release_prepare"
+import {
+  release_queue_gate_probe,
+  release_queue_guarded_execution,
+  release_queue_restore_failed_execution,
+  release_queue_restore_step,
+} from "lib/release_queue_gate"
+import { require_release_repo_path } from "lib/release_repo_guard"
+import { pre_release_pr_body_text, release_recovery_note_report } from "lib/release_reporting"
+import {
+  DEFAULT_PLANNER,
+  ReleaseConfig,
+  finish_release_run_timing,
+  parse_release_args,
+  release_log_event,
+  release_run_dir,
+  release_timed_phase,
+  resolve_pin_sha,
+  timed_release_steps,
+} from "lib/release_runtime"
+pub import { prompt_asset, release_harness_root, release_run_root } from "lib/release_runtime"
+import { release_stage_timing_lines, release_stage_timings } from "lib/release_stage_timings"
+import { usage } from "lib/release_usage"
+import {
+  align_pre_tag_release_workspace,
+  finish_release_workspace,
+  materialize_release_workspace,
+  release_post_cleanup_config,
+} from "lib/release_workspace"
+import {
+  ReleaseWorkspaceLease,
+  release_workspace_lease_acquire,
+  release_workspace_lease_finish,
+  release_workspace_lease_shared,
+} from "lib/release_workspace_lease"
+import { ReleaseAuditReceipt } from "lib/run_receipts"
+import { ensure_release_sandbox } from "lib/sandbox_preflight"
+import { timing_artifacts, timing_summary_lines } from "lib/timing_report"
+
+fn finish_workspace(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  succeeded: bool,
+  run_id: string,
+  workspace_lease: ReleaseWorkspaceLease,
+) -> dict? {
+  let cleanup: dict? = nil
+  try {
+    cleanup = finish_release_workspace(harness, cfg, succeeded, run_id)
+  } finally {
+    const finished = release_workspace_lease_finish(harness.host_lease, workspace_lease)
+    if finished != nil {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "release_workspace_lease_released",
+        finished,
+      )
+    }
+  }
+  if cleanup != nil {
+    harness.stdio.println("== release workspace")
+    if trim(cleanup.warning ?? "") != "" {
+      harness.stdio.println("   warning: ${cleanup.warning}")
+    } else {
+      harness.stdio.println("   ${cleanup.detail}")
+    }
+  }
+  return cleanup
+}
+
+pipeline main(harness: Harness) {
+  const parsed_cfg = parse_release_args(harness.env, argv)
+  if parsed_cfg.help {
+    harness.stdio.println(usage())
+    return 0
+  }
+  const preflight = ensure_release_sandbox(
+    {stdio: harness.stdio, system: harness.system},
+    "release_harn.harn",
+  )
+  if preflight != nil {
+    return preflight
+  }
+  if parsed_cfg.chat_only {
+    return release_chat_only(harness, parsed_cfg)
+  }
+  const raw_cfg = resolve_release_flags_interactively(harness, parsed_cfg, argv)
+  require_release_repo_path(harness.fs, raw_cfg, "startup")
+  const run_id = harness.random.uuid_v7()
+  const started_iso = harness.clock.date_iso()
+  const repo_label = if raw_cfg.mock {
+    "(mock)"
+  } else {
+    raw_cfg.repo
+  }
+  const run_timing = start_timing(
+    harness.clock,
+    "release.run",
+    {
+      mode: raw_cfg.mode,
+      mock: raw_cfg.mock,
+      agent: raw_cfg.agent,
+      repo_kind: if raw_cfg.mock {
+        "mock"
+      } else {
+        "local"
+      },
+    },
+  )
+  harness.stdio.println("== harn release harness ${run_id}")
+  harness.stdio.println("   repo : ${repo_label}")
+  harness.stdio.println("   mode : ${raw_cfg.mode}")
+  harness.stdio.println("   bump : ${raw_cfg.bump}")
+  if raw_cfg.preid != "" {
+    harness.stdio.println("   preid: ${raw_cfg.preid}")
+  }
+  harness.stdio.println(
+    "   ${planner_audit_line({provider: raw_cfg.provider, model: raw_cfg.model, source: DEFAULT_PLANNER.source})}",
+  )
+  harness.stdio.println(
+    "   ${binder_audit_line(install_binder(harness, harness.clock, {tools: []}).audit)}",
+  )
+  const cost_limit = install_cost_budget(
+    {env: harness.env, llm: harness.llm},
+    "HARN_EXT_RELEASE_COST_LIMIT_USD",
+  )
+  harness.stdio.println("   ${cost_budget_audit_line(cost_limit)}")
+  const fleet_restart_required = release_fleet_self_check(harness, raw_cfg, run_id)
+  if fleet_restart_required {
+    finish_release_run_timing(harness.clock, run_timing, "fleet_self_update_restart", true)
+    return FLEET_SELF_RESTART_EXIT_CODE
+  }
+  const preflight_cfg = preflight_release_planner(harness, raw_cfg, run_id)
+  require_release_repo_path(harness.fs, preflight_cfg, "pin resolution")
+  let cfg = preflight_cfg
+  cfg["pin_sha"] = resolve_pin_sha(harness.process, preflight_cfg)
+  const run_events = release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "run_started",
+    {
+      repo: repo_label,
+      mode: cfg.mode,
+      bump: cfg.bump,
+      preid: cfg.preid,
+      agent: cfg.agent,
+      mock: cfg.mock,
+      pin_sha: cfg.pin_sha,
+      pin_sha_input: cfg.pin_sha_input,
+    },
+  )
+  harness.stdio.println("   pin  : ${cfg.pin_sha}")
+  harness.stdio.println("   events: ${run_events}")
+  harness.stdio.println("   tail : tail -f ${run_events}")
+  let owner_guard = release_owner_guard_acquire(harness.host_lease, cfg, {}, run_id)
+  if owner_guard.state == "owned" {
+    harness.stdio.println(
+      "   owner lease    : ${owner_guard.handle.domain} (${owner_guard.decision.action})",
+    )
+    const reclaimed_prior = owner_guard.record.reclaimed_prior
+    if reclaimed_prior != nil {
+      harness.stdio.println(
+        "   ↻ recovered dead owner ${reclaimed_prior.owner} run ${reclaimed_prior.run_id} (pid ${reclaimed_prior.owner_pid})",
+      )
+    }
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "owner_guard_acquired",
+      {
+        domain: owner_guard.handle.domain,
+        lease_id: owner_guard.handle.lease_id,
+        action: owner_guard.decision.action,
+        reason: owner_guard.decision.reason,
+        reclaimed_prior: reclaimed_prior,
+      },
+    )
+  }
+  const workspace_holder_class = if owner_guard.state == "owned" {
+    "release"
+  } else {
+    "audit"
+  }
+  const workspace_lease = release_workspace_lease_acquire(
+    harness,
+    cfg,
+    run_id,
+    workspace_holder_class,
+  )
+  if workspace_lease.state == "owned" {
+    harness.stdio.println(
+      "   workspace lease: ${workspace_lease.handle.domain} (${workspace_lease.decision.action}, ${workspace_holder_class})",
+    )
+  } else if workspace_lease.state == "fallback" {
+    harness.stdio.println(
+      "   workspace lease: per-run fallback (${workspace_lease.decision.reason})",
+    )
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_workspace_lease_decided",
+    workspace_lease.decision,
+  )
+  // The workspace lease is the authority for the stable path. Audits take it
+  // opportunistically; live releases wait rather than silently pay for a fresh
+  // checkout when an earlier audit still owns it.
+  try {
+    cfg = materialize_release_workspace(
+      harness,
+      cfg,
+      run_id,
+      release_workspace_lease_shared(workspace_lease),
+    )
+  } catch (e) {
+    release_workspace_lease_finish(harness.host_lease, workspace_lease)
+    release_owner_guard_finish(harness.host_lease, owner_guard, "workspace_materialization", false)
+    throw e
+  }
+  if cfg.release_workspace_managed {
+    harness.stdio.println("   workspace: ${cfg.repo}")
+    harness.stdio.println("   source   : ${cfg.source_repo} (left unchanged)")
+  }
+  try {
+    require_release_repo_path(harness.fs, cfg, "prior release fold preflight")
+    release_timed_phase(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "prior_release_fold_preflight",
+      "release.prior_release_fold_preflight",
+      {base: cfg.base, mock: cfg.mock},
+      { ->
+        release_prior_fold_preflight(harness, cfg, run_id)
+        return nil
+      },
+    )
+    release_sccache_preflight({stdio: harness.stdio, process: harness.process}, cfg)
+    require_release_repo_path(harness.fs, cfg, "release analysis")
+    release_log_event({clock: harness.clock, fs: harness.fs}, run_id, "analysis_started", {})
+    const raw_analysis = release_timed_phase(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "analysis",
+      "release.analysis",
+      {mode: cfg.mode, mock: cfg.mock},
+      { -> return analyze_release(harness, cfg) },
+    )
+    const derived_cfg = with_derived_release_options(cfg, raw_analysis)
+    require_release_repo_path(harness.fs, derived_cfg, "release-state detection")
+    // The resume precheck reads a blob OID per certified tooling path, so it is
+    // a real cost that used to disappear: the refusal throws before any span
+    // closes, and a refused resume is exactly the run whose elapsed time an
+    // operator asks about.
+    const fixup_state = release_timed_phase(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "resume_precheck",
+      "release.resume_precheck",
+      {},
+      fn() { return detect_fixup_state(harness, derived_cfg, raw_analysis) },
+    )
+    const published_version = release_body_gate_version(
+      raw_analysis.current_version,
+      raw_analysis.next_version,
+      raw_analysis.latest_tag,
+      fixup_state != nil && (fixup_state.release_exists ?? false),
+    )
+    const release_body_gate = release_timed_phase(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_body_integrity",
+      "release.body_integrity",
+      {mode: derived_cfg.mode, version: published_version},
+      { -> return release_body_integrity_gate(harness, derived_cfg, published_version, run_id) },
+    )
+    if !release_body_gate.proceed {
+      harness.stdio.println("!! release body integrity blocked live release side effects")
+      finish_workspace(harness, derived_cfg, false, run_id, workspace_lease)
+      finish_release_run_timing(harness.clock, run_timing, "release_body_integrity_blocked", false)
+      release_owner_guard_finish(
+        harness.host_lease,
+        owner_guard,
+        "release_body_integrity_blocked",
+        false,
+      )
+      return 1
+    }
+    // Post-merge drift detection only fires when a repair pass does not
+    // apply (i.e., the previous release cycle fully merged but main's
+    // `## v$current` body diverges from the pin-time `## Unreleased` that
+    // the published binary actually contains).
+    const drift_state = if fixup_state == nil {
+      detect_post_merge_drift(harness, derived_cfg, raw_analysis)
+    } else {
+      nil
+    }
+    if drift_state != nil {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "analysis_finished",
+        {
+          current_version: raw_analysis.current_version,
+          next_version: raw_analysis.next_version,
+          branch: raw_analysis.branch,
+          changelog_top: raw_analysis.changelog_top,
+          dirty_files: raw_analysis.dirty_files,
+          deterministic_findings: post_merge_drift_deterministic_findings(
+            raw_analysis.deterministic_findings,
+          ),
+          fixup_mode: false,
+          post_merge_drift: true,
+        },
+      )
+      owner_guard = release_owner_guard_update(
+        harness.host_lease,
+        owner_guard,
+        derived_cfg,
+        raw_analysis,
+      )
+      if owner_guard.state == "owned" {
+        harness.stdio.println(
+          "   owner lease    : ${owner_guard.handle.domain} (v${owner_guard.record.next_version})",
+        )
+        release_log_event(
+          {clock: harness.clock, fs: harness.fs},
+          run_id,
+          "owner_guard_updated",
+          {
+            domain: owner_guard.handle.domain,
+            lease_id: owner_guard.handle.lease_id,
+            version: owner_guard.record.next_version,
+            pin_sha: owner_guard.record.pin_sha,
+          },
+        )
+      }
+      if drift_state.kind == "paperwork_pr_open" {
+        harness.stdio.println("== post-merge paperwork PR already open: ${drift_state.pr_url}")
+        harness.stdio.println("   no changes needed (the open PR already fixes the drift)")
+        finish_workspace(harness, derived_cfg, true, run_id, workspace_lease)
+        finish_release_run_timing(harness.clock, run_timing, "post_merge_paperwork_pr_open", true)
+        release_owner_guard_finish(
+          harness.host_lease,
+          owner_guard,
+          "post_merge_paperwork_pr_open",
+          true,
+        )
+        return 0
+      }
+      const drift_exit = timed(
+        harness.clock,
+        "release.post_merge_paperwork",
+        {base: derived_cfg.base, mock: derived_cfg.mock},
+        { -> return run_post_merge_paperwork_pr(harness, derived_cfg, drift_state, run_id) },
+      ).result
+      finish_workspace(harness, derived_cfg, drift_exit == 0, run_id, workspace_lease)
+      finish_release_run_timing(
+        harness.clock,
+        run_timing,
+        "post_merge_paperwork_pr",
+        drift_exit == 0,
+      )
+      release_owner_guard_finish(
+        harness.host_lease,
+        owner_guard,
+        "post_merge_paperwork_pr",
+        drift_exit == 0,
+      )
+      return drift_exit
+    }
+    const effective_cfg = with_fixup_state(derived_cfg, fixup_state)
+    align_pre_tag_release_workspace(harness, effective_cfg, run_id)
+    // A pre-tag checkpoint may have been prepared before newer commits reached
+    // base. Re-snapshot deterministic facts at the recovered pin so the PR body
+    // cannot claim post-pin work that is absent from the immutable release.
+    const effective_raw_analysis = if fixup_state?.pre_tag_resume ?? false {
+      analyze_release(harness, effective_cfg)
+    } else {
+      raw_analysis
+    }
+    const base_analysis = analysis_with_fixup_state(effective_raw_analysis, fixup_state)
+    owner_guard = release_owner_guard_update(
+      harness.host_lease,
+      owner_guard,
+      effective_cfg,
+      base_analysis,
+    )
+    if owner_guard.state == "owned" {
+      harness.stdio.println(
+        "   owner lease    : ${owner_guard.handle.domain} (v${owner_guard.record.next_version})",
+      )
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "owner_guard_updated",
+        {
+          domain: owner_guard.handle.domain,
+          lease_id: owner_guard.handle.lease_id,
+          version: owner_guard.record.next_version,
+          pin_sha: owner_guard.record.pin_sha,
+        },
+      )
+    }
+    const lane_claim = release_lane_preflight(harness, effective_cfg, base_analysis, owner_guard)
+    // This lexical scope contains every terminal success, early return, throw,
+    // and cancellation after acquisition. Exact-OID cleanup cannot delete a
+    // replacement holder and cannot mask the primary release verdict.
+    defer {
+      release_lane_finish(harness, effective_cfg, lane_claim, run_id)
+    }
+    require_release_repo_path(harness.fs, effective_cfg, "preflight auto-remediation")
+    // Cheap local ownership remediation precedes the exact-tree Rust proof. A
+    // failed pre-publication workspace can therefore release only its local
+    // branch name without making the operator pay for a doomed compilation.
+    const crashed_reclaim = owner_reclaimed_dead_for_version(
+      owner_guard,
+      base_analysis.next_version,
+    )
+    release_preflight_autoremediate(harness, effective_cfg, base_analysis, run_id, crashed_reclaim)
+    require_release_repo_path(harness.fs, effective_cfg, "run/session view gate")
+    const view_gate = release_timed_phase(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "run_session_view_gate",
+      "release.run_session_view_gate",
+      {mode: effective_cfg.mode, mock: effective_cfg.mock},
+      { -> return release_run_session_view_gate(harness, effective_cfg, base_analysis) },
+    )
+    let analysis = base_analysis
+    analysis["run_session_view"] = view_gate
+    analysis["deterministic_findings"] = base_analysis.deterministic_findings + view_gate.findings
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "analysis_finished",
+      {
+        current_version: analysis.current_version,
+        next_version: analysis.next_version,
+        branch: analysis.branch,
+        changelog_top: analysis.changelog_top,
+        dirty_files: analysis.dirty_files,
+        deterministic_findings: analysis.deterministic_findings,
+        fixup_mode: analysis.fixup_mode,
+      },
+    )
+    harness.stdio.println(
+      "   current -> next : ${analysis.current_version} -> ${analysis.next_version}",
+    )
+    harness.stdio.println("   changelog top   : v${analysis.changelog_top}")
+    harness.stdio.println("   dirty files     : ${analysis.dirty_files}")
+    harness.stdio.println("   view schemas    : ${view_gate.summary_line}")
+    harness.stdio.println(
+      "   view fixture    : ${view_gate.check.command} -> ${view_gate.check.status}",
+    )
+    if effective_cfg.mode != "audit" && len(analysis.release_scope_findings ?? []) > 0 {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "release_scope_aborted",
+        {findings: analysis.release_scope_findings},
+      )
+      harness.stdio.println("== release scope: aborting before live release side effects")
+      for line in analysis.release_scope_findings {
+        harness.stdio.println("   - ${line}")
+      }
+      finish_workspace(harness, effective_cfg, false, run_id, workspace_lease)
+      finish_release_run_timing(harness.clock, run_timing, "release_scope_aborted", false)
+      release_owner_guard_finish(harness.host_lease, owner_guard, "release_scope_aborted", false)
+      return 2
+    }
+    if fixup_state?.tagged_fixup_pr != nil && !(fixup_state.conflicting ?? false) {
+      const fixup_pr = fixup_state.tagged_fixup_pr
+      harness.stdio.println("== tagged release fixup PR already open: ${fixup_pr.url}")
+      harness.stdio.println(
+        "   adopted signed head ${fixup_pr.head.sha}; no rebuild, retag, or branch rewrite needed",
+      )
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "tagged_fixup_pr_adopted",
+        {pr_url: fixup_pr.url, head_oid: fixup_pr.head.sha, tag: fixup_state.tag},
+      )
+      finish_workspace(harness, effective_cfg, true, run_id, workspace_lease)
+      finish_release_run_timing(harness.clock, run_timing, "tagged_fixup_pr_open", true)
+      release_owner_guard_finish(harness.host_lease, owner_guard, "tagged_fixup_pr_open", true)
+      return 0
+    }
+    if (effective_cfg.bootstrap_new_crates ?? false) && !(cfg.bootstrap_new_crates ?? false) {
+      harness.stdio.println("   bootstrap new crates: auto-enabled from release delta")
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "option_derived",
+        {bootstrap_new_crates: true},
+      )
+    }
+    if fixup_state != nil {
+      const pin_count = changelog_bullet_count(fixup_state.pin_unreleased)
+      const unreleased_count = changelog_bullet_count(analysis.changelog_unreleased_section ?? "")
+      const release_body_source = fixup_state.release_body_source ?? "pin-unreleased"
+      const note_report = release_recovery_note_report(
+        {
+          scope: effective_cfg.release_notes_scope,
+          version: analysis.next_version,
+          base: effective_cfg.base,
+          artifact_bullet_count: pin_count,
+          artifact_source: release_body_source,
+          current_unreleased_bullet_count: unreleased_count,
+        },
+      )
+      const label = if fixup_state.pre_tag_resume {
+        "resume immutable checkpoint"
+      } else if fixup_state.pre_tag_supersede ?? false {
+        "supersede stale pre-tag checkpoint"
+      } else if fixup_state.conflicting ?? false {
+        "resolving merge conflict"
+      } else if fixup_state.release_exists {
+        "post-publish paperwork"
+      } else {
+        "repair existing PR"
+      }
+      const mode_label = if fixup_state.pre_tag_resume {
+        "pre-tag checkpoint"
+      } else if fixup_state.pre_tag_supersede ?? false {
+        "pre-tag checkpoint supersede"
+      } else {
+        "fixup mode"
+      }
+      harness.stdio.println("== ${mode_label} (${label})")
+      const tag_state = if fixup_state.tag_exists {
+        "${fixup_state.tag} (already pushed; tag will not move)"
+      } else {
+        "${fixup_state.tag} (not yet pushed; will be tagged on this run)"
+      }
+      harness.stdio.println("   tag       : ${tag_state}")
+      harness.stdio.println("   pr        : ${fixup_state.pr_url}")
+      if fixup_state.conflicting ?? false {
+        harness.stdio.println(
+          "   conflict  : PR is `CONFLICTING` against ${cfg.base} — recreating branch on fresh ${cfg.base} resolves it implicitly",
+        )
+      }
+      if !(fixup_state.release_exists ?? false) && len(fixup_state.missing_assets ?? []) > 0 {
+        harness.stdio.println("   assets    : missing " + join(fixup_state.missing_assets, ", "))
+      }
+      harness.stdio.println("   pin       : ${fixup_state.original_pin} (recovered via merge-base)")
+      if note_report.artifact_line != nil {
+        harness.stdio.println("   artifact  : ${note_report.artifact_line}")
+      }
+      harness.stdio.println("   notes     : ${note_report.notes_line}")
+      harness.stdio.println("   plan      : ${note_report.plan}")
+      const supersede_advisory = if fixup_state.tooling_drift != nil {
+        release_checkpoint_supersede_advisory(fixup_state.tooling_drift)
+      } else {
+        nil
+      }
+      if supersede_advisory != nil {
+        harness.stdio.println("   supersede : ${supersede_advisory}")
+      }
+      // Only the certified-tooling identity refuses a tag. Base drift above is
+      // advisory: the checkpoint runs its own frozen copy, so what base now
+      // holds cannot change this run's outcome.
+      const resume_block = if fixup_state.pre_tag_resume && fixup_state.tooling_integrity != nil {
+        release_checkpoint_resume_block(fixup_state.tooling_integrity)
+      } else {
+        nil
+      }
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "fixup_mode_detected",
+        {
+          tag: fixup_state.tag,
+          pr_url: fixup_state.pr_url,
+          original_pin: fixup_state.original_pin,
+          tag_exists: fixup_state.tag_exists,
+          release_exists: fixup_state.release_exists,
+          missing_assets: fixup_state.missing_assets ?? [],
+          conflicting: fixup_state.conflicting ?? false,
+          release_notes_scope: effective_cfg.release_notes_scope,
+          artifact_note_source: release_body_source,
+          artifact_note_chars: len(fixup_state.pin_unreleased),
+          artifact_note_bullet_count: pin_count,
+          current_unreleased_bullet_count: unreleased_count,
+          pre_tag_resume: fixup_state.pre_tag_resume,
+          pre_tag_supersede: fixup_state.pre_tag_supersede ?? false,
+          gate_tooling_stale: fixup_state.tooling_drift?.stale ?? false,
+          gate_tooling_stale_paths: fixup_state.tooling_drift?.paths ?? [],
+          gate_tooling_supersede_pin: fixup_state.tooling_drift?.supersede_pin ?? "",
+          gate_tooling_intact: fixup_state.tooling_integrity?.intact ?? false,
+          gate_tooling_verified: fixup_state.tooling_integrity?.verified ?? [],
+          gate_tooling_tampered: fixup_state.tooling_integrity?.tampered ?? [],
+          gate_tooling_unproven: fixup_state.tooling_integrity?.unproven ?? [],
+        },
+      )
+      // Stop here rather than spend a full gate run reaching the failure the
+      // advisory above already named. The event is logged first so the refusal
+      // is in the run record, not only on the terminal.
+      if resume_block != nil {
+        throw resume_block
+      }
+    }
+    let agent_review_result = {
+      text: "(agent review skipped; pass --agent to enable local-model review)",
+      attempts: [],
+      validation_findings: [],
+      draft_changelog: nil,
+      artifacts: {},
+      // A skipped review gathered no evidence. This must default false so the
+      // loop-status relaxation can never fire on a review that never ran.
+      evidence_complete: false,
+    }
+    if cfg.agent && !(effective_cfg.pre_tag_resume ?? false) {
+      require_release_repo_path(harness.fs, effective_cfg, "agent review")
+      const model_label = if cfg.mock {
+        "mock provider"
+      } else {
+        cfg.model
+      }
+      harness.stdio.println("== agent review with ${model_label} ...")
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "agent_started",
+        {
+          model: model_label,
+          llm_transcript_dir: agent_artifact_paths(harness.fs, run_id).llm_transcript_dir,
+        },
+      )
+      agent_review_result = timed(
+        harness.clock,
+        "release.agent_review",
+        {
+          provider: if cfg.mock {
+            "mock"
+          } else {
+            cfg.provider
+          },
+          model: model_label,
+        },
+        { -> return agent_review(harness, effective_cfg, analysis, run_id) },
+      ).result
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "agent_finished",
+        {
+          draft_changelog: agent_review_result.draft_changelog,
+          artifacts: agent_review_result.artifacts,
+          validation_findings: agent_review_result.validation_findings,
+        },
+      )
+    }
+    const agent_text = agent_review_result.text
+    if cfg.mode != "audit"
+      && cfg.agent
+      && !(effective_cfg.pre_tag_resume ?? false)
+      && chat_enabled({term: harness.term, env: harness.env}, effective_cfg)
+      && agent_review_result.draft_changelog != nil {
+      const draft_path = agent_review_result.draft_changelog ?? ""
+      const changelog_text = if draft_path != "" && harness.fs.exists(draft_path) {
+        harness.fs.read_text(draft_path)
+      } else {
+        ""
+      }
+      const pr_body_preview = try {
+        pre_release_pr_body_text(harness.fs, analysis, agent_review_result, run_id)
+      } catch (_e) {
+        ""
+      }
+      const gate = timed(
+        harness.clock,
+        "release.pre_release_gate",
+        {mode: cfg.mode, mock: cfg.mock},
+        { ->
+          return pre_release_gate(
+            harness,
+            {
+              provider: cfg.provider,
+              model: cfg.model,
+              mock: cfg.mock,
+              tools: release_repair_tools(harness, effective_cfg, run_id),
+              timeout_s: cfg.chat_timeout_s,
+            },
+            {
+              changelog: changelog_text,
+              pr_body: pr_body_preview,
+              findings: analysis.deterministic_findings,
+            },
+            {
+              mode: cfg.mode,
+              next_version: analysis.next_version,
+              current_version: analysis.current_version,
+              repo: cfg.repo,
+              run_id: run_id,
+              base_branch: cfg.base,
+              latest_tag: analysis.latest_tag,
+              pin_sha: cfg.pin_sha,
+            },
+          )
+        },
+      ).result
+      if gate.decision == "abort" {
+        release_log_event(
+          {clock: harness.clock, fs: harness.fs},
+          run_id,
+          "pre_release_gate_aborted",
+          {reason: gate.reason},
+        )
+        harness.stdio.println("== chat: aborting before live release side effects (${gate.reason})")
+        finish_workspace(harness, effective_cfg, false, run_id, workspace_lease)
+        finish_release_run_timing(harness.clock, run_timing, "pre_release_gate_aborted", false)
+        release_owner_guard_finish(
+          harness.host_lease,
+          owner_guard,
+          "pre_release_gate_aborted",
+          false,
+        )
+        return 2
+      }
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "pre_release_gate_approved",
+        {reason: gate.reason},
+      )
+    }
+    const queue_gate = release_queue_gate_probe(harness, effective_cfg)
+    if queue_gate.audit != nil {
+      analysis["release_queue_reservation"] = queue_gate.audit
+      harness.stdio.println("   queue reservation: ${queue_gate.audit.reservation_id}")
+      harness.stdio.println(
+        "   queue plan       : ${len(queue_gate.audit.plan.holds)} hold(s), ${len(queue_gate.audit.plan.preserved)} preserved",
+      )
+    }
+    const build_scope = release_with_build_lease(
+      harness,
+      effective_cfg,
+      run_id,
+      { ->
+        let execution = nil
+        const view_blocker = run_session_view_release_blocker(effective_cfg, view_gate)
+        const notes_blocker = live_release_notes_blocker(
+          {fs: harness.fs, process: harness.process},
+          effective_cfg,
+          analysis,
+        )
+        // A review that never arrived is a provider availability failure, not a
+        // verdict on the release. When deterministic notes already exist —
+        // `## Unreleased` bullets or folded `changelog.d` fragments — the cut
+        // does not need the model's draft, so record the gap as advisory
+        // evidence and proceed. A review that DID arrive and proposes a
+        // malformed draft still blocks: that content would reach CHANGELOG.md.
+        const review_findings = agent_review_result.validation_findings
+        const review_gate_applies = cfg.agent && !(effective_cfg.pre_tag_resume ?? false)
+          && cfg.mode != "audit"
+          && len(review_findings) > 0
+        const review_unavailable_only = review_gate_applies
+          && audit_findings_are_availability_only(review_findings)
+        const review_unavailable_advisory = review_unavailable_only
+          && deterministic_release_notes_available(
+            {fs: harness.fs, process: harness.process},
+            effective_cfg,
+            analysis,
+          )
+        // A loop that ran out of turns says nothing about the audit itself, so
+        // a well-formed EVIDENCED audit is not worth failing a release over.
+        // The evidence check is load-bearing and not redundant: a repair
+        // attempt that makes no tool calls yields a polished audit whose only
+        // finding is this one, resting on no observation at all. Relaxing on
+        // "it was the only finding" would ship exactly those.
+        const review_loop_status_advisory = review_gate_applies
+          && audit_findings_are_loop_status_only(review_findings)
+          && (agent_review_result.evidence_complete ?? false)
+        const review_advisory = review_unavailable_advisory || review_loop_status_advisory
+        if review_advisory {
+          const reason = if review_loop_status_advisory {
+            "the review loop ended early but its audit is complete and evidenced"
+          } else {
+            "the review never arrived; proceeding on deterministic release notes"
+          }
+          harness.stdio.println("!! release-readiness review degraded: ${reason}")
+          release_log_event(
+            {clock: harness.clock, fs: harness.fs},
+            run_id,
+            "release_readiness_review_degraded",
+            {
+              findings: review_findings,
+              reason: reason,
+              evidence_complete: agent_review_result.evidence_complete ?? false,
+              proceeded_on: if review_loop_status_advisory {
+                "evidenced_agent_audit"
+              } else {
+                "deterministic_release_notes"
+              },
+              next_version: analysis.next_version,
+            },
+          )
+        }
+        if view_blocker != nil {
+          execution = [view_blocker]
+        } else if review_gate_applies && !review_advisory {
+          execution = [
+            recorded_step(
+              "agent-review-validation",
+              "validate local-model release audit before live release side effects",
+              command_result_fail(
+                2,
+                if review_unavailable_only {
+                  "the release-readiness review produced no audit and `## Unreleased`"
+                    + " carries no bullets, so this cut has no release notes to ship:\n"
+                    + review_findings.join("\n")
+                } else if audit_findings_are_loop_status_only(review_findings) {
+                  "the release-readiness review ended early AND did not close its"
+                    + " evidence contract, so its audit rests on no observation:\n"
+                    + review_findings.join("\n")
+                } else {
+                  "agent review failed validation:\n" + review_findings.join("\n")
+                },
+              ),
+            ),
+          ]
+        } else if notes_blocker != nil {
+          execution = [notes_blocker]
+        } else if cfg.mode == "prepare" {
+          require_release_repo_path(harness.fs, effective_cfg, "prepare execution")
+          harness.stdio.println("== running prepare ...")
+          release_log_event(
+            {clock: harness.clock, fs: harness.fs},
+            run_id,
+            "mode_execution_started",
+            {mode: "prepare"},
+          )
+          execution = timed_release_steps(
+            harness.clock,
+            "release.mode_execution",
+            {mode: "prepare", mock: effective_cfg.mock},
+            { ->
+              return execute_prepare(harness, effective_cfg, analysis, agent_review_result, run_id)
+            },
+          )
+        } else if cfg.mode == "ship-pr" {
+          const guarded = release_queue_guarded_execution(
+            harness,
+            queue_gate,
+            effective_cfg.mode,
+            { ->
+              require_release_repo_path(harness.fs, effective_cfg, "ship-pr execution")
+              harness.stdio.println("== running prepare + PR handoff ...")
+              release_log_event(
+                {clock: harness.clock, fs: harness.fs},
+                run_id,
+                "mode_execution_started",
+                {mode: "ship-pr"},
+              )
+              return release_recorded_steps(
+                timed_release_steps(
+                  harness.clock,
+                  "release.mode_execution",
+                  {mode: "ship-pr", mock: effective_cfg.mock},
+                  { ->
+                    return execute_ship_pr(
+                      harness,
+                      effective_cfg,
+                      analysis,
+                      agent_review_result,
+                      run_id,
+                      lane_claim?.oid ?? "",
+                    )
+                  },
+                ),
+              )
+            },
+          )
+          execution = release_queue_restore_failed_execution(harness, queue_gate, guarded)
+        } else if cfg.mode == "audit" {
+          execution = release_queue_guarded_execution(
+            harness,
+            queue_gate,
+            effective_cfg.mode,
+            { -> return [] },
+          ).steps
+        }
+        const cleanup = timed(
+          harness.clock,
+          "release.workspace_cleanup",
+          {mode: effective_cfg.mode, mock: effective_cfg.mock},
+          { ->
+            return finish_workspace(
+              harness,
+              effective_cfg,
+              !execution_failed(execution),
+              run_id,
+              workspace_lease,
+            )
+          },
+        ).result
+        return {execution: execution, cleanup: cleanup}
+      },
+    )
+    const execution = build_scope.execution
+    const cleanup = build_scope.cleanup
+    const outcome = if execution_failed(execution) {
+      "FAILED"
+    } else {
+      "ok"
+    }
+    const run_report = finish_release_run_timing(
+      harness.clock,
+      run_timing,
+      outcome,
+      outcome == "ok",
+    )
+    const timing = timing_artifacts(harness.obs)
+    const stage_timings = release_stage_timings(harness.obs)
+    const payload: ReleaseAuditReceipt = {
+      schema_version: "release_harn.audit.v1",
+      run_id: run_id,
+      started_iso: started_iso,
+      finished_iso: harness.clock.date_iso(),
+      duration_ms: run_report.duration_ms,
+      operator: harness.system.identity().username,
+      host: harness.system.identity().hostname ?? "",
+      config: effective_cfg,
+      analysis: analysis,
+      agent_review: agent_text,
+      agent_review_detail: agent_review_result,
+      execution: execution ?? [],
+      cleanup: cleanup,
+      trace_spans: timing.trace_spans,
+      timing_summary: timing.timing_summary,
+      stage_timings: stage_timings,
+    }
+    const written = write_report(harness.fs, run_id, payload)
+    const fixture = write_crystallization_fixture(harness, run_id, payload, written)
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "run_finished",
+      {
+        success: !execution_failed(execution),
+        report_json: written.json_path,
+        report_md: written.md_path,
+        fixture_dir: fixture.out_dir,
+      },
+    )
+    release_owner_guard_finish(harness.host_lease, owner_guard, outcome, outcome == "ok")
+    const pr_url = execution_pr_url(execution)
+    harness.stdio.println("== done (${outcome}, ${format_ms_human(run_report.duration_ms)})")
+    if pr_url != "" {
+      harness.stdio.println("   pr      : ${pr_url}")
+    }
+    if analysis.fixup_mode ?? false {
+      if analysis.fixup_release_exists ?? false {
+        harness.stdio.println(
+          "   tag     : ${analysis.fixup_tag} (unchanged; published artifact untouched)",
+        )
+      } else {
+        harness.stdio.println(
+          "   tag     : ${analysis.fixup_tag} (unchanged; release artifacts still need recovery)",
+        )
+      }
+    } else if cfg.mode == "ship-pr" && !execution_failed(execution) && !cfg.mock {
+      harness.stdio.println(
+        "   tag     : v${analysis.next_version} (pushed; publish-release.yml will ship)",
+      )
+    }
+    harness.stdio.println("   report  : ${written.md_path}")
+    const slow_timing_lines = timing_summary_lines(
+      timing.timing_summary,
+      {limit: 5, min_duration_ms: 1000},
+    )
+    if len(slow_timing_lines) > 0 {
+      harness.stdio.println("   timing  :")
+      for line in slow_timing_lines {
+        harness.stdio.println("     - ${line}")
+      }
+    }
+    // Every declared stage, including the ones that reported nothing. The
+    // slowest-N block above cannot say that a stage is missing.
+    harness.stdio.println("   stages  :")
+    for line in release_stage_timing_lines(stage_timings) {
+      harness.stdio.println("     - ${line}")
+    }
+    if len(analysis.deterministic_findings) > 0 {
+      harness.stdio.println("   findings:")
+      for f in analysis.deterministic_findings {
+        harness.stdio.println("     - ${f}")
+      }
+    }
+    const exit_code = if execution_failed(execution) {
+      const failed = decisive_failed_step(execution)
+      if failed != nil {
+        const explain = release_failure_explanation(failed)
+        harness.stdio.println("   ✗ failed : ${explain.headline}")
+        harness.stdio.println("     (step `${failed.name}`, status ${failed.status})")
+        const reason = trim(failed.stderr ?? "")
+        if reason != "" {
+          for line in split(reason, "\n") {
+            harness.stdio.println("     ${line}")
+          }
+        }
+        const next_step = trim(explain.next ?? "")
+        if next_step != "" {
+          harness.stdio.println("   next    : ${next_step}")
+        }
+      }
+      1
+    } else {
+      0
+    }
+    if chat_enabled({term: harness.term, env: harness.env}, effective_cfg) {
+      const post_cleanup_cfg = release_post_cleanup_config(effective_cfg, cleanup)
+      const chat_cfg = {
+        harness_kind: "release-harn",
+        run_id: run_id,
+        run_dir: release_run_dir(harness.fs, run_id),
+        audit_md_path: written.md_path,
+        audit_json_path: written.json_path,
+        llm_transcript_path: agent_artifact_paths(harness.fs, run_id).llm_transcript_jsonl,
+        provider: cfg.provider,
+        model: cfg.model,
+        repo: post_cleanup_cfg.repo,
+        mode_hint: cfg.mode,
+        outcome: outcome,
+        tools: release_repair_tools(harness, post_cleanup_cfg, run_id),
+        timeout_s: cfg.chat_timeout_s,
+        no_chat: cfg.no_chat,
+      }
+      run_chat_loop(harness, chat_cfg)
+    }
+    return exit_code
+  } catch (e) {
+    let cleanup_failure = ""
+    const queue_restore = release_queue_restore_step(harness, release_run_root(harness.fs))
+    if queue_restore != nil && execution_failed([queue_restore]) {
+      cleanup_failure = trim(queue_restore.stderr ?? "release queue restoration failed")
+    }
+    try {
+      const cleanup = finish_workspace(harness, cfg, false, run_id, workspace_lease)
+      if cleanup != nil && !cleanup.success {
+        const workspace_failure = trim(
+          cleanup.warning ?? cleanup.detail ?? "workspace cleanup failed",
+        )
+        cleanup_failure = join(
+          [cleanup_failure, workspace_failure].filter({ value -> value != "" }).to_list(),
+          "; ",
+        )
+      }
+    } catch (cleanup_error) {
+      cleanup_failure = join(
+        [cleanup_failure, to_string(cleanup_error)].filter({ value -> value != "" }).to_list(),
+        "; ",
+      )
+    }
+    finish_release_run_timing(harness.clock, run_timing, "exception", false)
+    release_owner_guard_finish(harness.host_lease, owner_guard, "exception", false)
+    if cleanup_failure != "" {
+      throw to_string(e) + "\nrelease workspace cleanup also failed: " + cleanup_failure
+    }
+    throw e
+  }
+}
+
+fn execution_pr_url(execution: list?) {
+  for step in execution ?? [] {
+    if step.name == "find-existing-pr" || step.name == "create-pr" {
+      const url = trim(step.stdout ?? "")
+      if starts_with(url, "https://") {
+        return url
+      }
+    }
+  }
+  return ""
+}
+
+fn format_ms_human(ms: int?) {
+  const total = ms ?? 0
+  if total < 1000 {
+    return "${total}ms"
+  }
+  const total_seconds = total / 1000
+  if total_seconds < 60 {
+    const tenths = (total + 50) / 100
+    const whole = tenths / 10
+    const frac = tenths - whole * 10
+    return "${whole}.${frac}s"
+  }
+  const minutes = total_seconds / 60
+  const seconds = total_seconds - minutes * 60
+  return "${minutes}m${seconds}s"
+}

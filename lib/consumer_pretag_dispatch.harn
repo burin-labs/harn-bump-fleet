@@ -1,0 +1,1441 @@
+import {
+  ConsumerPretagAttestationReceipt,
+  ConsumerPretagDispatchAttempt,
+  ConsumerPretagGateReceipt,
+  ConsumerPretagGateTarget,
+} from "./consumer_pretag_gate"
+import { fleet_observation_class } from "./fleet_observation_class"
+
+pub type ConsumerPretagJobRow = {
+  id: int,
+  run_id: int,
+  name: string,
+  status: string,
+  conclusion: string,
+  head_sha: string,
+  steps: list<{name: string, status: string, conclusion: string}>,
+}
+
+pub type ConsumerPretagJobsPage = {
+  repo: string,
+  run_id: int,
+  total_count: int,
+  jobs: list<ConsumerPretagJobRow>,
+}
+
+/** Workflow identity and the fields needed to judge its result. */
+pub type ConsumerPretagRunRow = {
+  id: int,
+  status: string,
+  conclusion: string,
+  html_url: string,
+  display_title: string,
+  head_sha: string,
+  workflow_path?: string,
+  event?: string,
+  head_branch?: string,
+}
+
+/** One bounded exception backed by a successful candidate job and red main baseline. */
+pub type ConsumerPretagFailureAttestation = {
+  run_id: int,
+  proof_job_id: int,
+  proof_step: string,
+  excluded_job_ids: list<int>,
+  excluded_checks: list<string>,
+  baseline_run_id: int,
+  baseline_job_id: int,
+  baseline_workflow_path: string,
+}
+
+pub type ConsumerPretagProofSelection = int | ConsumerPretagFailureAttestation
+
+/** Operator-selected exact consumer proof runs, keyed by repository slug. */
+pub type ConsumerPretagProofRuns = dict<string, ConsumerPretagProofSelection>
+
+fn positive_id(value: any, field: string, slug: string) -> int {
+  if type_of(value) != "int" || value <= 0 {
+    throw "consumer proof ${field} for ${slug} must be a positive integer GitHub Actions ID"
+  }
+  return value
+}
+
+fn normalize_failure_attestation(value: any, slug: string) -> ConsumerPretagFailureAttestation {
+  const expected = [
+    "baseline_job_id",
+    "baseline_run_id",
+    "baseline_workflow_path",
+    "excluded_checks",
+    "excluded_job_ids",
+    "proof_job_id",
+    "proof_step",
+    "run_id",
+  ]
+  if type_of(value) != "dict" || value.keys().sorted().to_list() != expected {
+    throw "consumer proof attestation for ${slug} must contain exactly: " + expected.join(", ")
+  }
+  const workflow = trim(to_string(value.baseline_workflow_path ?? ""))
+  if len(regex_captures("^\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml$", workflow)) == 0 {
+    throw "consumer proof baseline_workflow_path for ${slug} must name one workflow path"
+  }
+  const checks = value.excluded_checks
+  if type_of(checks) != "list" || len(checks) == 0 {
+    throw "consumer proof excluded_checks for ${slug} must be a nonempty list"
+  }
+  let normalized_checks: list<string> = []
+  for check in checks {
+    const name = trim(to_string(check))
+    if name == "" || contains(name, "\n") || normalized_checks.contains(name) {
+      throw "consumer proof excluded_checks for ${slug} must be unique nonempty one-line names"
+    }
+    normalized_checks = normalized_checks + [name]
+  }
+  const excluded_job_ids = value.excluded_job_ids
+  if type_of(excluded_job_ids) != "list" || len(excluded_job_ids) == 0 {
+    throw "consumer proof excluded_job_ids for ${slug} must be a nonempty list"
+  }
+  let normalized_job_ids: list<int> = []
+  for id in excluded_job_ids {
+    const normalized_id = positive_id(id, "excluded_job_ids", slug)
+    if normalized_job_ids.contains(normalized_id) {
+      throw "consumer proof excluded_job_ids for ${slug} must be unique"
+    }
+    normalized_job_ids = normalized_job_ids + [normalized_id]
+  }
+  const proof_step = trim(to_string(value.proof_step ?? ""))
+  if proof_step == "" || contains(proof_step, "\n") {
+    throw "consumer proof proof_step for ${slug} must be one nonempty line"
+  }
+  const normalized: ConsumerPretagFailureAttestation = {
+    run_id: positive_id(value.run_id, "run_id", slug),
+    proof_job_id: positive_id(value.proof_job_id, "proof_job_id", slug),
+    proof_step: proof_step,
+    excluded_job_ids: normalized_job_ids.sorted(),
+    excluded_checks: normalized_checks.sorted(),
+    baseline_run_id: positive_id(value.baseline_run_id, "baseline_run_id", slug),
+    baseline_job_id: positive_id(value.baseline_job_id, "baseline_job_id", slug),
+    baseline_workflow_path: workflow,
+  }
+  if normalized.excluded_job_ids.contains(normalized.proof_job_id) {
+    throw "consumer proof and excluded job IDs for ${slug} must differ"
+  }
+  return normalized
+}
+
+/** Parse and canonicalize the explicit recovery input before any dispatch. */
+pub fn parse_consumer_pretag_proof_runs_json(text: string) -> ConsumerPretagProofRuns {
+  if trim(text) == "" {
+    return {}
+  }
+  const parsed = try {
+    json_parse(text)
+  } catch (error) {
+    throw "consumer proof runs must be a JSON object mapping repository slugs to positive run IDs: "
+      + to_string(error)
+  }
+  if type_of(parsed) != "dict" {
+    throw "consumer proof runs must be a JSON object mapping repository slugs to positive run IDs"
+  }
+  let normalized: ConsumerPretagProofRuns = {}
+  for slug in parsed.keys().sorted() {
+    const selection = parsed[slug]
+    if len(regex_captures("^[^/[:space:]]+/[^/[:space:]]+$", slug)) == 0 {
+      throw "consumer proof run key '${slug}' must be a repository slug like owner/repository"
+    }
+    normalized[slug] = if type_of(selection) == "int" {
+      positive_id(selection, "run", slug)
+    } else {
+      normalize_failure_attestation(selection, slug)
+    }
+  }
+  return normalized
+}
+
+/**
+ * Everything the pre-tag gate does to the outside world, in one injected shape.
+ *
+ * `runs` lists this workflow's dispatched runs; the gate keeps only the ones
+ * whose name carries the exact candidate version and commit and whose source
+ * commit matches the captured consumer revision. That lookup is
+ * recovery-only: a fresh dispatch returns its authoritative run id directly.
+ * An existing unique match is the durable checkpoint for a resumed release,
+ * and ambiguity is always refused rather than resolved by picking the newest.
+ */
+pub type ConsumerPretagDispatchReceipt = {run_id: int, head_sha: string}
+
+pub type ConsumerPretagGateAdapter = {
+  consumer_revision: fn(ConsumerPretagGateTarget) -> Result<string, dict>,
+  dispatch: fn(ConsumerPretagGateTarget) -> Result<ConsumerPretagDispatchReceipt, dict>,
+  runs: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
+  run: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagRunRow, dict>,
+  jobs?: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagJobsPage, dict>,
+  // The consumer's own `main` push history for the declared workflow. It is
+  // what makes a consumer-side red attributable: a job already failing on the
+  // consumer's default branch is not a job this candidate broke. Without it
+  // the gate cannot derive an exclusion and every red fails the release.
+  main_runs?: fn(ConsumerPretagGateTarget) -> Result<list<ConsumerPretagRunRow>, dict>,
+  wait: fn(int) -> nil,
+  now_ms: fn() -> int,
+}
+
+/**
+ * Told the run id of a gate as soon as the gate is bound to one.
+ *
+ * A dispatched consumer run outlives the lane that started it. If the
+ * certification is cancelled while a gate is polling, the only thing that can
+ * still reach that run is a record made before the cancellation, so the id is
+ * published the moment it is known rather than when the gate settles.
+ */
+pub type ConsumerPretagRunRecorder = fn(string, int) -> nil
+
+pub type ConsumerPretagGatePolicy = {
+  dispatch_visibility_ms?: int,
+  initial_poll_interval_ms?: int,
+  poll_interval_ms: int,
+  deadline_ms: int,
+  recovery_visibility_ms?: int,
+}
+
+pub const CONSUMER_PRETAG_GATE_POLICY: ConsumerPretagGatePolicy = {
+  dispatch_visibility_ms: 60000,
+  // GitHub's read-after-dispatch view normally settles within seconds. Start
+  // there, then back off to the ordinary fleet polling interval so visibility
+  // lag is cheap without making a long consumer run noisy.
+  initial_poll_interval_ms: 1000,
+  poll_interval_ms: 30000,
+  // A consumer may queue behind scarce self-hosted capacity before its own
+  // workflow starts doing useful work. Keep this below the hosted release
+  // owner's five-hour bound while allowing one hour of queueing plus the
+  // consumer's long integration proof.
+  deadline_ms: 180 * 60 * 1000,
+}
+
+type PendingGate = {
+  target: ConsumerPretagGateTarget,
+  run_id: int,
+  dispatched?: bool,
+  visibility_error?: string,
+  visibility_stop_ms?: int,
+  // Carried so a gate that survived a dropped dispatch can still prove it did.
+  // A retry whose evidence is dropped the moment the gate passes cannot be
+  // told apart from a retry that never ran.
+  dispatch_attempts?: list<ConsumerPretagDispatchAttempt>,
+}
+
+/** Attach the gate's dispatch history to whatever verdict it reached. */
+fn with_attempts(
+  receipt: ConsumerPretagGateReceipt,
+  gate: PendingGate,
+) -> ConsumerPretagGateReceipt {
+  if len(gate.dispatch_attempts ?? []) == 0 {
+    return receipt
+  }
+  return receipt + {dispatch_attempts: gate.dispatch_attempts ?? []}
+}
+
+type CandidateResolution = {
+  receipts: list<ConsumerPretagGateReceipt>,
+  pending: list<PendingGate>,
+  unseen: list<PendingGate>,
+}
+
+/** Fresh cuts mutate immediately; only a resumed checkpoint reconciles visibility first. */
+pub fn consumer_pretag_gate_policy(pre_tag_resume: bool) -> ConsumerPretagGatePolicy {
+  return CONSUMER_PRETAG_GATE_POLICY
+    + {
+      recovery_visibility_ms: if pre_tag_resume {
+        60000
+      } else {
+        0
+      },
+    }
+}
+
+/**
+ * How many times a dispatch may be sent, and how long the waits between sends
+ * are.
+ *
+ * A release that has already built and certified a candidate must not be thrown
+ * away because one HTTP request was dropped in transit. Five sends spread over
+ * roughly two minutes covers the transient failures actually seen without
+ * turning an outage into a two-minute stall on every consumer: a rejection the
+ * remote actually answered is not retried at all.
+ */
+pub const CONSUMER_PRETAG_DISPATCH_ATTEMPTS = 5
+
+pub const CONSUMER_PRETAG_DISPATCH_BACKOFF_MS: list<int> = [5000, 15000, 40000, 60000]
+
+/**
+ * Whether a failed dispatch is worth sending again.
+ *
+ * The judgement is not made here. `fleet_observation_class` already owns the
+ * question "can a later attempt find this satisfied?" for every connector error
+ * in this repository, and it decides from the structured `code` and `category`
+ * rather than from message text. A second classifier living at this seam would
+ * drift from that one, and the direction it would drift is the dangerous one:
+ * two answers to whether a failure is transient, disagreeing silently.
+ *
+ * The one thing this adds is unwrapping the envelope. A dispatch error arrives
+ * as `{message: {code, category, message}}`, so the classified record is one
+ * level in; a record without a category at the top is unwrapped before it is
+ * classified, and anything else is passed through unchanged.
+ */
+pub fn consumer_pretag_dispatch_is_retryable(error: any) -> bool {
+  const inner = if error?.category == nil && error?.message != nil {
+    error?.message
+  } else {
+    error
+  }
+  return fleet_observation_class(inner).disposition == "retry"
+}
+
+/** How long to wait before send number `attempt` + 1. */
+pub fn consumer_pretag_dispatch_backoff_ms(attempt: int) -> int {
+  return CONSUMER_PRETAG_DISPATCH_BACKOFF_MS[attempt - 1] ?? 60000
+}
+
+/**
+ * What the harness concluded about a consumer-side red on its own, with no
+ * operator-typed JSON.
+ *
+ * `unbacked` names the failing jobs the consumer's own `main` does not already
+ * fail, which are the jobs this candidate is answerable for. `succeeded` is
+ * carried because an exclusion set that covers every job excludes the whole
+ * proof: a run where nothing passed proved nothing, however well its failures
+ * are explained.
+ */
+pub type ConsumerPretagDerivedExclusions = {
+  admissible: bool,
+  excluded: list<{id: int, name: string}>,
+  unbacked: list<string>,
+  succeeded: int,
+  reason: string,
+}
+
+/**
+ * Decide, from job censuses alone, whether every red in a consumer proof run
+ * is a red the candidate could not have caused.
+ *
+ * A failing job is attributable to the consumer's own default branch when a
+ * job of the same name completed as a failure on the baseline. Anything else
+ * is the candidate's. An empty baseline census is never an exclusion: it means
+ * the question was not answered, and a red with no baseline is the candidate's
+ * by default.
+ */
+pub fn derive_consumer_pretag_exclusions(
+  candidate_jobs: list<ConsumerPretagJobRow>,
+  baseline_jobs: list<ConsumerPretagJobRow>,
+) -> ConsumerPretagDerivedExclusions {
+  const failed = candidate_jobs.filter({ job -> job.conclusion != "success" }).to_list()
+  const succeeded = len(candidate_jobs.filter({ job -> job.conclusion == "success" }).to_list())
+  if len(failed) == 0 {
+    return {
+      admissible: false,
+      excluded: [],
+      unbacked: [],
+      succeeded: succeeded,
+      reason: "no failing job to attribute",
+    }
+  }
+  if len(baseline_jobs) == 0 {
+    return {
+      admissible: false,
+      excluded: [],
+      unbacked: failed.map({ job -> job.name }).to_list(),
+      succeeded: succeeded,
+      reason:
+        "consumer main baseline reported no jobs, so ${len(failed)} failing job(s) stay attributed to the candidate",
+    }
+  }
+  let excluded: list<{id: int, name: string}> = []
+  let unbacked: list<string> = []
+  for job in failed {
+    const backed = baseline_jobs.any(
+      { row -> row.name == job.name && row.status == "completed" && row.conclusion == "failure" },
+    )
+    if backed {
+      excluded = excluded + [{id: job.id, name: job.name}]
+    } else {
+      unbacked = unbacked + [job.name]
+    }
+  }
+  if len(unbacked) > 0 {
+    return {
+      admissible: false,
+      excluded: excluded,
+      unbacked: unbacked,
+      succeeded: succeeded,
+      reason: "${len(unbacked)} failing job(s) the consumer's main does not already fail: "
+        + join(unbacked, ", "),
+    }
+  }
+  if succeeded == 0 {
+    return {
+      admissible: false,
+      excluded: excluded,
+      unbacked: [],
+      succeeded: 0,
+      reason: "every job in the run failed, so excluding all of them would prove nothing",
+    }
+  }
+  return {
+    admissible: true,
+    excluded: excluded,
+    unbacked: [],
+    succeeded: succeeded,
+    reason: "${len(excluded)} failing job(s) already failing on the consumer's main; "
+      + "${succeeded} job(s) proved the candidate",
+  }
+}
+
+fn unreadable(target: ConsumerPretagGateTarget, detail: string) -> ConsumerPretagGateReceipt {
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: "unreadable",
+    run_url: "",
+    detail: detail,
+  }
+}
+
+fn candidate_runs(
+  target: ConsumerPretagGateTarget,
+  rows: list<ConsumerPretagRunRow>,
+) -> list<ConsumerPretagRunRow> {
+  const title = "Harn candidate ${target.version} @ ${target.revision}"
+  return rows.filter(
+    { row ->
+      trim(row.display_title) == title
+        && row.head_sha == target.consumer_revision
+    },
+  )
+    .to_list()
+}
+
+/**
+ * The consumer's newest completed failing `main` push run of the declared
+ * workflow, with its jobs. This is the baseline a derived exclusion is
+ * measured against.
+ */
+fn consumer_main_baseline(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+) -> Result<{run: ConsumerPretagRunRow, jobs: list<ConsumerPretagJobRow>}, string> {
+  if adapter.main_runs == nil || adapter.jobs == nil {
+    return Err("adapter cannot read the consumer's main baseline")
+  }
+  const list_main = adapter.main_runs
+    ?? fn(_target) { return Err({message: "main run reader unavailable"}) }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const listed = list_main(target)
+  if is_err(listed) {
+    return Err("could not read the consumer's main history: " + to_string(unwrap_err(listed)))
+  }
+  const workflow_path = ".github/workflows/${target.workflow}"
+  const failing = unwrap(listed).filter(
+    { row ->
+      trim(row.workflow_path ?? "") == workflow_path
+        && trim(row.event ?? "") == "push"
+        && trim(row.head_branch ?? "") == "main"
+        && row.status == "completed"
+        && row.conclusion == "failure"
+        && len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 1
+    },
+  )
+    .to_list()
+  if len(failing) == 0 {
+    return Err("consumer main has no completed failing ${workflow_path} push to attribute against")
+  }
+  const baseline = failing[0]
+    ?? {id: 0, status: "", conclusion: "", html_url: "", display_title: "", head_sha: ""}
+  const baseline_target = target + {consumer_revision: baseline.head_sha}
+  const page = read_jobs(baseline_target, baseline.id)
+  if is_err(page) {
+    return Err("could not read consumer main baseline jobs: " + to_string(unwrap_err(page)))
+  }
+  const jobs = exact_jobs(unwrap(page), baseline_target, baseline.id)
+  if is_err(jobs) {
+    return Err(to_string(unwrap_err(jobs)))
+  }
+  return Ok({run: baseline, jobs: unwrap(jobs)})
+}
+
+/**
+ * Attribute a consumer-side red before it fails the release.
+ *
+ * A red on a job the candidate cannot reach is excluded here, structurally,
+ * from evidence the harness reads itself. The operator JSON form remains, as
+ * an override for cases this cannot decide — it is no longer the only way a
+ * pre-existing consumer breakage stops failing a tag.
+ *
+ * Returns nil whenever the failure stands, so every path that cannot prove an
+ * exclusion keeps the red.
+ */
+fn derived_failure_receipt(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt? {
+  if adapter.jobs == nil || adapter.main_runs == nil {
+    return nil
+  }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const candidate_page = read_jobs(target, row.id)
+  if is_err(candidate_page) {
+    return nil
+  }
+  const candidate_jobs = exact_jobs(unwrap(candidate_page), target, row.id)
+  if is_err(candidate_jobs) {
+    return nil
+  }
+  const jobs = unwrap(candidate_jobs)
+  if jobs.any({ job -> job.status != "completed" }) {
+    return nil
+  }
+  const baseline = consumer_main_baseline(target, adapter)
+  if is_err(baseline) {
+    return nil
+  }
+  const baseline_run = unwrap(baseline).run
+  const derived = derive_consumer_pretag_exclusions(jobs, unwrap(baseline).jobs)
+  if !derived.admissible {
+    return nil
+  }
+  const first_excluded = derived.excluded[0] ?? {id: 0, name: ""}
+  const baseline_job = unwrap(baseline).jobs.filter(
+    { job -> job.name == first_excluded.name && job.conclusion == "failure" },
+  )
+    .to_list()[0]
+    ?? {id: 0, name: first_excluded.name}
+  const proof_job = jobs.filter({ job -> job.conclusion == "success" }).to_list()[0]
+    ?? {id: 0, name: "", steps: []}
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: "passed",
+    run_url: row.html_url,
+    detail: "derived attestation: " + derived.reason,
+    attestation: {
+      candidate_run_id: row.id,
+      candidate_revision: target.revision,
+      consumer_revision: row.head_sha,
+      proof_job: {id: proof_job.id, name: proof_job.name, step: ""},
+      excluded_jobs: derived.excluded,
+      excluded_checks: derived.excluded.map({ job -> job.name }).to_list(),
+      baseline_run: {
+        id: baseline_run.id,
+        workflow_path: baseline_run.workflow_path ?? "",
+        head_sha: baseline_run.head_sha,
+      },
+      baseline_job: {id: baseline_job.id, name: baseline_job.name},
+    },
+  }
+}
+
+fn settle(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+  expected_run_id: int,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt? {
+  if row.id != expected_run_id
+    || trim(row.display_title) != "Harn candidate ${target.version} @ ${target.revision}" {
+    return unreadable(target, "run lookup returned a different run or candidate identity")
+  }
+  if row.head_sha != target.consumer_revision {
+    return unreadable(target, "run ${row.id} does not name the captured consumer revision")
+  }
+  if target.proof_job != nil {
+    return settle_declared_job(target, row, adapter)
+  }
+  if row.status != "completed" {
+    return nil
+  }
+  const passed = row.conclusion == "success"
+  // A red is attributed before it becomes a verdict. Only a failure can be
+  // attributed: `timed_out` never reported per-job conclusions to compare.
+  if !passed && row.conclusion == "failure" {
+    const derived = derived_failure_receipt(target, row, adapter)
+    if derived != nil {
+      return derived
+    }
+  }
+  // `cancelled`, `stale` and `startup_failure` never judged the candidate, so
+  // they are unreadable rather than a verdict either way.
+  const settled = passed || row.conclusion == "failure" || row.conclusion == "timed_out"
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: if passed {
+      "passed"
+    } else if settled {
+      "failed"
+    } else {
+      "unreadable"
+    },
+    run_url: row.html_url,
+    detail: if settled {
+      "run ${to_string(row.id)} concluded '${row.conclusion}'"
+    } else {
+      "run ${to_string(row.id)} concluded '${row.conclusion}' without judging the candidate"
+    },
+  }
+}
+
+fn exact_jobs(
+  page: ConsumerPretagJobsPage,
+  target: ConsumerPretagGateTarget,
+  run_id: int,
+) -> Result<list<ConsumerPretagJobRow>, dict> {
+  if page.repo != target.slug || page.run_id != run_id {
+    return Err({message: "workflow jobs page identified a different repository or run"})
+  }
+  if page.total_count != len(page.jobs) {
+    return Err(
+      {
+        message: "workflow jobs page did not completely describe the selected run",
+        retryable_while_active: true,
+      },
+    )
+  }
+  for job in page.jobs {
+    if job.run_id != run_id || job.head_sha != target.consumer_revision {
+      return Err({message: "workflow job identity did not match the selected run and source"})
+    }
+  }
+  return Ok(page.jobs)
+}
+
+fn settle_declared_job(
+  target: ConsumerPretagGateTarget,
+  row: ConsumerPretagRunRow,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt? {
+  if adapter.jobs == nil {
+    return unreadable(target, "consumer proof adapter cannot inspect the declared workflow job")
+  }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const page = read_jobs(target, row.id)
+  if is_err(page) {
+    return nil
+  }
+  const exact = exact_jobs(unwrap(page), target, row.id)
+  if is_err(exact) {
+    // GitHub can report the run before its jobs endpoint has published the
+    // complete census. That is an unanswered observation while the run is
+    // active, and becomes a structural failure only after the run settles.
+    const problem = unwrap_err(exact)
+    return if row.status == "completed" || !(problem.retryable_while_active ?? false) {
+      unreadable(target, to_string(problem))
+    } else {
+      nil
+    }
+  }
+  const jobs = unwrap(exact)
+  const selector = target.proof_job ?? {name: "", step: ""}
+  const selected = jobs.filter({ job -> job.name == selector.name }).to_list()
+  if len(selected) == 0 {
+    return if row.status == "completed" {
+      unreadable(target, "completed run did not contain the declared candidate proof job")
+    } else {
+      nil
+    }
+  }
+  if len(selected) != 1 {
+    return unreadable(target, "run contained the declared candidate proof job more than once")
+  }
+  const job = selected[0]
+    ?? {
+      id: 0,
+      run_id: row.id,
+      name: "",
+      status: "",
+      conclusion: "",
+      head_sha: row.head_sha,
+      steps: [],
+    }
+  if job.status != "completed" {
+    return nil
+  }
+  const selected_steps = job.steps.filter({ step -> step.name == selector.step }).to_list()
+  if len(selected_steps) != 1 {
+    return unreadable(
+      target,
+      if len(selected_steps) == 0 {
+        "candidate proof job did not contain the declared proof step"
+      } else {
+        "candidate proof job contained the declared proof step more than once"
+      },
+    )
+  }
+  const step = selected_steps[0] ?? {name: "", status: "", conclusion: ""}
+  if step.status != "completed" {
+    return nil
+  }
+  const passed = job.conclusion == "success" && step.conclusion == "success"
+  const failed = [job.conclusion, step.conclusion].any(
+    { conclusion -> conclusion == "failure" || conclusion == "timed_out" },
+  )
+  const advisory = jobs.filter({ candidate -> candidate.id != job.id }).map(
+    { candidate ->
+      {
+        id: candidate.id,
+        name: candidate.name,
+        status: candidate.status,
+        conclusion: candidate.conclusion,
+      }
+    },
+  )
+    .to_list()
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: if passed {
+      "passed"
+    } else if failed {
+      "failed"
+    } else {
+      "unreadable"
+    },
+    run_url: row.html_url,
+    detail: if passed {
+      "declared candidate proof job and step passed"
+    } else if failed {
+      "declared candidate proof job or step failed"
+    } else {
+      "declared candidate proof job or step did not report a judging conclusion"
+    },
+    job_proof: {
+      run_id: row.id,
+      job: {id: job.id, name: job.name, step: selector.step},
+      advisory_jobs: advisory,
+    },
+  }
+}
+
+fn one_job(
+  jobs: list<ConsumerPretagJobRow>,
+  id: int,
+  purpose: string,
+) -> Result<ConsumerPretagJobRow, dict> {
+  const found = jobs.filter({ job -> job.id == id }).to_list()
+  if len(found) != 1 {
+    return Err({message: "${purpose} job ${id} was not present exactly once"})
+  }
+  return Ok(found[0])
+}
+
+fn verify_attestation_baseline(
+  target: ConsumerPretagGateTarget,
+  attestation: ConsumerPretagFailureAttestation,
+  adapter: ConsumerPretagGateAdapter,
+  read_jobs: fn(ConsumerPretagGateTarget, int) -> Result<ConsumerPretagJobsPage, dict>,
+) -> Result<{run: ConsumerPretagRunRow, job: ConsumerPretagJobRow}, string> {
+  const baseline = adapter.run(target, attestation.baseline_run_id)
+  if is_err(baseline) {
+    return Err("could not read attestation baseline run: " + to_string(unwrap_err(baseline)))
+  }
+  const run = unwrap(baseline)
+  if run.id != attestation.baseline_run_id
+    || run.workflow_path != attestation.baseline_workflow_path
+    || run.event != "push"
+    || run.head_branch != "main"
+    || run.status != "completed"
+    || run.conclusion != "failure"
+    || len(regex_captures("^[0-9a-f]{40}$", run.head_sha)) == 0 {
+    return Err("attestation baseline was not a completed failing main push")
+  }
+  const baseline_target = target + {consumer_revision: run.head_sha}
+  const page = read_jobs(baseline_target, attestation.baseline_run_id)
+  if is_err(page) {
+    return Err("could not read attestation baseline jobs: " + to_string(unwrap_err(page)))
+  }
+  const jobs = exact_jobs(unwrap(page), baseline_target, attestation.baseline_run_id)
+  if is_err(jobs) {
+    return Err(to_string(unwrap_err(jobs)))
+  }
+  const job = one_job(unwrap(jobs), attestation.baseline_job_id, "baseline failure")
+  if is_err(job) || unwrap(job).status != "completed" || unwrap(job).conclusion != "failure" {
+    return Err("attestation baseline job was not a completed failure")
+  }
+  return Ok({run: run, job: unwrap(job)})
+}
+
+fn attested_failure_receipt(
+  target: ConsumerPretagGateTarget,
+  candidate: ConsumerPretagRunRow,
+  attestation: ConsumerPretagFailureAttestation,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagGateReceipt {
+  if candidate.status != "completed" || candidate.conclusion != "failure" {
+    return unreadable(target, "attested candidate run must be a completed failure")
+  }
+  if adapter.jobs == nil {
+    return unreadable(target, "consumer proof adapter cannot inspect exact workflow jobs")
+  }
+  const read_jobs = adapter.jobs
+    ?? fn(_target, _run_id) { return Err({message: "workflow jobs reader unavailable"}) }
+  const candidate_page = read_jobs(target, attestation.run_id)
+  if is_err(candidate_page) {
+    return unreadable(
+      target,
+      "could not read attested candidate jobs: " + to_string(unwrap_err(candidate_page)),
+    )
+  }
+  const candidate_jobs = exact_jobs(unwrap(candidate_page), target, attestation.run_id)
+  if is_err(candidate_jobs) {
+    return unreadable(target, to_string(unwrap_err(candidate_jobs)))
+  }
+  const jobs = unwrap(candidate_jobs)
+  if jobs.any({ job -> job.status != "completed" }) {
+    return unreadable(target, "attested candidate run still has pending jobs")
+  }
+  const proof = one_job(jobs, attestation.proof_job_id, "candidate proof")
+  if is_err(proof) {
+    return unreadable(target, to_string(unwrap_err(proof)))
+  }
+  const proof_job = unwrap(proof)
+  const proof_steps = proof_job.steps.filter(
+    { step -> step.name == attestation.proof_step && step.status == "completed" },
+  )
+    .to_list()
+  if proof_job.conclusion != "success" || len(proof_steps) != 1
+    || proof_steps[0]?.conclusion != "success" {
+    return unreadable(target, "attested candidate proof job and step did not report success")
+  }
+  const failed = jobs.filter({ job -> job.conclusion != "success" }).to_list()
+  const unexpected = failed.filter({ job -> !attestation.excluded_job_ids.contains(job.id) })
+    .to_list()
+  const missing = attestation.excluded_job_ids.filter(
+    { id -> !failed.any({ job -> job.id == id && job.conclusion == "failure" }) },
+  )
+    .to_list()
+  if len(unexpected) > 0 || len(missing) > 0 {
+    return unreadable(
+      target,
+      "attested candidate run has unaccounted or missing failed jobs: "
+        + unexpected.map({ job -> "${job.name}:${job.conclusion}" }).to_list().join(", "),
+    )
+  }
+  const baseline = verify_attestation_baseline(target, attestation, adapter, read_jobs)
+  if is_err(baseline) {
+    return unreadable(target, unwrap_err(baseline))
+  }
+  const baseline_run = unwrap(baseline).run
+  const baseline_job = unwrap(baseline).job
+  const evidence: ConsumerPretagAttestationReceipt = {
+    candidate_run_id: candidate.id,
+    candidate_revision: target.revision,
+    consumer_revision: candidate.head_sha,
+    proof_job: {id: proof_job.id, name: proof_job.name, step: attestation.proof_step},
+    excluded_jobs: failed.map({ job -> {id: job.id, name: job.name} }).to_list(),
+    excluded_checks: attestation.excluded_checks,
+    baseline_run: {
+      id: baseline_run.id,
+      workflow_path: baseline_run.workflow_path ?? "",
+      head_sha: baseline_run.head_sha,
+    },
+    baseline_job: {id: baseline_job.id, name: baseline_job.name},
+  }
+  return {
+    slug: target.slug,
+    workflow: target.workflow,
+    status: "passed",
+    run_url: candidate.html_url,
+    detail: "operator attestation accepted one baseline-backed consumer-main failure",
+    attestation: evidence,
+  }
+}
+
+/** Bind an explicit run to its own source revision without reading current main. */
+fn resolve_explicit_run(
+  declared_target: ConsumerPretagGateTarget,
+  selection: ConsumerPretagProofSelection,
+  adapter: ConsumerPretagGateAdapter,
+  recorder: ConsumerPretagRunRecorder?,
+) -> CandidateResolution {
+  const run_id = to_int(
+    if type_of(selection) == "int" {
+      selection
+    } else {
+      selection.run_id
+    },
+  )
+    ?? 0
+  const read = adapter.run(declared_target, run_id)
+  if is_err(read) {
+    return {
+      receipts: [
+        unreadable(
+          declared_target,
+          "explicit run ${run_id} could not be read: " + to_string(unwrap_err(read)),
+        ),
+      ],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const row = unwrap(read)
+  const expected_title = "Harn candidate ${declared_target.version} @ ${declared_target.revision}"
+  const expected_workflow = ".github/workflows/${declared_target.workflow}"
+  let identity_error = ""
+  if row.id != run_id {
+    identity_error = "explicit run lookup returned another run ID"
+  } else if trim(row.workflow_path ?? "") != expected_workflow {
+    identity_error = "explicit run ${run_id} does not name declared workflow ${expected_workflow}"
+  } else if trim(row.event ?? "") != "workflow_dispatch" {
+    identity_error = "explicit run ${run_id} was not started by workflow_dispatch"
+  } else if trim(row.display_title) != expected_title {
+    identity_error = "explicit run ${run_id} does not name candidate ${declared_target.version} @ ${declared_target.revision}"
+  } else if len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 0 {
+    identity_error = "explicit run ${run_id} has no valid consumer source revision"
+  }
+  if identity_error != "" {
+    return {receipts: [unreadable(declared_target, identity_error)], pending: [], unseen: []}
+  }
+  const target = declared_target + {consumer_revision: row.head_sha}
+  if recorder != nil {
+    (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
+  }
+  if type_of(selection) == "dict" && row.status != "completed" {
+    return {
+      receipts: [unreadable(target, "attested consumer proof run is not terminal")],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const receipt = if type_of(selection) == "dict" {
+    const attestation = schema_expect(selection, ConsumerPretagFailureAttestation)
+    attested_failure_receipt(target, row, attestation, adapter)
+  } else {
+    settle(target, row, run_id, adapter)
+  }
+  return if receipt == nil {
+    {receipts: [], pending: [{target: target, run_id: run_id}], unseen: []}
+  } else {
+    {
+      receipts: [receipt ?? unreadable(target, "explicit run produced no terminal receipt")],
+      pending: [],
+      unseen: [],
+    }
+  }
+}
+
+fn resolve_candidate_rows(
+  target: ConsumerPretagGateTarget,
+  rows: list<ConsumerPretagRunRow>,
+  adapter: ConsumerPretagGateAdapter,
+  recorder: ConsumerPretagRunRecorder?,
+  ambiguity_context: string,
+) -> CandidateResolution {
+  const title = "Harn candidate ${target.version} @ ${target.revision}"
+  if rows.any(
+    { row ->
+      trim(row.display_title) == title
+        && len(regex_captures("^[0-9a-f]{40}$", row.head_sha)) == 0
+    },
+  ) {
+    return {
+      receipts: [unreadable(target, "candidate run has no valid consumer source revision")],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const found = candidate_runs(target, rows)
+  if len(found) == 0 {
+    return {receipts: [], pending: [], unseen: [{target: target, run_id: 0, visibility_error: nil}]}
+  }
+  if len(found) > 1 {
+    return {
+      receipts: [
+        unreadable(
+          target,
+          "${to_string(len(found))} ${ambiguity_context} runs name this candidate and consumer revision; refusing to "
+            + "guess which one judged it",
+        ),
+      ],
+      pending: [],
+      unseen: [],
+    }
+  }
+  const row = found[0]
+    ?? {
+      id: 0,
+      status: "completed",
+      conclusion: "startup_failure",
+      html_url: "",
+      display_title: "",
+      head_sha: "",
+    }
+  const receipt = settle(target, row, row.id, adapter)
+  if receipt != nil {
+    return {
+      receipts: [receipt ?? unreadable(target, "candidate run produced no terminal receipt")],
+      pending: [],
+      unseen: [],
+    }
+  }
+  if recorder != nil {
+    let _ = (recorder ?? fn(_slug, _id) { return nil })(target.slug, row.id)
+  }
+  return {receipts: [], pending: [{target: target, run_id: row.id}], unseen: []}
+}
+
+/** One dispatch outcome plus every send it took to get there. */
+pub type ConsumerPretagDispatchOutcome = {
+  receipt?: ConsumerPretagDispatchReceipt,
+  attempts: list<ConsumerPretagDispatchAttempt>,
+  last_error: string,
+  retryable: bool,
+}
+
+/**
+ * Send the dispatch, retrying only what a retry can fix.
+ *
+ * A dropped request is indistinguishable from one that never arrived, so the
+ * only way to learn anything is to send it again. This is bounded rather than
+ * patient: a release that has already built and certified a candidate is worth
+ * two minutes of retrying and is not worth stalling behind an outage.
+ *
+ * Every send is recorded, including the ones that failed, so "it retried" is a
+ * claim the receipt can prove rather than one a reader has to take on faith.
+ */
+pub fn consumer_pretag_dispatch_with_retry(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+  max_attempts: int = CONSUMER_PRETAG_DISPATCH_ATTEMPTS,
+) -> ConsumerPretagDispatchOutcome {
+  let attempts: list<ConsumerPretagDispatchAttempt> = []
+  let last_error = ""
+  let retryable = false
+  let attempt = 0
+  while attempt < max_attempts {
+    attempt = attempt + 1
+    if attempt > 1 {
+      // Look before sending again. A dropped response is indistinguishable
+      // from a dropped request, so a transport failure after the remote
+      // already accepted the dispatch classifies as retryable and the resend
+      // starts a second run for the same candidate. The pre-tag resume scan
+      // then finds two runs naming one candidate and refuses to guess which
+      // judged it, so the cost of this retry lands on a later attempt as a
+      // release that can no longer be resumed.
+      //
+      // The run's identity is its display title, which already names the
+      // candidate and the consumer revision, because GitHub does not echo
+      // dispatch inputs back on a run. So a re-read answers the only question
+      // that matters here: did the previous send arrive? A run that exists is
+      // adopted; a resend happens only when none does.
+      const adopted = adopt_dispatched_run(target, adapter)
+      if adopted != nil {
+        return {receipt: adopted, attempts: attempts, last_error: "", retryable: false}
+      }
+    }
+    const sent = adapter.dispatch(target)
+    if !is_err(sent) {
+      return {receipt: unwrap(sent), attempts: attempts, last_error: "", retryable: false}
+    }
+    const error = unwrap_err(sent)
+    last_error = to_string(error)
+    retryable = consumer_pretag_dispatch_is_retryable(error)
+    attempts = attempts
+      + [{attempt: attempt, at_ms: adapter.now_ms(), error: last_error}]
+    // A refusal the remote actually answered is a fact about this request. It
+    // will read the same on every send, so repeating it only delays the report.
+    if !retryable {
+      return {attempts: attempts, last_error: last_error, retryable: false}
+    }
+    if attempt < max_attempts {
+      adapter.wait(consumer_pretag_dispatch_backoff_ms(attempt))
+    }
+  }
+  return {attempts: attempts, last_error: last_error, retryable: true}
+}
+
+/**
+ * The run a previous send already started, if one exists.
+ *
+ * `nil` means "no run to adopt", and it is returned for an unreadable listing
+ * as well as an empty one. That is deliberate: an unreadable listing is not
+ * evidence that nothing was dispatched, but the alternative to resending is
+ * failing the gate outright, and a duplicate run is a recoverable state while
+ * a release that refused to try is not. The duplicate is still reported by the
+ * resume scan, so it stays visible rather than silently accepted.
+ *
+ * More than one matching run is also `nil`. The damage this exists to prevent
+ * has already happened by then, and adopting one of them would be the guess
+ * the resume scan deliberately refuses to make.
+ */
+fn adopt_dispatched_run(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+) -> ConsumerPretagDispatchReceipt? {
+  const listed = adapter.runs(target)
+  if is_err(listed) {
+    return nil
+  }
+  const found = candidate_runs(target, unwrap(listed))
+  if len(found) != 1 {
+    return nil
+  }
+  const row = found[0]
+  if row == nil {
+    return nil
+  }
+  if row.id <= 0 {
+    // A row without a usable id cannot be polled later, so adopting it would
+    // trade a duplicate run for a gate that can never read its own proof.
+    return nil
+  }
+  return {run_id: row.id, head_sha: row.head_sha}
+}
+
+fn dispatch_unseen_candidates(
+  gates: list<PendingGate>,
+  adapter: ConsumerPretagGateAdapter,
+  recovery_visibility_ms: int,
+  dispatch_visibility_ms: int,
+  recorder: ConsumerPretagRunRecorder?,
+) -> CandidateResolution {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  let pending: list<PendingGate> = []
+  for gate in gates {
+    const target = gate.target
+    if recovery_visibility_ms > 0 && gate.visibility_error != nil {
+      receipts = receipts
+        + [
+          unreadable(
+            target,
+            "could not reconcile a previously accepted recovery dispatch before mutation: "
+              + to_string(gate.visibility_error),
+          ),
+        ]
+      continue
+    }
+    const outcome = consumer_pretag_dispatch_with_retry(target, adapter)
+    if outcome.receipt == nil {
+      const sends = len(outcome.attempts)
+      const summary = if outcome.retryable {
+        "dispatch unreachable after ${to_string(sends)} attempts; last error: ${outcome.last_error}"
+      } else {
+        "dispatch failed: ${outcome.last_error}"
+      }
+      receipts = receipts
+        + [
+          unreadable(target, summary)
+            + {
+              cause: if outcome.retryable {
+                "consumer_dispatch_unreachable"
+              } else {
+                "consumer_dispatch_rejected"
+              },
+              dispatch_attempts: outcome.attempts,
+            },
+        ]
+      continue
+    }
+    const dispatched = unwrap(outcome.receipt)
+    const run_id = dispatched.run_id
+    if run_id <= 0 {
+      receipts = receipts + [unreadable(target, "dispatch returned no valid run identity")]
+      continue
+    }
+    // Publish the accepted run before any suspension point. A sibling can fail
+    // immediately after dispatch, and cancellation must already be able to
+    // reach the hosted work without waiting for list visibility.
+    if recorder != nil {
+      (recorder ?? fn(_slug, _id) { return nil })(target.slug, run_id)
+    }
+    if dispatched.head_sha != target.consumer_revision {
+      receipts = receipts
+        + [
+          unreadable(
+            target,
+            "consumer main moved during dispatch; run ${run_id} does not prove the captured revision",
+          ),
+        ]
+      continue
+    }
+    pending = pending
+      + [
+        gate
+          + {
+            run_id: run_id,
+            dispatched: true,
+            visibility_stop_ms: adapter.now_ms() + dispatch_visibility_ms,
+            dispatch_attempts: outcome.attempts,
+          },
+      ]
+  }
+  return {receipts: receipts, pending: pending, unseen: []}
+}
+
+fn capture_consumer_revision(
+  target: ConsumerPretagGateTarget,
+  adapter: ConsumerPretagGateAdapter,
+) -> Result<ConsumerPretagGateTarget, string> {
+  const revision = adapter.consumer_revision(target)
+  if is_err(revision) {
+    return Err("could not resolve consumer revision: " + to_string(unwrap_err(revision)))
+  }
+  if len(regex_captures("^[0-9a-f]{40}$", unwrap(revision))) == 0 {
+    return Err("consumer revision must be a 40-character commit SHA")
+  }
+  return Ok(target + {consumer_revision: unwrap(revision)})
+}
+
+fn unknown_explicit_run_receipts(
+  targets: list<ConsumerPretagGateTarget>,
+  explicit_runs: ConsumerPretagProofRuns,
+) -> list<ConsumerPretagGateReceipt> {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  for slug in explicit_runs.keys() {
+    if !targets.any({ target -> target.slug == slug }) {
+      receipts = receipts
+        + [
+          {
+            slug: slug,
+            workflow: "",
+            status: "unreadable",
+            run_url: "",
+            detail: "explicit consumer proof run names a repository with no declared pre-tag gate",
+          },
+        ]
+    }
+  }
+  return receipts
+}
+
+fn pending_gate_detail(gate: PendingGate) -> string {
+  if gate.run_id == 0 {
+    return "no run naming this candidate appeared before the gate deadline"
+  }
+  if gate.visibility_error != nil {
+    return if gate.dispatched ?? false {
+      "run ${to_string(gate.run_id)} did not become readable as the exact dispatched candidate "
+        + "before the gate deadline: ${gate.visibility_error ?? "unknown visibility error"}"
+    } else {
+      "run ${to_string(gate.run_id)} could not be read before the gate deadline: "
+        + (gate.visibility_error ?? "unknown read error")
+    }
+  }
+  if gate.target.proof_job != nil {
+    return "run ${to_string(gate.run_id)} did not produce terminal declared-job proof before the gate deadline"
+  }
+  return "run ${to_string(gate.run_id)} was still running at the gate deadline"
+}
+
+/** Read every bound run once without turning read-after-dispatch lag into a verdict. */
+fn poll_pending_gates(
+  pending: list<PendingGate>,
+  adapter: ConsumerPretagGateAdapter,
+) -> CandidateResolution {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  let still_pending: list<PendingGate> = []
+  for gate in pending {
+    if gate.run_id == 0 {
+      still_pending = still_pending + [gate]
+      continue
+    }
+    const row = adapter.run(gate.target, gate.run_id)
+    if is_err(row) {
+      const detail = "exact run lookup failed: " + to_string(unwrap_err(row))
+      if (gate.dispatched ?? false)
+        && adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
+        receipts = receipts + [with_attempts(unreadable(gate.target, detail), gate)]
+      } else {
+        still_pending = still_pending + [gate + {visibility_error: detail}]
+      }
+      continue
+    }
+    const observed = unwrap(row)
+    const expected_title = "Harn candidate ${gate.target.version} @ ${gate.target.revision}"
+    if (gate.dispatched ?? false)
+      && (observed.id != gate.run_id || trim(observed.display_title) != expected_title) {
+      const detail = "run lookup returned a different run or candidate identity"
+      if adapter.now_ms() >= (gate.visibility_stop_ms ?? adapter.now_ms()) {
+        receipts = receipts + [with_attempts(unreadable(gate.target, detail), gate)]
+      } else {
+        still_pending = still_pending + [gate + {visibility_error: detail}]
+      }
+      continue
+    }
+    const settled = settle(gate.target, observed, gate.run_id, adapter)
+    if settled == nil {
+      still_pending = still_pending + [gate + {visibility_error: nil}]
+      continue
+    }
+    receipts = receipts + [with_attempts(settled ?? unreadable(gate.target, "unreachable"), gate)]
+  }
+  return {receipts: receipts, pending: still_pending, unseen: []}
+}
+
+/**
+ * Resume or dispatch every consumer gate, then wait for all of them together.
+ *
+ * A unique run naming the candidate and captured consumer revision is adopted
+ * before mutation. A fresh dispatch binds its authoritative run id before any
+ * wait and must report the captured consumer revision. Resolving every target
+ * before polling keeps the wall clock at the slowest consumer.
+ *
+ * A gate still running at the deadline is pending and leaves the release
+ * unproven; the consumer has not yet answered.
+ */
+fn run_consumer_pretag_gates_validated(
+  targets: list<ConsumerPretagGateTarget>,
+  adapter: ConsumerPretagGateAdapter,
+  policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
+  recorder: ConsumerPretagRunRecorder? = nil,
+  explicit_runs: ConsumerPretagProofRuns = {},
+) -> list<ConsumerPretagGateReceipt> {
+  let receipts: list<ConsumerPretagGateReceipt> = []
+  // Recovery reconciliation and consumer polling share this one bound. The
+  // grace period must not silently extend the release's advertised deadline.
+  const stop_at_ms = adapter.now_ms() + policy.deadline_ms
+  let pending: list<PendingGate> = []
+  let awaiting_dispatch: list<PendingGate> = []
+  for declared_target in targets {
+    const explicit_run_id = explicit_runs[declared_target.slug]
+    if explicit_run_id != nil {
+      const resolved = resolve_explicit_run(declared_target, explicit_run_id, adapter, recorder)
+      receipts = receipts + resolved.receipts
+      pending = pending + resolved.pending
+      continue
+    }
+    const captured = capture_consumer_revision(declared_target, adapter)
+    if is_err(captured) {
+      receipts = receipts + [unreadable(declared_target, unwrap_err(captured))]
+      continue
+    }
+    const target = unwrap(captured)
+    const before = adapter.runs(target)
+    if is_err(before) {
+      receipts = receipts
+        + [
+          unreadable(
+            target,
+            "could not inventory existing runs before dispatch: "
+              + to_string(unwrap_err(before)),
+          ),
+        ]
+      continue
+    }
+    const resolved = resolve_candidate_rows(target, unwrap(before), adapter, recorder, "existing")
+    receipts = receipts + resolved.receipts
+    pending = pending + resolved.pending
+    awaiting_dispatch = awaiting_dispatch + resolved.unseen
+  }
+  const visibility_ms = policy.recovery_visibility_ms ?? 0
+  const requested_visibility_stop_ms = adapter.now_ms() + visibility_ms
+  const visibility_stop_ms = if requested_visibility_stop_ms < stop_at_ms {
+    requested_visibility_stop_ms
+  } else {
+    stop_at_ms
+  }
+  while len(awaiting_dispatch) > 0
+    && visibility_ms > 0
+    && adapter.now_ms() < visibility_stop_ms {
+    const remaining_ms = visibility_stop_ms - adapter.now_ms()
+    adapter.wait(
+      if policy.poll_interval_ms < remaining_ms {
+        policy.poll_interval_ms
+      } else {
+        remaining_ms
+      },
+    )
+    let still_unseen: list<PendingGate> = []
+    for gate in awaiting_dispatch {
+      const observed = adapter.runs(gate.target)
+      if is_err(observed) {
+        still_unseen = still_unseen
+          + [gate + {visibility_error: to_string(unwrap_err(observed))}]
+        continue
+      }
+      const rows = unwrap(observed)
+      const resolved = resolve_candidate_rows(
+        gate.target,
+        rows,
+        adapter,
+        recorder,
+        "recovery-visible",
+      )
+      receipts = receipts + resolved.receipts
+      pending = pending + resolved.pending
+      still_unseen = still_unseen + resolved.unseen
+    }
+    awaiting_dispatch = still_unseen
+  }
+  if len(awaiting_dispatch) > 0 && adapter.now_ms() < stop_at_ms {
+    const dispatched = dispatch_unseen_candidates(
+      awaiting_dispatch,
+      adapter,
+      visibility_ms,
+      policy.dispatch_visibility_ms ?? policy.deadline_ms,
+      recorder,
+    )
+    receipts = receipts + dispatched.receipts
+    pending = pending + dispatched.pending
+  } else {
+    pending = pending + awaiting_dispatch
+  }
+  let poll_interval_ms = policy.initial_poll_interval_ms ?? policy.poll_interval_ms
+  if poll_interval_ms <= 0 || poll_interval_ms > policy.poll_interval_ms {
+    poll_interval_ms = policy.poll_interval_ms
+  }
+  while len(pending) > 0 && adapter.now_ms() < stop_at_ms {
+    const polled = poll_pending_gates(pending, adapter)
+    receipts = receipts + polled.receipts
+    pending = polled.pending
+    if len(pending) > 0 {
+      const remaining_ms = stop_at_ms - adapter.now_ms()
+      if remaining_ms > 0 {
+        adapter.wait(
+          if poll_interval_ms < remaining_ms {
+            poll_interval_ms
+          } else {
+            remaining_ms
+          },
+        )
+        poll_interval_ms = if poll_interval_ms < policy.poll_interval_ms / 2 {
+          poll_interval_ms * 2
+        } else {
+          policy.poll_interval_ms
+        }
+      }
+    }
+  }
+  for gate in pending {
+    receipts = receipts
+      + [
+        {
+          slug: gate.target.slug,
+          workflow: gate.target.workflow,
+          status: if (gate.dispatched ?? false) && gate.visibility_error != nil {
+            "unreadable"
+          } else {
+            "pending"
+          },
+          run_url: "",
+          detail: pending_gate_detail(gate),
+        },
+      ]
+  }
+  return receipts
+}
+
+/** Validate the complete explicit-run map before the gate performs any I/O. */
+pub fn run_consumer_pretag_gates(
+  targets: list<ConsumerPretagGateTarget>,
+  adapter: ConsumerPretagGateAdapter,
+  policy: ConsumerPretagGatePolicy = CONSUMER_PRETAG_GATE_POLICY,
+  recorder: ConsumerPretagRunRecorder? = nil,
+  explicit_runs: ConsumerPretagProofRuns = {},
+) -> list<ConsumerPretagGateReceipt> {
+  const invalid = unknown_explicit_run_receipts(targets, explicit_runs)
+  if len(invalid) > 0 {
+    return invalid
+  }
+  return run_consumer_pretag_gates_validated(targets, adapter, policy, recorder, explicit_runs)
+}

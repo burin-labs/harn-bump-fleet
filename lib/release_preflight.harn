@@ -1,0 +1,896 @@
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { env_str } from "std/config"
+import { git_run } from "std/git"
+import { HostLeaseOptions, with_host_lease } from "std/host_lease"
+import { read_line } from "std/io"
+import { BumpKind, next, parse_release, version_from_tag } from "std/semver"
+import {
+  chat_cfg_from_run_dir,
+  chat_enabled,
+  pick_recent_run,
+  resolve_chat_run_path,
+} from "./chat_runs"
+import { base_ref_fetch_args } from "./checkout_cleanup"
+import { fleet_self_check } from "./fleet_selfcheck"
+import {
+  HarnReleaseContract,
+  contract_development_release_target,
+  contract_next_development_version,
+  contract_workspace_proves_release_fold,
+  harn_release_contract_from_text,
+} from "./harn_release_contract"
+import { hosted_release_lane_claim_write } from "./hosted_release_lane_cleanup"
+import { planner_preflight_audit_line, run_planner_preflight } from "./llm_defaults"
+import { run_chat_loop } from "./post_run_chat"
+import {
+  preflight_remediate_base_behind,
+  preflight_remediate_stale_release_branch,
+} from "./preflight_remediation"
+import { release_repair_tools } from "./release_agent_tools"
+import { changelog_top_from_text, workspace_version_from_manifest } from "./release_analysis"
+import { coerce_flag_choice, release_flag_passed } from "./release_commands"
+import { failed_release_workspace_authorization } from "./release_failed_workspace"
+import {
+  ReleaseLaneClaim,
+  claim_release_lane,
+  finish_release_lane,
+  finish_release_lane_durable,
+  release_lane_blocking_reason,
+  release_lane_cleanup_warning,
+  release_lane_report,
+} from "./release_lane_lock"
+import { ReleaseOwnerGuard } from "./release_owner_guard"
+import {
+  ReleaseConfig,
+  ReleaseGithubPrFilters,
+  ReleaseGithubPullRequest,
+  expand_home,
+  latest_release_tag,
+  release_git_remote_refs,
+  release_github_pr_list,
+  release_log_event,
+  release_open_pr_count,
+  release_repo_slug,
+  run_git,
+} from "./release_runtime"
+import { ensure_healthy_sccache } from "./sccache_preflight"
+
+pub type PriorReleaseFoldEvidence = {
+  contract: HarnReleaseContract,
+  base_ref: string,
+  latest_tag: string,
+  workspace_version: string,
+  changelog_version: string,
+  recovery_ref: string,
+  recovery_pr_number: int?,
+  recovery_pr_url: string,
+}
+
+pub type PriorReleaseFoldDecision = {proceed: bool, reason: string, detail: string}
+
+/** `EX_TEMPFAIL`: the supported outer launcher must re-exec updated fleet code. */
+pub const FLEET_SELF_RESTART_EXIT_CODE = 75
+
+pub type PriorReleaseFoldConfig = {
+  repo: string,
+  base: string,
+  bump?: BumpKind,
+  preid?: string,
+  mode: "audit" | "prepare" | "ship-pr",
+  mock: bool,
+  yes_live_release: bool,
+}
+
+pub fn release_chat_only(harness: Harness, raw_cfg: ReleaseConfig) -> int {
+  if !chat_enabled({term: harness.term, env: harness.env}, raw_cfg) {
+    harness.stdio.eprintln("--chat-only requires an interactive terminal (and HARN_EXT_CHAT != 0)")
+    return 2
+  }
+  const kind = "release-harn"
+  const target_dir = if trim(raw_cfg.chat_run ?? "") != "" {
+    resolve_chat_run_path(harness.fs, kind, raw_cfg.chat_run)
+  } else {
+    const pick = pick_recent_run(harness, {stdio: harness.stdio, fs: harness.fs}, kind, 12)
+    if pick == nil {
+      nil
+    } else {
+      pick.dir
+    }
+  }
+  if target_dir == nil {
+    harness.stdio.println("(no run selected; exiting)")
+    return 0
+  }
+  const chat_cfg = chat_cfg_from_run_dir(
+    harness.fs,
+    {
+      provider: raw_cfg.provider,
+      model: raw_cfg.model,
+      repo: expand_home(harness.env, raw_cfg.repo),
+      mock: raw_cfg.mock,
+      timeout_s: raw_cfg.chat_timeout_s,
+      tools: release_repair_tools(
+        harness,
+        {...raw_cfg, repo: expand_home(harness.env, raw_cfg.repo)},
+        basename(target_dir),
+      ),
+      no_chat: raw_cfg.no_chat,
+    },
+    kind,
+    target_dir,
+  )
+  run_chat_loop(harness, chat_cfg)
+  return 0
+}
+
+/** Prompt once for a single release-shaping flag and echo any fallback note. */
+fn release_prompt_flag(stdio: HarnessStdio, label: any, choices: any, default_val: any) {
+  const r = read_line(stdio, {prompt: label, timeout_ms: 60000, trim: true})
+  const resolved = coerce_flag_choice(r.value ?? "", r.ok ?? false, choices, default_val)
+  if resolved.note != "" {
+    stdio.println("   ↳ ${resolved.note}")
+  }
+  return resolved.value
+}
+
+/**
+ * On an interactive terminal, fill in the release-shaping flags the operator
+ * didn't pass (`--mode`, `--bump`) with a short prompt. Gated by
+ * `chat_enabled`, so CI, piped/redirected stdin, `--no-chat`, and
+ * `HARN_EXT_CHAT=0` all keep today's silent-default behavior untouched. Returns
+ * `cfg` with the resolved values.
+ */
+pub fn resolve_release_flags_interactively(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  argv: list<string>,
+) -> ReleaseConfig {
+  if !chat_enabled({term: harness.term, env: harness.env}, cfg) {
+    return cfg
+  }
+  let out = cfg
+  if !release_flag_passed(argv, "--mode") {
+    out["mode"] = release_prompt_flag(
+      harness.stdio,
+      "ℹ No --mode given. Release mode — audit / prepare / ship-pr [audit]: ",
+      ["audit", "prepare", "ship-pr"],
+      "audit",
+    )
+  }
+  if !release_flag_passed(argv, "--bump") {
+    out["bump"] = release_prompt_flag(
+      harness.stdio,
+      "ℹ No --bump given. Version bump — patch / minor / major [patch]: ",
+      ["patch", "minor", "major"],
+      "patch",
+    )
+  }
+  // A non-audit mode picked interactively still needs the explicit live flag —
+  // surface that so the operator isn't surprised by a read-only "live" run.
+  if out.mode != "audit" && !(out.yes_live_release ?? false)
+    && !release_flag_passed(argv, "--yes-live-release") {
+    harness.stdio.println(
+      "   ↳ note: live ${out.mode} side effects still require --yes-live-release; without it this run stays read-only",
+    )
+  }
+  return out
+}
+
+/**
+ * Clear a poisoned `sccache` daemon before the build-heavy `prepare` step.
+ *
+ * Only relevant for modes that compile (`prepare`/`ship-pr`) and never for
+ * mock runs. A daemon left confined by an earlier sandboxed build (harn's
+ * sandbox, a sandboxed agent shell, …) breaks every cargo build machine-wide
+ * with `Operation not permitted` — which is exactly how the v0.8.82 release's
+ * warm-prebuild died despite running `--no-sandbox`. See lib/sccache_preflight.
+ */
+pub fn release_sccache_preflight(
+  harness: {stdio: HarnessStdio, process: HarnessProcess},
+  cfg: dict,
+) -> nil {
+  if cfg.mock ?? false {
+    return
+  }
+  if !(cfg.mode == "prepare" || cfg.mode == "ship-pr") {
+    return
+  }
+  const result = ensure_healthy_sccache({ cmd -> harness.process.shell(cmd) })
+  if result.restarted {
+    harness.stdio.println(
+      "   ⚠ ${result.detail} — stale sandbox confinement cleared; the prepare build will spawn a fresh server",
+    )
+  } else if result.checked {
+    harness.stdio.println("   ✓ sccache daemon healthy")
+  }
+}
+
+/**
+ * Require cross-host ownership before any expensive release work begins.
+ *
+ * Placed where the next version first exists and nothing has been compiled
+ * yet. Every collision guard downstream of here — the immutable attempt ref,
+ * the write-once certification branch, the tag — is correct and costs a full
+ * build to reach.
+ *
+ * The initial advisory observed real contention twice. v0.10.66 proved the
+ * remaining hazard: the losing hosted recovery reached publication after the
+ * holder moved the release PR head. Reporting that collision without stopping
+ * was neither safe nor useful, so ownership is now fail-closed.
+ *
+ * Only live prepare and ship-pr claim. An audit or a mock run publishing a
+ * real ref into the release repository would be a side effect those modes
+ * promise not to have.
+ */
+pub fn release_lane_preflight(
+  harness: Harness,
+  cfg: dict,
+  analysis: dict,
+  owner: ReleaseOwnerGuard,
+) -> ReleaseLaneClaim? {
+  if (cfg.mock ?? false) || owner.state != "owned" {
+    return nil
+  }
+  if !(cfg.mode == "prepare" || cfg.mode == "ship-pr") {
+    return nil
+  }
+  const version = trim(to_string(analysis?.next_version ?? ""))
+  const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  if version == "" || slug == "" {
+    return nil
+  }
+  const holder = {
+    run_id: owner.record.run_id,
+    host: owner.record.host,
+    mode: to_string(cfg.mode),
+    started_at: harness.clock.date_iso(),
+    workflow_run_id: to_int(env_str(harness.env, "GITHUB_RUN_ID") ?? ""),
+    workflow_run_attempt: to_int(env_str(harness.env, "GITHUB_RUN_ATTEMPT") ?? ""),
+  }
+  const claim = claim_release_lane(
+    harness,
+    {
+      slug: slug,
+      base_branch: to_string(cfg.base ?? "main"),
+      version: version,
+      holder: holder,
+      now: harness.clock.date_iso(),
+    },
+  )
+  for line in release_lane_report(claim) {
+    harness.stdio.println(line)
+  }
+  const blocked = release_lane_blocking_reason(claim)
+  if blocked != nil {
+    throw blocked
+  }
+  // The out-of-process cancellation owner cannot safely infer a lane from an
+  // absent artifact. Persist its exact claimant immediately after acquisition;
+  // if that fails, release the just-created ref before leaving this boundary.
+  try {
+    hosted_release_lane_claim_write(harness, slug, claim, holder)
+  } catch (error) {
+    const rolled_back = finish_release_lane(harness, slug, claim)
+    throw "could not persist hosted release lane claim; rollback=${rolled_back.reason}: "
+      + to_string(error)
+  }
+  return claim
+}
+
+/**
+ * Terminal release-lane cleanup. Never throws: the exact outcome is logged and
+ * a warning is visible, while the release's primary success/failure is kept.
+ */
+pub fn release_lane_finish(
+  harness: Harness,
+  cfg: dict,
+  claim: ReleaseLaneClaim?,
+  run_id: string,
+) -> nil {
+  if claim == nil {
+    return
+  }
+  try {
+    const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+    const result = finish_release_lane_durable(harness, slug, claim)
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_lane_finished",
+      {
+        attempted: result.attempted,
+        released: result.released,
+        reason: result.reason,
+        version: result.version,
+        ref: result.ref,
+        oid: result.oid,
+      },
+    )
+    if result.released {
+      harness.stdio.println("   ✓ release lane released: ${result.ref}")
+    } else if result.attempted {
+      harness.stdio.eprintln(release_lane_cleanup_warning(result, claim.holder?.started_at ?? ""))
+    }
+  } catch (error) {
+    harness.stdio.eprintln(
+      "   ⚠ release lane cleanup failed without changing the release verdict: ${to_string(error)}",
+    )
+  }
+}
+
+/**
+ * The bump-fleet checkout's own default branch. This is the repo
+ * release_harn.harn lives in, NOT the target release repo (`cfg.repo`/`cfg.base`).
+ */
+fn fleet_default_branch(env: HarnessEnv) {
+  return env_str(env, "HARN_EXT_FLEET_DEFAULT_BRANCH") ?? "main"
+}
+
+/**
+ * F4: guard against the bump-fleet checkout running its own stale release code.
+ *
+ * release_harn checks the TARGET repo's freshness but never its own; a stale
+ * bump-fleet runs old logic and can crash mid-cut (the v0.9.21 failure). Only
+ * mutating modes gate; pure audit is read-only. A behind, fast-forwardable
+ * checkout fast-forwards in place by default rather than failing the launch,
+ * then the supported outer launcher starts a fresh process before release work;
+ * it fails loud only on a diverged history or a dirty tree (the latter
+ * overridable with `--self-update` / `FLEET_SELF_UPDATE=1`). Never silently stale.
+ */
+pub fn release_fleet_self_check(harness: Harness, cfg: ReleaseConfig, run_id: string) -> bool {
+  if cfg.mock ?? false {
+    return false
+  }
+  if cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
+    return false
+  }
+  const result = fleet_self_check(
+    harness.tools,
+    { args -> git_run(harness.process, args) },
+    { p -> harness.fs.exists(p) },
+    {
+      mode: cfg.mode,
+      opt_in: cfg.self_update ?? false,
+      default_branch: fleet_default_branch(harness.env),
+    },
+  )
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "fleet_self_check",
+    {
+      action: result.action,
+      reason: result.reason,
+      fleet_root: result.fleet_root ?? "",
+      remote_ref: result.remote_ref ?? "",
+      local_sha: result.local_sha ?? "",
+      remote_sha: result.remote_sha ?? "",
+    },
+  )
+  if result.action == "fail" {
+    harness.stdio.println("   ✗ bump-fleet self-check: ${result.reason}")
+    throw "bump-fleet checkout is stale: ${result.reason}\nremediation: ${result.remediation ?? "git pull --ff-only"}"
+  }
+  if result.action == "restart" {
+    harness.stdio.println("   ↻ bump-fleet self-update: ${result.reason}")
+    harness.stdio.println(
+      "     exit ${FLEET_SELF_RESTART_EXIT_CODE}; scripts/with_env.sh restarts this supported path exactly once",
+    )
+    return true
+  } else if result.action == "warn" {
+    harness.stdio.println("   ⚠ bump-fleet self-check: ${result.reason}")
+  } else if result.action == "proceed" {
+    harness.stdio.println("   ✓ bump-fleet self-check: ${result.reason}")
+  }
+  return false
+}
+
+pub fn prior_release_fold_base_evidence(
+  base_ref: string,
+  latest_tag: string,
+  cargo_toml: string,
+  changelog: string,
+  contract: HarnReleaseContract,
+) -> PriorReleaseFoldEvidence {
+  return {
+    contract: contract,
+    base_ref: trim(base_ref),
+    latest_tag: trim(latest_tag),
+    workspace_version: workspace_version_from_manifest(cargo_toml),
+    changelog_version: changelog_top_from_text(changelog),
+    recovery_ref: "",
+    recovery_pr_number: nil,
+    recovery_pr_url: "",
+  }
+}
+
+pub fn prior_release_fold_decision(evidence: PriorReleaseFoldEvidence) -> PriorReleaseFoldDecision {
+  const latest_version = version_from_tag(trim(evidence.latest_tag))
+  if latest_version == "" {
+    return {proceed: true, reason: "no prior release tag exists", detail: ""}
+  }
+  // Harn's exported contract owns which workspace shapes prove the fold; this
+  // gate owns only the decision and its remediation text.
+  const workspace_version = trim(evidence.workspace_version)
+  const development_form = contract_next_development_version(evidence.contract, latest_version)
+  const workspace_matches = contract_workspace_proves_release_fold(
+    evidence.contract,
+    workspace_version,
+    latest_version,
+  )
+  const changelog_matches = trim(evidence.changelog_version) == latest_version
+  if workspace_matches && changelog_matches {
+    return {
+      proceed: true,
+      reason: "${evidence.base_ref} contains the ${evidence.latest_tag} release fold",
+      detail: "",
+    }
+  }
+  let mismatches = []
+  if !workspace_matches {
+    mismatches = mismatches
+      + [
+        "workspace version is ${evidence.workspace_version} "
+          + "(expected ${latest_version} or ${development_form})",
+      ]
+  }
+  if !changelog_matches {
+    mismatches = mismatches
+      + ["CHANGELOG top is v${evidence.changelog_version} (expected v${latest_version})"]
+  }
+  const ref = trim(evidence.recovery_ref)
+  const pr_url = trim(evidence.recovery_pr_url)
+  const recovery = if pr_url != "" && evidence.recovery_pr_number != nil {
+    "orphaned fold: PR #${evidence.recovery_pr_number} ${pr_url}"
+      + if ref == "" {
+        ""
+      } else {
+        " (head `${ref}`)"
+      }
+  } else if ref != "" {
+    "orphaned fold branch: `${ref}`"
+  } else {
+    "no matching fold PR or branch was found"
+  }
+  return {
+    proceed: false,
+    reason: join(mismatches, "; "),
+    detail: "latest published tag ${evidence.latest_tag} is not folded into ${evidence.base_ref}: "
+      + join(mismatches, "; ")
+      + ". ${recovery}. Recreate the fold from ${evidence.latest_tag} on fresh origin base, merge it, then rerun the release.",
+  }
+}
+
+pub fn prior_release_fold_recovery_allowed(
+  evidence: PriorReleaseFoldEvidence,
+  bump: BumpKind,
+  mode: "audit" | "prepare" | "ship-pr" = "ship-pr",
+  preid: string = "",
+) -> bool {
+  if mode != "ship-pr" || trim(evidence.recovery_ref) == "" {
+    return false
+  }
+  // This predicate asks whether base is exactly one bump BEHIND the latest tag,
+  // i.e. the fold never landed, so it reads the raw workspace version on
+  // purpose. It stays correct across the development-version cutover only
+  // because `next` strips a prerelease rather than bumping past it:
+  // `next("0.10.114-dev", "patch")` is `0.10.114`, so an unfolded base still
+  // resolves to the tag it is missing. `release_development_version_contract`
+  // pins that behavior; if it ever changes, this comparison must resolve the
+  // workspace version through `release_analysis` first.
+  const current = trim(evidence.workspace_version)
+  const development_target = contract_development_release_target(evidence.contract, current)
+  if development_target != nil {
+    return development_target == version_from_tag(evidence.latest_tag)
+  }
+  if parse_release(current) == nil {
+    return false
+  }
+  return next(current, bump, preid) == version_from_tag(evidence.latest_tag)
+}
+
+fn release_fold_pr(
+  pull_requests: list<ReleaseGithubPullRequest>,
+  tag: string,
+) -> ReleaseGithubPullRequest? {
+  const release_title = "Release ${tag}"
+  for prefer_open in [true, false] {
+    for pr in pull_requests {
+      const head = pr.head.ref
+      const matches = pr.title == release_title || head == "release/${tag}"
+        || starts_with(head, "release-attempt/${tag}/")
+        || starts_with(head, "release-fold/${tag}")
+      if matches && pr.github_state == "open" == prefer_open {
+        return pr
+      }
+    }
+  }
+  return nil
+}
+
+fn release_fold_remote_refs(
+  process: HarnessProcess,
+  cfg: PriorReleaseFoldConfig,
+  tag: string,
+) -> list<string> {
+  const refs = release_git_remote_refs(
+    process,
+    cfg,
+    [
+      "refs/heads/release/${tag}",
+      "refs/heads/release-attempt/${tag}/*",
+      "refs/heads/release-fold/${tag}*",
+    ],
+  )
+  if !refs.success {
+    throw "could not inspect remote release-fold branches: ${trim(refs.stderr)}"
+  }
+  return refs.refs.map({ ref -> regex_replace("^refs/heads/", "", ref.name) }).to_list()
+}
+
+pub fn release_fold_pr_probe_filters(
+  base: string,
+  remote_refs: list<string>,
+) -> list<ReleaseGithubPrFilters> {
+  let filters: list<ReleaseGithubPrFilters> = []
+  for ref in remote_refs {
+    filters = filters + [{base: base, head: ref, state: "open", limit: 1}]
+  }
+  for ref in remote_refs {
+    filters = filters + [{base: base, head: ref, state: "all", limit: 1}]
+  }
+  return filters
+}
+
+pub fn release_prior_fold_preflight(
+  harness: Harness,
+  cfg: PriorReleaseFoldConfig,
+  run_id: string,
+) -> nil {
+  if cfg.mock || cfg.mode == "audit" || !cfg.yes_live_release {
+    return
+  }
+  const fetched = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    base_ref_fetch_args(cfg.base),
+  )
+  if !fetched.success {
+    throw "failed to refresh origin/${cfg.base} for prior-release fold preflight: ${trim(fetched.stderr)}"
+  }
+  const latest_tag = latest_release_tag(harness.process, cfg)
+  const cargo = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["show", "origin/${cfg.base}:Cargo.toml"],
+  )
+  const changelog = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["show", "origin/${cfg.base}:CHANGELOG.md"],
+  )
+  const contract_source = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["show", "origin/${cfg.base}:scripts/release_contract.json"],
+  )
+  const contract = if contract_source.success {
+    harn_release_contract_from_text(contract_source.stdout)
+  } else {
+    nil
+  }
+  if !cargo.success || !changelog.success || contract == nil {
+    throw "could not read Cargo.toml, CHANGELOG.md, and a valid scripts/release_contract.json from refreshed origin/${cfg.base}; refusing to start a release"
+  }
+  const base_ref = "origin/${cfg.base}"
+  const base = prior_release_fold_base_evidence(
+    base_ref,
+    latest_tag,
+    cargo.stdout,
+    changelog.stdout,
+    contract,
+  )
+  const preliminary = prior_release_fold_decision(base)
+  let recovery_ref = ""
+  let recovery_pr_number: int? = nil
+  let recovery_pr_url = ""
+  if !preliminary.proceed {
+    const remote_refs = release_fold_remote_refs(harness.process, cfg, latest_tag)
+    let pr: ReleaseGithubPullRequest? = nil
+    for filters in release_fold_pr_probe_filters(cfg.base, remote_refs) {
+      if pr == nil {
+        pr = release_fold_pr(release_github_pr_list(harness, cfg, filters), latest_tag)
+      }
+    }
+    recovery_ref = if pr != nil {
+      pr.head.ref
+    } else if len(remote_refs) > 0 {
+      remote_refs[0] ?? ""
+    } else {
+      ""
+    }
+    recovery_pr_number = pr?.number
+    recovery_pr_url = pr?.url ?? ""
+  }
+  const evidence: PriorReleaseFoldEvidence = {
+    contract: base.contract,
+    base_ref: base.base_ref,
+    latest_tag: base.latest_tag,
+    workspace_version: base.workspace_version,
+    changelog_version: base.changelog_version,
+    recovery_ref: recovery_ref,
+    recovery_pr_number: recovery_pr_number,
+    recovery_pr_url: recovery_pr_url,
+  }
+  const decision = prior_release_fold_decision(evidence)
+  const recovery_allowed = prior_release_fold_recovery_allowed(
+    evidence,
+    cfg.bump ?? "patch",
+    cfg.mode,
+    cfg.preid ?? "",
+  )
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "prior_release_fold_preflight",
+    {
+      proceed: decision.proceed || recovery_allowed,
+      recovery_allowed: recovery_allowed,
+      latest_tag: evidence.latest_tag,
+      workspace_version: evidence.workspace_version,
+      changelog_version: evidence.changelog_version,
+      recovery_ref: evidence.recovery_ref,
+      recovery_pr_url: evidence.recovery_pr_url,
+      reason: decision.reason,
+    },
+  )
+  if !decision.proceed && !recovery_allowed {
+    throw decision.detail
+  }
+  if recovery_allowed {
+    harness.stdio.println(
+      "   ↻ prior release fold: recovering ${evidence.latest_tag} from `${evidence.recovery_ref}` before any newer release",
+    )
+  } else {
+    harness.stdio.println(
+      "   ✓ prior release fold: ${evidence.latest_tag} is recorded on origin/${cfg.base}",
+    )
+  }
+}
+
+/**
+ * F2/F3: heal the known-safe preflight blockers deterministically before a live
+ * mutating run — a stale `release/vX.Y.Z` local branch with no open PR and no
+ * unique un-pushed commits, and a base branch behind origin with a clean tree.
+ * Anything not known-safe (open PR, unique work, dirty tree) fails loud instead
+ * of destroying anything. Fixup and pre-tag resume own their own branch
+ * handling.
+ */
+pub fn release_preflight_autoremediate(
+  harness: Harness,
+  cfg: dict,
+  analysis: dict,
+  run_id: string,
+  crashed_reclaim: bool = false,
+) -> nil {
+  if cfg.mock ?? false {
+    return
+  }
+  if cfg.mode == "audit" || !(cfg.yes_live_release ?? false) {
+    return
+  }
+  if cfg.fixup_mode ?? false {
+    return
+  }
+  if cfg.pre_tag_resume ?? false {
+    return
+  }
+  const git = { args -> run_git({env: harness.env, process: harness.process}, cfg, args) }
+  const base_result = preflight_remediate_base_behind(
+    harness.tools,
+    git,
+    {base: cfg.base, preserve_checkout: trim(cfg.pin_sha_input ?? "") != ""},
+  )
+  release_preflight_report(harness, run_id, "base-behind", base_result)
+  const version = trim(analysis.next_version ?? "")
+  if version != "" {
+    const open_pr_count = { branch -> release_open_pr_count(harness, cfg, branch) }
+    const branch_result = preflight_remediate_stale_release_branch(
+      harness.tools,
+      git,
+      open_pr_count,
+      {
+        version: "v${version}",
+        base: cfg.base,
+        crashed_reclaim: crashed_reclaim,
+        resume_current_dirty: true,
+      },
+      { workspace, branch ->
+        return failed_release_workspace_authorization(harness.fs, workspace, branch)
+      },
+    )
+    release_preflight_report(harness, run_id, "stale-release-branch", branch_result)
+  }
+}
+
+fn release_preflight_report(harness: Harness, run_id: any, label: any, result: any) {
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "preflight_autoremediate",
+    {
+      case: label,
+      action: result.action,
+      safe: result.safe ?? false,
+      reason: result.reason,
+      remediated: result.remediated ?? false,
+      discarded: result.discarded,
+    },
+  )
+  if result.action == "fail" {
+    harness.stdio.println("   ✗ preflight (${label}): ${result.reason}")
+    throw "preflight remediation refused (${label}): ${result.reason}"
+  }
+  const discarded = result.discarded
+  if discarded?.preserved_workspace != nil {
+    harness.stdio.println(
+      "   ↻ preflight (${label}): detached ${discarded.branch} from failed run ${discarded.recovery_run_id}; preserved ${to_string(discarded.dirty_file_count)} dirty file(s) byte-for-byte at ${discarded.preserved_workspace}",
+    )
+  } else if discarded != nil {
+    harness.stdio.println(
+      "   ↻ preflight (${label}): preserved crashed branch ${discarded.branch} at ${discarded.head_sha} (${to_string(discarded.dirty_file_count)} dirty file(s))",
+    )
+  } else if result.remediated ?? false {
+    harness.stdio.println("   ↻ preflight (${label}): ${result.reason}")
+  }
+}
+
+pub fn release_build_lease_options(cfg: dict, run_id: string) -> HostLeaseOptions {
+  return {
+    owner: "release-harn.${run_id}",
+    resource_class: "rust-heavy",
+    domain: trim(cfg.build_lease_domain ?? "release-build"),
+    priority_class: "interactive",
+    wait_timeout_ms: if cfg.wait_build_lock ?? false {
+      20 * 60 * 1000
+    } else {
+      0
+    },
+    reason: "serialize release build work",
+    metadata: {mode: cfg.mode ?? ""},
+  }
+}
+
+/** Run the build-heavy release phase under one cancellation-safe host lease. */
+pub fn release_with_build_lease<T>(
+  harness: Harness,
+  cfg: dict,
+  run_id: string,
+  body: fn() -> T,
+) -> T {
+  if (cfg.mock ?? false)
+    || !(cfg.mode == "prepare" || cfg.mode == "ship-pr")
+    || !(cfg.yes_live_release ?? false) {
+    return body()
+  }
+  const result = with_host_lease(
+    harness.host_lease,
+    harness.clock,
+    release_build_lease_options(cfg, run_id),
+    { handle ->
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "build_lease_acquired",
+        {lease_id: handle.lease_id, domain: handle.domain, recovered: false},
+      )
+      harness.stdio.println("   ✓ build lease: ${handle.domain}")
+      return {value: body()}
+    },
+  )
+  if result.status == "deferred" {
+    const active = result.acquire.defer?.active
+    const owner = active?.owner ?? "another process"
+    throw "release build lease is held by ${owner}; rerun with --wait to queue behind it"
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "build_lease_released",
+    {
+      lease_id: result.acquire.handle?.lease_id ?? "",
+      domain: result.acquire.handle?.domain ?? "release-build",
+    },
+  )
+  const completed = result.value
+  if completed == nil {
+    throw "release build lease completed without a callback receipt"
+  }
+  return completed.value
+}
+
+fn release_planner_preflight_required(cfg: any) {
+  return cfg.agent && cfg.mode != "audit" && (cfg.yes_live_release ?? false) && !(cfg.mock ?? false)
+}
+
+/**
+ * Actionable remediation for a planner that has no usable provider. Harn reads
+ * provider keys from the environment and does not auto-load `.env`, so the most
+ * common cause is an unsourced credential; point at the canonical release
+ * launcher and its discovery order rather than leaving the
+ * operator to rediscover it after a failed launch.
+ */
+pub fn planner_credential_remediation() -> string {
+  return "Provider credentials are read from the environment (Harn does not auto-load .env).\n"
+    + "Use the release launcher, which sources the configured env files, e.g.:\n"
+    + "  scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release\n"
+    + "Discovery order (later overrides earlier): $HARN_EXT_BUMP_FLEET_ENV_FILE "
+    + "(default ~/projects/burin-code/.env), $HARN_EXT_BUMP_FLEET_ENV_FILES, ./.env, ./.env.local."
+}
+
+fn release_planner_preflight_error(decision: any) {
+  let lines = ["release planner preflight found no healthy provider before mutation"]
+  for attempt in decision?.attempts ?? [] {
+    const detail = trim(attempt.message ?? "")
+    const suffix = if detail == "" {
+      ""
+    } else {
+      ": " + detail
+    }
+    lines = lines
+      + [
+        "- ${attempt.provider}/${attempt.model}: ${attempt.classification} (${attempt.health_status})${suffix}",
+      ]
+  }
+  lines = lines + ["", planner_credential_remediation()]
+  return lines.join("\n")
+}
+
+pub fn preflight_release_planner(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+) -> ReleaseConfig {
+  if !release_planner_preflight_required(cfg) {
+    return cfg
+  }
+  harness.stdio.println("== planner preflight ...")
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "planner_preflight_started",
+    {provider: cfg.provider, model: cfg.model, source: cfg.planner_source ?? ""},
+  )
+  const decision = run_planner_preflight(
+    {env: harness.env, llm: harness.llm},
+    {provider: cfg.provider, model: cfg.model, source: cfg.planner_source ?? "requested"},
+  )
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "planner_preflight_finished",
+    decision,
+  )
+  harness.stdio.println("   ${planner_preflight_audit_line(decision)}")
+  for attempt in decision.attempts ?? [] {
+    if attempt.valid {
+      harness.stdio.println("   ✓ ${attempt.provider}/${attempt.model}")
+    } else {
+      harness.stdio.println(
+        "   ✗ ${attempt.provider}/${attempt.model}: ${attempt.classification} (${attempt.health_status})",
+      )
+    }
+  }
+  if !(decision.healthy ?? false) {
+    throw release_planner_preflight_error(decision)
+  }
+  if decision.disable_binder ?? false {
+    harness.stdio.println("   ↳ binder disabled: its provider failed planner preflight")
+  }
+  const selected = decision.selected
+  let out = cfg
+  out["provider"] = selected.provider
+  out["model"] = selected.model
+  out["planner_preflight"] = decision
+  return out
+}

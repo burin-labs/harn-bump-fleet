@@ -1,0 +1,1 @@
+Report one elapsed time per declared release timeline stage in the run receipt, the written report, and the console, and name the stages that reported nothing instead of leaving them out of the table.

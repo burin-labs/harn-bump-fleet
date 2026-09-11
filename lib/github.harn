@@ -1,0 +1,1440 @@
+// `github_branch_head`, `github_claim_ref`, and `github_release_ref` are the
+// connector symbols whose names the fleet also exports, so they stay behind a
+// module alias. Harn has no `import ... as`.
+import * as github_connector from "harn-github-connector/default"
+import {
+  GithubAutoMergeDisableReceipt,
+  GithubAutoMergeReceipt,
+  GithubBranchHead,
+  GithubClientOptions,
+  GithubCommitSignature,
+  GithubConnectorResult,
+  GithubFileLookupRequest,
+  GithubMergeQueueEntries,
+  GithubMergeability,
+  GithubPullRequestChecks,
+  GithubPullRequestCommits,
+  GithubPullRequestCreateReceipt,
+  GithubPullRequestEditReceipt,
+  GithubPullRequestFiles,
+  GithubPullRequestSummary,
+  GithubPullRequestUpsertReceipt,
+  GithubPullRequestView,
+  GithubRefClaim,
+  GithubRefClaimPayload,
+  GithubRefRelease,
+  GithubReleaseEditReceipt,
+  GithubReleaseLease,
+  GithubReleaseLookup,
+  GithubWorkflowCancelReceipt,
+  GithubWorkflowDispatchReceipt,
+  GithubWorkflowJobs,
+  GithubWorkflowRerunReceipt,
+  GithubWorkflowRun,
+  GithubWorkflowRuns,
+  GithubWorktreeCommitReceipt,
+  api_call,
+  call,
+  call_typed,
+  github_close_pr,
+  github_create_signed_commit,
+  github_file_at_ref,
+  github_latest_release_lookup,
+  github_release,
+  github_release_edit_body,
+  github_resolve_mergeable,
+  github_upsert_pull_request,
+  pulls_disable_auto_merge,
+  pulls_enable_auto_merge,
+} from "harn-github-connector/default"
+pub import { GithubConnectorError } from "harn-github-connector/default"
+// The worktree adapter is the connector's only module that shells out to local
+// `git`, and it ships as a separate export from the pure API surface.
+import { github_commit_worktree } from "harn-github-connector/worktree"
+
+pub type GithubPullReference = int | string
+
+pub type GithubIssueSummary = {number: int, title: string, body: string, state: string}
+
+pub type GithubAuthenticatedUser = {login: string}
+
+pub type GithubRefSnapshotState = "present" | "absent"
+
+/** Exact ref target and immutable claimant headline observed before a leased delete. */
+pub type GithubRefSnapshot = {
+  repo: string,
+  ref: string,
+  state: GithubRefSnapshotState,
+  oid: string,
+  holder_headline: string,
+}
+
+pub type GithubSshSigningKey = {id: int, key: string, title: string, created_at: string}
+
+pub type GithubSshSigningKeys = list<GithubSshSigningKey>
+
+pub type GithubPrCreateRequest = {
+  slug: string,
+  title: string,
+  head: string,
+  base: string,
+  body: string,
+}
+
+pub type GithubAutoMergeHoldRequest = {
+  slug: string,
+  pull_number: int,
+  expected_head_oid: string,
+  base_branch: string,
+  expected_base_oid: string,
+  restore_merge_method: string,
+}
+
+pub type GithubCommitReachability = {
+  reachable: bool,
+  status: string,
+  base_sha: string,
+  branch: string,
+}
+
+/** One repository file to publish, addressed by path and carrying exact text. */
+pub type GithubBranchCommitFile = {path: string, contents: string}
+
+/** Leased request for one GitHub-signed commit that publishes exact file text. */
+pub type GithubBranchCommitRequest = {
+  slug: string,
+  branch: string,
+  expected_head_oid: string,
+  headline: string,
+  body: string,
+  files: list<GithubBranchCommitFile>,
+  deletions?: list<string>,
+}
+
+/** Idempotent request for the one automation pull request a head branch may have. */
+pub type GithubPrUpsertRequest = {
+  slug: string,
+  head: string,
+  base: string,
+  title: string,
+  body: string,
+  expected_head_oid: string,
+}
+
+type GithubPullRequestList = list<GithubPullRequestSummary>
+
+/**
+ * `options` is a parameter rather than a constant so a caller can name the
+ * endpoint. Defaulting it to fleet policy and resolving it here means a test
+ * cannot reach these calls at all without ambient credentials: the connector
+ * resolves a token before it builds a URL, so a mocked endpoint is never
+ * consulted and the answer differs between a laptop and a runner.
+ */
+fn github_call_typed<T>(
+  harness: Harness,
+  method: string,
+  args: dict,
+  schema: Schema<T>,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<T> {
+  const opts: dict = options
+  return call_typed(harness, method, opts + args, schema)
+}
+
+/**
+ * Connector policy for long-lived fleet and release operations. GitHub's core
+ * limit normally resets within an hour; wait through a bounded 15-minute tail
+ * instead of abandoning an in-flight release or partially observed fleet run.
+ */
+pub fn github_connector_options() -> GithubClientOptions {
+  return {
+    allow_gh_auth_fallback: true,
+    rate_limit_max_sleep_seconds: 900,
+    // The connector owns HTTP retry semantics: safe reads get bounded,
+    // jittered exponential backoff and honor Retry-After. Unsafe methods are
+    // still single-shot unless a caller supplies an idempotency contract and
+    // explicitly enables retry_unsafe.
+    retry: {max_attempts: 4, base_ms: 500, cap_ms: 5000, respect_retry_after: true},
+  }
+}
+
+/** True only for the connector's explicit transient transport classification. */
+pub fn github_is_transient_read_error(error: {code: string, ...rest}) -> bool {
+  return lowercase(trim(to_string(error?.code ?? ""))) == "network"
+}
+
+/** True only when the connector reports an exhausted GitHub rate limit. */
+pub fn github_is_rate_limited_read_error(error: {code: string, ...rest}) -> bool {
+  return lowercase(trim(to_string(error?.code ?? ""))) == "rate_limited"
+}
+
+/** Resolve the human account represented by the active GitHub credential. */
+pub fn github_authenticated_user(
+  harness: Harness,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubAuthenticatedUser> {
+  const result = api_call(harness, {path: "/user", options: options})
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  const value = unwrap(result)
+  if !schema_is(value, GithubAuthenticatedUser) {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "authenticated GitHub user response omitted login",
+      },
+    )
+  }
+  return Ok(value)
+}
+
+/** Read the public SSH signing keys GitHub can attribute to one account. */
+pub fn github_user_ssh_signing_keys(
+  harness: Harness,
+  login: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubSshSigningKeys> {
+  if trim(login) == "" {
+    return Err(
+      {
+        code: "invalid_user",
+        category: "schema_drift",
+        message: "SSH signing-key lookup requires a GitHub login",
+      },
+    )
+  }
+  const result = api_call(
+    harness,
+    {path: "/users/" + url_encode(login) + "/ssh_signing_keys", options: options},
+  )
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  const value = unwrap(result)
+  if !schema_is(value, GithubSshSigningKeys) {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "GitHub SSH signing-key response did not match its public contract",
+      },
+    )
+  }
+  return Ok(value)
+}
+
+/** Read one branch's exact commit through the connector-owned contract. */
+pub fn github_branch_head(
+  harness: Harness,
+  slug: string,
+  branch: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubBranchHead> {
+  const parts = github_slug_parts(slug)
+  if parts == nil || trim(branch) == "" {
+    return Err(
+      {
+        code: "invalid_branch",
+        category: "schema_drift",
+        message: "branch-head lookup requires owner/name and a branch",
+      },
+    )
+  }
+  return github_connector.github_branch_head(
+    harness,
+    {owner: parts.owner, repo: parts.repo, branch: branch, options: options},
+  )
+}
+
+/** Prove that one exact commit is on a named branch using GitHub's compare graph. */
+pub fn github_commit_reachable_from_branch(
+  harness: Harness,
+  slug: string,
+  commit_sha: string,
+  branch: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubCommitReachability> {
+  const parts = github_slug_parts(slug)
+  if parts == nil || trim(commit_sha) == "" || trim(branch) == "" {
+    return Err(
+      {
+        code: "invalid_commit_reachability",
+        category: "schema_drift",
+        message: "commit reachability requires owner/name, an exact commit, and a branch",
+      },
+    )
+  }
+  const result = api_call(
+    harness,
+    {
+      path: "/repos/${parts.owner}/${parts.repo}/compare/${commit_sha}...${url_encode(branch)}",
+      options: options,
+    },
+  )
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  const observed = unwrap(result)
+  const status = lowercase(trim(to_string(observed?.status ?? "")))
+  if !["ahead", "identical", "behind", "diverged"].contains(status) {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "GitHub compare response omitted a recognized status",
+      },
+    )
+  }
+  return Ok(
+    {
+      reachable: status == "ahead" || status == "identical",
+      status: status,
+      base_sha: commit_sha,
+      branch: branch,
+    },
+  )
+}
+
+pub fn github_slug_parts(slug: any) -> {owner: string, repo: string}? {
+  const parts = split(to_string(slug), "/")
+  if len(parts) != 2 || trim(parts[0]) == "" || trim(parts[1]) == "" {
+    return nil
+  }
+  return {owner: parts[0], repo: parts[1]}
+}
+
+/** Read a repository file at an exact ref without erasing connector failures. */
+pub fn github_file_text_at_ref_result(
+  harness: Harness,
+  slug: string,
+  path: string,
+  ref: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<string?> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err(
+      {
+        code: "invalid_repository",
+        category: "schema_drift",
+        message: "invalid GitHub slug: " + slug,
+      },
+    )
+  }
+  const request: GithubFileLookupRequest = {
+    owner: parts.owner,
+    repo: parts.repo,
+    path: path,
+    ref: ref,
+    options: options,
+  }
+  const result = github_file_at_ref(harness, request)
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  const lookup = unwrap(result)
+  return Ok(
+    if lookup.state == "found" {
+      lookup.file.text
+    } else {
+      nil
+    },
+  )
+}
+
+/**
+ * Read a repository file at an exact ref. Proven absence is nil; provider failures remain errors.
+ *
+ * Existing callers keep the throwing facade. Retry-aware orchestration uses
+ * `github_file_text_at_ref_result` so transport evidence remains typed.
+ */
+pub fn github_file_text_at_ref(
+  harness: Harness,
+  slug: string,
+  path: string,
+  ref: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> string? {
+  const result = github_file_text_at_ref_result(harness, slug, path, ref, options)
+  if is_err(result) {
+    throw "GitHub file lookup failed for ${slug}:${path}@${ref}: " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+/** Extract a pull request number from either `123` or a GitHub pull URL. */
+pub fn github_pr_number(pr_ref: GithubPullReference) -> int? {
+  const direct = to_int(to_string(pr_ref))
+  if direct != nil {
+    return direct
+  }
+  const matches = regex_captures("/pull/([0-9]+)", to_string(pr_ref))
+  if len(matches) == 0 {
+    return nil
+  }
+  return to_int(matches[0].groups[0])
+}
+
+/**
+ * Return typed pull requests matching connector-owned filters.
+ *
+ * `options` is exposed for the same reason it is on the write helpers: a caller
+ * that names its endpoint can be tested against it, and one that does not still
+ * gets fleet policy.
+ */
+pub fn github_pr_list(
+  harness: Harness,
+  slug: string,
+  filters: dict = {},
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestList> {
+  return github_call_typed(
+    harness,
+    "github.pr.list",
+    {repo: slug, filters: filters},
+    GithubPullRequestList,
+    options,
+  )
+}
+
+/** Read one pull request, including branch-protection and queue evidence. */
+pub fn github_pr_view(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestView> {
+  const number = github_pr_number(pr_ref)
+  if number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "pull request view requires a number or canonical pull URL",
+      },
+    )
+  }
+  return github_call_typed(
+    harness,
+    "github.pr.view",
+    {repo: slug, number: number},
+    GithubPullRequestView,
+    options,
+  )
+}
+
+/** Read every commit on one stable pull-request head. */
+pub fn github_pr_commits(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  expected_head_oid: string,
+  per_page: int = 100,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestCommits> {
+  const parts = github_slug_parts(slug)
+  const number = github_pr_number(pr_ref)
+  if parts == nil || number == nil || trim(expected_head_oid) == "" {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "pull request commits require owner/name, a number, and an exact head",
+      },
+    )
+  }
+  return github_connector.github_pr_commits(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: number,
+      expected_head_oid: expected_head_oid,
+      per_page: per_page,
+      options: options,
+    },
+  )
+}
+
+/** List the files changed by one pull request. */
+pub fn github_pr_files(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  page: int = 1,
+  per_page: int = 100,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestFiles> {
+  const number = github_pr_number(pr_ref)
+  if number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "pull request file lookup requires a number or canonical pull URL",
+      },
+    )
+  }
+  return github_call_typed(
+    harness,
+    "github.pr.files",
+    {repo: slug, number: number, page: page, per_page: per_page},
+    GithubPullRequestFiles,
+    options,
+  )
+}
+
+/** Read one pull request's check rollup, optionally bound to an exact head. */
+pub fn github_pr_checks(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  expected_head_oid: string = "",
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestChecks> {
+  const number = github_pr_number(pr_ref)
+  if number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "pull request checks lookup requires a number or canonical pull URL",
+      },
+    )
+  }
+  return github_call_typed(
+    harness,
+    "github.pr.checks",
+    {
+      repo: slug,
+      number: number,
+      head_sha: if trim(expected_head_oid) == "" {
+        nil
+      } else {
+        expected_head_oid
+      },
+    },
+    GithubPullRequestChecks,
+    options,
+  )
+}
+
+/** Resolve GitHub's mergeability state into an explicit conflict bit. */
+pub fn github_pr_mergeability(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubMergeability> {
+  const parts = github_slug_parts(slug)
+  const number = github_pr_number(pr_ref)
+  if parts == nil || number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "mergeability lookup requires owner/name and a pull request number",
+      },
+    )
+  }
+  return github_resolve_mergeable(
+    harness,
+    {owner: parts.owner, repo: parts.repo, pull_number: number, options: options},
+  )
+}
+
+/** Create a pull request and retain its observed head SHA. */
+pub fn github_pr_create(
+  harness: Harness,
+  request: GithubPrCreateRequest,
+) -> GithubConnectorResult<GithubPullRequestCreateReceipt> {
+  return github_call_typed(
+    harness,
+    "github.pr.create",
+    {
+      repo: request.slug,
+      title: request.title,
+      head: request.head,
+      base: request.base,
+      body: request.body,
+    },
+    GithubPullRequestCreateReceipt,
+  )
+}
+
+/** Edit a pull request through the connector-owned PATCH contract. */
+pub fn github_pr_edit(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  edits: dict,
+) -> GithubConnectorResult<GithubPullRequestEditReceipt> {
+  const number = github_pr_number(pr_ref)
+  if number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "pull request edit requires a number or canonical pull URL",
+      },
+    )
+  }
+  return github_call_typed(
+    harness,
+    "github.pr.edit",
+    edits + {repo: slug, number: number},
+    GithubPullRequestEditReceipt,
+  )
+}
+
+/** Read one exact release. A visible repository with no tag returns `found: false`. */
+pub fn github_release_at_tag(
+  harness: Harness,
+  slug: string,
+  tag: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubReleaseLookup> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  return github_release(harness, {owner: parts.owner, repo: parts.repo, tag: tag, options: options})
+}
+
+/** Replace a release body only while its observed release and tag identities remain current. */
+pub fn github_release_body_edit(
+  harness: Harness,
+  slug: string,
+  tag: string,
+  body: string,
+  lease: GithubReleaseLease,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubReleaseEditReceipt> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  return github_release_edit_body(
+    harness,
+    {owner: parts.owner, repo: parts.repo, tag: tag, body: body, lease: lease, options: options},
+  )
+}
+
+/** Enable auto-merge only while the PR still has the observed head. */
+pub fn github_enable_auto_merge(
+  harness: Harness,
+  slug: string,
+  pr_ref: GithubPullReference,
+  expected_head_oid: string,
+  merge_method: string = "squash",
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubAutoMergeReceipt> {
+  const parts = github_slug_parts(slug)
+  const pr_number = github_pr_number(pr_ref)
+  if parts == nil || pr_number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "auto-merge requires owner/name and a pull request number",
+      },
+    )
+  }
+  return pulls_enable_auto_merge(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: pr_number,
+      expected_head_oid: expected_head_oid,
+      method: merge_method,
+      options: options,
+    },
+  )
+}
+
+/** One exact local Git state published to a branch as a GitHub-signed commit. */
+pub type GithubWorktreePublishRequest = {
+  slug: string,
+  branch: string,
+  headline: string,
+  repo_dir: string,
+  source: string,
+  base_oid?: string?,
+  create_branch?: bool?,
+  reset_branch?: bool?,
+  expected_branch_oid?: string?,
+}
+
+/**
+ * Publish one prepared worktree as a commit GitHub signs server-side.
+ *
+ * Slug-shaped like every other wrapper here, and defaulted to fleet connector
+ * policy, so a caller names a repository rather than an owner and a name.
+ */
+pub fn github_worktree_commit(
+  harness: Harness,
+  request: GithubWorktreePublishRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubWorktreeCommitReceipt> {
+  const parts = github_slug_parts(request.slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  return github_commit_worktree(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      branch: request.branch,
+      headline: request.headline,
+      repo_dir: request.repo_dir,
+      source: request.source,
+      base_oid: request.base_oid,
+      create_branch: request.create_branch,
+      reset_branch: request.reset_branch,
+      expected_branch_oid: request.expected_branch_oid,
+      options: options,
+    },
+  )
+}
+
+/**
+ * Ask GitHub whether it counts a commit as signed.
+ *
+ * This is the same question a `required_signatures` ruleset asks, and the only
+ * one that matters for merge admission. `git verify-commit` answers a different
+ * one -- whether *this machine* can check the signature -- and the two diverge
+ * exactly where it counts: a commit GitHub signed server-side has no signer in
+ * a local allowed-signers file, and a commit signed by a key GitHub cannot
+ * attribute to the committer verifies locally and is refused by the ruleset.
+ */
+pub fn github_commit_signature(
+  harness: Harness,
+  slug: string,
+  sha: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubCommitSignature> {
+  return github_call_typed(
+    harness,
+    "github.commit.signature",
+    {repo: slug, sha: sha},
+    GithubCommitSignature,
+    options,
+  )
+}
+
+/** List one branch's merge queue through the connector-owned closed record. */
+pub fn github_merge_queue_entries(
+  harness: Harness,
+  slug: string,
+  branch: string,
+  limit: int = 100,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubMergeQueueEntries> {
+  return github_call_typed(
+    harness,
+    "github.merge_queue.entries",
+    {repo: slug, branch: branch, limit: limit},
+    GithubMergeQueueEntries,
+    options,
+  )
+}
+
+/** Disable auto-merge only while the PR remains at the observed head and base. */
+pub fn github_disable_auto_merge(
+  harness: Harness,
+  request: GithubAutoMergeHoldRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubAutoMergeDisableReceipt> {
+  const parts = github_slug_parts(request.slug)
+  const number = github_pr_number(request.pull_number)
+  if parts == nil || number == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "auto-merge hold requires a pull request number",
+      },
+    )
+  }
+  return pulls_disable_auto_merge(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: number,
+      expected_head_oid: request.expected_head_oid,
+      base_branch: request.base_branch,
+      expected_base_oid: request.expected_base_oid,
+      restore_merge_method: request.restore_merge_method,
+      options: options,
+    },
+  )
+}
+
+/**
+ * The rulesets a repository enforces.
+ *
+ * The list endpoint returns names and enforcement but not the rules, so each
+ * active ruleset is fetched by id. Classic branch protection is not consulted:
+ * it answers 404 on a branch governed by rulesets, and a 404 read as "nothing
+ * required" would let every drifted commit through.
+ */
+pub fn github_repository_rulesets(
+  harness: Harness,
+  slug: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<list> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const listed = api_call(
+    harness,
+    {path: "/repos/${parts.owner}/${parts.repo}/rulesets", options: options},
+  )
+  if is_err(listed) {
+    return Err(unwrap_err(listed))
+  }
+  let detailed = []
+  for summary in unwrap(listed) ?? [] {
+    const id = to_string(summary?.id ?? "")
+    if trim(id) == "" {
+      continue
+    }
+    const one = api_call(
+      harness,
+      {path: "/repos/${parts.owner}/${parts.repo}/rulesets/${id}", options: options},
+    )
+    if is_err(one) {
+      return Err(unwrap_err(one))
+    }
+    detailed = detailed + [unwrap(one)]
+  }
+  return Ok(detailed)
+}
+
+/** What GitHub returns when it merges a pull request. */
+pub type GithubPullRequestMergeResult = {merged: bool, sha: string, message: string}
+
+/**
+ * Merge one pull request under an exact head lease.
+ *
+ * `sha` is the head this caller observed and judged. GitHub refuses the merge
+ * if the pull request moved since, so a head nobody judged cannot be merged by
+ * a decision made about an earlier one.
+ *
+ * This goes through the connector's raw `pulls.merge` rather than its
+ * `pulls_merge_safe` helper, because that helper's request record has no `sha`
+ * field and strips `method` from the body it sends. Without those two, the
+ * merge would carry no lease and would default to a merge commit, which the
+ * branch's own rules reject: harn's main allows squash and rebase only.
+ */
+pub fn github_pr_merge(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  expected_head_oid: string,
+  merge_method: string = "squash",
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestMergeResult> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const head = lowercase(trim(expected_head_oid))
+  if regex_match("^[0-9a-f]{40}$", head) == nil {
+    return Err(
+      {
+        code: "invalid_pull_request",
+        category: "schema_drift",
+        message: "merging a release pull request requires its exact observed head",
+      },
+    )
+  }
+  const merged = call(
+    harness,
+    "pulls.merge",
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: pr_number,
+      sha: head,
+      merge_method: merge_method,
+      options: options,
+    },
+  )
+  if is_err(merged) {
+    return Err(unwrap_err(merged))
+  }
+  const value = unwrap(merged)
+  if !schema_is(value, GithubPullRequestMergeResult) {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "GitHub merge response did not report whether the pull request merged",
+      },
+    )
+  }
+  return Ok(value)
+}
+
+/** Close a PR with an operator-visible comment. */
+pub fn github_pr_close(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  comment: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> dict {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return {ok: false, error: {code: "invalid_repo", message: "repo must be owner/name"}}
+  }
+  return github_close_pr(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      pull_number: pr_number,
+      comment: comment,
+      options: options,
+    },
+  )
+}
+
+/** Add an operator-visible PR comment. */
+pub fn github_pr_comment(
+  harness: Harness,
+  slug: string,
+  pr_number: int,
+  body: string,
+) -> GithubConnectorResult<unknown> {
+  return call(
+    harness,
+    "github.pr.comment",
+    github_connector_options() + {repo: slug, number: pr_number, body: body},
+  )
+}
+
+/**
+ * How many releases one page reads.
+ *
+ * GitHub's release payload carries each full changelog body — roughly 18 KB per
+ * release for Harn — and the connector refuses a response over 1 MB. A page of
+ * 100 is about 1.8 MB and fails outright, so the depth is capped well under
+ * that with room for bodies to grow.
+ *
+ * Callers measuring distance therefore saturate here. That is harmless for the
+ * only question asked of it: anything this far behind is far past any
+ * threshold, so an undercount cannot flip a verdict.
+ */
+const RELEASE_PAGE_DEPTH = 20
+
+/**
+ * Published release tags, newest first, up to [`RELEASE_PAGE_DEPTH`].
+ *
+ * Drafts and prereleases are excluded because they are not adoptable: counting
+ * them would report every consumer as behind a release it must not pin.
+ */
+pub fn github_published_release_tags(
+  harness: Harness,
+  slug: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<list<string>> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const result = api_call(
+    harness,
+    {
+      path:
+        "/repos/${parts.owner}/${parts.repo}/releases?per_page=${to_string(RELEASE_PAGE_DEPTH)}",
+      options: options,
+    },
+  )
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  let tags = []
+  for row in unwrap(result) ?? [] {
+    if (row?.draft ?? false) || (row?.prerelease ?? false) {
+      continue
+    }
+    const tag = trim(to_string(row?.tag_name ?? ""))
+    if tag != "" {
+      tags = tags + [tag]
+    }
+  }
+  return Ok(tags)
+}
+
+/**
+ * The query that finds an alarm's existing issue.
+ *
+ * Factored out so a test can assert the exact shape offline: getting this
+ * wrong does not fail loudly, it silently opens a duplicate issue every run
+ * until the alarm is noise nobody reads.
+ */
+pub fn github_open_issues_query(label: string) -> dict {
+  return {labels: label, state: "open", per_page: 100}
+}
+
+fn github_query_string(query: dict) -> string {
+  let parts = []
+  for key in query.keys().sort() {
+    parts = parts + ["${key}=${url_encode(to_string(query[key]))}"]
+  }
+  return join(parts, "&")
+}
+
+/**
+ * List open issues carrying a label.
+ *
+ * GitHub's issues endpoint returns pull requests too — every PR is an issue in
+ * that API. Rows carrying `pull_request` are dropped here so a caller counting
+ * "open alarms" cannot be fooled by an unrelated pull request that happens to
+ * share the label.
+ */
+pub fn github_open_issues_with_label(
+  harness: Harness,
+  slug: string,
+  label: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<list<GithubIssueSummary>> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const query = github_query_string(github_open_issues_query(label))
+  const result = api_call(
+    harness,
+    {path: "/repos/${parts.owner}/${parts.repo}/issues?${query}", options: options},
+  )
+  if is_err(result) {
+    return Err(unwrap_err(result))
+  }
+  let issues = []
+  for row in unwrap(result) ?? [] {
+    if row?.pull_request != nil {
+      continue
+    }
+    issues = issues
+      + [
+        {
+          number: to_int(row?.number ?? 0),
+          title: to_string(row?.title ?? ""),
+          body: to_string(row?.body ?? ""),
+          state: to_string(row?.state ?? ""),
+        },
+      ]
+  }
+  return Ok(issues)
+}
+
+/** Open one labelled issue. */
+pub fn github_issue_create(
+  harness: Harness,
+  slug: string,
+  title: string,
+  body: string,
+  labels: list<string>,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<unknown> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const opts: dict = options
+  return call(
+    harness,
+    "issues.create",
+    opts
+      + {owner: parts.owner, repo: parts.repo, title: title, body: body, labels: labels},
+  )
+}
+
+/** Refresh an open issue's body, or close it, without touching anything else. */
+pub fn github_issue_update(
+  harness: Harness,
+  slug: string,
+  issue_number: int,
+  fields: dict,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<unknown> {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const opts: dict = options
+  return call(
+    harness,
+    "issues.update",
+    opts + {owner: parts.owner, repo: parts.repo, issue_number: issue_number} + fields,
+  )
+}
+
+/** Dispatch a workflow at an exact ref and retain the resolved run identity. */
+pub fn github_workflow_dispatch(
+  harness: Harness,
+  slug: string,
+  workflow: string,
+  fields: dict? = nil,
+  ref: string = "main",
+) -> GithubConnectorResult<GithubWorkflowDispatchReceipt> {
+  return github_call_typed(
+    harness,
+    "github.actions.workflow_dispatch",
+    {repo: slug, workflow_id: workflow, ref: ref, inputs: fields ?? {}},
+    GithubWorkflowDispatchReceipt,
+  )
+}
+
+/** Read one exact workflow run through the connector's closed record. */
+pub fn github_actions_run(
+  harness: Harness,
+  slug: string,
+  run_id: int,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubWorkflowRun> {
+  return github_call_typed(
+    harness,
+    "github.actions.run",
+    {repo: slug, run_id: run_id},
+    GithubWorkflowRun,
+    options,
+  )
+}
+
+/** List workflow runs through the connector's closed page contract. */
+pub fn github_actions_runs(
+  harness: Harness,
+  slug: string,
+  workflow: string,
+  branch: string = "main",
+) -> GithubConnectorResult<GithubWorkflowRuns> {
+  return github_call_typed(
+    harness,
+    "github.actions.runs",
+    {repo: slug, workflow_id: workflow, branch: branch, event: "workflow_dispatch", per_page: 100},
+    GithubWorkflowRuns,
+  )
+}
+
+/**
+ * One workflow's `push` runs on a branch.
+ *
+ * Separate from `github_actions_runs` because the two answer different
+ * questions: that one lists what this release dispatched, this one lists what
+ * the branch did on its own. Only the second can say a failure predates a
+ * candidate.
+ */
+pub fn github_actions_push_runs(
+  harness: Harness,
+  slug: string,
+  workflow: string,
+  branch: string = "main",
+) -> GithubConnectorResult<GithubWorkflowRuns> {
+  return github_call_typed(
+    harness,
+    "github.actions.runs",
+    {repo: slug, workflow_id: workflow, branch: branch, event: "push", per_page: 100},
+    GithubWorkflowRuns,
+  )
+}
+
+/** Read jobs and steps for one exact workflow run, optionally scoped to its latest attempt. */
+pub fn github_actions_run_jobs(
+  harness: Harness,
+  slug: string,
+  run_id: int,
+  filter: string = "all",
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubWorkflowJobs> {
+  return github_call_typed(
+    harness,
+    "github.actions.run_jobs",
+    {repo: slug, run_id: run_id, filter: filter, per_page: 100},
+    GithubWorkflowJobs,
+    options,
+  )
+}
+
+/** Request cancellation of one exact workflow run and retain its typed receipt. */
+pub fn github_actions_run_cancel(
+  harness: Harness,
+  slug: string,
+  run_id: int,
+) -> GithubConnectorResult<GithubWorkflowCancelReceipt> {
+  return github_call_typed(
+    harness,
+    "github.actions.run_cancel",
+    {repo: slug, run_id: run_id},
+    GithubWorkflowCancelReceipt,
+  )
+}
+
+/** Request another attempt of one exact workflow run and retain its typed receipt. */
+pub fn github_actions_run_rerun(
+  harness: Harness,
+  slug: string,
+  run_id: int,
+) -> GithubConnectorResult<GithubWorkflowRerunReceipt> {
+  return github_call_typed(
+    harness,
+    "github.actions.run_rerun",
+    {repo: slug, run_id: run_id},
+    GithubWorkflowRerunReceipt,
+  )
+}
+
+/** List one canonical workflow-run page. Provider failures remain typed errors. */
+pub fn github_workflow_runs(
+  harness: Harness,
+  slug: string,
+  workflow: string,
+  filters: dict = {},
+  limit: int = 10,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubWorkflowRuns> {
+  return github_call_typed(
+    harness,
+    "github.actions.runs",
+    filters + {repo: slug, workflow_id: workflow, per_page: limit},
+    GithubWorkflowRuns,
+    options,
+  )
+}
+
+/** Resolve a repository's latest GitHub release tag. */
+pub fn github_latest_release_tag(
+  harness: Harness,
+  slug: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> string {
+  const parts = github_slug_parts(slug)
+  if parts == nil {
+    throw "invalid GitHub slug: " + slug
+  }
+  const lookup = github_latest_release_lookup(
+    harness,
+    {owner: parts.owner, repo: parts.repo, options: options},
+  )
+  if is_err(lookup) {
+    throw "could not resolve latest release for ${slug}: " + to_string(unwrap_err(lookup))
+  }
+  const resolved = unwrap(lookup)
+  if resolved.state == "absent" {
+    throw "could not resolve latest release for ${slug}: repository has no releases"
+  }
+  return trim(resolved.release.tag_name)
+}
+
+/**
+ * What a ref claim points at.
+ *
+ * A lock has nothing to point at yet, so it names a `payload` and the connector
+ * mints a parentless commit from it — the message a loser reads to learn who
+ * holds the ref. A claim that opens a branch already has its object and names
+ * an `oid` instead. Exactly one, because a claim that named both would leave
+ * the connector to pick, and a claim that named neither has nothing to say.
+ */
+pub type GithubRefClaimObject = {oid?: string, payload?: GithubRefClaimPayload}
+
+/**
+ * Claim one ref for this run, atomically across machines.
+ *
+ * Contention is an outcome rather than an error: a lost claim returns
+ * `claimed: false` alongside the oid the ref actually holds and the holder's
+ * headline, so a caller learns both that it lost and to whom. For a branch
+ * claim, that oid is also the lease a follow-up commit needs, which is why
+ * creating an automation branch and appending to an existing one take the same
+ * path here.
+ */
+pub fn github_claim_ref(
+  harness: Harness,
+  slug: string,
+  ref: string,
+  object: GithubRefClaimObject,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubRefClaim> {
+  const parts = github_slug_parts(slug)
+  const names_oid = trim(object.oid ?? "") != ""
+  const names_payload = trim(object.payload?.message ?? "") != ""
+  if parts == nil || !starts_with(trim(ref), "refs/") || names_oid == names_payload {
+    return Err(
+      {
+        code: "invalid_ref_claim",
+        category: "schema_drift",
+        message:
+          "a ref claim requires owner/name, a `refs/...` ref, and exactly one of an oid or a payload message",
+      },
+    )
+  }
+  return github_connector.github_claim_ref(
+    harness,
+    {owner: parts.owner, repo: parts.repo, ref: ref, options: options} + object,
+  )
+}
+
+/** Release one ref, and only while it still holds this run's exact object. */
+pub fn github_release_ref(
+  harness: Harness,
+  slug: string,
+  ref: string,
+  expected_oid: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubRefRelease> {
+  const parts = github_slug_parts(slug)
+  if parts == nil || !starts_with(trim(ref), "refs/") || trim(expected_oid) == "" {
+    return Err(
+      {
+        code: "invalid_ref_release",
+        category: "schema_drift",
+        message: "a ref release requires owner/name, a `refs/...` ref, and an expected oid",
+      },
+    )
+  }
+  return github_connector.github_release_ref(
+    harness,
+    {owner: parts.owner, repo: parts.repo, ref: ref, expected_oid: expected_oid, options: options},
+  )
+}
+
+/**
+ * Read the exact ref target and payload headline that an out-of-process
+ * finalizer must prove before asking the connector for an exact-OID delete.
+ */
+pub fn github_ref_snapshot(
+  harness: Harness,
+  slug: string,
+  ref: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubRefSnapshot> {
+  const parts = github_slug_parts(slug)
+  const normalized_ref = trim(ref)
+  if parts == nil || !starts_with(normalized_ref, "refs/") {
+    return Err(
+      {
+        code: "invalid_ref_snapshot",
+        category: "schema_drift",
+        message: "a ref snapshot requires owner/name and a fully qualified refs/... ref",
+      },
+    )
+  }
+  const suffix = regex_replace("^refs/", "", normalized_ref)
+  const observed = api_call(
+    harness,
+    {path: "/repos/${parts.owner}/${parts.repo}/git/ref/${suffix}", options: options},
+  )
+  if is_err(observed) {
+    const failure = unwrap_err(observed)
+    if (failure?.http_status ?? 0) == 404 {
+      return Ok({repo: slug, ref: normalized_ref, state: "absent", oid: "", holder_headline: ""})
+    }
+    return Err(failure)
+  }
+  const oid = lowercase(trim(to_string(unwrap(observed)?.object?.sha ?? "")))
+  if len(regex_captures("^[0-9a-f]{40}$", oid)) != 1 {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "GitHub ref snapshot omitted a full commit OID",
+      },
+    )
+  }
+  const commit = api_call(
+    harness,
+    {path: "/repos/${parts.owner}/${parts.repo}/git/commits/${oid}", options: options},
+  )
+  if is_err(commit) {
+    return Err(unwrap_err(commit))
+  }
+  const message = to_string(unwrap(commit)?.message ?? "")
+  if trim(message) == "" {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "GitHub ref payload commit omitted its claimant headline",
+      },
+    )
+  }
+  return Ok(
+    {
+      repo: slug,
+      ref: normalized_ref,
+      state: "present",
+      oid: oid,
+      holder_headline: split(message, "\n")[0],
+    },
+  )
+}
+
+/**
+ * Publish exact file text as one GitHub-signed commit under a branch-head lease.
+ *
+ * Text crosses this boundary as text and is encoded here, so no caller has to
+ * hold a base64 payload to describe a file it already has. The lease is the
+ * safety property: a branch that moved between observation and write fails
+ * closed rather than silently rebasing the caller's intent onto someone else's.
+ */
+pub fn github_branch_commit(
+  harness: Harness,
+  request: GithubBranchCommitRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubSignedCommitReceipt> {
+  const parts = github_slug_parts(request.slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  const additions = request.files.map(
+    { file -> {path: file.path, contents_base64: base64_encode(file.contents)} },
+  )
+    .to_list()
+  return github_create_signed_commit(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      branch: request.branch,
+      expected_head_oid: request.expected_head_oid,
+      headline: request.headline,
+      body: request.body,
+      additions: additions,
+      deletions: (request.deletions ?? []).map({ path -> {path: path} }).to_list(),
+      options: options,
+    },
+  )
+}
+
+/** Create or refresh the single pull request a head branch may have open. */
+pub fn github_pr_upsert(
+  harness: Harness,
+  request: GithubPrUpsertRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> GithubConnectorResult<GithubPullRequestUpsertReceipt> {
+  const parts = github_slug_parts(request.slug)
+  if parts == nil {
+    return Err({code: "invalid_repo", category: "schema_drift", message: "repo must be owner/name"})
+  }
+  return github_upsert_pull_request(
+    harness,
+    {
+      owner: parts.owner,
+      repo: parts.repo,
+      head: request.head,
+      base: request.base,
+      title: request.title,
+      body: request.body,
+      expected_head_oid: request.expected_head_oid,
+      options: options,
+    },
+  )
+}

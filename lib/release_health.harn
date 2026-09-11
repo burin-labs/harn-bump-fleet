@@ -1,0 +1,500 @@
+import { newest_workflow_run_after } from "./workflow_runs"
+
+pub type PublishWorkflowJob = {id: int, name: string, status: string, conclusion: string}
+
+pub type PublishWorkflowRun = {
+  workflow: string,
+  status: string,
+  conclusion: string,
+  head_branch: string,
+  created_at?: string,
+  url?: string,
+  jobs_observed?: bool,
+  jobs?: list<PublishWorkflowJob>,
+  ...rest,
+}
+
+pub type PublishWorkflowRunDetail = {
+  workflow: string,
+  status: string,
+  conclusion: string,
+  url: string,
+  created_at: string,
+  head_branch: string,
+}
+
+pub type PublishWatchInputs = {
+  runs: list<PublishWorkflowRun>,
+  required_workflows: list<string>,
+  tag: string,
+  accepted_run_ids?: list<int>,
+}
+
+pub type PublishWatchDecision = {
+  state: "failed" | "healthy" | "pending",
+  message: string,
+  failed_workflows: list<string>,
+  failed_runs: list<PublishWorkflowRunDetail>,
+  ancillary_failures?: list<string>,
+}
+
+pub type PublishBinaryRecoveryInputs = {
+  runs: list<PublishWorkflowRun>,
+  tag: string,
+  already_dispatched?: bool,
+}
+
+pub type PublishBinaryRecoveryDecision = {
+  should_dispatch: bool,
+  reason?: string,
+  workflow?: string,
+  fields?: {tag: string},
+  failed_run?: PublishWorkflowRunDetail,
+  message?: string,
+}
+
+pub type PostPublishWarmCacheInputs = {enabled?: bool, publish_state: string, slug: string}
+
+pub type PostPublishWarmCacheDecision = {
+  should_dispatch: bool,
+  reason?: string,
+  workflow?: string,
+  fields?: {warm_cache_only: bool},
+  message?: string,
+}
+
+/**
+ * Post-tag publish-health decisions. The fleet is tag-first: the harn-side
+ * `publish-release.yml` and `build-release-binaries.yml` fire on the tag push,
+ * so the heavy release-build checks only run AFTER the tag exists and cannot
+ * gate it. This module classifies the tag-triggered workflow runs the fleet
+ * polls after tagging, and renders operator-facing recovery guidance when a
+ * published release lands red.
+ *
+ * Logic stays pure so the poll loop can be exercised with synthetic run rows.
+ */
+/** Conclusions that mean a workflow run finished in a non-recoverable bad state. */
+fn is_failed_conclusion(conclusion: string?) {
+  const c = lowercase(trim(conclusion ?? ""))
+  return c == "failure" || c == "cancelled" || c == "timed_out"
+    || c == "startup_failure"
+    || c == "stale"
+    || c == "action_required"
+}
+
+fn is_success_conclusion(conclusion: string?) {
+  return lowercase(trim(conclusion ?? "")) == "success"
+}
+
+fn run_completed(run: dict) {
+  return lowercase(trim(run?.status ?? "")) == "completed"
+}
+
+fn job_completed_successfully(job: dict) {
+  return lowercase(trim(job?.status ?? "")) == "completed"
+    && is_success_conclusion(job?.conclusion)
+}
+
+fn failed_jobs(run: dict) {
+  return (run?.jobs ?? []).filter(
+    { job ->
+      lowercase(trim(job?.status ?? "")) == "completed"
+        && is_failed_conclusion(job?.conclusion)
+    },
+  )
+    .to_list()
+}
+
+/**
+ * A tag workflow may publish successfully and then fail its independent
+ * development-bump follow-up. Accept that exact shape without turning an
+ * unreadable or partially successful publication workflow green.
+ */
+fn publish_jobs_prove_ancillary_failure_only(run: dict) -> list<string>? {
+  if run?.workflow != "publish-release.yml"
+    || lowercase(trim(run?.conclusion ?? "")) != "failure"
+    || !(run?.jobs_observed ?? false) {
+    return nil
+  }
+  const jobs = run?.jobs ?? []
+  const drift = jobs.filter({ job -> job.name == "Detect tag drift" }).to_list()
+  const publish = jobs.filter({ job -> job.name == "Publish release" }).to_list()
+  if len(drift) != 1 || len(publish) != 1
+    || (drift[0]?.id ?? 0) <= 0
+    || (publish[0]?.id ?? 0) <= 0
+    || drift[0].id == publish[0].id
+    || !job_completed_successfully(drift[0])
+    || !job_completed_successfully(publish[0]) {
+    return nil
+  }
+  const failed = failed_jobs(run)
+  if len(failed) != 1
+    || (failed[0]?.id ?? 0) <= 0
+    || failed[0].id == drift[0].id
+    || failed[0].id == publish[0].id {
+    return nil
+  }
+  let names: list<string> = []
+  for job in failed {
+    if job.name != "Open post-release development bump" {
+      return nil
+    }
+    names = names + [job.name]
+  }
+  return names
+}
+
+fn run_effectively_failed(run: dict) {
+  return run_completed(run)
+    && is_failed_conclusion(run?.conclusion)
+    && publish_jobs_prove_ancillary_failure_only(run) == nil
+}
+
+fn run_effectively_successful(run: dict) {
+  return run_completed(run)
+    && (is_success_conclusion(run?.conclusion)
+      || publish_jobs_prove_ancillary_failure_only(run) != nil)
+}
+
+fn run_matches_tag(run: dict, tag: string?, accepted_run_ids: list<int> = []) {
+  const expected = trim(tag ?? "")
+  if expected == "" || expected == "v<unknown>" {
+    return true
+  }
+  const run_id = to_int(run?.id ?? 0) ?? 0
+  return run.head_branch == expected
+    || (run_id > 0 && accepted_run_ids.any({ accepted -> accepted == run_id }))
+}
+
+fn pending_workflow_detail(workflow: any, runs: any) {
+  const name = to_string(workflow)
+  const matches = runs.filter({ run -> to_string(run?.workflow ?? "") == name })
+  if len(matches) == 0 {
+    return name + " (not observed yet)"
+  }
+  const run = matches[0]
+  const status = trim(run?.status ?? "unknown")
+  const conclusion = trim(run?.conclusion ?? "")
+  const url = trim(run?.url ?? "")
+  let detail = name + " (" + status
+  if conclusion != "" {
+    detail = detail + "/" + conclusion
+  }
+  detail = detail + ")"
+  if url != "" {
+    detail = detail + " " + url
+  }
+  return detail
+}
+
+fn completed_run_detail(run: dict) {
+  const workflow = to_string(run?.workflow ?? "(unknown workflow)")
+  const status = trim(run?.status ?? "unknown")
+  const conclusion = trim(run?.conclusion ?? "")
+  const url = trim(run?.url ?? "")
+  const created_at = run.created_at ?? ""
+  let detail = workflow + " (" + status
+  if conclusion != "" {
+    detail = detail + "/" + conclusion
+  }
+  if created_at != "" {
+    detail = detail + ", created " + created_at
+  }
+  detail = detail + ")"
+  if url != "" {
+    detail = detail + " " + url
+  }
+  return detail
+}
+
+fn workflow_run_detail(run: dict) {
+  return {
+    workflow: to_string(run?.workflow ?? "(unknown workflow)"),
+    status: trim(run?.status ?? "unknown"),
+    conclusion: trim(run?.conclusion ?? ""),
+    url: trim(run?.url ?? ""),
+    created_at: run.created_at ?? "",
+    head_branch: run.head_branch,
+  }
+}
+
+pub fn newest_run_for_workflow(runs: any, workflow: any) {
+  const name = to_string(workflow)
+  const matches = runs.filter({ run -> to_string(run?.workflow ?? "") == name })
+  const newest = newest_workflow_run_after(matches, "")
+  if newest != nil {
+    return {...newest, workflow: name}
+  }
+  if len(matches) == 0 {
+    return nil
+  }
+  return matches[0]
+}
+
+fn workflow_names(values: any) {
+  let names = []
+  for value in values ?? [] {
+    const name = trim(to_string(value ?? ""))
+    if name != "" {
+      names = names + [name]
+    }
+  }
+  return names
+}
+
+fn workflow_name_in(names: list, needle: string) {
+  for name in names {
+    if name == needle {
+      return true
+    }
+  }
+  return false
+}
+
+fn has_unclassified_workflow(names: string | bytes | list | dict | set | range | nil) {
+  if len(names) == 0 {
+    return true
+  }
+  for name in names {
+    if name != "publish-release.yml" && name != "build-release-binaries.yml" {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Classify publish health from observed tag-triggered workflow runs.
+ *
+ * `runs` is a list of canonical connector workflow-run records plus the
+ * HBF-owned `workflow` identity used to group independent list calls.
+ * `required_workflows` is the set of workflow identifiers that must each show
+ * a completed+success run for the publish to count as healthy.
+ *
+ * Returns `{state, message, failed_workflows}` with state:
+ *   "failed"  — at least one observed run concluded in a bad state.
+ *   "healthy" — every required workflow has a completed+success run.
+ *   "pending" — required runs are still queued/in_progress (or unobserved).
+ */
+pub fn publish_watch_decision(inputs: PublishWatchInputs) -> PublishWatchDecision {
+  const runs = inputs.runs ?? []
+  const required = inputs.required_workflows ?? []
+  const tag = trim(inputs.tag ?? "v<unknown>")
+  const accepted_run_ids = inputs.accepted_run_ids ?? []
+  const scoped_runs = runs.filter({ run -> run_matches_tag(run, tag, accepted_run_ids) })
+  let latest_required = []
+  for workflow in required {
+    const latest = newest_run_for_workflow(scoped_runs, workflow)
+    if latest != nil {
+      latest_required = latest_required + [latest]
+    }
+  }
+  let failed_workflows = []
+  let failed_runs = []
+  for run in latest_required {
+    if run_effectively_failed(run) {
+      failed_workflows = failed_workflows + [to_string(run?.workflow ?? "(unknown workflow)")]
+      failed_runs = failed_runs + [workflow_run_detail(run)]
+    }
+  }
+  if len(failed_workflows) > 0 {
+    const failed_list = latest_required.filter({ run -> run_effectively_failed(run) }).map(
+      { run -> completed_run_detail(run) },
+    )
+      .join(", ")
+    return {
+      state: "failed",
+      message: "publish for ${tag} is red: ${failed_list} concluded in a failed state",
+      failed_workflows: failed_workflows,
+      failed_runs: failed_runs,
+    }
+  }
+  let unsatisfied = []
+  let ancillary_failures: list<string> = []
+  for workflow in required {
+    const run = newest_run_for_workflow(scoped_runs, workflow)
+    const satisfied = run != nil && run_effectively_successful(run)
+    if !satisfied {
+      unsatisfied = unsatisfied + [to_string(workflow)]
+    } else {
+      ancillary_failures = ancillary_failures
+        + (publish_jobs_prove_ancillary_failure_only(run) ?? [])
+    }
+  }
+  if len(unsatisfied) == 0 && len(required) > 0 {
+    return {
+      state: "healthy",
+      message: "publish for ${tag} is green: all required publication jobs succeeded"
+        + if len(ancillary_failures) == 0 {
+          ""
+        } else {
+          "; ancillary failure remains: " + ancillary_failures.join(", ")
+        },
+      failed_workflows: [],
+      failed_runs: [],
+      ancillary_failures: ancillary_failures,
+    }
+  }
+  const waiting_list = unsatisfied.map(
+    { workflow -> pending_workflow_detail(workflow, scoped_runs) },
+  )
+    .join(", ")
+  return {
+    state: "pending",
+    message: "publish for ${tag} not yet confirmed green: still waiting on ${waiting_list}",
+    failed_workflows: [],
+    failed_runs: [],
+  }
+}
+
+/**
+ * Decide whether the publish watch can safely auto-recover a red binary build.
+ *
+ * This is intentionally narrower than `publish_watch_decision`: only a green
+ * publish-release.yml plus a completed failed build-release-binaries.yml is
+ * recoverable automatically. Crates/tag publication failures stay manual.
+ */
+pub fn publish_binary_recovery_decision(
+  inputs: PublishBinaryRecoveryInputs,
+) -> PublishBinaryRecoveryDecision {
+  const runs = inputs.runs ?? []
+  const tag = trim(inputs.tag ?? "v<unknown>")
+  if inputs.already_dispatched ?? false {
+    return {should_dispatch: false, reason: "binary recovery already dispatched"}
+  }
+  const scoped_runs = runs.filter({ run -> run_matches_tag(run, tag) })
+  const publish = newest_run_for_workflow(scoped_runs, "publish-release.yml")
+  if !(publish != nil && run_completed(publish) && is_success_conclusion(publish?.conclusion)) {
+    return {should_dispatch: false, reason: "publish-release.yml is not green"}
+  }
+  const build_runs = scoped_runs.filter(
+    { run -> to_string(run?.workflow ?? "") == "build-release-binaries.yml" },
+  )
+  const active_builds = build_runs.filter({ run -> !run_completed(run) })
+  if len(active_builds) > 0 {
+    return {should_dispatch: false, reason: "build-release-binaries.yml is still active"}
+  }
+  const build = newest_run_for_workflow(scoped_runs, "build-release-binaries.yml")
+  if build != nil && run_completed(build) && is_failed_conclusion(build?.conclusion) {
+    return {
+      should_dispatch: true,
+      workflow: "build-release-binaries.yml",
+      fields: {tag: tag},
+      failed_run: workflow_run_detail(build),
+      message:
+        "build-release-binaries.yml failed after publish-release.yml succeeded; dispatching idempotent asset recovery for ${tag}",
+    }
+  }
+  return {should_dispatch: false, reason: "build-release-binaries.yml is not a completed failure"}
+}
+
+fn release_repo_label(slug: string?) {
+  if trim(slug ?? "") == "" {
+    return "<owner/repo>"
+  }
+  return trim(slug)
+}
+
+fn inspect_failed_runs_lines(repo: any, include_publish: bool, include_binaries: bool) {
+  let lines = ["1. inspect the failed run(s):"]
+  if include_publish {
+    lines = lines + ["     gh run list --repo ${repo} --workflow=publish-release.yml --limit 5"]
+  }
+  if include_binaries {
+    lines = lines
+      + ["     gh run list --repo ${repo} --workflow=build-release-binaries.yml --limit 5"]
+  }
+  return lines
+}
+
+fn publish_yank_recovery_lines(tag: string, first_step: string, final_step: string) {
+  return [
+    "${first_step}. if nothing usable shipped, yank the git tag before anyone repins to it:",
+    "     git push origin --delete ${tag} && git tag -d ${tag}",
+    "3. crates.io is immutable: if a crate already published, yank that version instead:",
+    "     cargo yank --version <X.Y.Z> <crate>",
+    "${final_step}. fix the cause on the base branch, then re-run release_harn to re-tag and re-publish.",
+  ]
+}
+
+fn binary_asset_recovery_lines(tag: string, repo: any, first_step: string, final_step: string) {
+  return [
+    "${first_step}. recover missing release assets by rebuilding from the immutable merged-main tag:",
+    "     gh workflow run build-release-binaries.yml --repo ${repo} -f force_rebuild=true -f tag=${tag}",
+    "     harn run --no-sandbox wait_harn_release_ready.harn -- --tag ${tag}",
+    "${final_step}. verify the rebuilt assets attest to the exact tag target before resuming the release watcher.",
+  ]
+}
+
+/**
+ * Operator-facing recovery path for a red post-tag release. The tag is already
+ * pushed, and the failing workflow determines whether recovery is a crates/tag
+ * rollback or an idempotent binary-asset rebuild from the existing tag.
+ * Returned as lines so callers can fold them into a step's stderr.
+ */
+pub fn publish_failure_recovery_lines(
+  tag: string,
+  slug: string,
+  failed_workflows: list<string>,
+) -> list<string> {
+  const repo = release_repo_label(slug)
+  const failed = workflow_names(failed_workflows)
+  const publish_failed = workflow_name_in(failed, "publish-release.yml")
+  const binaries_failed = workflow_name_in(failed, "build-release-binaries.yml")
+  const unknown_failed = has_unclassified_workflow(failed)
+  if binaries_failed && !publish_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: binary release assets may be missing, but the crates/tag can still be valid.",
+    ]
+      + inspect_failed_runs_lines(repo, false, true)
+      + binary_asset_recovery_lines(tag, repo, "2", "3")
+  }
+  if publish_failed && !binaries_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: publish-release.yml failed, so crates.io/tag state may be partial.",
+    ]
+      + inspect_failed_runs_lines(repo, true, false)
+      + publish_yank_recovery_lines(tag, "2", "4")
+  }
+  if publish_failed && binaries_failed && !unknown_failed {
+    return [
+      "release publish for ${tag} is RED: inspect publish-release.yml first because crates.io/tag state may be partial.",
+    ]
+      + inspect_failed_runs_lines(repo, true, true)
+      + publish_yank_recovery_lines(tag, "2", "4")
+      + binary_asset_recovery_lines(tag, repo, "5", "6")
+  }
+  return [
+    "release publish for ${tag} is RED: an unclassified publish workflow failed, so inspect before choosing recovery.",
+  ]
+    + inspect_failed_runs_lines(repo, true, true)
+    + publish_yank_recovery_lines(tag, "2", "4")
+    + binary_asset_recovery_lines(tag, repo, "5", "6")
+}
+
+/**
+ * Decide whether a completed release should kick off a default-branch release
+ * cache warm. This is a post-publish tailwind, not a release gate: dispatch
+ * failures should be recorded loudly by the caller but must not make the
+ * already-published release fail.
+ */
+pub fn post_publish_warm_cache_dispatch_decision(
+  inputs: PostPublishWarmCacheInputs,
+) -> PostPublishWarmCacheDecision {
+  if !(inputs.enabled ?? true) {
+    return {should_dispatch: false, reason: "post-publish warm-cache dispatch disabled"}
+  }
+  if trim(inputs.publish_state ?? "") != "healthy" {
+    return {should_dispatch: false, reason: "publish watch did not confirm healthy"}
+  }
+  const slug = trim(inputs.slug ?? "")
+  if slug == "" {
+    return {should_dispatch: false, reason: "could not resolve repository slug"}
+  }
+  return {
+    should_dispatch: true,
+    workflow: "build-release-binaries.yml",
+    fields: {warm_cache_only: true},
+    message: "publish is green; dispatching default-branch release-cache warm for " + slug,
+  }
+}

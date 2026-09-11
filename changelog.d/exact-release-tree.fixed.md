@@ -1,0 +1,1 @@
+Release contract checks now certify the exact pull-request and merge-queue tree with the canonical changelog fold, so a fragment merged after candidate preparation blocks the release before that tree can be tagged.
