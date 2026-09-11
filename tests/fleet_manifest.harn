@@ -1,0 +1,611 @@
+import {
+  FleetRepository,
+  bump_arms_auto_merge,
+  fleet_pr_title_area,
+  fleet_release_required_contexts,
+  harn_bump_repositories,
+  harn_package_repositories,
+  harn_update_arm_decision,
+  harn_update_workflow_path,
+  package_status_action_reference,
+  parse_fleet_manifest,
+  parse_workflow_policy_reference,
+  read_fleet_manifest,
+  resolve_fleet_root,
+  resolve_harn_update_spec,
+  scoped_harn_bump_repositories,
+  validate_fleet_manifest,
+} from "../lib/fleet_manifest"
+
+fn thrown(callback: closure) -> string {
+  return try {
+    callback()
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+}
+
+pipeline test_auto_arm_requires_the_exact_signed_head_and_respects_withholds(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const ordinary = schema_expect(
+    manifest.repositories.find({ repo -> repo.slug == "burin-labs/20eq" }),
+    FleetRepository,
+  )
+  const spec = resolve_harn_update_spec(manifest, ordinary, "v0.10.116")
+  assert_eq(harn_update_arm_decision(spec, "aaaa", false, "aaaa", 0).action, "arm")
+  assert_eq(
+    harn_update_arm_decision(spec, "aaaa", false, "bbbb", 0),
+    {action: "refuse", reason: "signed head evidence moved from the observed PR lease"},
+  )
+  assert_eq(harn_update_arm_decision(spec, "aaaa", false, "aaaa", 1).action, "refuse")
+  const tap = schema_expect(
+    manifest.repositories.find({ repo -> repo.slug == "burin-labs/homebrew-burin" }),
+    FleetRepository,
+  )
+  const withheld = resolve_harn_update_spec(
+    manifest,
+    tap + {bump_enable_auto_merge: false},
+    "v0.10.116",
+  )
+  assert_eq(
+    harn_update_arm_decision(withheld, "aaaa", false),
+    {action: "withhold", reason: "held_by_manifest"},
+  )
+  assert_eq(harn_update_arm_decision(withheld, "aaaa", true).action, "refuse")
+}
+
+pipeline test_managed_runtime_repins_are_autonomously_armed(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const repositories = harn_bump_repositories(manifest)
+  assert(len(repositories) > 0)
+  for repo in repositories {
+    assert(bump_arms_auto_merge(repo), "runtime repin is withheld: ${repo.slug}")
+  }
+}
+
+pipeline test_scoped_harn_bump_repositories_selects_one_managed_target_and_fails_closed(
+  harness: Harness,
+) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const selected = scoped_harn_bump_repositories(manifest, "burin-labs/harn-cloud")
+  assert_eq(selected.map({ repo -> repo.slug }).to_list(), ["burin-labs/harn-cloud"])
+  assert_eq(
+    len(scoped_harn_bump_repositories(manifest, nil)),
+    len(harn_bump_repositories(manifest)),
+  )
+  assert(
+    contains(
+      thrown({ -> scoped_harn_bump_repositories(manifest, "burin-labs/not-managed") }),
+      "not a managed Harn bump repository",
+    ),
+  )
+}
+
+pipeline test_fleet_manifest_is_typed_unique_and_complete(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  assert_eq(manifest.schema_version, 1)
+  assert(len(manifest.repositories) >= 30)
+  let slugs = {}
+  let directories = {}
+  for repo in manifest.repositories {
+    assert_eq(slugs[repo.slug] ?? false, false, "duplicate fleet slug ${repo.slug}")
+    assert_eq(
+      directories[repo.directory] ?? false,
+      false,
+      "duplicate fleet directory ${repo.directory}",
+    )
+    slugs[repo.slug] = true
+    directories[repo.directory] = true
+  }
+  assert(slugs["burin-labs/20eq"])
+  assert(len(harn_package_repositories(manifest)) >= 25)
+  assert(len(harn_bump_repositories(manifest)) >= 20)
+  assert_eq(
+    len(manifest.repositories.filter({ repo -> repo.package_ci_ownership == "fleet" }).to_list()),
+    20,
+  )
+  assert_eq(
+    len(manifest.repositories.filter({ repo -> repo.bump_workflow_ownership != nil }).to_list()),
+    len(harn_bump_repositories(manifest)),
+    "every runtime-bump adapter must name its workflow owner",
+  )
+  const notion_repositories = manifest.repositories.filter(
+    { repo -> repo.slug == "burin-labs/notion-sdk-harn" },
+  )
+    .to_list()
+  assert_eq(len(notion_repositories), 1)
+  assert_eq(
+    notion_repositories[0]?.bump_refresh_command,
+    "harn install --locked || harn install\nharn run scripts/regen.harn -- --apply\n",
+    "the Notion SDK bump must regenerate generated output and its provenance receipt",
+  )
+  assert_eq(
+    notion_repositories[0]?.bump_validate_command,
+    "harn package verify .\nharn run scripts/check_generated_provenance.harn\nharn run tests/recorded/notion_sdk_smoke.harn\n",
+    "the Notion SDK bump must prove provenance and the recorded consumer path",
+  )
+  const projection_consumers = manifest.repositories.filter(
+    { repo -> repo.consumer_owned_contract ?? false },
+  )
+    .map({ repo -> repo.slug })
+    .to_list()
+  assert_eq(
+    projection_consumers,
+    ["burin-labs/burin-code", "burin-labs/harn-cloud"],
+    "public policy names consumers without disclosing their destination paths",
+  )
+}
+
+pipeline test_consumer_owned_contract_requires_runtime_hydration_and_rejects_public_leaks() {
+  const repo: FleetRepository = {
+    slug: "owner/private-consumer",
+    directory: "private-consumer",
+    consumer_owned_contract: true,
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+  }
+  const base: any = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/policy/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [repo],
+  }
+  const parsed = parse_fleet_manifest(base)
+  assert(
+    contains(
+      thrown({ -> resolve_harn_update_spec(parsed, repo, "v1.2.3") }),
+      "consumer contract was not hydrated",
+    ),
+  )
+  const private_fields = [
+    {harn_pin_kind: "version_file"},
+    {harn_pin_path: "private/version"},
+    {package_validate_command: "private/package-check"},
+    {bump_refresh_command: "private/refresh"},
+    {bump_refresh_notes: "private notes"},
+    {bump_validate_command: "private/validate"},
+    {bump_node_version: "24"},
+    {bump_allowed_new_files: ["private/generated"]},
+    {consumer_contract_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  ]
+  for private_field in private_fields {
+    assert_ne(
+      thrown({ -> parse_fleet_manifest(base + {repositories: [repo + private_field]}) }),
+      "",
+    )
+  }
+  assert(
+    contains(
+      thrown(
+        { ->
+          parse_fleet_manifest(
+            base + {repositories: [repo + {bump_validate_command: "private/validate"}]},
+          )
+        },
+      ),
+      "consumer-owned paths or commands",
+    ),
+  )
+}
+
+pipeline test_resolved_update_contract_keeps_defaults_and_specializes_homebrew(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const ordinary = schema_expect(
+    manifest.repositories.find({ repo -> repo.slug == "burin-labs/20eq" }),
+    FleetRepository,
+  )
+  const ordinary_spec = resolve_harn_update_spec(manifest, ordinary, "v0.10.116")
+  assert_eq(harn_update_workflow_path(ordinary), ".github/workflows/bump-harn.yml")
+  assert_eq(ordinary_spec.workflow_path, ".github/workflows/bump-harn.yml")
+  assert_eq(ordinary_spec.workflow_name, "bump-harn.yml")
+  assert_eq(ordinary_spec.branch, "automation/bump-harn-runtime")
+  assert_eq(ordinary_spec.pin, {kind: "auto"})
+  assert(ordinary_spec.repair_enabled)
+  assert(ordinary_spec.auto_arm)
+  assert(ordinary_spec.require_signed_head)
+  assert_eq(ordinary_spec.prerequisites, [])
+  assert_eq(ordinary_spec.max_releases_behind, 1)
+  const tap = schema_expect(
+    manifest.repositories.find({ repo -> repo.slug == "burin-labs/homebrew-burin" }),
+    FleetRepository,
+  )
+  const tap_spec = resolve_harn_update_spec(manifest, tap, "v0.10.116")
+  assert_eq(harn_update_workflow_path(tap), ".github/workflows/bump-harn-formula.yml")
+  assert_eq(tap_spec.workflow_path, ".github/workflows/bump-harn-formula.yml")
+  assert_eq(tap_spec.workflow_name, "bump-harn-formula.yml")
+  assert_eq(tap_spec.branch, "automation/harn-formula-v0.10.116")
+  assert_eq(tap_spec.pin, {kind: "formula", path: "Formula/harn.rb"})
+  assert(!tap_spec.repair_enabled)
+  assert(tap_spec.auto_arm)
+  assert(tap_spec.require_signed_head)
+  assert_eq(tap_spec.max_releases_behind, 0)
+  assert(
+    contains(
+      thrown({ -> resolve_harn_update_spec(manifest, tap, "../v0.10.116") }),
+      "unsafe Git branch",
+    ),
+  )
+  const burin = schema_expect(
+    manifest.repositories.find({ repo -> repo.slug == "burin-labs/burin-code" }),
+    FleetRepository,
+  )
+  assert(
+    contains(
+      thrown({ -> resolve_harn_update_spec(manifest, burin, "v0.10.116") }),
+      "consumer contract was not hydrated",
+    ),
+  )
+}
+
+pipeline test_fleet_root_expansion() {
+  assert_eq(resolve_fleet_root("~/projects", "/Users/test"), "/Users/test/projects")
+  assert_eq(resolve_fleet_root("~", "/Users/test"), "/Users/test")
+  assert_eq(resolve_fleet_root("/srv/repos", "/Users/test"), "/srv/repos")
+}
+
+pipeline test_workflow_policy_reference_is_typed() {
+  assert_eq(
+    parse_workflow_policy_reference(
+      "burin-labs/.github/.github/workflows/harn-package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ),
+    {
+      slug: "burin-labs/.github",
+      path: ".github/workflows/harn-package.yml",
+      ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    },
+  )
+  assert(
+    contains(
+      thrown(
+        { ->
+          parse_workflow_policy_reference(
+            "burin-labs/harn/scripts/bump-harn.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          )
+        },
+      ),
+      "invalid fleet reusable-workflow policy reference",
+    ),
+  )
+}
+
+pipeline test_package_status_action_is_derived_from_the_workflow_authority() {
+  assert_eq(
+    package_status_action_reference(
+      "burin-labs/.github/.github/workflows/harn-package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ),
+    "burin-labs/.github/.github/actions/require-successful-needs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  )
+}
+
+pipeline test_fleet_manifest_rejects_ambiguous_or_unsafe_contracts() {
+  const base = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/repo/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/repo/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [],
+  }
+  const duplicate = base
+    + {
+      repositories: [
+        {slug: "burin-labs/pkg", directory: "one"},
+        {slug: "burin-labs/pkg", directory: "two"},
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(duplicate) }), "duplicate"))
+  const escaped = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "../pkg", harn_package: true}]}
+  assert(contains(thrown({ -> validate_fleet_manifest(escaped) }), "invalid"))
+  const poll_without_package = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", run_poll_tick: true}]}
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(poll_without_package) }), "without harn_package"),
+  )
+  const workers_without_package = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", test_jobs: 1}]}
+  assert(
+    contains(
+      thrown({ -> validate_fleet_manifest(workers_without_package) }),
+      "positive harn_package worker count",
+    ),
+  )
+  const ownership_without_package = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", package_ci_ownership: "fleet"}]}
+  assert(
+    contains(
+      thrown({ -> validate_fleet_manifest(ownership_without_package) }),
+      "delegates package CI without harn_package",
+    ),
+  )
+  const validation_without_ownership = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/pkg",
+          directory: "pkg",
+          harn_package: true,
+          package_validate_command: "harn run scripts/check.harn",
+        },
+      ],
+    }
+  assert(
+    contains(
+      thrown({ -> validate_fleet_manifest(validation_without_ownership) }),
+      "without delegated package CI",
+    ),
+  )
+  // Pin ownership may declare the command too. The release's consumer contract
+  // compares that input for every packaged repository, so refusing the
+  // declaration here made the comparison unsatisfiable for a pin-owned
+  // repository that authored its own validation.
+  const validation_under_pin_ownership = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/pkg",
+          directory: "pkg",
+          harn_package: true,
+          package_ci_ownership: "pin",
+          package_validate_command: "harn run scripts/check.harn",
+        },
+      ],
+    }
+  assert_eq(thrown({ -> validate_fleet_manifest(validation_under_pin_ownership) }), "")
+  const empty_validation_under_pin = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/pkg",
+          directory: "pkg",
+          harn_package: true,
+          package_ci_ownership: "pin",
+          package_validate_command: "   ",
+        },
+      ],
+    }
+  assert(
+    contains(
+      thrown({ -> validate_fleet_manifest(empty_validation_under_pin) }),
+      "without delegated package CI",
+    ),
+    "an empty command is still refused; relaxing ownership must not relax emptiness",
+  )
+  const package_without_ownership = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", harn_package: true}]}
+  assert(
+    contains(
+      thrown({ -> validate_fleet_manifest(package_without_ownership) }),
+      "without explicit package CI ownership",
+    ),
+  )
+  const command_without_bump = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", bump_refresh_command: "refresh"}]}
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(command_without_bump) }), "without harn_bump"),
+  )
+  const ownership_without_bump = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", bump_workflow_ownership: "fleet"}]}
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(ownership_without_bump) }), "without harn_bump"),
+  )
+  const unvalidated_owned_app = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/pkg",
+          directory: "pkg",
+          harn_bump: true,
+          bump_workflow_ownership: "fleet",
+        },
+      ],
+    }
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(unvalidated_owned_app) }), "without validation"),
+  )
+  const invalid_node = base
+    + {
+      repositories: [
+        {slug: "burin-labs/pkg", directory: "pkg", harn_bump: true, bump_node_version: "../22"},
+      ],
+    }
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(invalid_node) }), "invalid bump_node_version"),
+  )
+  const implicit_formula = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/tap",
+          directory: "tap",
+          harn_bump: true,
+          harn_pin_path: "Formula/harn.rb",
+        },
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(implicit_formula) }), "explicit pin kind"))
+  const unsafe_workflow = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/tap",
+          directory: "tap",
+          harn_bump: true,
+          bump_workflow_path: "../bump.yml",
+        },
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(unsafe_workflow) }), "unsafe bump workflow"))
+  const template_without_bump = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/tap",
+          directory: "tap",
+          bump_branch_template: "automation/harn-formula-{target}",
+        },
+      ],
+    }
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(template_without_bump) }), "without harn_bump"),
+  )
+  const branch_and_template = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/tap",
+          directory: "tap",
+          harn_bump: true,
+          bump_branch: "automation/harn-formula",
+          bump_branch_template: "automation/harn-formula-{target}",
+        },
+      ],
+    }
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(branch_and_template) }), "both a bump branch"),
+  )
+  for invalid_template in [
+    "automation/harn-formula",
+    "automation/{target}/harn-formula-{target}",
+    "../automation/harn-formula-{target}",
+  ] {
+    const invalid = base
+      + {
+        repositories: [
+          {
+            slug: "burin-labs/tap",
+            directory: "tap",
+            harn_bump: true,
+            bump_branch_template: invalid_template,
+          },
+        ],
+      }
+    assert(contains(thrown({ -> validate_fleet_manifest(invalid) }), "bump branch template"))
+  }
+  const unmanaged_prerequisite = base
+    + {
+      repositories: [
+        {
+          slug: "burin-labs/app",
+          directory: "app",
+          harn_bump: true,
+          bump_prerequisites: ["burin-labs/tap"],
+        },
+      ],
+    }
+  assert(
+    contains(thrown({ -> validate_fleet_manifest(unmanaged_prerequisite) }), "unmanaged update"),
+  )
+  const mutable_policy = base
+    + {
+      policy: {
+        package_workflow: "owner/repo/.github/workflows/package.yml@main",
+        bump_workflow: base.policy.bump_workflow,
+      },
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(mutable_policy) }), "immutable"))
+  const unsafe_branch = base + {fleet: {default_root: "~/projects", default_branch: "../main"}}
+  assert(contains(thrown({ -> validate_fleet_manifest(unsafe_branch) }), "default_branch"))
+  const legacy_projection_registry = base
+    + {
+      file_projections: [
+        {
+          source_slug: "owner/source",
+          source_path: "index.toml",
+          target_slug: "owner/target",
+          target_path: "generated/index.toml",
+        },
+      ],
+    }
+  assert(
+    contains(
+      thrown({ -> parse_fleet_manifest(legacy_projection_registry) }),
+      "must be declared by consumers",
+    ),
+  )
+}
+
+pipeline test_pull_request_title_policy_is_declared_in_pairs_and_read_by_slug(harness: Harness) {
+  const base = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/repo/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/repo/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [],
+  }
+  const gate_without_area = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", pr_title_gate: true}]}
+  assert(contains(thrown({ -> validate_fleet_manifest(gate_without_area) }), "without an area"))
+  const area_without_gate = base
+    + {repositories: [{slug: "burin-labs/pkg", directory: "pkg", pr_title_area: "Harn"}]}
+  assert(contains(thrown({ -> validate_fleet_manifest(area_without_gate) }), "no gate enforces"))
+  const unsafe_area = base
+    + {
+      repositories: [
+        {slug: "burin-labs/pkg", directory: "pkg", pr_title_gate: true, pr_title_area: "[Harn]"},
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(unsafe_area) }), "not a plain word"))
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  assert_eq(fleet_pr_title_area(manifest, "burin-labs/burin-code"), "Harn")
+  assert_eq(fleet_pr_title_area(manifest, "burin-labs/20eq"), "")
+  assert_eq(fleet_pr_title_area(manifest, "burin-labs/not-in-this-manifest"), "")
+}
+
+/**
+ * The release-context declaration is typed policy read by slug, and its shape
+ * is refused at the manifest seam.
+ *
+ * A blank entry would resolve to `MISSING` on every commit and hold the release
+ * forever; a duplicate would count the same pending row twice in a number a
+ * reader is meant to trust. A repository the manifest does not name declares
+ * nothing, which leaves its decision on the ruleset set alone.
+ */
+pipeline test_release_required_contexts_are_declared_and_read_by_slug(harness: Harness) {
+  const base = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/repo/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/repo/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [],
+  }
+  const blank = base
+    + {
+      repositories: [
+        {slug: "burin-labs/pkg", directory: "pkg", release_required_contexts: ["E2E", "  "]},
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(blank) }), "empty release required context"))
+  const duplicated = base
+    + {
+      repositories: [
+        {slug: "burin-labs/pkg", directory: "pkg", release_required_contexts: ["E2E", "E2E"]},
+      ],
+    }
+  assert(contains(thrown({ -> validate_fleet_manifest(duplicated) }), "more than once"))
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  // The lane that is branch-covered and ruleset-optional, so nothing read it
+  // before this list existed.
+  assert_eq(fleet_release_required_contexts(manifest, "burin-labs/harn"), ["Slow E2E suite"])
+  // The positive control: a repository with no declaration, and one the
+  // manifest does not name at all, both declare nothing.
+  assert_eq(fleet_release_required_contexts(manifest, "burin-labs/20eq"), [])
+  assert_eq(fleet_release_required_contexts(manifest, "burin-labs/not-in-this-manifest"), [])
+}

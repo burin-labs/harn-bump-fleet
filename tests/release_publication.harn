@@ -1,0 +1,1005 @@
+import { GitRemoteRef, git_ls_remote } from "std/git"
+import {
+  RELEASE_GATE_TOOLING_PATHS,
+  recovered_checkpoint_tooling_integrity,
+  release_checkpoint_resume_block,
+  release_checkpoint_supersede_advisory,
+  release_checkpoint_tooling_drift,
+  release_checkpoint_tooling_integrity,
+  release_recovery_candidate_preference,
+  release_recovery_checkpoint_route,
+  release_recovery_is_pre_tag_resume,
+  release_recovery_notes_scope,
+  release_recovery_pin_decision,
+  release_target_version_with_fixup,
+  with_fixup_state,
+} from "../lib/release_fixup"
+import { verify_release_recovery_source } from "../lib/release_notes"
+import {
+  publish_release_publication,
+  release_attempt_for_version,
+  release_publication,
+  release_publication_decision,
+  release_publication_pr_decision,
+  release_publication_push_reconciliation,
+  release_publications_from_remote_refs,
+  release_recovery_pull_requests,
+  release_recovery_source,
+  superseded_release_attempts,
+} from "../lib/release_publication"
+import { remote_tag_target_sha } from "../lib/release_repin"
+import { ReleaseRepoConfig, parse_release_args } from "../lib/release_runtime"
+
+fn sh(process: HarnessProcess, command: any) {
+  const result = process.shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+fn fixture(harness: Harness) {
+  const root = path_join(
+    harness.fs.temp_dir(),
+    "immutable-release-publication-" + harness.random.uuid_v7(),
+  )
+  const origin = path_join(root, "origin.git")
+  const work = path_join(root, "work")
+  sh(harness.process, "git init --bare -q '" + origin + "'")
+  sh(harness.process, "git init -q '" + work + "'")
+  sh(harness.process, "git -C '" + work + "' config user.email test@example.com")
+  sh(harness.process, "git -C '" + work + "' config user.name test")
+  sh(harness.process, "git -C '" + work + "' checkout -q -b main")
+  harness.fs.write_text(path_join(work, "fixture.txt"), "first\n")
+  sh(
+    harness.process,
+    "git -C '" + work + "' add fixture.txt && git -C '" + work + "' commit -q -m first",
+  )
+  sh(harness.process, "git -C '" + work + "' remote add origin '" + origin + "'")
+  return {root: root, origin: origin, work: work}
+}
+
+fn head(process: HarnessProcess, work: string) -> string {
+  return trim(sh(process, "git -C '" + work + "' rev-parse HEAD").stdout)
+}
+
+fn remote_attempt_ref(publication: any) -> GitRemoteRef {
+  return {
+    oid: publication.head_oid,
+    ref: "refs/heads/${publication.remote_ref}",
+    name: "refs/heads/${publication.remote_ref}",
+    peeled: false,
+  }
+}
+
+pipeline test_release_publication_contract_is_immutable(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  assert_eq(publication.local_branch, "release/v1.2.3")
+  assert_eq(publication.remote_ref, "release-attempt/v1.2.3/${oid}")
+  assert_eq(release_publication_decision(publication, "").action, "publish")
+  assert_eq(release_publication_decision(publication, oid).action, "resume")
+  assert_eq(
+    release_publication_decision(publication, "fedcba9876543210fedcba9876543210fedcba98").action,
+    "fail",
+  )
+}
+
+pipeline test_release_publication_preserves_prerelease_identity(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.4-rc.10", oid)
+  assert_eq(publication.local_branch, "release/v1.2.4-rc.10")
+  assert_eq(publication.remote_ref, "release-attempt/v1.2.4-rc.10/${oid}")
+}
+
+pipeline test_release_publication_reconciles_ambiguous_push_from_origin(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const accepted = release_publication_push_reconciliation(publication, false, oid)
+  assert_eq(accepted.success, true)
+  assert_eq(accepted.action, "reconciled")
+  const absent = release_publication_push_reconciliation(publication, false, "")
+  assert_eq(absent.success, false)
+  assert_eq(absent.action, "push_failed")
+  const conflict = release_publication_push_reconciliation(
+    publication,
+    false,
+    "fedcba9876543210fedcba9876543210fedcba98",
+  )
+  assert_eq(conflict.success, false)
+  assert_eq(conflict.action, "confirmation_mismatch")
+}
+
+pipeline test_release_publication_selects_only_prior_attempt_prs(task: any) {
+  const publication = release_publication("1.2.3", "0123456789abcdef0123456789abcdef01234567")
+  const prior_oid = "fedcba9876543210fedcba9876543210fedcba98"
+  const prior = superseded_release_attempts(
+    publication,
+    [
+      {
+        number: 1,
+        url: "https://example.test/pull/1",
+        head: {ref: publication.remote_ref, sha: publication.head_oid},
+      },
+      {
+        number: 2,
+        url: "https://example.test/pull/2",
+        head: {ref: "release-attempt/v1.2.3/${prior_oid}", sha: prior_oid},
+      },
+      {
+        number: 3,
+        url: "https://example.test/pull/3",
+        head: {ref: "release-attempt/v1.2.4/${prior_oid}", sha: prior_oid},
+      },
+    ],
+  )
+  assert_eq(len(prior), 1)
+  assert_eq(prior[0]?.number, 2)
+}
+
+pipeline test_legacy_mutable_release_pr_fails_loud(task: any) {
+  const error = try {
+    release_attempt_for_version(
+      "1.2.3",
+      [
+        {
+          number: 4,
+          url: "https://example.test/pull/4",
+          head: {ref: "release/v1.2.3", sha: "fedcba9876543210fedcba9876543210fedcba98"},
+        },
+      ],
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(error, "legacy mutable release PR"), true)
+}
+
+pipeline test_tagged_fixup_pr_is_partitioned_from_immutable_recovery(task: any) {
+  const tag_oid = "0123456789abcdef0123456789abcdef01234567"
+  const attempt_oid = "fedcba9876543210fedcba9876543210fedcba98"
+  const fixup = {
+    number: 4,
+    url: "https://example.test/pull/4",
+    head: {ref: "release/v1.2.3", sha: tag_oid},
+  }
+  const attempt = {
+    number: 5,
+    url: "https://example.test/pull/5",
+    head: {ref: "release-attempt/v1.2.3/${attempt_oid}", sha: attempt_oid},
+  }
+  const partition = release_recovery_pull_requests("1.2.3", [fixup, attempt], tag_oid)
+  assert_eq(partition.tagged_fixup, fixup)
+  assert_eq(partition.immutable_attempts, [attempt])
+  const duplicate_probe = release_recovery_pull_requests("1.2.3", [fixup, fixup], tag_oid)
+  assert_eq(duplicate_probe.tagged_fixup, fixup)
+  const pre_tag_error = try {
+    release_recovery_pull_requests("1.2.3", [fixup], "")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(pre_tag_error, "before a signed tag selects an immutable attempt"), true)
+  const malformed_tag_error = try {
+    release_recovery_pull_requests("1.2.3", [fixup], "not-an-oid")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(malformed_tag_error, "full 40-hex OID"), true)
+}
+
+pipeline test_release_attempt_discovery_requires_one_exact_ref_and_head(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const pull_request = {
+    number: 7,
+    url: "https://example.test/pull/7",
+    head: {ref: publication.remote_ref, sha: oid},
+  }
+  const attempt = release_attempt_for_version("1.2.3", [pull_request])
+  assert_eq(attempt.publication, publication)
+  assert_eq(attempt.pull_request, pull_request)
+  assert_eq(release_attempt_for_version("1.2.4", [pull_request]), nil)
+  assert_eq(release_publication_pr_decision(publication, pull_request).action, "accept")
+  assert_eq(
+    release_publication_pr_decision(
+      publication,
+      pull_request + {head: pull_request.head + {sha: "fedcba9876543210fedcba9876543210fedcba98"}},
+    ).action,
+    "fail",
+  )
+}
+
+pipeline test_release_attempt_discovery_fails_loud_on_drift_or_ambiguity(task: any) {
+  const first_oid = "0123456789abcdef0123456789abcdef01234567"
+  const second_oid = "fedcba9876543210fedcba9876543210fedcba98"
+  const first = {
+    number: 7,
+    url: "https://example.test/pull/7",
+    head: {ref: "release-attempt/v1.2.3/${first_oid}", sha: first_oid},
+  }
+  const second = {
+    number: 8,
+    url: "https://example.test/pull/8",
+    head: {ref: "release-attempt/v1.2.3/${second_oid}", sha: second_oid},
+  }
+  const drift_error = try {
+    release_attempt_for_version("1.2.3", [first + {head: first.head + {sha: second_oid}}])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(drift_error, "does not match immutable ref"), true)
+  const malformed_error = try {
+    release_attempt_for_version(
+      "1.2.3",
+      [
+        {
+          number: 9,
+          url: "https://example.test/pull/9",
+          head: {ref: "release-attempt/v1.2.3/not-an-oid", sha: first_oid},
+        },
+      ],
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(malformed_error, "full 40-hex OID"), true)
+  const ambiguous_error = try {
+    release_attempt_for_version("1.2.3", [first, second])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(ambiguous_error, "multiple open immutable release attempts"), true)
+}
+
+pipeline test_release_recovery_source_handles_tag_only_crash_and_reconciles_pr(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const pull_request = {
+    number: 7,
+    url: "https://example.test/pull/7",
+    head: {ref: publication.remote_ref, sha: oid},
+  }
+  const remote_refs = [remote_attempt_ref(publication)]
+  const pre_tag_crash = release_recovery_source("1.2.3", [], remote_refs, "")
+  assert_eq(pre_tag_crash?.publication, publication)
+  assert_eq(pre_tag_crash?.pull_request, nil)
+  const tag_only = release_recovery_source("1.2.3", [], remote_refs, oid)
+  assert_eq(tag_only?.publication, publication)
+  assert_eq(tag_only?.pull_request, nil)
+  const reconciled = release_recovery_source("1.2.3", [pull_request], remote_refs, oid)
+  assert_eq(reconciled?.publication, publication)
+  assert_eq(reconciled?.pull_request, pull_request)
+  const mismatch = try {
+    release_recovery_source(
+      "1.2.3",
+      [pull_request],
+      remote_refs,
+      "fedcba9876543210fedcba9876543210fedcba98",
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(mismatch, "but open immutable attempt"), true)
+}
+
+pipeline test_release_recovery_source_uses_exact_tag_after_attempt_cleanup(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const recovered = release_recovery_source("1.2.3", [], [], oid)
+  assert_eq(recovered?.publication, release_publication("1.2.3", oid))
+  assert_eq(recovered?.pull_request, nil)
+  const malformed = try {
+    release_recovery_source("1.2.3", [], [], "not-an-oid")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(malformed, "full 40-hex OID"), true)
+}
+
+pipeline test_explicit_pin_selects_one_of_multiple_bare_release_attempts(task: any) {
+  const stale = release_publication("1.2.3", "0123456789abcdef0123456789abcdef01234567")
+  const requested = release_publication("1.2.3", "fedcba9876543210fedcba9876543210fedcba98")
+  const refs = [remote_attempt_ref(stale), remote_attempt_ref(requested)]
+  const selected = release_recovery_source("1.2.3", [], refs, "", requested.head_oid)
+  assert_eq(selected?.publication, requested)
+  const unpinned = try {
+    release_recovery_source("1.2.3", [], refs, "")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(unpinned, "multiple unclaimed immutable release attempts"), true)
+  const missing = try {
+    release_recovery_source("1.2.3", [], refs, "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(missing, "has no matching immutable origin ref"), true)
+}
+
+pipeline test_recovery_default_selects_the_unique_newest_base_ancestor(task: any) {
+  const old_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const new_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const new_attempt = "2222222222222222222222222222222222222222"
+  const candidates = [
+    {
+      publication: release_publication("1.2.3", "1111111111111111111111111111111111111111"),
+      pin_oid: old_pin,
+    },
+    {publication: release_publication("1.2.3", new_attempt), pin_oid: new_pin},
+  ]
+  const selected = release_recovery_candidate_preference(
+    "1.2.3",
+    candidates,
+    "",
+    fn(older, newer) { return older == old_pin && newer == new_pin },
+  )
+  assert_eq(selected.attempt_oid, new_attempt)
+  assert_eq(selected.pin_oid, new_pin)
+  assert_eq(selected.mode, "newest_base_ancestor")
+}
+
+pipeline test_recovery_default_fails_with_exact_pin_commands_when_ancestry_is_ambiguous(task: any) {
+  const first_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const second_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const first_ref = "release-attempt/v1.2.3/1111111111111111111111111111111111111111"
+  const second_ref = "release-attempt/v1.2.3/2222222222222222222222222222222222222222"
+  const candidates = [
+    {
+      publication: release_publication("1.2.3", "1111111111111111111111111111111111111111"),
+      pin_oid: first_pin,
+    },
+    {
+      publication: release_publication("1.2.3", "2222222222222222222222222222222222222222"),
+      pin_oid: second_pin,
+    },
+  ]
+  const message = try {
+    release_recovery_candidate_preference(
+      "1.2.3",
+      candidates,
+      "",
+      fn(_older, _newer) { return false },
+    )
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(message, "no unique newest source pin can be proven"))
+  assert(contains(message, "--at-sha ${first_pin}"))
+  assert(contains(message, "--at-sha ${second_pin}"))
+  assert(contains(message, first_ref))
+  assert(contains(message, second_ref))
+}
+
+pipeline test_recovery_explicit_pin_selects_one_exact_candidate(task: any) {
+  const first_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const second_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const second_attempt = "2222222222222222222222222222222222222222"
+  const candidates = [
+    {
+      publication: release_publication("1.2.3", "1111111111111111111111111111111111111111"),
+      pin_oid: first_pin,
+    },
+    {publication: release_publication("1.2.3", second_attempt), pin_oid: second_pin},
+  ]
+  const selected = release_recovery_candidate_preference(
+    "1.2.3",
+    candidates,
+    second_pin,
+    fn(_older, _newer) { return false },
+  )
+  assert_eq(selected.attempt_oid, second_attempt)
+  assert_eq(selected.mode, "explicit_pin")
+}
+
+pipeline test_only_bare_immutable_attempt_resumes_pre_tag_checkpoint(task: any) {
+  assert_eq(release_recovery_is_pre_tag_resume(false, ""), true)
+  assert_eq(release_recovery_is_pre_tag_resume(true, ""), false)
+  assert_eq(release_recovery_is_pre_tag_resume(false, "https://example.test/pull/7"), false)
+}
+
+pipeline test_pre_tag_resume_preserves_explicit_release_pin(harness: Harness, task: any) {
+  const requested = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const stale = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  let cfg = parse_release_args(harness.env, ["--at-sha", requested])
+  cfg["pin_sha"] = requested
+  const resumed = with_fixup_state(
+    cfg,
+    {
+      publication: release_publication("1.2.3", "cccccccccccccccccccccccccccccccccccccccc"),
+      tag: "v1.2.3",
+      pr_url: "",
+      original_pin: stale,
+      pin_unreleased: "## Unreleased\n",
+      release_body_source: "attempt-release-section",
+      tag_exists: false,
+      release_exists: false,
+      missing_assets: [],
+      conflicting: false,
+      pre_tag_resume: true,
+    },
+  )
+  assert_eq(resumed.pin_sha, requested)
+  assert_eq(resumed.release_notes_scope, "immutable_checkpoint")
+  const rejected = release_recovery_pin_decision(requested, requested, stale)
+  assert_eq(rejected.compatible, false)
+  assert_eq(rejected.effective_pin, requested)
+  const automatic = release_recovery_pin_decision("", requested, stale)
+  assert_eq(automatic.compatible, true)
+  assert_eq(automatic.effective_pin, stale)
+  assert_eq(release_recovery_checkpoint_route(true, rejected), "supersede_pre_tag")
+  assert_eq(release_recovery_checkpoint_route(true, automatic), "resume_pre_tag")
+  assert_eq(release_recovery_checkpoint_route(false, rejected), "repair")
+  const superseded = with_fixup_state(
+    cfg,
+    {
+      publication: release_publication("1.2.3", "cccccccccccccccccccccccccccccccccccccccc"),
+      tag: "v1.2.3",
+      pr_url: "",
+      original_pin: stale,
+      pin_unreleased: "## Unreleased\n",
+      release_body_source: "attempt-release-section",
+      tag_exists: false,
+      release_exists: false,
+      missing_assets: [],
+      conflicting: false,
+      pre_tag_resume: false,
+      pre_tag_supersede: true,
+    },
+  )
+  assert_eq(superseded.pin_sha, requested)
+  assert_eq(superseded.fixup_mode, true)
+  assert_eq(superseded.pre_tag_resume, false)
+  assert_eq(superseded.pre_tag_supersede, true)
+  assert_eq(superseded.release_notes_scope, "candidate_tree")
+}
+
+pipeline test_recovery_note_route_tracks_the_artifact_source(task: any) {
+  assert_eq(release_recovery_notes_scope(false), "candidate_tree")
+  assert_eq(release_recovery_notes_scope(true), "frozen_artifact")
+}
+
+pipeline test_pre_tag_resume_preserves_checkpoint_version_after_candidate_analysis(
+  harness: Harness,
+  task: any,
+) {
+  const fixup = {
+    publication: release_publication("1.2.3", "cccccccccccccccccccccccccccccccccccccccc"),
+    tag: "v1.2.3",
+    pr_url: "",
+    original_pin: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    pin_unreleased: "## Unreleased\n",
+    release_body_source: "attempt-release-section",
+    tag_exists: false,
+    release_exists: false,
+    missing_assets: [],
+    conflicting: false,
+    pre_tag_resume: true,
+  }
+  assert_eq(release_target_version_with_fixup("1.2.4", fixup), "1.2.3")
+  assert_eq(release_target_version_with_fixup("1.2.4", nil), "1.2.4")
+  const cfg = parse_release_args(harness.env, [])
+  const resumed = with_fixup_state(cfg, fixup)
+  assert_eq(resumed.release_notes_scope, "immutable_checkpoint")
+}
+
+pipeline test_pre_tag_release_recovery_requires_and_validates_remote_immutable_ref(task: any) {
+  const oid = "0123456789abcdef0123456789abcdef01234567"
+  const publication = release_publication("1.2.3", oid)
+  const missing = try {
+    release_recovery_source("1.2.3", [], [], "", oid)
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(missing, "no matching immutable origin ref"), true)
+  const drifting_ref = remote_attempt_ref(publication)
+    + {oid: "fedcba9876543210fedcba9876543210fedcba98"}
+  const drifting = try {
+    release_publications_from_remote_refs("1.2.3", [drifting_ref])
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(drifting, "not its content-addressed OID"), true)
+}
+
+pipeline test_release_publication_pushes_once_and_resumes_exact_ref(harness: Harness, task: any) {
+  const f = fixture(harness)
+  const publication = release_publication("1.2.3", head(harness.process, f.work))
+  const first = publish_release_publication(
+    harness.process,
+    {repo: f.work, mock: false},
+    publication,
+  )
+  assert_eq(first.success, true)
+  assert_eq(first.action, "published")
+  assert_eq(first.push_git_receipt.success, true)
+  assert_eq(first.remote_git_receipt.success, true)
+  const remote = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true},
+  )
+  assert_eq(remote.success, true)
+  assert_eq(remote.data.refs[0].oid, publication.head_oid)
+  const discovered = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/release-attempt/v1.2.3/*"], heads: true},
+  )
+  assert_eq(discovered.success, true)
+  assert_eq(len(discovered.data.refs), 1)
+  assert_eq(
+    release_recovery_source("1.2.3", [], discovered.data.refs, "")?.publication,
+    publication,
+  )
+  const resumed = publish_release_publication(
+    harness.process,
+    {repo: f.work, mock: false},
+    publication,
+  )
+  assert_eq(resumed.success, true)
+  assert_eq(resumed.action, "resume")
+  assert_eq(resumed.push_git_receipt, nil)
+  assert_eq(resumed.remote_git_receipt.success, true)
+  harness.fs.delete(f.root)
+}
+
+pipeline test_release_publication_pushes_captured_oid_when_local_head_advances(
+  harness: Harness,
+  task: any,
+) {
+  const f = fixture(harness)
+  const captured_oid = head(harness.process, f.work)
+  const publication = release_publication("1.2.3", captured_oid)
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "advanced\n")
+  sh(harness.process, "git -C '" + f.work + "' commit -q -am advanced")
+  assert_ne(head(harness.process, f.work), captured_oid)
+  const result = publish_release_publication(
+    harness.process,
+    {repo: f.work, mock: false},
+    publication,
+  )
+  assert_eq(result.success, true)
+  const remote = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true},
+  )
+  assert_eq(remote.data.refs[0].oid, captured_oid)
+  harness.fs.delete(f.root)
+}
+
+pipeline test_unsigned_remote_tag_is_not_a_verified_recovery_source(harness: Harness, task: any) {
+  const f = fixture(harness)
+  const repo_cfg: ReleaseRepoConfig = {repo: f.work, mock: false}
+  const captured_oid = head(harness.process, f.work)
+  const publication = release_publication("1.2.3", captured_oid)
+  assert_eq(
+    publish_release_publication(harness.process, {repo: f.work, mock: false}, publication).success,
+    true,
+  )
+  sh(harness.process, "git -C '" + f.work + "' tag -a v1.2.3 -m release " + captured_oid)
+  sh(harness.process, "git -C '" + f.work + "' push -q origin refs/tags/v1.2.3")
+  sh(harness.process, "git -C '" + f.work + "' tag -d v1.2.3 >/dev/null")
+  const refs = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/tags/v1.2.3", "refs/tags/v1.2.3^{}"]},
+  )
+  assert_eq(refs.success, true)
+  assert_eq(remote_tag_target_sha(refs.data.refs), captured_oid)
+  const attempts = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true},
+  )
+  const recovery = release_recovery_source(
+    "1.2.3",
+    [],
+    attempts.data.refs,
+    remote_tag_target_sha(refs.data.refs),
+  )
+  assert_eq(recovery?.publication?.head_oid, captured_oid)
+  const verification_error = try {
+    verify_release_recovery_source(
+      {env: harness.env, process: harness.process},
+      repo_cfg,
+      "v1.2.3",
+      publication,
+      refs.data.refs,
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert_eq(contains(verification_error, "failed signature verification"), true)
+  harness.fs.delete(f.root)
+}
+
+pipeline test_recovery_uses_repository_owned_release_tag_trust(harness: Harness, task: any) {
+  const f = fixture(harness)
+  const repo_cfg: ReleaseRepoConfig = {repo: f.work, mock: false}
+  const captured_oid = head(harness.process, f.work)
+  const publication = release_publication("1.2.3", captured_oid)
+  assert_eq(
+    publish_release_publication(harness.process, {repo: f.work, mock: false}, publication).success,
+    true,
+  )
+  const key = path_join(f.root, "release-signing-key")
+  const wrong_trust = path_join(f.root, "wrong-allowed-signers")
+  sh(harness.process, "ssh-keygen -q -t ed25519 -N '' -f '" + key + "'")
+  harness.fs.mkdir(path_join(f.work, ".github"), true)
+  harness.fs.write_text(
+    path_join(f.work, ".github", "release-bot-allowed-signers"),
+    "harn-release-bot[bot]@users.noreply.github.com " + trim(harness.fs.read_text(key + ".pub"))
+      + "\n",
+  )
+  harness.fs.write_text(wrong_trust, "")
+  sh(harness.process, "git -C '" + f.work + "' config user.name 'harn-release-bot[bot]'")
+  sh(
+    harness.process,
+    "git -C '" + f.work
+      + "' config user.email 'harn-release-bot[bot]@users.noreply.github.com'",
+  )
+  sh(harness.process, "git -C '" + f.work + "' config gpg.format ssh")
+  sh(harness.process, "git -C '" + f.work + "' config user.signingkey '" + key + "'")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' config gpg.ssh.allowedSignersFile '" + wrong_trust + "'",
+  )
+  sh(harness.process, "git -C '" + f.work + "' tag -s v1.2.3 -m release " + captured_oid)
+  const ambient = harness.process.shell("git -C '" + f.work + "' verify-tag --raw v1.2.3")
+  assert_eq(ambient.success, false)
+  sh(harness.process, "git -C '" + f.work + "' push -q origin refs/tags/v1.2.3")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' push -q origin :refs/heads/" + publication.remote_ref,
+  )
+  sh(harness.process, "git -C '" + f.work + "' tag -d v1.2.3 >/dev/null")
+  const refs = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/tags/v1.2.3", "refs/tags/v1.2.3^{}"]},
+  )
+  const recovery = release_recovery_source("1.2.3", [], [], remote_tag_target_sha(refs.data.refs))
+  assert_eq(recovery?.publication, publication)
+  const verified = verify_release_recovery_source(
+    {env: harness.env, process: harness.process},
+    repo_cfg,
+    "v1.2.3",
+    publication,
+    refs.data.refs,
+  )
+  assert_eq(verified.immutable_ref, "refs/tags/v1.2.3")
+  assert_ne(verified.tag_object_oid, "")
+  harness.fs.delete(f.root)
+}
+
+pipeline test_release_publication_new_head_never_rewrites_prior_attempt(
+  harness: Harness,
+  task: any,
+) {
+  const f = fixture(harness)
+  const first_publication = release_publication("1.2.3", head(harness.process, f.work))
+  assert_eq(
+    publish_release_publication(harness.process, {repo: f.work, mock: false}, first_publication)
+      .success,
+    true,
+  )
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "second\n")
+  sh(harness.process, "git -C '" + f.work + "' commit -q -am second")
+  const second_publication = release_publication("1.2.3", head(harness.process, f.work))
+  assert_ne(second_publication.remote_ref, first_publication.remote_ref)
+  assert_eq(
+    publish_release_publication(harness.process, {repo: f.work, mock: false}, second_publication)
+      .success,
+    true,
+  )
+  const prior = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${first_publication.remote_ref}"], heads: true},
+  )
+  assert_eq(prior.data.refs[0].oid, first_publication.head_oid)
+  harness.fs.delete(f.root)
+}
+
+pipeline test_release_publication_ref_mismatch_fails_before_any_mutation(
+  harness: Harness,
+  task: any,
+) {
+  const f = fixture(harness)
+  const publication = release_publication("1.2.3", head(harness.process, f.work))
+  harness.fs.write_text(path_join(f.work, "fixture.txt"), "conflicting\n")
+  sh(harness.process, "git -C '" + f.work + "' commit -q -am conflicting")
+  const conflicting_oid = head(harness.process, f.work)
+  sh(harness.process, "git -C '" + f.work + "' push -q origin HEAD:refs/heads/scratch")
+  sh(
+    harness.process,
+    "git --git-dir='" + f.origin + "' update-ref refs/heads/" + publication.remote_ref + " "
+      + conflicting_oid,
+  )
+  const result = publish_release_publication(
+    harness.process,
+    {repo: f.work, mock: false},
+    publication,
+  )
+  assert_eq(result.success, false)
+  assert_eq(result.action, "fail")
+  const remote = git_ls_remote(
+    harness.process,
+    "origin",
+    {repo: f.work, refs: ["refs/heads/${publication.remote_ref}"], heads: true},
+  )
+  assert_eq(remote.data.refs[0].oid, conflicting_oid)
+  harness.fs.delete(f.root)
+}
+
+/**
+ * A checkpoint validates with the release-gate tooling frozen in its own tree,
+ * so a fix landing on `base` under one of those paths cannot reach it. This is
+ * the v0.10.53 case: harn#6105 fixed scripts/release_audit_contract.harn, the
+ * candidate's pin predated it, and two resumes failed identically.
+ */
+pipeline test_checkpoint_tooling_drift_surfaces_the_supersede_escape(harness: Harness, task: any) {
+  const base_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const stale = release_checkpoint_tooling_drift(
+    ["docs/readme.md", "scripts/release_audit_contract.harn"],
+    base_head,
+  )
+  assert_eq(stale.stale, true)
+  assert_eq(stale.paths, ["scripts/release_audit_contract.harn"])
+  assert_eq(stale.supersede_pin, base_head)
+  const advisory = release_checkpoint_supersede_advisory(stale)
+  assert(advisory != nil)
+  // The escape must name both the flag and the commit; discovering it
+  // previously required reading three library files.
+  assert(contains(advisory ?? "", "--at-sha ${base_head}"))
+  assert(contains(advisory ?? "", "scripts/release_audit_contract.harn"))
+  // The immutable audit ref is preserved by this route; say so, because the
+  // obvious cleanup path (sweep_release_refs) correctly refuses to help.
+  assert(contains(advisory ?? "", "preserved"))
+  // Following this advice is what invalidates it: superseding mints a second
+  // attempt, and if that run fails the version holds two, at which point the
+  // same command form fails with `selected 0 immutable attempts`. That failure
+  // lands at the *next* recovery, so the cost has to be stated here.
+  assert(contains(advisory ?? "", "second immutable attempt"))
+  assert(contains(advisory ?? "", "abandon_release_attempts.harn"))
+}
+
+/**
+ * The v0.10.131 refusal. `scripts/release_ship.sh` changed on base between the
+ * pin and f2664888 — a function rename and two log strings inside the publish
+ * path the frozen gate never reaches — and the checkpoint refused to tag.
+ *
+ * Base drift is advice, never a refusal: a resume executes its own frozen
+ * copy, so what base holds afterwards cannot change this run's outcome. Revert
+ * `release_checkpoint_resume_block` to taking the drift record and this fails.
+ */
+pipeline test_base_drift_advises_but_never_refuses_the_tag(harness: Harness, task: any) {
+  const base_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const stale = release_checkpoint_tooling_drift(["scripts/release_ship.sh"], base_head)
+  // The advisory still names the escape, so an operator can still supersede.
+  const advisory = release_checkpoint_supersede_advisory(stale)
+  assert(advisory != nil)
+  assert(contains(advisory ?? "", "--at-sha ${base_head}"))
+  assert(contains(advisory ?? "", "scripts/release_ship.sh"))
+  // Nothing about base reaches the refusal. The certified tooling is intact,
+  // so the tag proceeds.
+  let frozen: dict<string, string> = {}
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    frozen[path] = "1111111111111111111111111111111111111111"
+  }
+  const integrity = release_checkpoint_tooling_integrity(frozen, frozen, "pin", "attempt")
+  assert_eq(integrity.intact, true)
+  assert_eq(integrity.tampered, [])
+  assert_eq(integrity.unproven, [])
+  assert_eq(release_checkpoint_resume_block(integrity), nil)
+}
+
+/**
+ * The negative control for the same seam. A resume whose attempt tree carries
+ * different gate tooling than the pin it was certified against must still
+ * refuse, and must name the paths rather than a bare verdict.
+ */
+pipeline test_tampered_frozen_gate_tooling_still_refuses(harness: Harness, task: any) {
+  let frozen: dict<string, string> = {}
+  let attempt: dict<string, string> = {}
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    frozen[path] = "1111111111111111111111111111111111111111"
+    attempt[path] = "1111111111111111111111111111111111111111"
+  }
+  attempt["scripts/release_gate.sh"] = "2222222222222222222222222222222222222222"
+  const integrity = release_checkpoint_tooling_integrity(frozen, attempt, "pin", "attempt")
+  assert_eq(integrity.intact, false)
+  assert_eq(integrity.tampered, ["scripts/release_gate.sh"])
+  assert_eq(len(integrity.verified), len(RELEASE_GATE_TOOLING_PATHS) - 1)
+  const block = release_checkpoint_resume_block(integrity)
+  assert(block != nil)
+  assert(contains(block ?? "", "refusing to resume"))
+  assert(contains(block ?? "", "scripts/release_gate.sh"))
+  assert(contains(block ?? "", "abandon_release_attempts.harn"))
+}
+
+/**
+ * Absence must not read as agreement. A census that read nothing has verified
+ * nothing, so every declared path is pending and the refusal reports the
+ * pending names and count.
+ */
+pipeline test_unreadable_gate_tooling_reads_as_unproven(harness: Harness, task: any) {
+  const nothing = release_checkpoint_tooling_integrity({}, {}, "pin", "attempt")
+  assert_eq(nothing.intact, false)
+  assert_eq(nothing.verified, [])
+  assert_eq(nothing.unproven, RELEASE_GATE_TOOLING_PATHS)
+  const block = release_checkpoint_resume_block(nothing)
+  assert(block != nil)
+  assert(contains(block ?? "", "unreadable"))
+  assert(contains(block ?? "", "verified 0 of ${len(RELEASE_GATE_TOOLING_PATHS)}"))
+  // One side present is still nothing proven.
+  let frozen: dict<string, string> = {}
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    frozen[path] = "1111111111111111111111111111111111111111"
+  }
+  const half = release_checkpoint_tooling_integrity(frozen, {}, "pin", "attempt")
+  assert_eq(half.intact, false)
+  assert_eq(half.unproven, RELEASE_GATE_TOOLING_PATHS)
+}
+
+/** A healthy checkpoint must still resume; this gate blocks releases when wrong. */
+pipeline test_healthy_checkpoint_is_never_blocked(harness: Harness, task: any) {
+  let frozen: dict<string, string> = {}
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    frozen[path] = "3333333333333333333333333333333333333333"
+  }
+  assert_eq(
+    release_checkpoint_resume_block(
+      release_checkpoint_tooling_integrity(frozen, frozen, "pin", "attempt"),
+    ),
+    nil,
+  )
+  // No recovered base head means no honest supersede target, so resuming is
+  // still the only route available and must not be advised against.
+  const unknown_base = release_checkpoint_tooling_drift(["scripts/release_gate.sh"], "")
+  assert_eq(release_checkpoint_supersede_advisory(unknown_base), nil)
+}
+
+pipeline test_checkpoint_tooling_drift_stays_quiet_for_unrelated_change(
+  harness: Harness,
+  task: any,
+) {
+  const clean = release_checkpoint_tooling_drift(
+    ["crates/harn-vm/src/lib.rs", "CHANGELOG.md"],
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  )
+  assert_eq(clean.stale, false)
+  assert_eq(clean.paths, [])
+  assert_eq(release_checkpoint_supersede_advisory(clean), nil)
+  // No base head recovered means no command we could honestly print.
+  const unknown_base = release_checkpoint_tooling_drift(["scripts/release_gate.sh"], "")
+  assert_eq(unknown_base.stale, true)
+  assert_eq(release_checkpoint_supersede_advisory(unknown_base), nil)
+}
+
+pipeline test_checkpoint_tooling_drift_covers_every_gate_path(harness: Harness, task: any) {
+  // Every declared gate path must be detected; a path added to the constant
+  // without detection would silently reintroduce the forever-resume loop.
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    const drift = release_checkpoint_tooling_drift(
+      [path],
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    assert_eq(drift.stale, true)
+    assert_eq(drift.paths, [path])
+  }
+  // Substring lookalikes must not trip the gate.
+  const lookalike = release_checkpoint_tooling_drift(
+    ["scripts/release_gate.sh.bak", "tests/scripts/release_gate.sh"],
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  )
+  assert_eq(lookalike.stale, false)
+}
+
+/**
+ * The seam source review cannot settle: whether the git reads actually resolve
+ * the declared tooling paths on both sides. Run it against a real repository.
+ *
+ * This is the v0.10.131 shape end to end. The pin and the attempt carry the
+ * same gate tooling; base then rewrites `scripts/release_ship.sh`. Integrity
+ * must hold and the tag must proceed. Mutating the attempt's copy is the
+ * negative control and must refuse.
+ */
+pipeline test_certified_tooling_integrity_reads_real_git_blobs(harness: Harness, task: any) {
+  const f = fixture(harness)
+  sh(harness.process, "mkdir -p '" + path_join(f.work, "scripts") + "'")
+  for path in RELEASE_GATE_TOOLING_PATHS {
+    harness.fs.write_text(path_join(f.work, path), "# certified\n")
+  }
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' add -A && git -C '" + f.work + "' commit -q -m certified",
+  )
+  const pin = head(harness.process, f.work)
+  // The attempt is the prepared candidate parented at the pin: it touches the
+  // changelog, never the gate tooling.
+  harness.fs.write_text(path_join(f.work, "CHANGELOG.md"), "## v9.9.9\n")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' add -A && git -C '" + f.work + "' commit -q -m prepare",
+  )
+  const attempt = head(harness.process, f.work)
+  const cfg = {repo: f.work, mock: false}
+  const io = {env: harness.env, process: harness.process}
+  const intact = recovered_checkpoint_tooling_integrity(io, cfg, pin, attempt, true)
+  assert_eq(intact.unproven, [])
+  assert_eq(intact.tampered, [])
+  assert_eq(intact.verified, RELEASE_GATE_TOOLING_PATHS)
+  assert_eq(intact.intact, true)
+  assert_eq(release_checkpoint_resume_block(intact), nil)
+  // Negative control: the attempt's own copy of the gate script is not the one
+  // that was certified.
+  harness.fs.write_text(path_join(f.work, "scripts/release_ship.sh"), "# tampered\n")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' add -A && git -C '" + f.work + "' commit -q -m tamper",
+  )
+  const tampered_attempt = head(harness.process, f.work)
+  const tampered = recovered_checkpoint_tooling_integrity(io, cfg, pin, tampered_attempt, true)
+  assert_eq(tampered.intact, false)
+  assert_eq(tampered.tampered, ["scripts/release_ship.sh"])
+  const block = release_checkpoint_resume_block(tampered)
+  assert(block != nil)
+  assert(contains(block ?? "", "scripts/release_ship.sh"))
+  // A commit that carries none of the declared paths proves nothing.
+  const empty = recovered_checkpoint_tooling_integrity(io, cfg, "HEAD~3", attempt, true)
+  assert_eq(empty.intact, false)
+  assert_eq(empty.unproven, RELEASE_GATE_TOOLING_PATHS)
+  harness.fs.delete(f.root)
+}
+
+/**
+ * The seam that source review cannot settle: whether the paths git actually
+ * emits for a pin..base comparison are the repo-relative form the drift
+ * matcher compares against. Run it against a real repository.
+ */
+pipeline test_gate_tooling_drift_matches_real_git_diff_paths(harness: Harness, task: any) {
+  const f = fixture(harness)
+  const pin = head(harness.process, f.work)
+  sh(harness.process, "mkdir -p '" + path_join(f.work, "scripts") + "'")
+  harness.fs.write_text(path_join(f.work, "scripts/release_gate.sh"), "#!/bin/sh\nexit 0\n")
+  harness.fs.write_text(path_join(f.work, "unrelated.txt"), "noise\n")
+  sh(
+    harness.process,
+    "git -C '" + f.work + "' add -A && git -C '" + f.work + "' commit -q -m gatefix",
+  )
+  const base_head = head(harness.process, f.work)
+  // Exactly the command detect_fixup_state issues during recovery.
+  const changed = sh(
+    harness.process,
+    "git -C '" + f.work + "' diff --name-only " + pin + " " + base_head,
+  )
+  const drift = release_checkpoint_tooling_drift(split(trim(changed.stdout), "\n"), base_head)
+  assert_eq(drift.stale, true)
+  assert_eq(drift.paths, ["scripts/release_gate.sh"])
+  assert_eq(drift.supersede_pin, base_head)
+  assert(contains(release_checkpoint_supersede_advisory(drift) ?? "", "--at-sha ${base_head}"))
+  // A pin that already contains the fix must stay quiet.
+  const settled = sh(
+    harness.process,
+    "git -C '" + f.work + "' diff --name-only " + base_head + " " + base_head,
+  )
+  const no_drift = release_checkpoint_tooling_drift(split(trim(settled.stdout), "\n"), base_head)
+  assert_eq(no_drift.stale, false)
+  assert_eq(release_checkpoint_supersede_advisory(no_drift), nil)
+  harness.fs.delete(f.root)
+}

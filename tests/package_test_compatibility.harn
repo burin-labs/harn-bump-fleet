@@ -1,0 +1,346 @@
+import {
+  classify_package_test_compatibility,
+  package_test_compatibility_passed,
+  package_test_compatibility_scan,
+} from "../lib/package_test_compatibility"
+
+fn command(success: bool, exit_code: int, stdout: string = "") -> dict {
+  return {success: success, exit_code: exit_code, stdout: stdout, stderr: ""}
+}
+
+fn inventory(ok: bool, selected: int, discovered: int) -> string {
+  return if ok {
+    json_stringify(
+      {
+        schemaVersion: 1,
+        ok: true,
+        data: {
+          selected_file_count: selected,
+          discovered_test_count: discovered,
+          files_without_tests: [],
+          files_with_errors: [],
+          allow_empty: false,
+        },
+      },
+    )
+  } else {
+    json_stringify(
+      {
+        schemaVersion: 1,
+        ok: false,
+        error: {
+          code: "package_test_discovery_failed",
+          message: "package test discovery failed",
+          details: {
+            inventory: {
+              selected_file_count: selected,
+              discovered_test_count: discovered,
+              files_without_tests: [{path: "tests/noop.harn", sha256: "sha256:abc"}],
+              files_with_errors: [],
+              allow_empty: false,
+            },
+            problems: ["tests/noop.harn contains no discoverable test pipeline"],
+          },
+        },
+      },
+    )
+  }
+}
+
+pipeline test_classification_preserves_failed_receipt_and_counts(task: unknown) {
+  const raw = inventory(false, 1, 0)
+  const row = classify_package_test_compatibility(
+    {
+      repository: "burin-labs/example",
+      revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      before: sha256("clean"),
+      after: sha256("clean"),
+      command: command(false, 1, raw),
+      receipt_text: raw,
+    },
+  )
+  assert_eq(row.status, "failed")
+  assert_eq(row.selected_file_count, 1)
+  assert_eq(row.discovered_test_count, 0)
+  assert_eq(row.receipt_sha256, sha256(raw))
+  assert(
+    contains(json_stringify(row.receipt), "tests/noop.harn contains no discoverable test pipeline"),
+  )
+}
+
+pipeline test_classification_refuses_absent_measurement_and_mutation(task: unknown) {
+  const absent = classify_package_test_compatibility(
+    {
+      repository: "burin-labs/example",
+      revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      before: sha256("clean"),
+      after: sha256("clean"),
+      command: command(false, 1),
+      receipt_text: "",
+    },
+  )
+  assert_eq(absent.status, "unmeasured")
+  assert_eq(absent.selected_file_count, nil)
+  const raw = inventory(true, 1, 1)
+  const mutated = classify_package_test_compatibility(
+    {
+      repository: "burin-labs/example",
+      revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      before: sha256("before"),
+      after: sha256("after"),
+      command: command(true, 0, raw),
+      receipt_text: raw,
+    },
+  )
+  assert_eq(mutated.status, "failed")
+  assert_eq(mutated.reason, "package test inventory mutated the repository")
+}
+
+pipeline test_fleet_scan_counts_every_selected_repository_without_vacuous_green(
+  harness: Harness,
+  task: unknown,
+) {
+  const root = harness.fs.mkdtemp_in_workspace("package-compatibility-root-")
+  const receipts = harness.fs.mkdtemp_in_workspace("package-compatibility-receipts-")
+  const harn_bin = path_join(root, "harn")
+  harness.fs.write_text(harn_bin, "candidate")
+  const receipt = package_test_compatibility_scan(
+    {fs: harness.fs, process: harness.process},
+    [{slug: "burin-labs/pass", directory: "pass"}, {slug: "burin-labs/fail", directory: "fail"}],
+    root,
+    harn_bin,
+    receipts,
+    {
+      revision: fn(_directory) { return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      fingerprint: fn(_directory) { return sha256("clean") },
+      inventory: fn(directory, _receipt_path) {
+        const passed = ends_with(directory, "/pass")
+        const raw = inventory(
+          passed,
+          1,
+          if passed {
+            1
+          } else {
+            0
+          },
+        )
+        return command(
+          passed,
+          if passed {
+            0
+          } else {
+            1
+          },
+          raw,
+        )
+      },
+    },
+  )
+  assert_eq(receipt.selected_count, 2)
+  assert_eq(receipt.passed_count, 1)
+  assert_eq(receipt.failed_count, 1)
+  assert_eq(receipt.unmeasured_count, 0)
+  assert(!package_test_compatibility_passed(receipt))
+}
+
+/**
+ * The runtime this test claims to measure, refusing anything else.
+ *
+ * `harn` on the search path is not necessarily the pinned runtime. On a
+ * developer machine it is whatever was installed last, and this test then
+ * measures that instead: every probe comes back unmeasured, because an older
+ * runtime has no `package test-inventory` at all, and the failure reads as the
+ * pin being wrong rather than as the wrong binary being asked. That cost real
+ * time twice before it was tracked down, and in CI the two happen to be the
+ * same binary, so nothing there ever says otherwise.
+ *
+ * So the subject is resolved and then asserted against `.harn-version`. A test
+ * whose subject comes from the environment must prove the subject it got is the
+ * one it named.
+ */
+fn pinned_runtime_from(
+  process: HarnessProcess,
+  declared: string,
+  candidates: list<string>,
+) -> string {
+  for candidate in candidates {
+    if trim(candidate) == "" {
+      continue
+    }
+    const version = try {
+      const probe = process.run({program: candidate, args: ["--version"], timeout_ms: 20000})
+      trim(probe.stdout ?? "")
+    } catch (_error) {
+      ""
+    }
+    if version == "harn ${declared}" {
+      return candidate
+    }
+  }
+  throw "no runtime on this machine reports the pinned version ${declared}; "
+    + "`harn` on the path is not it, and neither HARN_BIN nor .harn/bin/harn supplies it. "
+    + "This test measures the pinned runtime, so it refuses to measure another one."
+}
+
+fn pinned_runtime(harness: Harness) -> string {
+  const root = dirname(harness.fs.cwd())
+  return pinned_runtime_from(
+    harness.process,
+    trim(harness.fs.read_text(path_join(root, ".harn-version"))),
+    [harness.env.get("HARN_BIN") ?? "", path_join(root, ".harn/bin/harn"), "harn"],
+  )
+}
+
+fn fixture_package(fs: HarnessFs, kind: string, body: string) -> string {
+  const dir = fs.mkdtemp_in_workspace("package-discovery-${kind}-")
+  fs.write_text(
+    path_join(dir, "harn.toml"),
+    join(
+      [
+        "[package]",
+        "name = \"discovery_fixture_${kind}\"",
+        "version = \"0.1.0\"",
+        "description = \"Fixture package for test discovery\"",
+        "license = \"MIT\"",
+        "harn = \">=0.10.55,<0.11\"",
+        "",
+      ],
+      "\n",
+    ),
+  )
+  fs.write_text(path_join(dir, "tests", "probe.harn"), body)
+  return dir
+}
+
+/**
+ * Run the real `harn package test-inventory` against real fixture packages.
+ *
+ * Every other test here hands the classifier hand-written JSON. That proves the
+ * classifier reads a shape correctly; it cannot prove the runtime emits that
+ * shape, and a receipt reader tested only against its own idea of the receipt
+ * is the failure this issue was opened about. So this drives the pinned runtime
+ * and feeds its actual output through the production classifier.
+ *
+ * It also fails, rather than skipping, when the runtime cannot inventory at
+ * all. A skip here would read exactly like a pass, and the whole gate exists
+ * because a check that runs nothing looked green.
+ */
+pipeline test_the_pinned_runtime_emits_the_receipt_the_classifier_reads(
+  harness: Harness,
+  task: unknown,
+) {
+  const cases = [
+    // The migration surface: an ordinary pipeline name discovers nothing.
+    {kind: "noop", body: "pipeline probe(task: unknown) {\n  assert_eq(1, 1)\n}\n", proves: false},
+    // Both supported discovery styles must prove nonzero execution.
+    {
+      kind: "underscore",
+      body: "pipeline test_underscore_is_discovered(task: unknown) {\n  assert_eq(1, 1)\n}\n",
+      proves: true,
+    },
+    {
+      kind: "attribute",
+      body: "@test\npipeline attribute_is_discovered(task: unknown) {\n  assert_eq(1, 1)\n}\n",
+      proves: true,
+    },
+  ]
+  const runtime = pinned_runtime(harness)
+  let measured = 0
+  for probe in cases {
+    const dir = fixture_package(harness.fs, probe.kind, probe.body)
+    const result = harness.process.run(
+      {
+        program: runtime,
+        args: ["package", "test-inventory", ".", "--json"],
+        cwd: dir,
+        timeout_ms: 120000,
+      },
+    )
+    const row = classify_package_test_compatibility(
+      {
+        repository: "burin-labs/${probe.kind}",
+        revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        before: sha256("clean"),
+        after: sha256("clean"),
+        command: result,
+        receipt_text: result.stdout ?? "",
+      },
+    )
+    // An unmeasured row means the pinned runtime could not inventory at all,
+    // which is the pin being wrong, not the fixture. Say so rather than
+    // letting it pass as "nothing to report".
+    assert_eq(
+      "${probe.kind}:${row.status}",
+      "${probe.kind}:" + if probe.proves {
+        "passed"
+      } else {
+        "failed"
+      },
+    )
+    assert_eq(row.selected_file_count, 1)
+    assert_eq(
+      row.discovered_test_count,
+      if probe.proves {
+        1
+      } else {
+        0
+      },
+    )
+    measured = measured + 1
+  }
+  // A loop that ran zero times would assert nothing at all.
+  assert_eq(measured, len(cases))
+}
+
+/** The migration diagnosis has to name what to change, not only that it failed. */
+pipeline test_a_file_with_no_discoverable_test_names_the_migration(
+  harness: Harness,
+  task: unknown,
+) {
+  const dir = fixture_package(
+    harness.fs,
+    "diagnosis",
+    "pipeline probe(task: unknown) {\n  assert_eq(1, 1)\n}\n",
+  )
+  const result = harness.process.run(
+    {
+      program: pinned_runtime(harness),
+      args: ["package", "test-inventory", ".", "--json"],
+      cwd: dir,
+      timeout_ms: 120000,
+    },
+  )
+  const raw = result.stdout ?? ""
+  assert(contains(raw, "no discoverable test pipeline"))
+  assert(contains(raw, "test_*"))
+  assert(contains(raw, "@test"))
+  assert(contains(raw, "tests/probe.harn"))
+}
+
+pipeline test_the_subject_is_proven_to_be_the_pinned_runtime(harness: Harness, task: unknown) {
+  /**
+   * The resolution is asserted directly, because the candidate order hides it
+   * otherwise: the pinned binary sits second, so dropping the version check
+   * still happens to select it and every probe still passes. What has to be
+   * true is that a runtime reporting another version is never accepted, and
+   * that nothing matching leaves this refusing rather than measuring something
+   * else.
+   */
+  const root = dirname(harness.fs.cwd())
+  const declared = trim(harness.fs.read_text(path_join(root, ".harn-version")))
+  const pinned = path_join(root, ".harn/bin/harn")
+  // A candidate reporting another version is skipped even when it comes first.
+  assert_eq(pinned_runtime_from(harness.process, declared, ["/usr/bin/false", pinned]), pinned)
+  // A candidate that cannot be run at all is skipped rather than throwing.
+  assert_eq(pinned_runtime_from(harness.process, declared, ["/nonexistent/harn", pinned]), pinned)
+  // And when nothing matches it refuses instead of falling back. That is the
+  // case that used to read as the pin being wrong.
+  const refusal = try {
+    pinned_runtime_from(harness.process, "0.0.0-not-a-real-pin", ["/usr/bin/false", pinned])
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(refusal, "0.0.0-not-a-real-pin"))
+  assert(contains(refusal, "refuses to measure another one"))
+}

@@ -1,0 +1,764 @@
+import { render_bump_workflow } from "../lib/bump_workflow_projection"
+import { FleetManifest, FleetRepository, bump_adapter_contract } from "../lib/fleet_manifest"
+import {
+  bump_adapter_admission,
+  evaluate_bump_workflow_semantics,
+  evaluate_file_projection,
+  evaluate_fleet_policy,
+  evaluate_workflow_policy_anchor,
+  fleet_policy_failure_lines,
+} from "../lib/fleet_policy"
+import { render_package_ci } from "../lib/package_ci_projection"
+
+fn manifest() -> FleetManifest {
+  return {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [],
+  }
+}
+
+pipeline test_file_projection_requires_exact_source_bytes() {
+  const projection = {
+    source_slug: "owner/source",
+    source_path: "index.toml",
+    target_slug: "owner/target",
+    target_path: "generated/index.toml",
+  }
+  assert_eq(evaluate_file_projection(projection, "version = 2\n", "version = 2\n").ok, true)
+  const drift = evaluate_file_projection(projection, "version = 2\n", "version = 1\n")
+  assert_eq(drift.ok, false)
+  assert_eq(drift.violations, ["target bytes drift from the canonical source"])
+}
+
+pipeline test_workflow_policy_anchor_requires_a_resolvable_pin() {
+  const current = evaluate_workflow_policy_anchor(
+    "package_workflow",
+    "owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "same\n",
+    "same\n",
+  )
+  assert_eq(current.ok, true)
+  assert_eq(current.violations, [])
+  assert_eq(current.behind, false)
+  assert_eq(current.notes, [])
+  // A pin that does not resolve is broken now: consumers cannot run.
+  const missing_pin = evaluate_workflow_policy_anchor("bump_workflow", "owner/harn/x@a", nil, "t")
+  assert_eq(missing_pin.violations, ["workflow is missing at the policy pin"])
+  assert_eq(missing_pin.ok, false)
+  // An owner workflow that has disappeared is likewise a real integrity signal.
+  const missing_owner = evaluate_workflow_policy_anchor("bump_workflow", "owner/harn/x@a", "p", nil)
+  assert_eq(missing_owner.violations, ["workflow is missing on the owner's default branch"])
+  assert_eq(missing_owner.ok, false)
+}
+
+/**
+ * THE REGRESSION SHAPE for harn-bump-fleet#976.
+ *
+ * A commit to the owner's workflow between releases must not pin this check
+ * red. The manifest names a SHA precisely so upstream commits do not take
+ * effect until someone promotes them, so a pin trailing the owner's newest
+ * bytes is the designed steady state, not a defect.
+ *
+ * This failed the fleet daily for as long as a release took to arrive, twice
+ * before (#792, #823) and again in #976. Every one of those rounds was repaired
+ * by moving or re-timing the check; none removed the reason it could not go
+ * green, which is why the class kept coming back.
+ */
+pipeline test_a_pin_that_trails_the_owner_does_not_fail_the_run() {
+  const trailing = evaluate_workflow_policy_anchor("bump_workflow", "owner/harn/x@a", "old", "new")
+  assert_eq(trailing.ok, true, "trailing the owner is not an integrity violation")
+  assert_eq(trailing.violations, [])
+  assert_eq(trailing.behind, true, "but it must still be reported")
+  assert_eq(len(trailing.notes), 1)
+  assert(
+    contains(to_string(trailing.notes[0]), "next release promotes it"),
+    to_string(trailing.notes[0]),
+  )
+}
+
+/**
+ * THE CADENCE INVARIANT, which is the part meant to stop a third recurrence.
+ *
+ * This check is read daily by `bump-fleet.yml` and written only by
+ * `promote_bump_workflow.harn`, which runs once per release. Any failing
+ * condition that only a release can clear therefore guarantees a permanently
+ * red gate between releases.
+ *
+ * So the rule is not "trailing is allowed" — it is that EVERY failing condition
+ * must be repairable without waiting for a release. Both surviving violations
+ * satisfy that: a missing pin and a missing owner workflow are both fixed by
+ * editing `fleet.toml` or restoring the file, neither of which needs a release.
+ *
+ * If a future change adds a violation that only promotion can clear, this test
+ * is the one that should stop it.
+ */
+pipeline test_no_failing_condition_requires_a_release_to_clear() {
+  // The only input difference a release makes is bringing `pinned` up to
+  // `current`. If that transition is what flips a verdict from failing to
+  // passing, the gate depends on the release cadence.
+  const before_release = evaluate_workflow_policy_anchor("bump_workflow", "r", "old", "new")
+  const after_release = evaluate_workflow_policy_anchor("bump_workflow", "r", "new", "new")
+  assert_eq(
+    before_release.ok,
+    after_release.ok,
+    "promotion must not be what turns this check green",
+  )
+  // And promotion must still be observable, or the fix would have traded a
+  // false alarm for silence.
+  assert(before_release.behind && !after_release.behind, "promotion must still be visible")
+}
+
+fn package_repo(poll_tick: bool = false) -> FleetRepository {
+  return {
+    slug: "owner/package",
+    directory: "package",
+    harn_package: true,
+    harn_bump: true,
+    run_poll_tick: poll_tick,
+  }
+}
+
+pipeline test_fleet_policy_accepts_thin_canonical_projections() {
+  const result = evaluate_fleet_policy(
+    manifest(),
+    package_repo(true),
+    """
+on:
+  pull_request:
+jobs:
+  package:
+    uses: owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      run-poll-tick: true
+  status:
+    name: CI status
+    if: always()
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/policy/.github/actions/require-successful-needs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          results-json: \${{ toJSON(needs.*.result) }}
+""",
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      validate-command: harn package verify .
+      apply-behavior-preserving-fixes: false
+    """,
+  )
+  assert_eq(result.violations, [])
+  assert_eq(result.ok, true)
+}
+
+pipeline test_dispatch_admission_rejects_stale_semantics_but_accepts_current_projection() {
+  const declared = manifest()
+  const repo = package_repo() + {bump_workflow_ownership: "fleet"}
+  const current = render_bump_workflow(declared, repo)
+  const contract = bump_adapter_contract(declared, repo)
+  assert_eq(evaluate_bump_workflow_semantics(contract, current), [])
+  const stale = current.replace(
+    "      validate-command: harn package verify .",
+    "      validate-command: ./scripts/obsolete-check",
+  )
+  const violations = evaluate_bump_workflow_semantics(contract, stale)
+  assert_eq(violations, ["bump adapter validate-command projection disagrees with fleet.toml"])
+  assert(len(violations) > 0, "the stale-adapter falsifier must exercise a non-empty finding")
+  const blocked = bump_adapter_admission(contract, Ok(stale))
+  assert_eq([blocked.ok, blocked.status], [false, "stale_bump_adapter"])
+  assert(contains(blocked.detail, "validate-command"))
+  assert_eq(bump_adapter_admission(contract, Ok(current)).status, "ready")
+}
+
+pipeline test_fleet_policy_accepts_product_specific_checks_under_one_rollup() {
+  const repo: FleetRepository = {
+    slug: "owner/package",
+    directory: "package",
+    harn_package: true,
+    harn_bump: true,
+    run_poll_tick: false,
+    test_jobs: 2,
+  }
+  const result = evaluate_fleet_policy(
+    manifest(),
+    repo,
+    """
+on:
+  pull_request:
+jobs:
+  package:
+    uses: owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      test-jobs: 2
+  generated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./check-generated
+  status:
+    name: CI status
+    if: always()
+    needs: [package, generated]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/policy/.github/actions/require-successful-needs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          results-json: \${{ toJSON(needs.*.result) }}
+""",
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      validate-command: harn package verify .
+      apply-behavior-preserving-fixes: false
+    """,
+  )
+  assert_eq(result.violations, [])
+  assert_eq(result.ok, true)
+}
+
+pipeline test_fleet_policy_requires_exact_bytes_for_fleet_owned_package_ci() {
+  const repo: FleetRepository = {
+    slug: "owner/harn-example-connector",
+    directory: "harn-example-connector",
+    harn_package: true,
+    package_ci_ownership: "fleet",
+  }
+  const expected = render_package_ci(manifest(), repo)
+  assert_eq(evaluate_fleet_policy(manifest(), repo, expected, nil).violations, [])
+  assert_eq(
+    evaluate_fleet_policy(manifest(), repo, expected + "# local drift\n", nil).violations,
+    ["package CI bytes drift from the fleet-owned projection"],
+  )
+}
+
+pipeline test_fleet_policy_rejects_each_status_contract_escape_hatch() {
+  const repo: FleetRepository = {slug: "owner/package", directory: "package", harn_package: true}
+  const canonical = """
+on:
+  pull_request:
+jobs:
+  package:
+    uses: owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  status:
+    name: CI status
+    if: always()
+    needs: [package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/policy/.github/actions/require-successful-needs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          results-json: \${{ toJSON(needs.*.result) }}
+"""
+  const cases = [
+    {name: "non-always status", source: canonical.replace("if: always()", "if: success()")},
+    {
+      name: "independently pinned action",
+      source: canonical.replace(
+        "require-successful-needs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "require-successful-needs@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ),
+    },
+    {
+      name: "partial results projection",
+      source: canonical.replace(
+        "results-json: " + "$" + "{{ toJSON(needs.*.result) }}",
+        "results-json: '[]'",
+      ),
+    },
+  ]
+  const expected = [
+    "package CI must have one always-running CI status job that depends on every "
+      + "verification job and uses the co-versioned successful-needs action",
+  ]
+  for case in cases {
+    const result = evaluate_fleet_policy(manifest(), repo, case.source, nil)
+    assert_eq(result.violations, expected, case.name)
+    assert_eq(result.ok, false, case.name)
+  }
+}
+
+pipeline test_fleet_policy_flags_a_bump_adapter_that_arms_against_the_manifest() {
+  // A repository that withholds arming is protected by BYTES in another
+  // repository, so the audit has to notice when those bytes stop saying it.
+  // Dropping the line restores the reusable workflow's `default: true`, which
+  // is exactly the silent re-arm this override exists to prevent.
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_validate_command: "./scripts/check-runtime",
+    bump_enable_auto_merge: false,
+  }
+  const armed = """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      validate-command: ./scripts/check-runtime
+      apply-behavior-preserving-fixes: false
+"""
+  assert_eq(
+    evaluate_fleet_policy(manifest(), repo, nil, armed).violations,
+    ["bump adapter auto-merge projection disagrees with fleet.toml"],
+  )
+  const held = evaluate_fleet_policy(
+    manifest(),
+    repo,
+    nil,
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      validate-command: ./scripts/check-runtime
+      apply-behavior-preserving-fixes: false
+      enable-auto-merge: false
+""",
+  )
+  assert_eq(held.violations, [])
+  assert_eq(held.ok, true)
+}
+
+pipeline test_fleet_policy_checks_declared_application_bump_capabilities() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_refresh_command: "./scripts/refresh-runtime",
+    bump_validate_command: "./scripts/check-runtime",
+    bump_node_version: "22",
+  }
+  const accepted = evaluate_fleet_policy(
+    manifest(),
+    repo,
+    nil,
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      node-version: "22"
+      refresh-command: ./scripts/refresh-runtime
+      validate-command: ./scripts/check-runtime
+      apply-behavior-preserving-fixes: false
+""",
+  )
+  assert_eq(accepted.violations, [])
+  const drift = evaluate_fleet_policy(
+    manifest(),
+    repo,
+    nil,
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+""",
+  )
+  assert_eq(
+    drift.violations,
+    [
+      "bump adapter refresh-command projection disagrees with fleet.toml",
+      "bump adapter Node.js projection disagrees with fleet.toml",
+      "bump adapter validate-command projection disagrees with fleet.toml",
+      "bump adapter behavior-preserving fix projection disagrees with fleet.toml",
+    ],
+  )
+}
+
+pipeline test_fleet_policy_rejects_orchestration_sha_drift_from_uses_pin() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_validate_command: "./scripts/check-runtime",
+  }
+  const drift = evaluate_fleet_policy(
+    manifest(),
+    repo,
+    nil,
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: cccccccccccccccccccccccccccccccccccccccc
+      validate-command: ./scripts/check-runtime
+      apply-behavior-preserving-fixes: false
+""",
+  )
+  assert_eq(
+    drift.violations,
+    ["bump adapter orchestration-sha must match the reusable workflow policy pin"],
+  )
+}
+
+pipeline test_fleet_policy_requires_exact_bytes_for_fleet_owned_bump_workflow() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: "./scripts/verify",
+  }
+  const expected = render_bump_workflow(manifest(), repo)
+  assert_eq(evaluate_fleet_policy(manifest(), repo, nil, expected).violations, [])
+  assert_eq(
+    evaluate_fleet_policy(manifest(), repo, nil, expected + "# local drift\n").violations,
+    ["bump workflow bytes drift from the fleet-owned projection"],
+  )
+}
+
+/**
+ * A consumer that declares a contract digest gets a two-job render: the
+ * contract gate beside the delegated bump job. The verifier must accept what
+ * the renderer emits, or every consumer with a contract is refused at
+ * publication for a job it did not write.
+ */
+pipeline test_fleet_policy_accepts_the_renderers_own_contract_gate_job() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: "./scripts/verify",
+    consumer_contract_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  }
+  const rendered = render_bump_workflow(manifest(), repo)
+  assert(rendered.contains("\n  consumer-contract-projection:\n"))
+  assert_eq(evaluate_fleet_policy(manifest(), repo, nil, rendered).violations, [])
+}
+
+pipeline test_fleet_policy_rejects_legacy_or_drifting_projections() {
+  const result = evaluate_fleet_policy(
+    manifest(),
+    package_repo(),
+    """
+on:
+  pull_request:
+jobs:
+  package:
+    uses: owner/policy/.github/workflows/package.yml@cccccccccccccccccccccccccccccccccccccccc
+    with:
+      run-poll-tick: true
+""",
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+  schedule:
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@cccccccccccccccccccccccccccccccccccccccc
+""",
+  )
+  assert_eq(result.ok, false)
+  assert_eq(
+    result.violations,
+    [
+      "package CI does not pin the canonical reusable workflow",
+      "bump adapter retains a repository-local schedule",
+      "bump adapter does not pin the canonical reusable workflow",
+    ],
+  )
+}
+
+pipeline test_fleet_policy_reports_malformed_workflows_as_drift() {
+  const result = evaluate_fleet_policy(manifest(), package_repo(), "jobs: []", "on: []")
+  assert_eq(result.ok, false)
+  assert_eq(
+    result.violations,
+    [
+      "package CI is not a valid workflow projection",
+      "bump workflow is not a valid workflow projection",
+    ],
+  )
+}
+
+pipeline test_fleet_policy_requires_the_dispatched_version_input() {
+  const missing = evaluate_fleet_policy(
+    manifest(),
+    {slug: "owner/application", directory: "application", harn_bump: true},
+    nil,
+    "on: workflow_dispatch\njobs:\n  bump:\n    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    with:\n      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      apply-behavior-preserving-fixes: false\n",
+  )
+  assert_eq(missing.violations, ["bump workflow workflow_dispatch omits the version input"])
+  const wrong_type = evaluate_fleet_policy(
+    manifest(),
+    {slug: "owner/application", directory: "application", harn_bump: true},
+    nil,
+    "on:\n  workflow_dispatch:\n    inputs:\n      version:\n        type: boolean\njobs:\n  bump:\n    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    with:\n      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      apply-behavior-preserving-fixes: false\n",
+  )
+  assert_eq(
+    wrong_type.violations,
+    ["bump workflow workflow_dispatch version input must have type string"],
+  )
+}
+
+pipeline test_fleet_policy_names_the_manifest_owned_missing_workflow() {
+  const repo: FleetRepository = {
+    slug: "owner/tap",
+    directory: "tap",
+    harn_bump: true,
+    bump_workflow_path: ".github/workflows/bump-harn-formula.yml",
+  }
+  assert_eq(
+    evaluate_fleet_policy(manifest(), repo, nil, nil).violations,
+    ["missing .github/workflows/bump-harn-formula.yml"],
+  )
+}
+
+pipeline test_repository_owned_bump_workflow_keeps_its_local_job_and_recovery_schedule() {
+  const repo: FleetRepository = {
+    slug: "owner/tap",
+    directory: "tap",
+    harn_bump: true,
+    bump_workflow_ownership: "repository",
+    bump_workflow_path: ".github/workflows/bump-harn-formula.yml",
+  }
+  const workflow = """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  publish-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node script/publish-formula.mjs
+"""
+  assert_eq(evaluate_bump_workflow_semantics(bump_adapter_contract(manifest(), repo), workflow), [])
+  assert_eq(evaluate_fleet_policy(manifest(), repo, nil, workflow).violations, [])
+}
+
+pipeline test_dispatch_admits_a_repository_owned_bump_workflow() {
+  const repo: FleetRepository = {
+    slug: "owner/tap",
+    directory: "tap",
+    harn_bump: true,
+    bump_workflow_ownership: "repository",
+    bump_workflow_path: ".github/workflows/bump-harn-formula.yml",
+  }
+  const workflow = """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  publish-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node script/publish-formula.mjs
+"""
+  const contract = bump_adapter_contract(manifest(), repo)
+  assert_eq(contract.repository_owned, true)
+  const admission = bump_adapter_admission(contract, Ok(workflow))
+  assert_eq(
+    [admission.ok, admission.status],
+    [true, "ready"],
+    "dispatch must judge a repository-owned bump workflow with the audit's contract",
+  )
+  assert_eq(evaluate_fleet_policy(manifest(), repo, nil, workflow).violations, [])
+}
+
+pipeline test_dispatch_still_refuses_a_drifted_fleet_owned_bump_adapter() {
+  const declared = manifest()
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: "./scripts/verify",
+  }
+  const contract = bump_adapter_contract(declared, repo)
+  assert_eq(contract.repository_owned, false)
+  const drifted = render_bump_workflow(declared, repo).replace(
+    "      validate-command: ./scripts/verify",
+    "      validate-command: ./scripts/obsolete-check",
+  )
+  const admission = bump_adapter_admission(contract, Ok(drifted))
+  assert_eq([admission.ok, admission.status], [false, "stale_bump_adapter"])
+  assert_eq(admission.detail, "bump adapter validate-command projection disagrees with fleet.toml")
+}
+
+pipeline test_repository_owned_bump_workflow_still_requires_a_typed_version_input() {
+  const repo: FleetRepository = {
+    slug: "owner/tap",
+    directory: "tap",
+    harn_bump: true,
+    bump_workflow_ownership: "repository",
+  }
+  const workflow = """
+on:
+  workflow_dispatch:
+jobs:
+  publish-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node script/publish-formula.mjs
+"""
+  assert_eq(
+    evaluate_fleet_policy(manifest(), repo, nil, workflow).violations,
+    ["bump workflow workflow_dispatch omits the version input"],
+  )
+}
+
+pipeline test_fleet_policy_rejects_parallel_legacy_jobs() {
+  const result = evaluate_fleet_policy(
+    manifest(),
+    package_repo(),
+    """
+on:
+  pull_request:
+jobs:
+  package:
+    uses: owner/policy/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  status:
+    name: CI status
+    needs: package
+  legacy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: scripts/install_harn.sh
+""",
+    """
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      validate-command: harn package verify .
+      apply-behavior-preserving-fixes: false
+  legacy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: scripts/install_harn.sh
+""",
+  )
+  assert_eq(
+    result.violations,
+    [
+      "package CI must have one always-running CI status job that depends on every verification job and uses the co-versioned successful-needs action",
+      "bump adapter must contain only the canonical reusable job",
+    ],
+  )
+}
+
+/**
+ * The receipt is one JSON document teed to a file, so a red job's last forty
+ * lines are whichever rows sorted last and all of them read `ok: true`. These
+ * lines exist so the exit status arrives with its cause. A passing row must
+ * contribute nothing, or the summary is noise and gets ignored like the
+ * document did.
+ */
+pipeline test_only_failing_rows_reach_the_failure_summary(task: unknown) {
+  const lines = fleet_policy_failure_lines(
+    [
+      {
+        name: "package_workflow",
+        reference: "owner/repo/path@sha",
+        ok: true,
+        behind: false,
+        violations: [],
+        notes: [],
+      },
+      {
+        name: "bump_workflow",
+        reference: "owner/repo/path@sha",
+        ok: false,
+        behind: true,
+        violations: ["pinned reference is behind"],
+        notes: [],
+      },
+    ],
+    [
+      {slug: "owner/green", ok: true, violations: ["ignored because the row passed"]},
+      {slug: "owner/red", ok: false, violations: ["ci.yml drifted", "bump workflow missing"]},
+    ],
+    [{source: "a/x", target: "b/y", ok: false, violations: ["target file is missing"]}],
+  )
+  assert_eq(len(lines), 4)
+  assert_eq(lines[0], "FAILED workflow policy bump_workflow: pinned reference is behind")
+  assert_eq(lines[1], "FAILED owner/red: ci.yml drifted")
+  assert_eq(lines[2], "FAILED owner/red: bump workflow missing")
+  assert_eq(lines[3], "FAILED a/x -> b/y: target file is missing")
+  for line in lines {
+    assert_eq(contains(line, "owner/green"), false, "a passing row must contribute nothing")
+  }
+  assert_eq(len(fleet_policy_failure_lines([], [], [])), 0)
+}
+
+/** A row that failed for a reason nobody recorded must still be named, not silent. */
+pipeline test_a_failure_with_no_recorded_violation_is_still_reported(task: unknown) {
+  const lines = fleet_policy_failure_lines(
+    [],
+    [{slug: "owner/silent", ok: false, violations: []}],
+    [],
+  )
+  assert_eq(len(lines), 1)
+  assert_eq(lines[0], "FAILED owner/silent: failed with no recorded violation")
+}

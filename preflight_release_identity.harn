@@ -1,0 +1,138 @@
+#!/usr/bin/env harn
+/**
+ * preflight_release_identity.harn — prove the CONFINED context can sign a tag
+ * and authenticate a push, before the release spends anything.
+ *
+ * The release already probes both halves of its identity, and both probes ran
+ * outside the sandbox that the release itself runs in. Each therefore asserted
+ * a capability the release did not have where it uses it:
+ *
+ *   * the signer probe signed a tag unconfined, and stayed green while the
+ *     confined tagger could not read its key at all;
+ *   * the push probe dry-ran a push unconfined, and stayed green while the
+ *     confined push could not read its credential store.
+ *
+ * Both failures surfaced at the same place: after the release commit had
+ * already merged to the default branch, where there is no cheap way back. They
+ * were found one live release at a time, because a probe that runs in a
+ * different context than the work is not a probe of the work.
+ *
+ * This script is the same two questions asked in the right place. It runs
+ * through `scripts/harn_confined.sh`, so it sees exactly the sandbox the
+ * release gate sees, and it fails before a candidate exists rather than after
+ * a merge.
+ *
+ * It writes nothing that outlives it: the probe tag is local and deleted, and
+ * the push is `--dry-run`, which performs the full authenticated receive-pack
+ * handshake and sends no ref update.
+ *
+ * Usage: harn run preflight_release_identity.harn -- --repo /path/to/target
+ */
+fn flag_value(args: list<string>, name: string, fallback: string) -> string {
+  let index = 0
+  for arg in args {
+    if arg == name && index + 1 < len(args) {
+      return trim(args[index + 1])
+    }
+    index = index + 1
+  }
+  return fallback
+}
+
+type ProbeStep = {name: string, ok: bool, detail: string}
+
+fn git(process: HarnessProcess, repo: string, args: list<string>) -> dict {
+  return process.run({program: "git", args: ["-C", repo] + args})
+}
+
+fn step(name: string, result: dict) -> ProbeStep {
+  const ok = (result.exit_code ?? 1) == 0
+  const detail = if ok {
+    trim(result.stdout ?? "")
+  } else {
+    trim(result.stderr ?? "")
+  }
+  return {name: name, ok: ok, detail: detail}
+}
+
+pipeline main(harness: Harness) {
+  const repo = flag_value(argv, "--repo", "")
+  if repo == "" {
+    harness.stdio.println(
+      "usage: harn run preflight_release_identity.harn -- --repo PATH [--probe-ref NAME]",
+    )
+    return 2
+  }
+  // Unique per run so two probes can never collide on a shared checkout, and
+  // so a leaked local tag from a killed run cannot mask a real failure.
+  const nonce = flag_value(argv, "--probe-ref", to_string(harness.clock.timestamp()))
+  const probe_tag = "release-identity-preflight-${nonce}"
+  const probe_ref = "refs/heads/release-identity-preflight-${nonce}"
+  harness.stdio.println("== confined release identity preflight")
+  harness.stdio.println("   repo : ${repo}")
+  let steps: list<ProbeStep> = []
+  // 1. Signing. `git tag -s` is the exact command the release uses, so this
+  //    reads the same key through the same sandbox.
+  const created = git(
+    harness.process,
+    repo,
+    ["tag", "-s", probe_tag, "-m", "confined release identity preflight", "HEAD"],
+  )
+  steps = steps + [step("sign-probe-tag", created)]
+  if (created.exit_code ?? 1) == 0 {
+    // 2. Verification against the same trust root the release gates on.
+    steps = steps
+      + [
+        step(
+          "verify-probe-tag",
+          git(
+            harness.process,
+            repo,
+            [
+              "-c",
+              "gpg.ssh.allowedSignersFile=.github/release-bot-allowed-signers",
+              "verify-tag",
+              probe_tag,
+            ],
+          ),
+        ),
+      ]
+    // Always clean up, including when verification failed.
+    git(harness.process, repo, ["tag", "-d", probe_tag])
+  }
+  // 3. Authentication. `--dry-run` completes the authenticated handshake and
+  //    sends no ref update, so this proves the credential path without
+  //    creating anything on the remote.
+  steps = steps
+    + [
+      step(
+        "authenticate-probe-push",
+        git(
+          harness.process,
+          repo,
+          ["push", "--dry-run", "--no-verify", "origin", "HEAD:${probe_ref}"],
+        ),
+      ),
+    ]
+  let failed = 0
+  for probe in steps {
+    if probe.ok {
+      harness.stdio.println("   ✓ ${probe.name}")
+    } else {
+      failed = failed + 1
+      harness.stdio.println("   ✗ ${probe.name}")
+      harness.stdio.eprintln("     ${probe.detail}")
+    }
+  }
+  if failed > 0 {
+    harness.stdio.println("== confined release identity is NOT usable")
+    harness.stdio.eprintln(
+      "The release would fail in this exact context. Signing and push are both"
+        + " read through the sandbox, so a grant that is missing here is missing"
+        + " for the tag and the publish too.",
+    )
+    return 1
+  }
+  harness.stdio.println("== confined release identity holds")
+  return 0
+}

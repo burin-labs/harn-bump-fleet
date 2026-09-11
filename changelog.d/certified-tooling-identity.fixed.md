@@ -1,0 +1,1 @@
+Refuse a pre-tag resume only when the gate tooling it will execute is not the tooling the candidate was certified against; a later default-branch change to a release script is advisory and no longer refuses the tag.

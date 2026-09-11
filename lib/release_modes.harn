@@ -1,0 +1,441 @@
+import { command_result_ok } from "std/command"
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import {
+  ReleaseAgentReviewResult,
+  logged_live_shell_command_step,
+  maybe_recovery_advice_step,
+  prepare_repair_changed,
+  release_repair_fingerprint,
+  retry_prepare_after_agent_repair,
+} from "./release_agent"
+import { ReleaseAnalysis } from "./release_analysis"
+import { setup_release_branch, target_release_checkout_state } from "./release_checkout"
+import {
+  execution_failed,
+  last_failed_step,
+  recorded_step,
+  recovery_step_ref,
+} from "./release_execution"
+import { ensure_release_notes_with_run_id } from "./release_notes"
+import { release_harness_root } from "./release_paths"
+import {
+  execute_fixup_reconciliation,
+  release_candidate_materialization_plan,
+  release_prepare_audit_plan,
+} from "./release_prepare"
+import {
+  ReleaseConfig,
+  ReleaseNotesScope,
+  ReleaseRepoConfig,
+  append_command_step,
+  prompt_asset,
+  release_log_event,
+  release_run_dir,
+  require_live_confirmation,
+} from "./release_runtime"
+import { release_ship_pipeline } from "./release_ship"
+import { release_ship_certify_phase } from "./release_ship_certify"
+import { release_ship_pr_phase } from "./release_ship_pr"
+import { release_ship_prepare_phase } from "./release_ship_prepare"
+import {
+  ReleaseAuditReceipt,
+  ReleaseReportPaths,
+  release_audit_receipt_write,
+} from "./run_receipts"
+
+pub type PackageTestCompatibilityCommand = {argv: list<string>, receipt_path: string}
+
+/**
+ * The preflight runs only when a caller hands `prepare` a materialized fleet
+ * root. No configured root means no materialized checkouts to inventory, so
+ * the release proceeds exactly as it did before the preflight existed. This is
+ * the one switch: an unconfigured root must never be read as "nothing to
+ * report", because the two are indistinguishable in the receipt.
+ */
+pub fn package_test_compatibility_enabled(fleet_root: string) -> bool {
+  return trim(fleet_root) != ""
+}
+
+/** Build the pre-mutation fleet check around the exact candidate executable. */
+pub fn package_test_compatibility_command(
+  fs: HarnessFs,
+  run_id: string,
+  fleet_root: string,
+  candidate_harn_bin: string,
+) -> PackageTestCompatibilityCommand {
+  const receipt_path = path_join(
+    release_run_dir(fs, run_id),
+    "package-test-compatibility/aggregate.json",
+  )
+  return {
+    argv: [
+      candidate_harn_bin,
+      "run",
+      "--no-sandbox",
+      path_join(release_harness_root(fs), "preflight_package_test_compatibility.harn"),
+      "--",
+      "--fleet-root",
+      fleet_root,
+      "--harn-bin",
+      candidate_harn_bin,
+      "--receipt-out",
+      receipt_path,
+    ],
+    receipt_path: receipt_path,
+  }
+}
+
+pub type ReleaseNoteResetPlan = {paths: list<string>, argv: list<string>}
+
+pub type ReleaseNoteResetResult = {steps: list<dict>, success: bool}
+
+/** Build the exact reset command from paths proved to exist in the candidate tree. */
+pub fn release_note_reset_plan(
+  scope: ReleaseNotesScope,
+  tracked_fragment_listing: string = "",
+) -> ReleaseNoteResetPlan {
+  let paths = if scope == "immutable_checkpoint" {
+    []
+  } else {
+    ["CHANGELOG.md"]
+  }
+  if scope == "candidate_tree" && trim(tracked_fragment_listing) != "" {
+    paths = paths + ["changelog.d"]
+  }
+  const argv = len(paths) == 0 ? [] : ["git", "checkout", "HEAD", "--"] + paths
+  return {paths: paths, argv: argv}
+}
+
+/** Restore the note sources owned by the selected recovery policy. */
+pub fn reset_release_note_sources(
+  harness: Harness,
+  cfg: ReleaseRepoConfig,
+  scope: ReleaseNotesScope,
+  prior_steps: list<dict>,
+  run_id: string,
+) -> ReleaseNoteResetResult {
+  let steps = prior_steps
+  let tracked_fragment_listing = ""
+  if scope == "candidate_tree" {
+    const probe_name = "fixup-probe-release-note-sources"
+    const probe_argv = ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", "changelog.d"]
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_started",
+      {step: probe_name},
+    )
+    const probe = append_command_step(harness, cfg, steps, probe_name, probe_argv)
+    steps = probe.steps
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "step_finished",
+      {step: probe_name, success: probe.success, status: probe.status},
+    )
+    if !probe.success {
+      return {steps: steps, success: false}
+    }
+    tracked_fragment_listing = probe.stdout
+  }
+  const plan = release_note_reset_plan(scope, tracked_fragment_listing)
+  if len(plan.paths) == 0 {
+    return {steps: steps, success: true}
+  }
+  const reset_name = "fixup-reset-release-note-sources"
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_started",
+    {step: reset_name, paths: plan.paths},
+  )
+  const reset = append_command_step(harness, cfg, steps, reset_name, plan.argv)
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_finished",
+    {step: reset_name, success: reset.success, status: reset.status, paths: plan.paths},
+  )
+  return {steps: reset.steps, success: reset.success}
+}
+
+pub fn execute_prepare(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  agent_review_result: ReleaseAgentReviewResult,
+  run_id: string,
+  materialize_candidate: bool = false,
+) -> list<dict> {
+  require_live_confirmation(cfg)
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "phase_started",
+    {phase: "prepare", message: "starting release branch setup and prepare"},
+  )
+  let steps = []
+  const initial_target_state = target_release_checkout_state(harness, cfg, analysis)
+  if initial_target_state.matches {
+    steps = steps
+      + [
+        recorded_step(
+          "prepare-already-complete",
+          "prepared release branch already has v${analysis.next_version} release content",
+          command_result_ok(
+            "skipped prepare because branch ${initial_target_state.branch}, Cargo version ${initial_target_state.current_version}, and CHANGELOG top v${initial_target_state.changelog_top} already target v${analysis.next_version}",
+          ),
+        ),
+      ]
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
+  }
+  let prepare_command = ""
+  let candidate_harn_bin = ""
+  if !cfg.fixup_mode {
+    const plan = if materialize_candidate {
+      release_candidate_materialization_plan(harness, cfg, steps, run_id)
+    } else {
+      release_prepare_audit_plan(harness, cfg, steps, run_id)
+    }
+    steps = plan.steps
+    prepare_command = plan.command
+    candidate_harn_bin = plan.harn_bin
+    if execution_failed(steps) {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+    }
+    if package_test_compatibility_enabled(cfg.package_test_compatibility_root) {
+      const compatibility_command = package_test_compatibility_command(
+        harness.fs,
+        run_id,
+        cfg.package_test_compatibility_root,
+        candidate_harn_bin,
+      )
+      const compatibility = append_command_step(
+        harness,
+        cfg,
+        steps,
+        "preflight-package-test-compatibility",
+        compatibility_command.argv,
+        {timeout_ms: 15 * 60 * 1000},
+      )
+      steps = compatibility.steps
+      if !compatibility.success {
+        release_log_event(
+          {clock: harness.clock, fs: harness.fs},
+          run_id,
+          "phase_failed",
+          {
+            phase: "prepare",
+            failed_step: recovery_step_ref(last_failed_step(steps)),
+            package_test_compatibility_receipt: compatibility_command.receipt_path,
+          },
+        )
+        return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+      }
+    }
+  }
+  steps = steps + setup_release_branch(harness, cfg, analysis)
+  if execution_failed(steps) {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  // Fixup: first run Harn's canonical metadata preparation on fresh `<base>`
+  // so workspace crates and sibling dependencies added after the old pin are
+  // included. Then cherry-pick the immutable attempt with fresh-base conflict
+  // precedence. The selected release-note source is authoritative: tagged
+  // repair resets only CHANGELOG.md and preserves the shipped fragment
+  // deletions, while a pre-tag supersede restores both CHANGELOG.md and
+  // changelog.d from the fresh candidate tree before folding them together.
+  if cfg.fixup_mode {
+    steps = execute_fixup_reconciliation(harness, cfg, analysis, steps, run_id)
+    if execution_failed(steps) {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+    }
+    const reset = reset_release_note_sources(harness, cfg, cfg.release_notes_scope, steps, run_id)
+    steps = reset.steps
+    if !reset.success {
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "phase_failed",
+        {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+      )
+      return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+    }
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_started",
+    {step: "ensure-release-notes"},
+  )
+  steps = steps
+    + ensure_release_notes_with_run_id(harness, cfg, analysis, agent_review_result, run_id)
+  if execution_failed(steps) {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  if cfg.fixup_mode {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true},
+    )
+    return steps
+  }
+  const target_state = target_release_checkout_state(harness, cfg, analysis)
+  if target_state.matches {
+    steps = steps
+      + [
+        recorded_step(
+          "prepare-already-complete",
+          "prepared release branch already has v${analysis.next_version} release content",
+          command_result_ok(
+            "skipped prepare because branch ${target_state.branch}, Cargo version ${target_state.current_version}, and CHANGELOG top v${target_state.changelog_top} already target v${analysis.next_version}",
+          ),
+        ),
+      ]
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_finished",
+      {phase: "prepare", success: true, already_complete: true},
+    )
+    return steps
+  }
+  const prepare = logged_live_shell_command_step(
+    harness,
+    cfg,
+    steps,
+    "prepare",
+    prepare_command,
+    run_id,
+  )
+  steps = prepare.steps
+  if execution_failed(steps) {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_failed",
+      {phase: "prepare", failed_step: recovery_step_ref(last_failed_step(steps))},
+    )
+    return add_recovery_for_last_failure(harness, cfg, analysis, steps, run_id)
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "phase_finished",
+    {phase: "prepare", success: true},
+  )
+  return steps
+}
+
+pub fn execute_ship_pr(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  agent_review_result: ReleaseAgentReviewResult,
+  run_id: string,
+  release_generation: string = "",
+) -> list<dict> {
+  require_live_confirmation(cfg)
+  const certify = fn(prepared) { return release_ship_certify_phase(harness, cfg, prepared, run_id) }
+  const publish_pr = fn(certified) { return release_ship_pr_phase(
+    harness,
+    cfg,
+    certified,
+    agent_review_result,
+    run_id,
+    release_generation,
+  ) }
+  return release_ship_pipeline(
+    [],
+    {
+      prepare: fn(steps) { return release_ship_prepare_phase(
+        harness,
+        cfg,
+        analysis,
+        agent_review_result,
+        run_id,
+        steps,
+        fn(h, c, a, r, id) { return execute_prepare(h, c, a, r, id, true) },
+      ) },
+      certify: certify,
+      pr: publish_pr,
+    },
+  ).steps
+}
+
+fn add_recovery_for_last_failure(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  steps: list<dict>,
+  run_id: string,
+) -> list<dict> {
+  const failed = last_failed_step(steps)
+  if failed == nil {
+    return steps
+  }
+  const before_repair = release_repair_fingerprint(
+    {env: harness.env, process: harness.process},
+    cfg,
+  )
+  const recovered = maybe_recovery_advice_step(harness, cfg, analysis, steps, failed, run_id)
+  if cfg.agent && failed.name == "prepare" {
+    const after_repair = release_repair_fingerprint(
+      {env: harness.env, process: harness.process},
+      cfg,
+    )
+    if prepare_repair_changed(before_repair, after_repair) {
+      return retry_prepare_after_agent_repair(harness, cfg, recovered, failed, run_id)
+    }
+    harness.stdio.println(
+      "   → prepare retry skipped: recovery diagnosis made no tracked release-diff change",
+    )
+  }
+  return recovered
+}
+
+pub fn write_report(
+  fs: HarnessFs,
+  run_id: string,
+  payload: ReleaseAuditReceipt,
+) -> ReleaseReportPaths {
+  const out_dir = release_run_dir(fs, run_id)
+  const receipt = release_audit_receipt_write(fs, out_dir, payload)
+  const md_payload = {...payload, audit_sha: sha3_256(receipt.body)[0:16]}
+  const md = fs.render_prompt(prompt_asset(fs, "release_report.harn.prompt"), md_payload)
+  const md_path = path_join(out_dir, "release-audit.md")
+  fs.write_text(md_path, md)
+  return {json_path: receipt.json_path, md_path: md_path}
+}

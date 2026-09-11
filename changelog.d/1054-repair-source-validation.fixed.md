@@ -1,0 +1,1 @@
+Runtime update validation uses the prepared runtime before attempting formatting repairs, avoiding a redundant checkout-local installer that could hide source failures. Repair diagnostics name the consumer and retain both output streams. Strict package verification still checks formatting, and the canonical formatter remains a separate repair step after validation.

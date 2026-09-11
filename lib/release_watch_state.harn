@@ -1,0 +1,1497 @@
+import { read_json_result, write_json } from "std/fs"
+import {
+  schema_bool,
+  schema_closed_object,
+  schema_enum,
+  schema_int,
+  schema_list,
+  schema_literal,
+  schema_nullable,
+  schema_string,
+  schema_union,
+  schema_validator,
+} from "std/schema"
+import { is_v_release_semver } from "std/semver"
+import { publish_binary_recovery_decision, publish_watch_decision } from "./release_health"
+import { ReleaseLandingReceipt, ReleaseMergeMethod } from "./release_merge_lease"
+import { ReleasePublication, release_publication } from "./release_publication"
+import { required_harn_release_build_jobs } from "./release_readiness"
+
+pub type ReleaseDispatchStatus = "not_requested" | "succeeded" | "failed"
+
+pub type ReleaseWatchState = "pending" | "recovering" | "healthy" | "failed"
+
+pub type ReleaseWatchAction = "wait" | "complete" | "fail" | "dispatch_binary_recovery"
+
+pub type ReleaseWatchWarmCacheState = "not_requested" \
+  | "dispatch_accepted" \
+  | "running" \
+  | "suppressed" \
+  | "completed" \
+  | "failed"
+
+pub type ReleaseWatchWarmCacheMatrixIdentity = "pending" | "exact" | "other"
+
+pub type ReleaseWatchWarmCacheAction = "wait" | "dispatch" | "complete" | "fail" | "disabled"
+
+const MAX_WARM_CACHE_INTERRUPTION_ATTEMPTS = 3
+
+// A hosted overlap can win the race after the watcher probes GitHub and cause
+// an accepted workflow to skip its matrix. Bound those cheap-but-noisy
+// dispatches independently from the stricter cancellation retry budget.
+const MAX_WARM_CACHE_DISPATCHES = 5
+
+pub type ReleaseWatchRecovery = {
+  dispatched: bool,
+  dispatched_at: string,
+  dispatch_status: ReleaseDispatchStatus,
+  workflow_run_id: int,
+  workflow_run_url: string,
+  workflow_path: string,
+  source_ref: string,
+  source_sha: string,
+  event: string,
+  head_branch: string,
+}
+
+pub type ReleaseWatchRecoveryRequest = {tag: string}
+
+pub type ReleaseWatchRecoveryDispatch = {
+  accepted: bool,
+  run_id: int,
+  url: string,
+  workflow_path: string,
+  ref: string,
+  head_sha: string,
+  event: string,
+  head_branch: string,
+  ...rest,
+}
+
+pub type ReleaseWatchWarmCache = {
+  state: ReleaseWatchWarmCacheState,
+  source_sha: string,
+  workflow_run_id: int,
+  workflow_run_url: string,
+  attempt_count: int,
+  dispatched_at: string,
+  started_at: string,
+  finished_at: string,
+  updated_at: string,
+  message: string,
+}
+
+/**
+ * What the release shipped on top of the tree it certified.
+ *
+ * The contract is not tree identity. Main merges every twenty-one minutes at
+ * the median, so a two-hour certification almost never sees a still branch, and
+ * demanding identity would mean demanding a freeze. The shipped tree is the
+ * certified tree plus commits that passed main's own required checks, and this
+ * record is where that claim is checkable afterwards rather than asserted: the
+ * exact commits, the exact contexts, and where each conclusion was read.
+ *
+ * `state` keeps the three cases apart. `not_observed` is a release that has not
+ * reached its merge decision, `no_drift` is one that merged at the base it
+ * certified, and `recorded` carries the evidence. An empty record must never be
+ * readable as a clean release.
+ */
+pub type ReleaseCertificationDriftState = "not_observed" | "no_drift" | "recorded"
+
+pub type ReleaseCertificationDriftCheck = {
+  name: string,
+  state: string,
+  source: string,
+  /** A lane only a release runs, recorded so the tag gate can see it was proved. */
+  release_only: bool,
+}
+
+pub type ReleaseCertificationDriftCommit = {
+  sha: string,
+  pull_number: int,
+  checks: list<ReleaseCertificationDriftCheck>,
+  green: bool,
+  blocking_check: string,
+}
+
+pub type ReleaseCertificationDrift = {
+  state: ReleaseCertificationDriftState,
+  certified_base: string,
+  observed_main: string,
+  required_contexts: list<string>,
+  commits: list<ReleaseCertificationDriftCommit>,
+  drifted_paths: list<string>,
+  release_only_checks: list<string>,
+  observed_at: string,
+}
+
+/**
+ * Where the lanes only a release runs stand on the merged main commit.
+ *
+ * Required and typed rather than prose, because this is the field a reader
+ * checks months later to answer "was the tree this tag names ever proved?".
+ * `not_observed` is the default and never reads as a pass.
+ */
+pub type ReleaseMainDeltaCheckRecord = {name: string, state: string, run_url: string}
+
+pub type ReleaseMainDeltaRecord = {
+  state: string,
+  commit: string,
+  lanes: list<string>,
+  checks: list<ReleaseMainDeltaCheckRecord>,
+  failing_check: string,
+  observed_at: string,
+}
+
+pub type ReleaseWatchReceipt = {
+  schema_version: "release_harn.publish_watch.v9",
+  tag: string,
+  slug: string,
+  pin_sha: string,
+  publication: ReleasePublication,
+  release_commit_oid: string,
+  pr_url: string,
+  merge_lease_candidate_pr: int,
+  merge_lease_generation: string,
+  merge_lease_method: ReleaseMergeMethod | "",
+  landing: ReleaseLandingReceipt?,
+  required_workflows: list<string>,
+  observed_run_ids: list<int>,
+  state: ReleaseWatchState,
+  message: string,
+  recovery: ReleaseWatchRecovery,
+  warm_cache: ReleaseWatchWarmCache,
+  certification_drift: ReleaseCertificationDrift,
+  main_delta: ReleaseMainDeltaRecord,
+  created_at: string,
+  updated_at: string,
+}
+
+pub type ReleaseWatchObservation = {
+  runs: list<dict>,
+  assets_ready: bool,
+  missing_assets: list<string>,
+  observed_at: string,
+}
+
+pub type ReleaseWatchTransition = {
+  receipt: ReleaseWatchReceipt,
+  action: ReleaseWatchAction,
+  recovery_workflow?: string,
+  recovery_fields?: ReleaseWatchRecoveryRequest,
+}
+
+pub type ReleaseWatchWarmCacheRun = {
+  workflow_run_id: int,
+  workflow_run_url: string,
+  source_sha: string,
+  event: string,
+  head_branch: string,
+  status: string,
+  conclusion: string,
+  started_at: string,
+  completed_at: string,
+}
+
+pub type ReleaseWatchWarmCacheJob = {
+  name: string,
+  status: string,
+  conclusion: string,
+  active_step?: string,
+  started_at?: string,
+  completed_at?: string,
+}
+
+pub type ReleaseWatchWarmCacheObservation = {
+  observed_at: string,
+  release_pr_merged: bool,
+  overlap_active: bool,
+  run: ReleaseWatchWarmCacheRun?,
+  jobs: list<ReleaseWatchWarmCacheJob>,
+  jobs_observed: bool,
+}
+
+pub type ReleaseWatchWarmCacheTransition = {
+  warm_cache: ReleaseWatchWarmCache,
+  action: ReleaseWatchWarmCacheAction,
+}
+
+pub type ReleaseWatchWarmCacheDispatch = {
+  accepted: bool,
+  observed_at: string,
+  workflow_run_id: int,
+  workflow_run_url: string,
+  source_sha: string,
+  message: string,
+}
+
+pub type ReleaseWatchReceiptInputs = {
+  tag: string,
+  slug: string,
+  pin_sha: string,
+  publication?: {version: string, local_branch: string, remote_ref: string, head_oid: string},
+  pr_url: string,
+  merge_lease_generation?: string,
+  merge_lease_method?: ReleaseMergeMethod,
+  required_workflows?: list<string>,
+  created_at: string,
+}
+
+fn release_watch_recovery_schema() {
+  const legacy = schema_closed_object(
+    {
+      dispatched: schema_bool(),
+      dispatched_at: schema_string(),
+      dispatch_status: schema_enum(["not_requested", "succeeded", "failed"]),
+    },
+  )
+  const identity = {
+    workflow_run_id: schema_int() + {minimum: 1},
+    workflow_run_url: schema_string()
+      + {pattern: "^https://github[.]com/[^/]+/[^/]+/actions/runs/[0-9]+$"},
+    workflow_path: schema_literal(".github/workflows/build-release-binaries.yml"),
+    source_ref: schema_literal("main"),
+    source_sha: schema_string() + {pattern: "^[0-9a-f]{40}$"},
+    event: schema_literal("workflow_dispatch"),
+    head_branch: schema_literal("main"),
+  }
+  const absent = {
+    workflow_run_id: schema_literal(0),
+    workflow_run_url: schema_literal(""),
+    workflow_path: schema_literal(""),
+    source_ref: schema_literal(""),
+    source_sha: schema_literal(""),
+    event: schema_literal(""),
+    head_branch: schema_literal(""),
+  }
+  return schema_union(
+    [
+      legacy,
+      schema_closed_object(
+        {
+          dispatched: schema_bool(),
+          dispatched_at: schema_string(),
+          dispatch_status: schema_enum(["not_requested", "succeeded", "failed"]),
+        }
+          + absent,
+      ),
+      schema_closed_object(
+        {
+          dispatched: schema_literal(true),
+          dispatched_at: schema_string(),
+          dispatch_status: schema_literal("succeeded"),
+        }
+          + identity,
+      ),
+    ],
+  )
+}
+
+fn warm_cache_fields(state_schema: any, identity: bool, attempted: bool) {
+  return {
+    state: state_schema,
+    source_sha: if identity {
+      schema_string() + {pattern: "^[0-9a-f]{40}$"}
+    } else {
+      schema_literal("")
+    },
+    workflow_run_id: if identity {
+      schema_int() + {minimum: 1}
+    } else {
+      schema_literal(0)
+    },
+    workflow_run_url: if identity {
+      schema_string() + {pattern: "^https://github[.]com/[^/]+/[^/]+/actions/runs/[0-9]+$"}
+    } else {
+      schema_literal("")
+    },
+    attempt_count: if attempted {
+      schema_int() + {minimum: 1}
+    } else {
+      schema_literal(0)
+    },
+    dispatched_at: schema_string(),
+    started_at: schema_string(),
+    finished_at: schema_string(),
+    updated_at: schema_string(),
+    message: schema_string(),
+  }
+}
+
+fn release_watch_warm_cache_schema() {
+  const no_attempt = schema_closed_object(
+    warm_cache_fields(schema_literal("not_requested"), false, false),
+  )
+  const accepted = schema_closed_object(
+    warm_cache_fields(
+      schema_enum(["dispatch_accepted", "running", "suppressed", "completed"]),
+      true,
+      true,
+    ),
+  )
+  const failed_dispatch = schema_closed_object(
+    warm_cache_fields(schema_literal("failed"), false, true),
+  )
+  const failed_run = schema_closed_object(warm_cache_fields(schema_literal("failed"), true, true))
+  return schema_union([no_attempt, accepted, failed_dispatch, failed_run])
+}
+
+fn release_publication_schema() {
+  return schema_closed_object(
+    {
+      version: schema_string()
+        + {pattern: "^[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z-]+(?:[.][0-9A-Za-z-]+)*)?$"},
+      local_branch: schema_string()
+        + {pattern: "^release/v[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z-]+(?:[.][0-9A-Za-z-]+)*)?$"},
+      remote_ref: schema_string()
+        + {
+          pattern:
+            "^release-attempt/v[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z-]+(?:[.][0-9A-Za-z-]+)*)?/[0-9a-f]{40}$",
+        },
+      head_oid: schema_string() + {pattern: "^[0-9a-f]{40}$"},
+    },
+  )
+}
+
+fn release_certification_drift_schema() {
+  return schema_closed_object(
+    {
+      state: schema_enum(["not_observed", "no_drift", "recorded"]),
+      certified_base: schema_string(),
+      observed_main: schema_string(),
+      required_contexts: schema_list(schema_string()),
+      commits: schema_list(
+        schema_closed_object(
+          {
+            sha: schema_string(),
+            pull_number: schema_int(),
+            checks: schema_list(
+              schema_closed_object(
+                {
+                  name: schema_string(),
+                  state: schema_string(),
+                  source: schema_string(),
+                  release_only: schema_bool(),
+                },
+              ),
+            ),
+            green: schema_bool(),
+            blocking_check: schema_string(),
+          },
+        ),
+      ),
+      drifted_paths: schema_list(schema_string()),
+      release_only_checks: schema_list(schema_string()),
+      observed_at: schema_string(),
+    },
+  )
+}
+
+fn release_main_delta_schema() {
+  return schema_closed_object(
+    {
+      state: schema_enum(
+        [
+          "not_observed",
+          "skipped_tree_already_certified",
+          "skipped_no_release_only_lanes",
+          "not_started",
+          "incomplete",
+          "running",
+          "passed",
+          "failed",
+        ],
+      ),
+      commit: schema_string(),
+      lanes: schema_list(schema_string()),
+      checks: schema_list(
+        schema_closed_object(
+          {name: schema_string(), state: schema_string(), run_url: schema_string()},
+        ),
+      ),
+      failing_check: schema_string(),
+      observed_at: schema_string(),
+    },
+  )
+}
+
+/** A receipt that has not reached its tag decision carries no delta claim. */
+pub fn release_main_delta_record_unobserved() -> ReleaseMainDeltaRecord {
+  return {
+    state: "not_observed",
+    commit: "",
+    lanes: [],
+    checks: [],
+    failing_check: "",
+    observed_at: "",
+  }
+}
+
+/** A receipt that has not reached its merge decision carries no drift claim. */
+pub fn release_certification_drift_unobserved() -> ReleaseCertificationDrift {
+  return {
+    state: "not_observed",
+    certified_base: "",
+    observed_main: "",
+    required_contexts: [],
+    commits: [],
+    drifted_paths: [],
+    release_only_checks: [],
+    observed_at: "",
+  }
+}
+
+fn release_watch_receipt_schema() {
+  return schema_closed_object(
+    {
+      schema_version: schema_literal("release_harn.publish_watch.v9"),
+      tag: schema_string()
+        + {pattern: "^v[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z-]+(?:[.][0-9A-Za-z-]+)*)?$"},
+      slug: schema_string() + {pattern: "^[^/]+/[^/]+$"},
+      pin_sha: schema_string() + {pattern: "^[0-9a-f]{40}$"},
+      publication: release_publication_schema(),
+      release_commit_oid: schema_union(
+        [schema_literal(""), schema_string() + {pattern: "^[0-9a-f]{40}$"}],
+      ),
+      pr_url: schema_string() + {pattern: "^https://github[.]com/[^/]+/[^/]+/pull/[0-9]+$"},
+      merge_lease_candidate_pr: schema_int() + {minimum: 0},
+      merge_lease_generation: schema_string() + {pattern: "^(?:|[A-Za-z0-9._:/-]+)$"},
+      merge_lease_method: schema_enum(["", "merge", "rebase", "squash"]),
+      landing: schema_nullable(schema_of(ReleaseLandingReceipt)),
+      required_workflows: schema_list(schema_string()),
+      observed_run_ids: schema_list(schema_int()),
+      state: schema_enum(["pending", "recovering", "healthy", "failed"]),
+      message: schema_string(),
+      recovery: release_watch_recovery_schema(),
+      warm_cache: release_watch_warm_cache_schema(),
+      certification_drift: release_certification_drift_schema(),
+      main_delta: release_main_delta_schema(),
+      created_at: schema_string(),
+      updated_at: schema_string(),
+    },
+  )
+}
+
+/**
+ * Record what the release is about to ship on top of what it certified.
+ *
+ * Written before the merge, not after, so a merge that happens is always
+ * accompanied by the evidence that allowed it. A reader who finds a merged
+ * release whose record still says `not_observed` is looking at a merge nothing
+ * in this harness decided.
+ */
+/** Record where the release-only lanes stand on the merged main commit. */
+pub fn release_watch_receipt_record_main_delta(
+  receipt: ReleaseWatchReceipt,
+  delta: ReleaseMainDeltaRecord,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  return receipt + {main_delta: delta, updated_at: observed_at}
+}
+
+pub fn release_watch_receipt_record_certification_drift(
+  receipt: ReleaseWatchReceipt,
+  drift: ReleaseCertificationDrift,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  return receipt + {certification_drift: drift, updated_at: observed_at}
+}
+
+/** Re-derive immutable identity so valid-looking JSON cannot retarget a receipt. */
+fn receipt_publication_from_validated(value: dict) -> ReleasePublication? {
+  const publication = try {
+    release_publication(value.version, value.head_oid)
+  } catch (_error) {
+    nil
+  }
+  if publication == nil {
+    return nil
+  }
+  if value.local_branch != publication.local_branch || value.remote_ref != publication.remote_ref {
+    return nil
+  }
+  return publication
+}
+
+fn receipt_from_validated(value: dict, publication: ReleasePublication) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: value.tag,
+    slug: value.slug,
+    pin_sha: value.pin_sha,
+    publication: publication,
+    release_commit_oid: value.release_commit_oid,
+    pr_url: value.pr_url,
+    merge_lease_candidate_pr: value.merge_lease_candidate_pr,
+    merge_lease_generation: value.merge_lease_generation,
+    merge_lease_method: value.merge_lease_method,
+    landing: value.landing,
+    required_workflows: value.required_workflows,
+    observed_run_ids: value.observed_run_ids,
+    state: value.state,
+    message: value.message,
+    recovery: {
+      dispatched: value.recovery.dispatched,
+      dispatched_at: value.recovery.dispatched_at,
+      dispatch_status: value.recovery.dispatch_status,
+      workflow_run_id: value.recovery.workflow_run_id ?? 0,
+      workflow_run_url: value.recovery.workflow_run_url ?? "",
+      workflow_path: value.recovery.workflow_path ?? "",
+      source_ref: value.recovery.source_ref ?? "",
+      source_sha: value.recovery.source_sha ?? "",
+      event: value.recovery.event ?? "",
+      head_branch: value.recovery.head_branch ?? "",
+    },
+    warm_cache: {
+      state: value.warm_cache.state,
+      source_sha: value.warm_cache.source_sha,
+      workflow_run_id: value.warm_cache.workflow_run_id,
+      workflow_run_url: value.warm_cache.workflow_run_url,
+      attempt_count: value.warm_cache.attempt_count,
+      dispatched_at: value.warm_cache.dispatched_at,
+      started_at: value.warm_cache.started_at,
+      finished_at: value.warm_cache.finished_at,
+      updated_at: value.warm_cache.updated_at,
+      message: value.warm_cache.message,
+    },
+    certification_drift: value.certification_drift,
+    main_delta: value.main_delta,
+    created_at: value.created_at,
+    updated_at: value.updated_at,
+  }
+}
+
+/** Validate an untyped JSON value once at the persistence boundary. */
+pub fn release_watch_receipt_parse(value: dict) -> ReleaseWatchReceipt? {
+  const legacy_has_lease = trim(to_string(value?.merge_lease_generation ?? "")) != ""
+  const migrated = if value?.schema_version == "release_harn.publish_watch.v8" {
+    value
+      + {
+        schema_version: "release_harn.publish_watch.v9",
+        merge_lease_method: if legacy_has_lease {
+          "squash"
+        } else {
+          ""
+        },
+        landing: nil,
+      }
+  } else {
+    value
+  }
+  const report = schema_validator(release_watch_receipt_schema()).report(migrated)
+  if !report.ok {
+    return nil
+  }
+  const publication = receipt_publication_from_validated(report.value.publication)
+  if publication == nil || report.value.tag != "v${publication.version}" {
+    return nil
+  }
+  const lease_generation = trim(report.value.merge_lease_generation)
+  if lease_generation == "" != (report.value.merge_lease_candidate_pr == 0) {
+    return nil
+  }
+  if lease_generation == "" != (report.value.merge_lease_method == "") {
+    return nil
+  }
+  const landing = report.value.landing
+  if landing != nil
+    && (lease_generation == ""
+      || landing.tag_oid != publication.head_oid
+      || landing.release_pr != report.value.merge_lease_candidate_pr
+      || landing.merge_method != report.value.merge_lease_method) {
+    return nil
+  }
+  return receipt_from_validated(report.value, publication)
+}
+
+/** Read and validate a durable watch receipt. */
+pub fn release_watch_receipt_read(fs: HarnessFs, path: string) -> ReleaseWatchReceipt? {
+  const loaded = read_json_result(fs, path)
+  if !is_ok(loaded) {
+    return nil
+  }
+  return release_watch_receipt_parse(unwrap(loaded))
+}
+
+/** Write a receipt through rename-into-place so interruption cannot truncate it. */
+pub fn release_watch_receipt_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  receipt: ReleaseWatchReceipt,
+) -> string {
+  const temp_path = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temp_path, receipt, {pretty: true})
+  harness.fs.rename(temp_path, path)
+  return path
+}
+
+/** Resolve one canonical receipt path, rejecting traversal through the tag. */
+pub fn release_watch_receipt_path(root: string, tag: string) -> string {
+  const clean_tag = trim(tag)
+  if !is_v_release_semver(clean_tag) {
+    throw "release watch tag must be a canonical v-prefixed release version, got: " + clean_tag
+  }
+  return path_join(root, "watches", clean_tag + ".json")
+}
+
+/** Retarget only the mutable paperwork PR; immutable release identity is preserved. */
+pub fn release_watch_receipt_retarget_pr(
+  receipt: ReleaseWatchReceipt,
+  pr_url: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  const clean_url = trim(pr_url)
+  const expected_prefix = "https://github.com/${receipt.slug}/pull/"
+  if !clean_url.starts_with(expected_prefix) {
+    throw "replacement release PR must belong to ${receipt.slug}: ${clean_url}"
+  }
+  const number = to_int(clean_url.substring(len(expected_prefix)))
+  if number == nil || number <= 0 {
+    throw "replacement release PR URL must end in a positive pull request number: ${clean_url}"
+  }
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: receipt.release_commit_oid,
+    pr_url: clean_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: observed_at,
+  }
+}
+
+/** Bind the write-once published commit before or after an idempotent tag push. */
+pub fn release_watch_receipt_bind_main_commit(
+  receipt: ReleaseWatchReceipt,
+  release_commit_oid: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  const oid = lowercase(trim(release_commit_oid))
+  if regex_match("^[0-9a-f]{40}$", oid) == nil {
+    throw "release main commit must be an exact 40-hex OID"
+  }
+  if receipt.release_commit_oid != "" && receipt.release_commit_oid != oid {
+    throw "release receipt is already bound to ${receipt.release_commit_oid}, not ${oid}"
+  }
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: oid,
+    pr_url: receipt.pr_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: observed_at,
+  }
+}
+
+fn receipt_with_observation(
+  receipt: ReleaseWatchReceipt,
+  run_ids: list<int>,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: receipt.release_commit_oid,
+    pr_url: receipt.pr_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: observed_at,
+  }
+}
+
+fn receipt_with_status(
+  receipt: ReleaseWatchReceipt,
+  state: ReleaseWatchState,
+  message: string,
+) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: receipt.release_commit_oid,
+    pr_url: receipt.pr_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: state,
+    message: message,
+    recovery: receipt.recovery,
+    warm_cache: receipt.warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: receipt.updated_at,
+  }
+}
+
+fn receipt_with_warm_cache(
+  receipt: ReleaseWatchReceipt,
+  warm_cache: ReleaseWatchWarmCache,
+  updated_at: string,
+) -> ReleaseWatchReceipt {
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: receipt.release_commit_oid,
+    pr_url: receipt.pr_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: receipt.state,
+    message: receipt.message,
+    recovery: receipt.recovery,
+    warm_cache: warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: updated_at,
+  }
+}
+
+fn observed_run_ids(runs: list<dict>, tag: string, accepted_run_ids: list<int> = []) -> list<int> {
+  let ids: list<int> = []
+  for run in runs {
+    const run_id = to_int(run?.id ?? 0) ?? 0
+    if run.head_branch != tag
+      && !accepted_run_ids.any({ accepted -> accepted == run_id }) {
+      continue
+    }
+    if run_id > 0 && !ids.any({ existing -> existing == run_id }) {
+      ids = ids + [run_id]
+    }
+  }
+  return ids
+}
+
+fn merge_run_ids(existing: list<int>, observed: list<int>) -> list<int> {
+  let merged = existing
+  for id in observed {
+    if !merged.any({ prior -> prior == id }) {
+      merged = merged + [id]
+    }
+  }
+  return merged
+}
+
+/** Create the durable state written immediately after tag/branch/PR creation. */
+pub fn release_watch_receipt(inputs: ReleaseWatchReceiptInputs) -> ReleaseWatchReceipt {
+  const created_at = trim(inputs.created_at)
+  const publication = release_publication(
+    trim(inputs.publication?.version ?? ""),
+    trim(inputs.publication?.head_oid ?? ""),
+  )
+  const tag = trim(inputs.tag)
+  if tag != "v${publication.version}" {
+    throw "release watch tag ${tag} must match immutable publication version ${publication.version}"
+  }
+  const pr_prefix = "https://github.com/${trim(inputs.slug)}/pull/"
+  const candidate_pr = if trim(inputs.pr_url).starts_with(pr_prefix) {
+    to_int(trim(inputs.pr_url).substring(len(pr_prefix))) ?? 0
+  } else {
+    0
+  }
+  const merge_lease_generation = trim(inputs.merge_lease_generation ?? "")
+  const merge_lease_method: ReleaseMergeMethod | "" = if merge_lease_generation == "" {
+    ""
+  } else {
+    inputs.merge_lease_method ?? "squash"
+  }
+  if merge_lease_generation != "" && candidate_pr <= 0 {
+    throw "release merge lease generation requires an exact candidate pull request"
+  }
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: tag,
+    slug: trim(inputs.slug),
+    pin_sha: trim(inputs.pin_sha),
+    publication: publication,
+    release_commit_oid: "",
+    pr_url: trim(inputs.pr_url),
+    merge_lease_candidate_pr: if merge_lease_generation == "" {
+      0
+    } else {
+      candidate_pr
+    },
+    merge_lease_generation: merge_lease_generation,
+    merge_lease_method: merge_lease_method,
+    landing: nil,
+    required_workflows: inputs.required_workflows
+      ?? ["publish-release.yml", "build-release-binaries.yml"],
+    observed_run_ids: [],
+    state: "pending",
+    message: "release publish has not been observed yet",
+    recovery: {
+      dispatched: false,
+      dispatched_at: "",
+      dispatch_status: "not_requested",
+      workflow_run_id: 0,
+      workflow_run_url: "",
+      workflow_path: "",
+      source_ref: "",
+      source_sha: "",
+      event: "",
+      head_branch: "",
+    },
+    warm_cache: {
+      state: "not_requested",
+      source_sha: "",
+      workflow_run_id: 0,
+      workflow_run_url: "",
+      attempt_count: 0,
+      dispatched_at: "",
+      started_at: "",
+      finished_at: "",
+      updated_at: created_at,
+      message: "warm-cache dispatch has not been requested",
+    },
+    certification_drift: release_certification_drift_unobserved(),
+    main_delta: release_main_delta_record_unobserved(),
+    created_at: created_at,
+    updated_at: created_at,
+  }
+}
+
+/** Reduce one GitHub/assets snapshot into a persistent release transition. */
+pub fn release_watch_transition(
+  receipt: ReleaseWatchReceipt,
+  observation: ReleaseWatchObservation,
+) -> ReleaseWatchTransition {
+  const run_ids = merge_run_ids(
+    receipt.observed_run_ids,
+    observed_run_ids(
+      observation.runs,
+      receipt.tag,
+      if receipt.recovery.workflow_run_id > 0 {
+        [receipt.recovery.workflow_run_id]
+      } else {
+        []
+      },
+    ),
+  )
+  const base = receipt_with_observation(receipt, run_ids, observation.observed_at)
+  const decision = publish_watch_decision(
+    {
+      runs: observation.runs,
+      required_workflows: receipt.required_workflows,
+      tag: receipt.tag,
+      accepted_run_ids: if receipt.recovery.workflow_run_id > 0 {
+        [receipt.recovery.workflow_run_id]
+      } else {
+        []
+      },
+    },
+  )
+  // Assets are necessary publication evidence, but they must never launder a
+  // failed tag workflow. `publish_watch_decision` owns the one typed exception
+  // for an independently failed post-release development bump.
+  if observation.assets_ready && decision.state != "failed" {
+    const message = if len(decision.ancillary_failures ?? []) > 0 {
+      "required release assets are published; " + decision.message
+    } else {
+      "required release assets are published"
+    }
+    return {receipt: receipt_with_status(base, "healthy", message), action: "complete"}
+  }
+  if decision.state != "failed" {
+    const message = if decision.state == "healthy" {
+      "release workflows are green; waiting for finalized release assets: "
+        + join(observation.missing_assets, ", ")
+    } else {
+      decision.message
+    }
+    return {receipt: receipt_with_status(base, "pending", message), action: "wait"}
+  }
+  const recovery = publish_binary_recovery_decision(
+    {runs: observation.runs, tag: receipt.tag, already_dispatched: receipt.recovery.dispatched},
+  )
+  if recovery.should_dispatch ?? false {
+    return {
+      receipt: receipt_with_status(base, "recovering", recovery.message ?? ""),
+      action: "dispatch_binary_recovery",
+      recovery_workflow: recovery.workflow ?? "",
+      recovery_fields: {tag: trim(recovery.fields?.tag ?? "")},
+    }
+  }
+  if receipt.recovery.dispatched {
+    return {
+      receipt: receipt_with_status(
+        base,
+        "recovering",
+        "binary recovery was already dispatched; waiting for required release assets: "
+          + join(observation.missing_assets, ", "),
+      ),
+      action: "wait",
+    }
+  }
+  return {receipt: receipt_with_status(base, "failed", decision.message), action: "fail"}
+}
+
+/** Persist dispatch outcome before another poll can request duplicate recovery. */
+pub fn release_watch_record_recovery_dispatch(
+  receipt: ReleaseWatchReceipt,
+  dispatched_at: string,
+  fields: ReleaseWatchRecoveryRequest,
+  dispatch: ReleaseWatchRecoveryDispatch?,
+) -> ReleaseWatchReceipt {
+  const run_id = to_int(dispatch?.run_id ?? 0) ?? 0
+  const success = trim(fields.tag) == receipt.tag
+    && (dispatch?.accepted ?? false)
+    && run_id > 0
+    && trim(to_string(dispatch?.url ?? ""))
+      == "https://github.com/${receipt.slug}/actions/runs/${run_id}"
+    && trim(to_string(dispatch?.workflow_path ?? ""))
+      == ".github/workflows/build-release-binaries.yml"
+    && trim(to_string(dispatch?.ref ?? "")) == "main"
+    && trim(to_string(dispatch?.event ?? "")) == "workflow_dispatch"
+    && trim(to_string(dispatch?.head_branch ?? "")) == "main"
+    && regex_match("^[0-9a-f]{40}$", lowercase(trim(to_string(dispatch?.head_sha ?? "")))) != nil
+  return {
+    schema_version: "release_harn.publish_watch.v9",
+    tag: receipt.tag,
+    slug: receipt.slug,
+    pin_sha: receipt.pin_sha,
+    publication: receipt.publication,
+    release_commit_oid: receipt.release_commit_oid,
+    pr_url: receipt.pr_url,
+    merge_lease_candidate_pr: receipt.merge_lease_candidate_pr,
+    merge_lease_generation: receipt.merge_lease_generation,
+    merge_lease_method: receipt.merge_lease_method,
+    landing: receipt.landing,
+    required_workflows: receipt.required_workflows,
+    observed_run_ids: receipt.observed_run_ids,
+    state: if success {
+      "recovering"
+    } else {
+      "failed"
+    },
+    message: if success {
+      "binary recovery dispatched; waiting for required release assets"
+    } else {
+      "binary recovery dispatch failed or returned a mismatched run identity"
+    },
+    recovery: {
+      dispatched: success,
+      dispatched_at: dispatched_at,
+      dispatch_status: if success {
+        "succeeded"
+      } else {
+        "failed"
+      },
+      workflow_run_id: if success {
+        run_id
+      } else {
+        0
+      },
+      workflow_run_url: if success {
+        trim(to_string(dispatch?.url ?? ""))
+      } else {
+        ""
+      },
+      workflow_path: if success {
+        trim(to_string(dispatch?.workflow_path ?? ""))
+      } else {
+        ""
+      },
+      source_ref: if success {
+        trim(to_string(dispatch?.ref ?? ""))
+      } else {
+        ""
+      },
+      source_sha: if success {
+        lowercase(trim(to_string(dispatch?.head_sha ?? "")))
+      } else {
+        ""
+      },
+      event: if success {
+        trim(to_string(dispatch?.event ?? ""))
+      } else {
+        ""
+      },
+      head_branch: if success {
+        trim(to_string(dispatch?.head_branch ?? ""))
+      } else {
+        ""
+      },
+    },
+    warm_cache: receipt.warm_cache,
+    certification_drift: receipt.certification_drift,
+    main_delta: receipt.main_delta,
+    created_at: receipt.created_at,
+    updated_at: dispatched_at,
+  }
+}
+
+/**
+ * Conservatively hold warming while release work or a post-dispatch recovery candidate is active.
+ */
+pub fn release_watch_warm_cache_overlap(receipt: ReleaseWatchReceipt, runs: list<dict>) -> bool {
+  for run in runs {
+    if lowercase(trim(run?.status ?? "")) == "completed" {
+      continue
+    }
+    const id = run.id
+    if id == receipt.warm_cache.workflow_run_id {
+      continue
+    }
+    const head_sha = run.head_sha
+    const head_branch = run.head_branch
+    const same_release_source = head_sha == receipt.pin_sha || head_branch == receipt.tag
+    const recovery_for_release = if receipt.recovery.workflow_run_id > 0 {
+      id == receipt.recovery.workflow_run_id
+    } else {
+      receipt.recovery.dispatched
+        && lowercase(trim(run?.event ?? ""))
+          == "workflow_dispatch"
+        && (run.created_at ?? "") >= receipt.recovery.dispatched_at
+    }
+    if same_release_source || recovery_for_release {
+      return true
+    }
+  }
+  return false
+}
+
+fn warm_cache_status(
+  prior: ReleaseWatchWarmCache,
+  state: ReleaseWatchWarmCacheState,
+  observed_at: string,
+  message: string,
+  started_at: string,
+  finished_at: string,
+) -> ReleaseWatchWarmCache {
+  return {
+    state: state,
+    source_sha: prior.source_sha,
+    workflow_run_id: prior.workflow_run_id,
+    workflow_run_url: prior.workflow_run_url,
+    attempt_count: prior.attempt_count,
+    dispatched_at: prior.dispatched_at,
+    started_at: started_at,
+    finished_at: finished_at,
+    updated_at: observed_at,
+    message: message,
+  }
+}
+
+/** Record one connector dispatch result, including exact run identity, before another poll. */
+pub fn release_watch_record_warm_cache_dispatch(
+  receipt: ReleaseWatchReceipt,
+  dispatch: ReleaseWatchWarmCacheDispatch,
+) -> ReleaseWatchReceipt {
+  const warm_cache: ReleaseWatchWarmCache = if dispatch.accepted {
+    {
+      state: "dispatch_accepted",
+      source_sha: dispatch.source_sha,
+      workflow_run_id: dispatch.workflow_run_id,
+      workflow_run_url: dispatch.workflow_run_url,
+      attempt_count: receipt.warm_cache.attempt_count + 1,
+      dispatched_at: dispatch.observed_at,
+      started_at: "",
+      finished_at: "",
+      updated_at: dispatch.observed_at,
+      message: dispatch.message,
+    }
+  } else {
+    {
+      state: "failed",
+      source_sha: "",
+      workflow_run_id: 0,
+      workflow_run_url: "",
+      attempt_count: receipt.warm_cache.attempt_count + 1,
+      dispatched_at: dispatch.observed_at,
+      started_at: "",
+      finished_at: dispatch.observed_at,
+      updated_at: dispatch.observed_at,
+      message: dispatch.message,
+    }
+  }
+  return receipt_with_warm_cache(receipt, warm_cache, dispatch.observed_at)
+}
+
+fn matrix_jobs(jobs: list<ReleaseWatchWarmCacheJob>) -> list<ReleaseWatchWarmCacheJob> {
+  return jobs.filter({ job -> starts_with(trim(job.name), "Build ") }).to_list()
+}
+
+/** Classify a materialized build matrix before it can be trusted as a cache warm. */
+pub fn release_watch_warm_cache_matrix_identity(
+  jobs: list<ReleaseWatchWarmCacheJob>,
+) -> ReleaseWatchWarmCacheMatrixIdentity {
+  const builds = matrix_jobs(jobs)
+  if len(builds) == 0 {
+    return "pending"
+  }
+  const required = required_harn_release_build_jobs()
+  const observed = builds.map({ job -> job.name }).to_list()
+  const missing = required.filter({ name -> !observed.contains(name) }).to_list()
+  const unknown = observed.filter({ name -> !required.contains(name) }).to_list()
+  if len(builds) == len(required) && len(missing) == 0 && len(unknown) == 0 {
+    return "exact"
+  }
+  return "other"
+}
+
+/** Prove that an exact warm-cache matrix is terminally successful. */
+pub fn release_watch_warm_cache_matrix_succeeded(jobs: list<ReleaseWatchWarmCacheJob>) -> bool {
+  if release_watch_warm_cache_matrix_identity(jobs) != "exact" {
+    return false
+  }
+  return matrix_jobs(jobs).all(
+    { job -> lowercase(job.status) == "completed" && lowercase(job.conclusion) == "success" },
+  )
+}
+
+fn warm_cache_dispatch_transition(
+  warm_cache: ReleaseWatchWarmCache,
+  enabled: bool,
+  observation: ReleaseWatchWarmCacheObservation,
+) -> ReleaseWatchWarmCacheTransition {
+  if !observation.release_pr_merged {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        warm_cache.state,
+        observation.observed_at,
+        "waiting for the release pull request to merge",
+        warm_cache.started_at,
+        warm_cache.finished_at,
+      ),
+      action: "wait",
+    }
+  }
+  if observation.overlap_active {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        warm_cache.state,
+        observation.observed_at,
+        "waiting for release and recovery workflows to become terminal",
+        warm_cache.started_at,
+        warm_cache.finished_at,
+      ),
+      action: "wait",
+    }
+  }
+  if !enabled {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        warm_cache.state,
+        observation.observed_at,
+        "release pull request merged; post-publish warm cache not requested",
+        warm_cache.started_at,
+        warm_cache.finished_at,
+      ),
+      action: "disabled",
+    }
+  }
+  if warm_cache.attempt_count >= MAX_WARM_CACHE_DISPATCHES {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow exhausted ${MAX_WARM_CACHE_DISPATCHES} total dispatches",
+        warm_cache.started_at,
+        warm_cache.finished_at,
+      ),
+      action: "fail",
+    }
+  }
+  return {warm_cache: warm_cache, action: "dispatch"}
+}
+
+fn retryable_warm_cache_conclusion(conclusion: string) -> bool {
+  return ["cancelled", "stale", "startup_failure"].contains(lowercase(trim(conclusion)))
+}
+
+fn completed_warm_cache_failure_transition(
+  warm_cache: ReleaseWatchWarmCache,
+  observation: ReleaseWatchWarmCacheObservation,
+  conclusion: string,
+  started_at: string,
+  finished_at: string,
+) -> ReleaseWatchWarmCacheTransition {
+  const retryable = retryable_warm_cache_conclusion(conclusion)
+  if retryable && warm_cache.attempt_count < MAX_WARM_CACHE_INTERRUPTION_ATTEMPTS {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "suppressed",
+        observation.observed_at,
+        "warm-cache workflow run ${warm_cache.workflow_run_id} completed with ${conclusion}; retrying after transient workflow interruption (attempt ${warm_cache.attempt_count} of ${MAX_WARM_CACHE_INTERRUPTION_ATTEMPTS})",
+        started_at,
+        finished_at,
+      ),
+      action: "wait",
+    }
+  }
+  return {
+    warm_cache: warm_cache_status(
+      warm_cache,
+      "failed",
+      observation.observed_at,
+      if retryable {
+        "warm-cache workflow exhausted ${MAX_WARM_CACHE_INTERRUPTION_ATTEMPTS} interruption attempts after ${conclusion}"
+      } else {
+        "warm-cache workflow run ${warm_cache.workflow_run_id} completed with ${conclusion}"
+      },
+      started_at,
+      finished_at,
+    ),
+    action: "fail",
+  }
+}
+
+/** Reduce one immutable workflow snapshot without clock, filesystem, process, or network access. */
+pub fn release_watch_warm_cache_transition(
+  warm_cache: ReleaseWatchWarmCache,
+  enabled: bool,
+  observation: ReleaseWatchWarmCacheObservation,
+) -> ReleaseWatchWarmCacheTransition {
+  if warm_cache.state == "completed" {
+    return {warm_cache: warm_cache, action: "complete"}
+  }
+  if warm_cache.state == "not_requested" || warm_cache.state == "suppressed" {
+    return warm_cache_dispatch_transition(warm_cache, enabled, observation)
+  }
+  const run = observation.run
+  if run == nil {
+    if warm_cache.state == "failed" {
+      return {warm_cache: warm_cache, action: "fail"}
+    }
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        warm_cache.state,
+        observation.observed_at,
+        "waiting to observe warm-cache workflow run ${warm_cache.workflow_run_id}",
+        warm_cache.started_at,
+        warm_cache.finished_at,
+      ),
+      action: "wait",
+    }
+  }
+  if run.workflow_run_id != warm_cache.workflow_run_id
+    || run.workflow_run_url
+      != warm_cache.workflow_run_url
+    || lowercase(run.source_sha) != warm_cache.source_sha
+    || lowercase(run.event) != "workflow_dispatch"
+    || run.head_branch != "main" {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow identity changed while resuming persisted run",
+        warm_cache.started_at,
+        observation.observed_at,
+      ),
+      action: "fail",
+    }
+  }
+  const started_at = if trim(run.started_at) != "" {
+    run.started_at
+  } else {
+    warm_cache.started_at
+  }
+  if lowercase(run.status) != "completed" {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "running",
+        observation.observed_at,
+        "warm-cache workflow run ${warm_cache.workflow_run_id} is ${lowercase(run.status)}",
+        started_at,
+        "",
+      ),
+      action: "wait",
+    }
+  }
+  const finished_at = if trim(run.completed_at) != "" {
+    run.completed_at
+  } else {
+    observation.observed_at
+  }
+  const conclusion = lowercase(run.conclusion)
+  if conclusion != "success" {
+    return completed_warm_cache_failure_transition(
+      warm_cache,
+      observation,
+      conclusion,
+      started_at,
+      finished_at,
+    )
+  }
+  if !observation.jobs_observed {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "running",
+        observation.observed_at,
+        "warm-cache workflow is terminal; waiting for its job snapshot",
+        started_at,
+        "",
+      ),
+      action: "wait",
+    }
+  }
+  const builds = matrix_jobs(observation.jobs)
+  if len(builds) == 0 {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow reported no matrix build jobs",
+        started_at,
+        finished_at,
+      ),
+      action: "fail",
+    }
+  }
+  const executed = builds.filter({ job -> lowercase(job.conclusion) != "skipped" }).to_list()
+  if len(executed) == 0 {
+    if warm_cache.attempt_count >= MAX_WARM_CACHE_DISPATCHES {
+      return {
+        warm_cache: warm_cache_status(
+          warm_cache,
+          "failed",
+          observation.observed_at,
+          "warm-cache workflow exhausted ${MAX_WARM_CACHE_DISPATCHES} total dispatches without executing a matrix build",
+          started_at,
+          finished_at,
+        ),
+        action: "fail",
+      }
+    }
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "suppressed",
+        observation.observed_at,
+        "warm-cache workflow completed without executing a matrix build; retry after overlap clears",
+        started_at,
+        finished_at,
+      ),
+      action: "wait",
+    }
+  }
+  if len(executed) != len(builds) {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow skipped part of its matrix build",
+        started_at,
+        finished_at,
+      ),
+      action: "fail",
+    }
+  }
+  const required_jobs = required_harn_release_build_jobs()
+  const observed_names = executed.map({ job -> job.name }).to_list()
+  const missing_jobs = required_jobs.filter({ name -> !observed_names.contains(name) }).to_list()
+  const unknown_jobs = observed_names.filter({ name -> !required_jobs.contains(name) }).to_list()
+  if len(executed) != len(required_jobs) || len(missing_jobs) > 0 || len(unknown_jobs) > 0 {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow matrix identity drifted; missing="
+          + join(missing_jobs, ",")
+          + "; unknown="
+          + join(unknown_jobs, ","),
+        started_at,
+        finished_at,
+      ),
+      action: "fail",
+    }
+  }
+  if !release_watch_warm_cache_matrix_succeeded(observation.jobs) {
+    return {
+      warm_cache: warm_cache_status(
+        warm_cache,
+        "failed",
+        observation.observed_at,
+        "warm-cache workflow did not complete every executed matrix build successfully",
+        started_at,
+        finished_at,
+      ),
+      action: "fail",
+    }
+  }
+  return {
+    warm_cache: warm_cache_status(
+      warm_cache,
+      "completed",
+      observation.observed_at,
+      "warm-cache workflow completed with ${len(executed)} successful matrix build job(s)",
+      started_at,
+      finished_at,
+    ),
+    action: "complete",
+  }
+}
+
+pub fn release_watch_apply_warm_cache_transition(
+  receipt: ReleaseWatchReceipt,
+  transition: ReleaseWatchWarmCacheTransition,
+) -> ReleaseWatchReceipt {
+  return receipt_with_warm_cache(receipt, transition.warm_cache, transition.warm_cache.updated_at)
+}

@@ -1,0 +1,490 @@
+import { changelog_top, current_version } from "../lib/release_analysis"
+import { release_publication } from "../lib/release_publication"
+import { ReleaseConfig, parse_release_args, resolve_pin_sha } from "../lib/release_runtime"
+import {
+  align_pre_tag_release_workspace,
+  finish_release_workspace,
+  materialize_release_workspace,
+  release_analysis_snapshot,
+  release_post_cleanup_config,
+} from "../lib/release_workspace"
+import {
+  release_workspace_lease_acquire,
+  release_workspace_lease_finish,
+  release_workspace_lease_shared,
+} from "../lib/release_workspace_lease"
+
+fn sh(process: HarnessProcess, command: string) -> dict {
+  const result = process.shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+/**
+ * Seconds-resolution mtime, on both GNU and BSD `stat`.
+ *
+ * The two spell the same question incompatibly, and each silently misreads the
+ * other's flag: GNU `stat -f` asks about the filesystem and takes `%m` as a
+ * path, BSD `stat` has no `-c`. Trying GNU first and falling back keeps the
+ * caller from comparing two mount points and calling it an mtime.
+ */
+fn file_mtime(process: HarnessProcess, path: string) -> string {
+  const quoted = "'" + path + "'"
+  const stamp = trim(
+    sh(process, "stat -c '%Y' " + quoted + " 2>/dev/null || stat -f '%m' " + quoted).stdout,
+  )
+  if regex_match("^[0-9]+$", stamp) == nil {
+    throw "expected an epoch-seconds mtime for ${path}, got '${stamp}'"
+  }
+  return stamp
+}
+
+fn repo_fixture(harness: Harness) -> dict {
+  const root = path_join(harness.fs.temp_dir(), "release-workspace-" + harness.random.uuid_v7())
+  const repo = path_join(root, "harn")
+  sh(harness.process, "git init -q '" + repo + "'")
+  sh(harness.process, "git -C '" + repo + "' config user.email test@example.com")
+  sh(harness.process, "git -C '" + repo + "' config user.name test")
+  sh(harness.process, "git -C '" + repo + "' checkout -q -b main")
+  harness.fs.write_text(path_join(repo, "fixture.txt"), "pin\n")
+  sh(harness.process, "git -C '" + repo + "' add fixture.txt")
+  sh(harness.process, "git -C '" + repo + "' commit -q -m pin")
+  const pin = trim(sh(harness.process, "git -C '" + repo + "' rev-parse HEAD").stdout)
+  return {root: root, repo: repo, pin: pin}
+}
+
+fn live_cfg(env: HarnessEnv, repo: string, pin: string) -> ReleaseConfig {
+  let cfg = parse_release_args(
+    env,
+    ["--repo", repo, "--mode", "ship-pr", "--yes-live-release", "--at-sha", pin],
+  )
+  cfg["pin_sha"] = pin
+  return cfg
+}
+
+fn audit_pin_cfg(env: HarnessEnv, repo: string, pin: string, domain: string) -> ReleaseConfig {
+  let cfg = parse_release_args(env, ["--repo", repo, "--mode", "audit", "--at-sha", pin])
+  cfg["pin_sha"] = pin
+  cfg["release_workspace_lease_domain"] = domain
+  cfg["owner_guard_domain"] = domain + "-owner"
+  return cfg
+}
+
+fn audit_snapshot_fixture(harness: Harness) -> dict {
+  const root = path_join(
+    harness.fs.temp_dir(),
+    "release-audit-snapshot-" + harness.random.uuid_v7(),
+  )
+  const repo = path_join(root, "harn")
+  sh(harness.process, "git init -q '" + repo + "'")
+  sh(harness.process, "git -C '" + repo + "' config user.email test@example.com")
+  sh(harness.process, "git -C '" + repo + "' config user.name test")
+  sh(harness.process, "git -C '" + repo + "' checkout -q -b main")
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.3\"\n")
+  harness.fs.write_text(path_join(repo, "CHANGELOG.md"), "# Changelog\n\n## v1.2.3\n\n- Base.\n")
+  sh(harness.process, "git -C '" + repo + "' add Cargo.toml CHANGELOG.md")
+  sh(harness.process, "git -C '" + repo + "' commit -q -m base")
+  sh(harness.process, "git -C '" + repo + "' tag v1.2.3")
+  sh(harness.process, "git -C '" + repo + "' switch -q -c candidate")
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.4\"\n")
+  harness.fs.write_text(
+    path_join(repo, "CHANGELOG.md"),
+    "# Changelog\n\n## v1.2.4\n\n- Exact pinned candidate.\n\n## v1.2.3\n\n- Base.\n",
+  )
+  harness.fs.write_text(path_join(repo, "candidate.txt"), "pin\n")
+  sh(harness.process, "git -C '" + repo + "' add Cargo.toml CHANGELOG.md candidate.txt")
+  sh(harness.process, "git -C '" + repo + "' commit -q -m 'candidate (#42)'")
+  const pin = trim(sh(harness.process, "git -C '" + repo + "' rev-parse HEAD").stdout)
+  harness.fs.write_text(path_join(repo, "Cargo.toml"), "[workspace.package]\nversion = \"1.2.5\"\n")
+  harness.fs.write_text(path_join(repo, "candidate.txt"), "later\n")
+  sh(harness.process, "git -C '" + repo + "' add Cargo.toml candidate.txt")
+  sh(harness.process, "git -C '" + repo + "' commit -q -m later")
+  const later = trim(sh(harness.process, "git -C '" + repo + "' rev-parse HEAD").stdout)
+  sh(harness.process, "git -C '" + repo + "' switch -q main")
+  sh(harness.process, "git -C '" + repo + "' branch -f candidate '" + pin + "'")
+  return {root: root, repo: repo, pin: pin, later: later}
+}
+
+fn audit_cfg(harness: {env: HarnessEnv, process: HarnessProcess}, repo: string) -> ReleaseConfig {
+  let cfg = parse_release_args(
+    harness.env,
+    ["--repo", repo, "--mode", "audit", "--at-sha", "candidate"],
+  )
+  cfg["pin_sha"] = resolve_pin_sha(harness.process, cfg)
+  return cfg
+}
+
+pipeline test_audit_snapshot_is_exact_across_caller_and_ref_drift(harness: Harness, task: any) {
+  const fixture = audit_snapshot_fixture(harness)
+  const canonical_source = trim(
+    sh(harness.process, "git -C '" + fixture.repo + "' rev-parse --show-toplevel").stdout,
+  )
+  const source_head = trim(
+    sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout,
+  )
+  const source_status = sh(harness.process, "git -C '" + fixture.repo + "' status --porcelain")
+    .stdout
+  const unresolved = audit_cfg({env: harness.env, process: harness.process}, fixture.repo)
+  assert_eq(unresolved.pin_sha, fixture.pin)
+  let unresolved_error = ""
+  try {
+    release_analysis_snapshot({env: harness.env, process: harness.process}, unresolved)
+  } catch (e) {
+    unresolved_error = to_string(e)
+  }
+  assert_eq(unresolved_error, "release analysis requires one detached worktree at the resolved pin")
+  const run_id = "test-audit-snapshot-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(harness, unresolved, run_id)
+  sh(harness.process, "git -C '" + fixture.repo + "' branch -f candidate '" + fixture.later + "'")
+  const snapshot = release_analysis_snapshot({env: harness.env, process: harness.process}, cfg)
+  assert_eq(snapshot.kind, "detached_worktree")
+  assert_eq(snapshot.requested_sha, "candidate")
+  assert_eq(snapshot.resolved_sha, fixture.pin)
+  assert_eq(snapshot.analysis_head, fixture.pin)
+  assert_eq(snapshot.analysis_root, cfg.repo)
+  assert_eq(snapshot.source_repo, canonical_source)
+  assert_eq(current_version(harness.fs, cfg), "1.2.4")
+  assert_eq(changelog_top(harness.fs, cfg), "1.2.4")
+  assert_eq(harness.fs.read_text(path_join(cfg.repo, "candidate.txt")), "pin\n")
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + cfg.repo + "' rev-parse HEAD").stdout),
+    fixture.pin,
+  )
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse candidate").stdout),
+    fixture.later,
+  )
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout),
+    source_head,
+  )
+  assert_eq(
+    sh(harness.process, "git -C '" + fixture.repo + "' status --porcelain").stdout,
+    source_status,
+  )
+  let wrong_owner_error = ""
+  try {
+    finish_release_workspace(harness, cfg, false, "another-run")
+  } catch (e) {
+    wrong_owner_error = to_string(e)
+  }
+  assert(contains(wrong_owner_error, "not owned by run another-run"))
+  assert_eq(harness.fs.exists(cfg.repo), true)
+  const cleanup = finish_release_workspace(harness, cfg, false, run_id)
+  assert_eq(cleanup?.success, true)
+  assert_eq(cleanup?.preserved, false)
+  assert_eq(harness.fs.exists(cfg.repo), false)
+  const repeated = finish_release_workspace(harness, cfg, false, run_id)
+  assert_eq(repeated?.success, true)
+  assert_eq(repeated?.skipped, true)
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout),
+    source_head,
+  )
+  assert_eq(
+    sh(harness.process, "git -C '" + fixture.repo + "' status --porcelain").stdout,
+    source_status,
+  )
+}
+
+pipeline test_release_workspace_preserves_dirty_operator_checkout_and_warm_target(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = repo_fixture(harness)
+  sh(harness.process, "git -C '" + fixture.repo + "' switch -q -c operator-work")
+  harness.fs.write_text(path_join(fixture.repo, "fixture.txt"), "operator edit\n")
+  harness.fs.write_text(path_join(fixture.repo, "staged.txt"), "staged\n")
+  sh(harness.process, "git -C '" + fixture.repo + "' add staged.txt")
+  harness.fs.write_text(path_join(fixture.repo, "operator.txt"), "uncommitted\n")
+  const before_head = trim(
+    sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout,
+  )
+  const before_status = sh(
+    harness.process,
+    "git -C '" + fixture.repo + "' status --porcelain --untracked-files=normal",
+  ).stdout
+  const before_index = sh(harness.process, "git -C '" + fixture.repo + "' diff --cached --binary")
+    .stdout
+  const before_worktree = sh(harness.process, "git -C '" + fixture.repo + "' diff --binary").stdout
+  const original = live_cfg(harness.env, fixture.repo, fixture.pin)
+  const run_id = "test-dirty-operator-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(harness, original, run_id)
+  assert(cfg.repo != fixture.repo)
+  assert_eq(
+    cfg.source_repo,
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse --show-toplevel").stdout),
+  )
+  assert_eq(cfg.release_cargo_target_dir, original.release_cargo_target_dir)
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' branch --show-current").stdout),
+    "operator-work",
+  )
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout),
+    before_head,
+  )
+  assert_eq(
+    sh(
+      harness.process,
+      "git -C '" + fixture.repo + "' status --porcelain --untracked-files=normal",
+    ).stdout,
+    before_status,
+  )
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + cfg.repo + "' rev-parse HEAD").stdout),
+    fixture.pin,
+  )
+  assert_eq(trim(sh(harness.process, "git -C '" + cfg.repo + "' branch --show-current").stdout), "")
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
+  assert_eq(cleanup?.success, true)
+  assert_eq(harness.fs.exists(cfg.repo), false)
+  const post_cleanup_cfg = release_post_cleanup_config(cfg, cleanup)
+  assert_eq(post_cleanup_cfg.repo, cfg.source_repo)
+  assert_eq(post_cleanup_cfg.release_workspace, cfg.release_workspace)
+  assert_eq(harness.fs.exists(post_cleanup_cfg.repo), true)
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' branch --show-current").stdout),
+    "operator-work",
+  )
+  assert_eq(
+    sh(
+      harness.process,
+      "git -C '" + fixture.repo + "' status --porcelain --untracked-files=normal",
+    ).stdout,
+    before_status,
+  )
+  assert_eq(
+    sh(harness.process, "git -C '" + fixture.repo + "' diff --cached --binary").stdout,
+    before_index,
+  )
+  assert_eq(
+    sh(harness.process, "git -C '" + fixture.repo + "' diff --binary").stdout,
+    before_worktree,
+  )
+  assert_eq(harness.fs.read_text(path_join(fixture.repo, "operator.txt")), "uncommitted\n")
+}
+
+pipeline test_failed_release_workspace_is_preserved_with_recovery_path(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = repo_fixture(harness)
+  const run_id = "test-failed-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    run_id,
+  )
+  const cleanup = finish_release_workspace(harness, cfg, false, run_id)
+  assert_eq(cleanup?.preserved, true)
+  assert(contains(cleanup?.detail ?? "", cfg.repo))
+  assert_eq(harness.fs.exists(cfg.repo), true)
+  assert_eq(release_post_cleanup_config(cfg, cleanup).repo, cfg.repo)
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove '" + cfg.repo + "'")
+}
+
+pipeline test_successful_cleanup_preserves_unexpected_dirty_workspace(harness: Harness, task: any) {
+  const fixture = repo_fixture(harness)
+  const run_id = "test-dirty-workspace-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    run_id,
+  )
+  harness.fs.write_text(path_join(cfg.repo, "unexpected.txt"), "preserve me\n")
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
+  assert_eq(cleanup?.success, false)
+  assert_eq(cleanup?.preserved, true)
+  assert(contains(cleanup?.warning ?? "", "dirty"))
+  assert_eq(harness.fs.exists(cfg.repo), true)
+  assert_eq(release_post_cleanup_config(cfg, cleanup).repo, cfg.repo)
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + cfg.repo + "'")
+}
+
+pipeline test_pre_tag_resume_aligns_only_isolated_workspace_to_candidate(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = repo_fixture(harness)
+  harness.fs.write_text(path_join(fixture.repo, "candidate.txt"), "candidate\n")
+  sh(harness.process, "git -C '" + fixture.repo + "' add candidate.txt")
+  sh(harness.process, "git -C '" + fixture.repo + "' commit -q -m candidate")
+  const candidate = trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
+  const source_branch = trim(
+    sh(harness.process, "git -C '" + fixture.repo + "' branch --show-current").stdout,
+  )
+  const source_head = candidate
+  const run_id = "test-pre-tag-" + harness.random.uuid_v7()
+  let cfg = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    run_id,
+  )
+  cfg["pre_tag_resume"] = true
+  cfg["fixup_publication"] = release_publication("1.2.3", candidate)
+  align_pre_tag_release_workspace(harness, cfg, "test-pre-tag")
+  assert_eq(trim(sh(harness.process, "git -C '" + cfg.repo + "' rev-parse HEAD").stdout), candidate)
+  assert_eq(trim(sh(harness.process, "git -C '" + cfg.repo + "' branch --show-current").stdout), "")
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' branch --show-current").stdout),
+    source_branch,
+  )
+  assert_eq(
+    trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout),
+    source_head,
+  )
+  const cleanup = finish_release_workspace(harness, cfg, true, run_id)
+  assert_eq(cleanup?.success, true)
+}
+
+pipeline test_shared_workspace_is_reused_and_keeps_untouched_file_mtimes(
+  harness: Harness,
+  task: any,
+) {
+  // The whole point of a shared workspace is Cargo's fingerprint, which is an
+  // mtime comparison. A worktree recreated at any path — stable or not —
+  // presents every file as new and recompiles everything, so reuse only pays
+  // if it switches a surviving checkout instead of checking one out again.
+  // Falsifier: without reuse, `fixture.txt` carries a fresh mtime after the
+  // second run and every crate reading it would rebuild.
+  const fixture = repo_fixture(harness)
+  const first_run = "test-shared-first-" + harness.random.uuid_v7()
+  const first = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    first_run,
+    true,
+  )
+  assert_eq(basename(first.repo), "release")
+  assert_eq(basename(dirname(first.repo)), "harn-release-workspaces")
+  assert_eq(first.release_workspace_shared, true)
+  const stamped = file_mtime(harness.process, path_join(first.repo, "fixture.txt"))
+  const shipped = finish_release_workspace(harness, first, true, first_run)
+  assert_eq(shipped?.retained, true)
+  assert_eq(shipped?.preserved, false)
+  assert_eq(harness.fs.exists(first.repo), true)
+  // Retention is as final as removal for this run: post-run tools go back to
+  // the durable source checkout either way.
+  assert_eq(release_post_cleanup_config(first, shipped).repo, first.source_repo)
+  assert(first.source_repo != first.repo)
+  harness.fs.write_text(path_join(fixture.repo, "next.txt"), "next\n")
+  sh(harness.process, "git -C '" + fixture.repo + "' add next.txt")
+  sh(harness.process, "git -C '" + fixture.repo + "' commit -q -m next")
+  const next_pin = trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
+  const second_run = "test-shared-second-" + harness.random.uuid_v7()
+  const second = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, next_pin),
+    second_run,
+    true,
+  )
+  assert_eq(second.repo, first.repo)
+  assert_eq(
+    lowercase(trim(sh(harness.process, "git -C '" + second.repo + "' rev-parse HEAD").stdout)),
+    lowercase(next_pin),
+  )
+  assert_eq(harness.fs.exists(path_join(second.repo, "next.txt")), true)
+  assert_eq(file_mtime(harness.process, path_join(second.repo, "fixture.txt")), stamped)
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + second.repo + "'")
+}
+
+@serial(group: "host-lease-store")
+pipeline test_audits_reuse_one_leased_workspace_and_keep_untouched_file_mtimes(
+  harness: Harness,
+  task: any,
+) {
+  // Canonical audit behavior reaches both owners of the speedup: the lease
+  // selects the shared path, then audit cleanup retains the clean checkout.
+  // Falsifier: either a per-run path or removal gives fixture.txt a fresh mtime
+  // on the second materialization, which is the Cargo rebuild trigger.
+  const fixture = repo_fixture(harness)
+  const domain = "release-workspace-test-" + harness.random.uuid_v7()
+  const first_run = "test-audit-first-" + harness.random.uuid_v7()
+  const first_lease = release_workspace_lease_acquire(
+    harness,
+    audit_pin_cfg(harness.env, fixture.repo, fixture.pin, domain),
+    first_run,
+    "audit",
+  )
+  assert_eq(first_lease.state, "owned")
+  const first = materialize_release_workspace(
+    harness,
+    audit_pin_cfg(harness.env, fixture.repo, fixture.pin, domain),
+    first_run,
+    release_workspace_lease_shared(first_lease),
+  )
+  assert_eq(basename(first.repo), "release")
+  const stamped = file_mtime(harness.process, path_join(first.repo, "fixture.txt"))
+  const retained = finish_release_workspace(harness, first, true, first_run)
+  assert_eq(retained?.retained, true)
+  assert_eq(harness.fs.exists(first.repo), true)
+  assert_eq(release_workspace_lease_finish(harness.host_lease, first_lease)?.released, true)
+  harness.fs.write_text(path_join(fixture.repo, "next.txt"), "next\n")
+  sh(harness.process, "git -C '" + fixture.repo + "' add next.txt")
+  sh(harness.process, "git -C '" + fixture.repo + "' commit -q -m next")
+  const next_pin = trim(sh(harness.process, "git -C '" + fixture.repo + "' rev-parse HEAD").stdout)
+  const second_run = "test-audit-second-" + harness.random.uuid_v7()
+  const second_cfg = audit_pin_cfg(harness.env, fixture.repo, next_pin, domain)
+  const second_lease = release_workspace_lease_acquire(harness, second_cfg, second_run, "audit")
+  assert_eq(second_lease.state, "owned")
+  const second = materialize_release_workspace(
+    harness,
+    second_cfg,
+    second_run,
+    release_workspace_lease_shared(second_lease),
+  )
+  assert_eq(second.repo, first.repo)
+  assert_eq(file_mtime(harness.process, path_join(second.repo, "fixture.txt")), stamped)
+  assert_eq(harness.fs.exists(path_join(second.repo, "next.txt")), true)
+  release_workspace_lease_finish(harness.host_lease, second_lease)
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + second.repo + "'")
+}
+
+pipeline test_unreusable_shared_workspace_is_moved_aside_not_deleted(harness: Harness, task: any) {
+  // A surviving workspace may be the only copy of a failed release's recovery
+  // state, so a run that cannot reuse it must never remove it.
+  const fixture = repo_fixture(harness)
+  const first_run = "test-superseded-first-" + harness.random.uuid_v7()
+  const first = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    first_run,
+    true,
+  )
+  harness.fs.write_text(path_join(first.repo, "recovery.txt"), "do not lose me\n")
+  const second_run = "test-superseded-second-" + harness.random.uuid_v7()
+  const second = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    second_run,
+    true,
+  )
+  assert_eq(second.repo, first.repo)
+  const displaced = first.repo + "-superseded-" + second_run
+  assert_eq(harness.fs.exists(displaced), true)
+  assert_eq(harness.fs.read_text(path_join(displaced, "recovery.txt")), "do not lose me\n")
+  assert_eq(trim(sh(harness.process, "git -C '" + second.repo + "' status --porcelain").stdout), "")
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + second.repo + "'")
+  sh(harness.process, "git -C '" + fixture.repo + "' worktree remove --force '" + displaced + "'")
+}
+
+pipeline test_a_run_without_the_release_lane_keeps_its_own_workspace(harness: Harness, task: any) {
+  // Reuse is safe only because the release lane proves one run at a time. A run
+  // that does not hold it gets today's per-run path and today's refusal.
+  const fixture = repo_fixture(harness)
+  const run_id = "test-unshared-" + harness.random.uuid_v7()
+  const cfg = materialize_release_workspace(
+    harness,
+    live_cfg(harness.env, fixture.repo, fixture.pin),
+    run_id,
+  )
+  assert_eq(basename(cfg.repo), "release-" + run_id)
+  assert_eq(basename(dirname(cfg.repo)), "harn-release-workspaces")
+  assert_eq(cfg.release_workspace_shared, false)
+  const shipped = finish_release_workspace(harness, cfg, true, run_id)
+  assert_eq(shipped?.retained, false)
+  assert_eq(harness.fs.exists(cfg.repo), false)
+}

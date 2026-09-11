@@ -1,0 +1,1 @@
+Hosted release recovery can now adopt an operator-selected exact consumer pre-tag proof run. The release verifies the run's workflow, event, candidate identity, and source revision instead of recapturing a moved consumer `main` or dispatching duplicate CI.

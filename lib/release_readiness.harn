@@ -1,0 +1,485 @@
+import { ConnectorHttpResponse } from "std/connectors/http"
+import { connector_http_request } from "std/connectors/shared"
+import { poll_until } from "std/poll"
+import { is_prerelease, strip_v } from "std/semver"
+import { github_release_at_tag } from "./github"
+
+pub type HarnReleaseArtifact = {target: string, archive: string, workflow_job: string}
+
+pub type CrateVisibility = {published: bool, state: string}
+
+pub type GitHubReleaseState = {
+  found: bool,
+  draft: bool,
+  prerelease: bool,
+  finalized: bool,
+  asset_names: list<string>,
+}
+
+pub type HarnReleaseReadiness = {
+  target: string,
+  version_no_v: string,
+  crate_published: bool,
+  required_assets: list<string>,
+  asset_names: list<string>,
+  missing_assets: list<string>,
+  release_draft: bool,
+  release_prerelease: bool,
+  release_finalized: bool,
+  ready: bool,
+}
+
+pub type ReleaseReadinessPollOptions = {max_attempts?: int, interval_ms?: int, timeout_ms?: int}
+
+/** Connector response plus the minimal synthetic shape used by pure policy tests. */
+pub type CrateVisibilityResponse = ConnectorHttpResponse | {ok?: bool, status?: int, ...rest}
+
+pub type GitHubReleaseLookup = {
+  found?: bool,
+  release?: {draft?: bool, prerelease?: bool, assets?: list<{name: string, ...rest}>, ...rest},
+  ...rest,
+}
+
+pub type GitHubReleaseLookupResponse = GitHubReleaseLookup \
+  | Result<GitHubReleaseLookup, {message: string, ...rest}>
+
+pub type ReleaseReadinessAdapter = {
+  crate_visibility: fn(string) -> CrateVisibility,
+  github_release: fn(string) -> GitHubReleaseState,
+}
+
+pub type ReleaseReadinessPollResult = {
+  ready: bool,
+  attempts: int,
+  snapshot: HarnReleaseReadiness,
+  attempt_lines: list<string>,
+}
+
+/** One catalog owns both release archives and their producing matrix jobs. */
+fn release_artifact(target: any, extension: any = "tar.gz") -> HarnReleaseArtifact {
+  return {target: target, archive: "harn-${target}.${extension}", workflow_job: "Build ${target}"}
+}
+
+pub fn harn_release_artifacts() -> list<HarnReleaseArtifact> {
+  return [
+    release_artifact("aarch64-apple-darwin"),
+    release_artifact("aarch64-unknown-linux-gnu"),
+    release_artifact("x86_64-apple-darwin"),
+    release_artifact("x86_64-pc-windows-msvc", "zip"),
+    release_artifact("x86_64-unknown-linux-gnu"),
+  ]
+}
+
+pub fn required_harn_release_build_jobs() -> list<string> {
+  return harn_release_artifacts().map({ artifact -> artifact.workflow_job }).to_list()
+}
+
+/** Finalization writes these sidecars, so archives alone never prove a complete release. */
+pub fn required_harn_release_assets() -> list<string> {
+  return harn_release_artifacts().map({ artifact -> artifact.archive }).to_list()
+    + ["SHA256SUMS", "release-assets.json"]
+}
+
+pub fn missing_release_assets(
+  asset_names: list<string>,
+  required_assets: list<string>? = nil,
+) -> list<string> {
+  const required = required_assets ?? required_harn_release_assets()
+  return required.filter({ name -> !asset_names.any({ asset -> asset == name }) }).to_list()
+}
+
+/** Source-bearing sentinel plus one independent cross-check crate. */
+pub const HARN_REGISTRY_IMMUTABILITY_CRATES: list<string> = ["harn-vm", "harn-cli"]
+
+/** Same bounded ceiling Harn uses for package archives. */
+pub const HARN_REGISTRY_CRATE_ARCHIVE_MAX_BYTES: int = 67108864
+
+pub type CargoVcsInfo = {sha1: string, path_in_vcs: string, dirty: bool}
+
+pub type RegistryVersionIdentityState = "unpublished" \
+  | "matched" \
+  | "missing_vcs" \
+  | "conflict" \
+  | "unknown"
+
+/** Registry proof for one release version, independent of GitHub ref state. */
+pub type RegistryVersionProbe = {
+  version: string,
+  visibility: CrateVisibility,
+  identity_state: RegistryVersionIdentityState,
+  source_oid: string,
+  crates: list<string>,
+}
+
+pub fn crates_io_version_url(crate_name: string, version_no_v: string) -> string {
+  return "https://crates.io/api/v1/crates/${crate_name}/${version_no_v}"
+}
+
+pub fn crates_io_crate_archive_url(crate_name: string, version_no_v: string) -> string {
+  return "https://static.crates.io/crates/${crate_name}/${crate_name}-${version_no_v}.crate"
+}
+
+pub fn crate_visibility_from_response(response: CrateVisibilityResponse) -> CrateVisibility {
+  if response.ok ?? false {
+    return {published: true, state: "published"}
+  }
+  if to_int(response.status) == 404 {
+    return {published: false, state: "not_found"}
+  }
+  return {published: false, state: "unknown"}
+}
+
+/**
+ * Parse `.cargo_vcs_info.json` from a crate archive. The git SHA is the
+ * immutable packaged source; `dirty` is informational and may differ across
+ * crates that embed generated payloads.
+ */
+pub fn cargo_vcs_info_from_json(text: string) -> CargoVcsInfo? {
+  const parsed = try {
+    json_parse(text)
+  }
+  if is_err(parsed) {
+    return nil
+  }
+  const root = unwrap(parsed)
+  const sha1 = lowercase(trim(to_string(root?.git?.sha1 ?? "")))
+  if len(regex_captures("^[0-9a-f]{40}$", sha1)) != 1 {
+    return nil
+  }
+  return {
+    sha1: sha1,
+    path_in_vcs: trim(to_string(root?.path_in_vcs ?? "")),
+    dirty: root?.git?.dirty ?? false,
+  }
+}
+
+/** Locate and parse `.cargo_vcs_info.json` inside a `.crate` (gzip+tar) body. */
+pub fn cargo_vcs_info_from_crate_bytes(
+  archive_bytes: bytes,
+  crate_name: string,
+  version_no_v: string,
+) -> CargoVcsInfo? {
+  const expected = "${crate_name}-${version_no_v}/.cargo_vcs_info.json"
+  const entries = tar_extract(gzip_decode(archive_bytes))
+  for entry in entries {
+    if trim(to_string(entry.path ?? "")) == expected {
+      return cargo_vcs_info_from_json(bytes_to_string(entry.content))
+    }
+  }
+  return nil
+}
+
+/** Collapse per-crate VCS identities into one fail-closed probe result. */
+pub fn registry_version_probe_from_identities(
+  version_no_v: string,
+  visibility: CrateVisibility,
+  identities: list<{crate_name: string, info: CargoVcsInfo?}>,
+) -> RegistryVersionProbe {
+  const version = trim(version_no_v)
+  if visibility.state == "unknown" {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "unknown",
+      source_oid: "",
+      crates: identities.map({ entry -> entry.crate_name }).to_list(),
+    }
+  }
+  if !visibility.published {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "unpublished",
+      source_oid: "",
+      crates: [],
+    }
+  }
+  let source_oid = ""
+  let crates: list<string> = []
+  for entry in identities {
+    crates = crates + [entry.crate_name]
+    if entry.info == nil {
+      return {
+        version: version,
+        visibility: visibility,
+        identity_state: "missing_vcs",
+        source_oid: "",
+        crates: crates,
+      }
+    }
+    if source_oid == "" {
+      source_oid = entry.info.sha1
+      continue
+    }
+    if entry.info.sha1 != source_oid {
+      return {
+        version: version,
+        visibility: visibility,
+        identity_state: "conflict",
+        source_oid: "",
+        crates: crates,
+      }
+    }
+  }
+  if source_oid == "" {
+    return {
+      version: version,
+      visibility: visibility,
+      identity_state: "missing_vcs",
+      source_oid: "",
+      crates: crates,
+    }
+  }
+  return {
+    version: version,
+    visibility: visibility,
+    identity_state: "matched",
+    source_oid: source_oid,
+    crates: crates,
+  }
+}
+
+fn crate_version_visibility(
+  harness: {clock: HarnessClock, net: HarnessNet},
+  crate_name: any,
+  version_no_v: any,
+) -> CrateVisibility {
+  return crate_visibility_from_response(
+    connector_http_request(
+      harness.clock,
+      harness.net,
+      "GET",
+      crates_io_version_url(crate_name, version_no_v),
+      {
+        provider: "crates.io",
+        operation: "crate_version_visibility",
+        headers: {Accept: "application/json", "User-Agent": "harn-bump-fleet release-readiness"},
+        retry: {max_attempts: 1},
+      },
+    ),
+  )
+}
+
+fn crate_version_published(
+  harness: {clock: HarnessClock, net: HarnessNet},
+  crate_name: any,
+  version_no_v: any,
+) {
+  return crate_version_visibility(harness, crate_name, version_no_v).published
+}
+
+pub fn harn_crate_published(
+  harness: {clock: HarnessClock, net: HarnessNet},
+  version_no_v: string,
+) -> bool {
+  return crate_version_published(harness, "harn-cli", version_no_v)
+}
+
+pub fn download_crate_archive_bytes(
+  harness: Harness,
+  crate_name: string,
+  version_no_v: string,
+) -> bytes? {
+  const dir = path_join(harness.fs.temp_dir(), "registry-immutability-" + harness.random.uuid_v7())
+  harness.fs.mkdir(dir, true)
+  const path = path_join(dir, "${crate_name}-${version_no_v}.crate")
+  const downloaded = try {
+    harness.net.download(
+      crates_io_crate_archive_url(crate_name, version_no_v),
+      path,
+      {
+        headers: {"User-Agent": "harn-bump-fleet release-readiness"},
+        retry: {max: 1, backoff_ms: 0},
+        max_response_bytes: HARN_REGISTRY_CRATE_ARCHIVE_MAX_BYTES,
+      },
+    )
+  }
+  if is_err(downloaded) {
+    return nil
+  }
+  const receipt = unwrap(downloaded)
+  if !(receipt.ok ?? false) {
+    return nil
+  }
+  const body = try {
+    harness.fs.read_bytes(path)
+  }
+  if is_err(body) {
+    return nil
+  }
+  return unwrap(body)
+}
+
+fn crate_archive_vcs_identity(
+  harness: Harness,
+  crate_name: string,
+  version_no_v: string,
+) -> CargoVcsInfo? {
+  const archive = download_crate_archive_bytes(harness, crate_name, version_no_v)
+  if archive == nil {
+    return nil
+  }
+  return cargo_vcs_info_from_crate_bytes(archive, crate_name, version_no_v)
+}
+
+/**
+ * Ask crates.io whether `version` is already immutable, and when possible
+ * recover the packaged source OID from sentinel crate archives.
+ */
+pub fn probe_registry_version_immutability(
+  harness: Harness,
+  version_no_v: string,
+) -> RegistryVersionProbe {
+  const version = trim(version_no_v)
+  const visibility = crate_version_visibility(
+    {clock: harness.clock, net: harness.net},
+    HARN_REGISTRY_IMMUTABILITY_CRATES[0],
+    version,
+  )
+  if visibility.state == "unknown" || !visibility.published {
+    return registry_version_probe_from_identities(version, visibility, [])
+  }
+  let identities: list<{crate_name: string, info: CargoVcsInfo?}> = []
+  for crate_name in HARN_REGISTRY_IMMUTABILITY_CRATES {
+    identities = identities
+      + [{crate_name: crate_name, info: crate_archive_vcs_identity(harness, crate_name, version)}]
+  }
+  return registry_version_probe_from_identities(version, visibility, identities)
+}
+
+/** Normalize the connector result once; unknown provider state fails closed. */
+pub fn github_release_state(lookup: GitHubReleaseLookupResponse) -> GitHubReleaseState {
+  if is_err(lookup) || !(lookup?.found ?? false) {
+    return {found: false, draft: false, prerelease: false, finalized: false, asset_names: []}
+  }
+  const release = lookup.release
+  const draft = release?.draft ?? false
+  const prerelease = release?.prerelease ?? false
+  return {
+    found: true,
+    draft: draft,
+    prerelease: prerelease,
+    finalized: !draft && !prerelease,
+    asset_names: (release?.assets ?? []).map({ asset -> asset.name }).to_list(),
+  }
+}
+
+pub fn harn_release_readiness_from(
+  target: string,
+  crate: CrateVisibility,
+  release: GitHubReleaseState,
+) -> HarnReleaseReadiness {
+  const required = required_harn_release_assets()
+  const missing = missing_release_assets(release.asset_names, required)
+  const expected_prerelease = is_prerelease(strip_v(target))
+  const release_finalized = release.found && !release.draft
+    && release.prerelease == expected_prerelease
+  return {
+    target: target,
+    version_no_v: strip_v(target),
+    crate_published: crate.published,
+    required_assets: required,
+    asset_names: release.asset_names,
+    missing_assets: missing,
+    release_draft: release.draft,
+    release_prerelease: release.prerelease,
+    release_finalized: release_finalized,
+    ready: crate.published && len(missing) == 0 && release_finalized,
+  }
+}
+
+pub fn release_readiness_detail(snapshot: HarnReleaseReadiness) -> string {
+  const crate = if snapshot.crate_published {
+    "harn-cli ${snapshot.version_no_v} published"
+  } else {
+    "harn-cli ${snapshot.version_no_v} not visible on crates.io"
+  }
+  const assets = if len(snapshot.missing_assets) == 0 {
+    "required release assets present"
+  } else {
+    "missing release assets: " + join(snapshot.missing_assets, ", ")
+  }
+  const release = if snapshot.release_finalized {
+    "GitHub release finalized"
+  } else if snapshot.release_prerelease {
+    "GitHub release still marked prerelease"
+  } else if snapshot.release_draft {
+    "GitHub release still a draft"
+  } else {
+    "GitHub release finalization unknown"
+  }
+  return "${crate}; ${assets}; ${release}"
+}
+
+pub fn live_release_readiness_adapter(
+  harness: Harness,
+  repo: string = "burin-labs/harn",
+) -> ReleaseReadinessAdapter {
+  return {
+    crate_visibility: fn(version) { return crate_version_visibility(
+      {clock: harness.clock, net: harness.net},
+      "harn-cli",
+      version,
+    ) },
+    github_release: fn(tag) {
+      const result = github_release_at_tag(harness, repo, tag)
+      return if is_err(result) {
+        github_release_state(Err(unwrap_err(result)))
+      } else {
+        github_release_state(unwrap(result))
+      }
+    },
+  }
+}
+
+pub fn harn_release_readiness(harness: Harness, target: string) -> HarnReleaseReadiness {
+  const adapter = live_release_readiness_adapter(harness)
+  return harn_release_readiness_from(
+    target,
+    adapter.crate_visibility(strip_v(target)),
+    adapter.github_release(target),
+  )
+}
+
+/** Poll injected observations through std/poll, bounded by attempts and time. */
+pub fn wait_for_harn_release(
+  clock: HarnessClock,
+  target: string,
+  adapter: ReleaseReadinessAdapter,
+  options: ReleaseReadinessPollOptions = {},
+) -> ReleaseReadinessPollResult {
+  const max = options.max_attempts ?? 180
+  const interval = options.interval_ms ?? 20000
+  const practical = max > 0 && max <= 1000000 && interval > 0 && interval <= 86400000
+  const timeout = if practical {
+    options.timeout_ms ?? max * interval * 2
+  } else {
+    0
+  }
+  if timeout < 1 {
+    throw "release readiness polling requires positive practical bounds"
+  }
+  let attempts = 0
+  let last = nil
+  let lines = []
+  const ready = poll_until(
+    clock,
+    { ->
+      attempts = attempts + 1
+      last = harn_release_readiness_from(
+        target,
+        adapter.crate_visibility(strip_v(target)),
+        adapter.github_release(target),
+      )
+      lines = lines + ["attempt ${attempts}/${max}: ${release_readiness_detail(last)}"]
+      return if last.ready {
+        last
+      } else {
+        nil
+      }
+    },
+    {max_attempts: max, interval_ms: interval, timeout_ms: timeout},
+  )
+  const snapshot = ready ?? last
+  return {ready: snapshot.ready, attempts: attempts, snapshot: snapshot, attempt_lines: lines}
+}

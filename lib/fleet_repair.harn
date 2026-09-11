@@ -1,0 +1,1413 @@
+import { agent_edit_tools, agent_host_tools } from "std/agent/host_tools"
+import { agent_loop } from "std/agent/loop"
+import { agent_preset } from "std/agent/presets"
+import { is_v_semver } from "std/semver"
+import { workflow_run_repair } from "std/workflow/repair"
+import { FleetConvergenceRow, FleetConvergenceSnapshot } from "./fleet_convergence"
+import {
+  FleetManifest,
+  FleetRepository,
+  bump_validation_command,
+  resolve_harn_update_spec,
+} from "./fleet_manifest"
+pub import { fleet_repair_authority_audit } from "./fleet_repair_authority"
+pub import {
+  FleetRecoveryCandidate,
+  FleetRepairAuthorityAudit,
+  FleetRepairCandidate,
+  FleetRepairPlan,
+  FleetRepairPolicy,
+  FleetRepairReceipt,
+} from "./fleet_repair_contract"
+pub import {
+  FleetRepairAttempt,
+  FleetRepairControlPlaneEvidence,
+  FleetRepairResult,
+  FleetRepairSourceMutationEvidence,
+  FleetRepairTerminalOutcome,
+  FleetRepairTerminalResult,
+  FleetRepairValidationEvidence,
+  fleet_repair_terminal_outcome,
+} from "./fleet_repair_terminal"
+import { project_fleet_repair_terminal_result } from "./fleet_repair_terminal"
+import { github_pr_upsert, github_pr_view, github_worktree_commit } from "./github"
+import {
+  HarnUpdateRuntimeProvenance,
+  harn_update_budget_decision,
+  harn_update_route,
+  harn_update_usage,
+} from "./harn_update"
+import { install_binder, planner_defaults } from "./llm_defaults"
+import { pr_title_for_consumer } from "./pr_title_convention"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+import {
+  await_published_head,
+  load_pr_signature_metadata,
+  unsigned_commits,
+} from "./signed_bot_prs"
+import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
+
+// Change this when the repair prompt, tool surface, or receipt meaning changes.
+// A resumable agent session is evidence for one immutable repair contract, not
+// a cache that may outlive the checkout or the policy that created it.
+pub const REPAIR_CONTRACT_REVISION = "harn-update-repair-v10"
+
+// The repair controller itself needs GitHub and one model provider. Keep this
+// host-seeded allowlist exact: Harn's in-process clients must fail closed before
+// the first API request when the hosted launch contract drifts.
+pub const REPAIR_EGRESS_ALLOW = "api.github.com:443,api.cerebras.ai:443"
+
+pub const REPAIR_EGRESS_DEFAULT = "deny"
+
+pub const REPAIR_EGRESS_BLOCK_PRIVATE = "private"
+
+pub type FleetRepairEgressReadiness = {ready: bool, reason: string}
+
+pub fn fleet_repair_egress_readiness(
+  allow: string?,
+  default_action: string?,
+  block_private: string?,
+) -> FleetRepairEgressReadiness {
+  if trim(allow ?? "") != REPAIR_EGRESS_ALLOW {
+    return {ready: false, reason: "repair egress allowlist does not match the prepared contract"}
+  }
+  if trim(default_action ?? "") != REPAIR_EGRESS_DEFAULT {
+    return {ready: false, reason: "repair egress default must deny unmatched destinations"}
+  }
+  if trim(block_private ?? "") != REPAIR_EGRESS_BLOCK_PRIVATE {
+    return {ready: false, reason: "repair egress must retain the private-address guard"}
+  }
+  return {ready: true, reason: "exact repair destinations are prepared"}
+}
+
+const REPAIR_INSPECTION_ARGV_PREFIXES = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "blame"],
+  ["git", "rev-parse"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "view"],
+  ["rg"],
+  ["head"],
+  ["tail"],
+]
+
+/**
+ * Default repair breadth to the manifest-owned consumer set.
+ *
+ * The caller's Harn cost budget remains the global spend authority; an
+ * explicit repository limit is retained for rehearsals and operator overrides.
+ */
+pub fn fleet_repair_repository_limit(explicit: int?, manifest_repository_count: int) -> int {
+  return explicit ?? manifest_repository_count
+}
+
+/** Reserve every remaining retry before admitting one model attempt. */
+pub fn fleet_repair_safe_attempt_limit(
+  policy: FleetRepairPolicy,
+  repository_cost_usd: float,
+  run_cost_usd: float,
+) -> float {
+  const remaining_attempts = max(1, policy.max_attempts_per_repository)
+  return min(
+    policy.max_cost_per_attempt_usd,
+    min(
+      (policy.max_cost_per_repository_usd - repository_cost_usd) / remaining_attempts,
+      (policy.max_cost_per_run_usd - run_cost_usd) / remaining_attempts,
+    ),
+  )
+}
+
+fn repository_for(repositories: list<FleetRepository>, slug: string) -> FleetRepository? {
+  for repo in repositories {
+    if repo.slug == slug {
+      return repo
+    }
+  }
+  return nil
+}
+
+fn repair_refusal(row: FleetConvergenceRow, reason: string) {
+  return {repo: row.repo, reason: reason}
+}
+
+/**
+ * Admit only exact failed bump PRs with a manifest-owned validator.
+ *
+ * Provider/API failures, missing PRs, conflicts, drafts, and green-but-blocked
+ * branches are control-plane states rather than code failures. Sending those
+ * to a model would turn an operational problem into an unbounded edit request.
+ */
+pub fn fleet_repair_plan(
+  snapshot: FleetConvergenceSnapshot,
+  repositories: list<FleetRepository>,
+  policy: FleetRepairPolicy,
+  manifest: FleetManifest? = nil,
+) -> FleetRepairPlan {
+  const update_manifest: FleetManifest = manifest
+    ?? {
+      schema_version: 1,
+      fleet: {default_root: "~/projects", default_branch: "main"},
+      policy: {
+        package_workflow:
+          "owner/repo/.github/workflows/package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        bump_workflow:
+          "owner/repo/.github/workflows/bump.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+      repositories: repositories,
+    }
+  let candidates: list<FleetRepairCandidate> = []
+  let recoveries: list<FleetRecoveryCandidate> = []
+  let refused: list<{repo: string, reason: string}> = []
+  for row in snapshot.repositories {
+    if row.state != "failed" {
+      continue
+    }
+    const repo = repository_for(repositories, row.repo)
+    if repo == nil {
+      refused = refused + [repair_refusal(row, "repository_not_in_manifest")]
+      continue
+    }
+    const update = resolve_harn_update_spec(update_manifest, repo, snapshot.target)
+    if !update.repair_enabled {
+      refused = refused + [repair_refusal(row, "repair_disabled_by_update_contract")]
+      continue
+    }
+    if row.reason == "target_branch_missing_pull_request" {
+      if trim(row.head_sha ?? "") == "" || trim(row.branch_pin ?? "") == "" {
+        refused = refused + [repair_refusal(row, "missing_target_branch_lease")]
+      } else if len(candidates) + len(recoveries) >= policy.max_repositories {
+        refused = refused + [repair_refusal(row, "repository_budget_exhausted")]
+      } else {
+        recoveries = recoveries
+          + [
+            {
+              repo: row.repo,
+              head_sha: row.head_sha ?? "",
+              branch_pin: row.branch_pin ?? "",
+              branch: update.branch,
+              base_branch: update.base_branch,
+              auto_arm: update.auto_arm,
+              require_signed_head: update.require_signed_head,
+              pr_title_area: trim(repo.pr_title_area ?? ""),
+            },
+          ]
+      }
+      continue
+    }
+    if row.reason != "checks_failing" {
+      refused = refused + [repair_refusal(row, "failure_not_code_repairable:" + row.reason)]
+      continue
+    }
+    if (row.pr_number ?? 0) <= 0 || trim(row.head_sha ?? "") == "" {
+      refused = refused + [repair_refusal(row, "missing_pull_request_lease")]
+      continue
+    }
+    const validation_command = bump_validation_command(repo)
+    if validation_command == "" {
+      refused = refused + [repair_refusal(row, "missing_manifest_validator")]
+      continue
+    }
+    if len(candidates) >= policy.max_repositories {
+      refused = refused + [repair_refusal(row, "repository_budget_exhausted")]
+      continue
+    }
+    candidates = candidates
+      + [
+        {
+          repo: row.repo,
+          directory: repo.directory,
+          pr_number: row.pr_number ?? 0,
+          pr_url: row.pr_url ?? "",
+          head_sha: row.head_sha ?? "",
+          validation_command: validation_command,
+          failing_checks: row.failing_checks ?? [],
+          allowed_new_files: repo.bump_allowed_new_files ?? [],
+          branch: update.branch,
+          auto_arm: update.auto_arm,
+          require_signed_head: update.require_signed_head,
+        },
+      ]
+  }
+  return {target: snapshot.target, recoveries: recoveries, candidates: candidates, refused: refused}
+}
+
+/** Recover a signed target branch that the bump producer failed to present. */
+fn recover_target_branch(harness: Harness, candidate: FleetRecoveryCandidate) -> FleetRepairResult {
+  const upsert = github_pr_upsert(
+    harness,
+    {
+      slug: candidate.repo,
+      head: candidate.branch,
+      base: candidate.base_branch,
+      title: pr_title_for_consumer(candidate.pr_title_area, "Bump Harn runtime"),
+      body:
+        "Automated Harn runtime bump. The fleet controller recovered the exact signed target branch after the producer's post-publication comparison returned a false no-op. Merges through the normal queue.",
+      expected_head_oid: candidate.head_sha,
+    },
+  )
+  if is_err(upsert) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "pull_request_recovery_failed:" + to_string(unwrap_err(upsert)),
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const pr = unwrap(upsert)
+  const presented = {
+    pull_request_present_before: !pr.created,
+    pull_request_present_after: true,
+    auto_merge_before: pr.auto_merge_armed,
+    auto_merge_after: pr.auto_merge_armed,
+  }
+  if candidate.require_signed_head {
+    const metadata = try {
+      load_pr_signature_metadata(harness, candidate.repo, pr.number)
+    } catch (error) {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: "recovered_pull_request_signing_probe_failed:" + to_string(error),
+        pr_number: pr.number,
+        old_head_sha: candidate.head_sha,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+    if lowercase(metadata.head_oid) != lowercase(candidate.head_sha)
+      || len(unsigned_commits(metadata))
+        > 0 {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: "recovered_pull_request_head_is_not_exact_and_signed",
+        pr_number: pr.number,
+        old_head_sha: candidate.head_sha,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+  }
+  if !candidate.auto_arm {
+    return {
+      repo: candidate.repo,
+      status: "repaired",
+      reason: "target_branch_presented_auto_merge_withheld",
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      new_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const armed = github_enable_auto_merge_with_release_lease(
+    harness,
+    candidate.repo,
+    pr.number,
+    candidate.head_sha,
+    "squash",
+  )
+  if is_err(armed) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_failed:" + to_string(unwrap_err(armed)),
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const observed = github_pr_view(harness, candidate.repo, pr.number)
+  if is_err(observed) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_readback_failed:"
+        + to_string(unwrap_err(observed)),
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const after = unwrap(observed)
+  if lowercase(after.head.sha) != lowercase(candidate.head_sha) || !after.auto_merge_armed {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "recovered_pull_request_auto_merge_readback_did_not_match",
+      pr_number: pr.number,
+      old_head_sha: candidate.head_sha,
+      control_plane_mutation: presented
+        + {auto_merge_after: after.auto_merge_armed},
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  return {
+    repo: candidate.repo,
+    status: "repaired",
+    reason: "target_branch_presented_and_auto_merge_armed",
+    pr_number: pr.number,
+    old_head_sha: candidate.head_sha,
+    new_head_sha: candidate.head_sha,
+    control_plane_mutation: presented
+      + {auto_merge_after: after.auto_merge_armed},
+    attempts: [],
+    known_cost_usd: 0.0,
+    cost_status: "exact",
+  }
+}
+
+fn command_detail(result: dict) -> string {
+  const text = trim(result.combined ?? ((result.stdout ?? "") + "\n" + (result.stderr ?? "")))
+  return if len(text) <= 12000 {
+    text
+  } else {
+    text[len(text) - 12000:]
+  }
+}
+
+fn run_git(process: HarnessProcess, repo_dir: string, args: list<string>) {
+  return process.run({program: "git", args: args, cwd: repo_dir})
+}
+
+fn prepare_checkout(process: HarnessProcess, candidate: FleetRepairCandidate) -> string? {
+  const fetched = run_git(
+    process,
+    candidate.directory,
+    ["fetch", "--quiet", "origin", candidate.branch],
+  )
+  if !fetched.success {
+    return "fetch_failed: " + command_detail(fetched)
+  }
+  const checked = run_git(
+    process,
+    candidate.directory,
+    ["checkout", "--quiet", "--detach", candidate.head_sha],
+  )
+  if !checked.success {
+    return "checkout_failed: " + command_detail(checked)
+  }
+  const observed = run_git(process, candidate.directory, ["rev-parse", "HEAD"])
+  if !observed.success || lowercase(trim(observed.stdout)) != lowercase(candidate.head_sha) {
+    return "checkout_lease_mismatch"
+  }
+  const clean = run_git(process, candidate.directory, ["status", "--porcelain"])
+  if !clean.success || trim(clean.stdout) != "" {
+    return "checkout_not_clean"
+  }
+  return nil
+}
+
+/** Resolve one manifest-authorized new-file path without granting a write root. */
+pub fn fleet_repair_authorized_new_file_path(
+  candidate: FleetRepairCandidate,
+  requested_path: string,
+) -> string {
+  if !fleet_repair_new_file_allowed(requested_path, candidate.allowed_new_files) {
+    throw "repair_write is limited to an exact manifest-authorized new file: " + requested_path
+  }
+  return path_join(candidate.directory, requested_path)
+}
+
+/** Create—not overwrite—one exact file named by the candidate's manifest lease. */
+fn repair_write_authorized_new_file(fs: HarnessFs, candidate: FleetRepairCandidate, args: dict) {
+  const requested_path = to_string(args?.path ?? "")
+  const full_path = fleet_repair_authorized_new_file_path(candidate, requested_path)
+  if fs.exists(full_path) {
+    throw "repair_write creates new files only; the authorized path already exists: "
+      + requested_path
+  }
+  const content = to_string(args?.content ?? "")
+  fs.write_text(full_path, content)
+  return {path: requested_path, bytes_written: len(content), created: true}
+}
+
+fn repair_tools(harness: Harness, candidate: FleetRepairCandidate) {
+  const repo_dir = candidate.directory
+  const options = {
+    root: repo_dir,
+    cwd: repo_dir,
+    max_inline_bytes: 12000,
+    read_bytes: 12000,
+    tail_bytes: 12000,
+    search_max_matches: 160,
+    exclude_globs: [".git/**", "target/**", "node_modules/**", ".build/**"],
+    allow_argv_prefixes: REPAIR_INSPECTION_ARGV_PREFIXES,
+    // The standard edit module provides exact-text changes. General writes,
+    // deletion, and directory creation are intentionally absent; a separate
+    // tool below may create only a manifest-named file that does not exist.
+    enabled_tools: ["read", "command", "edit_file"],
+    names: {
+      read_file: "repair_read",
+      read_file_tail: "repair_read_tail",
+      search_files: "repair_search",
+      git_inspect: "repair_git",
+      run_command: "repair_inspect",
+      read_command_output: "repair_inspect_output",
+      read_command_output_tail: "repair_inspect_tail",
+      edit_file: "repair_edit",
+    },
+    descriptions: {
+      read_file:
+        "Read one UTF-8 file under the isolated downstream bump checkout. Pass a checkout-relative path only; never an absolute path.",
+      search_files:
+        "Search the isolated downstream bump checkout. Pass checkout-relative paths only; narrow broad searches with path or glob.",
+      git_inspect:
+        "Inspect the already-selected checkout's status, diff, log, show, blame, branches, or remotes without mutating git state. Omit repo entirely.",
+      run_command:
+        "Run one bounded read-only inspection command in the already-selected checkout. Pass argv as a list and omit cwd; shell strings are not accepted.",
+      edit_file:
+        "Apply one exact-text edit inside the isolated downstream bump checkout using a checkout-relative path only.",
+    },
+    output_format: "json",
+  }
+  const tools = agent_edit_tools(
+    harness.fs,
+    harness.tools,
+    agent_host_tools(harness, nil, options),
+    options,
+  )
+  if len(candidate.allowed_new_files) == 0 {
+    return tools
+  }
+  return tool_define(
+    tools,
+    "repair_write",
+    "Create one new UTF-8 file at an exact manifest-authorized checkout-relative path. This tool refuses every other path and never overwrites an existing file.",
+    {
+      parameters: {path: {type: "string"}, content: {type: "string"}},
+      returns: {type: "object"},
+      annotations: {kind: "edit", side_effect_level: "filesystem_write"},
+      handler: { args -> repair_write_authorized_new_file(harness.fs, candidate, args) },
+    },
+  )
+}
+
+pub fn fleet_repair_route(
+  policy: FleetRepairPolicy,
+  attempt: int,
+  prior_findings: list<string>,
+) -> HarnUpdateRoute {
+  if policy.route_override == "strong" {
+    return {tier: "strong", config_prefix: "HARN_UPDATE_STRONG", reason: "explicit_rehearsal_route"}
+  }
+  if policy.route_override == "value" {
+    return {tier: "value", config_prefix: "HARN_UPDATE_VALUE", reason: "explicit_rehearsal_route"}
+  }
+  return harn_update_route(
+    attempt,
+    if len(prior_findings) > 0 {
+      "same_validation_failure"
+    } else {
+      "checks_failing"
+    },
+    len(prior_findings) > 0,
+  )
+}
+
+/** One key per immutable checkout, resolved model, contract, and repair attempt. */
+pub fn fleet_repair_session_id(
+  candidate: FleetRepairCandidate,
+  runtime_provenance: HarnUpdateRuntimeProvenance,
+  route: HarnUpdateRoute,
+  provider: string,
+  model: string,
+  attempt: int,
+) -> string {
+  const workspace_anchor = sha3_256(candidate.directory)[0:12]
+  const route_anchor = sha3_256(
+    route.tier + "\n" + provider + "\n" + model + "\n"
+      + runtime_provenance.harn_version
+      + "\n"
+      + runtime_provenance.controller_revision
+      + "\n"
+      + runtime_provenance.repair_contract_revision,
+  )[0:12]
+  return "harn-update-repair-" + replace(candidate.repo, "/", "-") + "-"
+    + candidate.head_sha[0:12]
+    + "-"
+    + workspace_anchor
+    + "-"
+    + route_anchor
+    + "-"
+    + REPAIR_CONTRACT_REVISION
+    + "-"
+    + to_string(attempt)
+}
+
+fn repair_prompt(
+  fs: HarnessFs,
+  candidate: FleetRepairCandidate,
+  target: string,
+  prior_findings: list<string>,
+) -> string {
+  return fs.render_prompt(
+    "@prompts/fleet_repair_user.harn.prompt",
+    {
+      repo: candidate.repo,
+      target: target,
+      pr_number: candidate.pr_number,
+      pr_url: candidate.pr_url,
+      head_sha: candidate.head_sha,
+      failing_checks_json: json_stringify(candidate.failing_checks),
+      prior_findings: join(prior_findings, "\n"),
+    },
+  )
+}
+
+fn run_repair_agent(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+  target: string,
+  attempt: int,
+  prior_findings: list<string>,
+  policy: FleetRepairPolicy,
+) {
+  const route = fleet_repair_route(policy, attempt, prior_findings)
+  const planner = planner_defaults(harness.env, route.config_prefix)
+  const binder = install_binder(harness, harness.clock, repair_tools(harness, candidate))
+  // A session is resumable only for the same immutable head, checkout, model,
+  // and repair contract. Reusing a repository/attempt key across runners
+  // leaked old tool arguments into a new root, where an absolute path looked
+  // like a policy failure instead of stale context.
+  const session_id = fleet_repair_session_id(
+    candidate,
+    policy.runtime_provenance,
+    route,
+    planner.provider,
+    planner.model,
+    attempt,
+  )
+  const transcript_dir = path_join(
+    harness.fs.cwd(),
+    ".harn-runs/fleet-repair",
+    replace(target, "/", "-"),
+    replace(candidate.repo, "/", "-"),
+    "attempt-" + to_string(attempt),
+  )
+  harness.fs.mkdir(transcript_dir, true)
+  const result = agent_loop(
+    harness,
+    repair_prompt(harness.fs, candidate, target, prior_findings),
+    harness.fs.render_prompt("@prompts/fleet_repair_system.harn.prompt", {}),
+    agent_preset(
+      harness,
+      "repair",
+      {
+        provider: planner.provider,
+        model: planner.model,
+        max_tokens: policy.max_tokens_per_attempt,
+        temperature: 0.0,
+        tools: binder.tools,
+        tool_caller: binder.tool_caller,
+        timeout_ms: 900000,
+        idle_timeout_ms: 180000,
+        iteration_budget: {
+          mode: "adaptive",
+          initial: 6,
+          max: 12,
+          extend_by: 2,
+          total_cost_usd: policy.max_cost_per_attempt_usd,
+        },
+        // A named route is part of the prepared authority. Do not silently
+        // fail over to another provider with a different cost meter or tool
+        // contract; a later scheduled round can retry the declared route.
+        equivalent_failover: false,
+        require_successful_tools: ["repair_read"],
+        turn_policy: {allow_done_sentinel: false, max_prose_chars: 12000},
+        compaction: {
+          strategy: "hybrid",
+          keep_last_n: 10,
+          policy: release_compaction_policy(harness.agent, "validation_repair"),
+        },
+        transcript_projection: tool_repair_projection_policy(),
+        session_id: session_id,
+        llm_transcript_dir: transcript_dir,
+      },
+    ),
+  )
+  try {
+    harness.agent.close(session_id, {reason: result?.status ?? "completed"})
+  } catch (_close_error) {
+    nil
+  }
+  return {result: result, route: route, planner: planner}
+}
+
+/** Exact, bounded process context supplied to one consumer validator. */
+pub type FleetRepairValidationContext = {target: string, private_temp_root: string}
+
+fn validated_validation_context(
+  fs: HarnessFs,
+  context: FleetRepairValidationContext,
+) -> FleetRepairValidationContext {
+  const target = trim(context.target)
+  // Fleet dispatch owns a stable-only contract. Reuse its semantic parser so
+  // repair cannot grow a second, subtly different release-tag grammar.
+  if !is_v_semver(target) {
+    throw "fleet repair validator target must be an exact vX.Y.Z release tag"
+  }
+  const workspace_temp_root = trim(fs.workspace_temp_dir())
+  const private_temp_root = trim(context.private_temp_root)
+  if workspace_temp_root == "" || private_temp_root == ""
+    || !starts_with(workspace_temp_root, "/")
+    || !starts_with(private_temp_root, "/")
+    || split(workspace_temp_root, "/").contains("..")
+    || split(workspace_temp_root, "/").contains(".")
+    || split(private_temp_root, "/").contains("..")
+    || split(private_temp_root, "/").contains(".") {
+    throw "fleet repair validator temp root must be an absolute normalized path"
+  }
+  const prefix = if ends_with(workspace_temp_root, "/") {
+    workspace_temp_root
+  } else {
+    workspace_temp_root + "/"
+  }
+  if !starts_with(private_temp_root, prefix) {
+    throw "fleet repair validator temp root must stay inside workspace scratch"
+  }
+  return {target: target, private_temp_root: private_temp_root}
+}
+
+/**
+ * Run a consumer validator with the exact release inputs its bump contract
+ * names. Context validation happens before process launch so malformed release
+ * identities and lexically escaping scratch paths cannot become shell-expanded
+ * filesystem paths. The production caller supplies a newly minted directory;
+ * filesystem grants remain the authority against symlink traversal.
+ */
+pub fn fleet_repair_validate_candidate(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  candidate: FleetRepairCandidate,
+  context: FleetRepairValidationContext,
+) {
+  const validated = validated_validation_context(harness.fs, context)
+  if !harness.fs.exists(validated.private_temp_root) {
+    throw "fleet repair validator temp root does not exist"
+  }
+  const result = harness.process.run(
+    {
+      program: "bash",
+      args: ["-c", candidate.validation_command],
+      cwd: candidate.directory,
+      env: {HARN_BUMP_TARGET_TAG: validated.target, RUNNER_TEMP: validated.private_temp_root},
+    },
+  )
+  return {ok: result.success, output: "validator ${candidate.repo}: " + command_detail(result)}
+}
+
+fn validate_candidate(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  candidate: FleetRepairCandidate,
+  target: string,
+) {
+  const private_temp_root = harness.fs.mkdtemp_in_workspace("fleet-repair-validator-")
+  defer {
+    if harness.fs.exists(private_temp_root) {
+      harness.fs.delete(private_temp_root)
+    }
+  }
+  return fleet_repair_validate_candidate(
+    {fs: harness.fs, process: harness.process},
+    candidate,
+    {target: target, private_temp_root: private_temp_root},
+  )
+}
+
+/**
+ * Apply Harn's canonical, behavior-preserving formatter before spending a
+ * model call. Runtime bumps can legitimately change the target formatter, and
+ * formatting is a deterministic projection of that exact runtime rather than
+ * a source repair that benefits from agent judgment.
+ */
+fn format_candidate(process: HarnessProcess, candidate: FleetRepairCandidate) {
+  const result = process.run({program: "harn", args: ["fmt", "."], cwd: candidate.directory})
+  return {ok: result.success, output: command_detail(result)}
+}
+
+/** Shape deterministic validator output into the workflow's retry vocabulary. */
+pub fn fleet_repair_validation_findings(validation_ok: bool, output: string) -> list<string> {
+  return if validation_ok || trim(output) == "" {
+    []
+  } else {
+    [output]
+  }
+}
+
+/** Refuse inference when the local validator produced no code-level verdict. */
+pub fn fleet_repair_validation_environment_blocked(output: string) -> bool {
+  const detail = trim(output)
+  return contains(detail, "category: environment")
+    || starts_with(detail, "validator could not start under prepared process authority:")
+}
+
+fn fleet_repair_pre_agent_refusal(policy: FleetRepairPolicy, validation_output: string) -> string? {
+  if fleet_repair_validation_environment_blocked(validation_output) {
+    return "validator_environment_unavailable"
+  }
+  if policy.deterministic_only ?? false {
+    return "agent_repair_required"
+  }
+  return nil
+}
+
+fn changed_paths(process: HarnessProcess, candidate: FleetRepairCandidate) -> list<string> {
+  const result = run_git(
+    process,
+    candidate.directory,
+    ["diff", "--name-only", "--diff-filter=ACDMRTUXB", candidate.head_sha, "--"],
+  )
+  if !result.success {
+    throw "changed-path inventory failed: " + command_detail(result)
+  }
+  let paths = []
+  for raw in split(result.stdout, "\n") {
+    const path = trim(raw)
+    if path == "" {
+      continue
+    }
+    if starts_with(path, "/") || len(regex_captures("(^|/)\\.\\.(/|$)", path)) > 0
+      || contains(path, "\t") {
+      throw "repair produced unsafe path: " + path
+    }
+    paths = paths + [path]
+  }
+  const untracked = run_git(
+    process,
+    candidate.directory,
+    ["ls-files", "--others", "--exclude-standard"],
+  )
+  if !untracked.success {
+    throw "untracked-path inventory failed: " + command_detail(untracked)
+  }
+  for raw in split(untracked.stdout, "\n") {
+    const path = trim(raw)
+    if path == "" {
+      continue
+    }
+    if !fleet_repair_new_file_allowed(path, candidate.allowed_new_files) {
+      throw "repair produced unauthorized new file: " + path
+    }
+    paths = paths + [path]
+  }
+  return paths
+}
+
+/** Admit new files only when the repository manifest names the exact safe path. */
+pub fn fleet_repair_new_file_allowed(path: string, allowed: list<string>) -> bool {
+  if trim(path) != path || path == "" || starts_with(path, "/")
+    || len(regex_captures("(^|/)\\.\\.(/|$)", path))
+      > 0 {
+    return false
+  }
+  return allowed.contains(path)
+}
+
+fn publish_candidate(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+) -> FleetRepairSourceMutationEvidence {
+  // Tracked changes and manifest-authorized new files cross one exact-head
+  // publisher. Build output and invented paths remain outside its authority.
+  const staged = run_git(harness.process, candidate.directory, ["add", "-u"])
+  if !staged.success {
+    throw "repair staging failed: " + command_detail(staged)
+  }
+  for path in candidate.allowed_new_files {
+    const add = run_git(harness.process, candidate.directory, ["add", "--", path])
+    if !add.success {
+      throw "authorized new-file staging failed for ${path}: " + command_detail(add)
+    }
+  }
+  const published = github_worktree_commit(
+    harness,
+    {
+      slug: candidate.repo,
+      branch: candidate.branch,
+      headline: "Repair Harn runtime bump validation",
+      repo_dir: candidate.directory,
+      source: "index",
+      base_oid: candidate.head_sha,
+      expected_branch_oid: candidate.head_sha,
+    },
+  )
+  if is_err(published) {
+    throw "repair publication failed: " + to_string(unwrap_err(published))
+  }
+  const publication = unwrap(published)
+  const new_head = trim(publication.commit_oid)
+  if !publication.committed || new_head == "" {
+    throw "repair publication returned no created commit"
+  }
+  const settled = await_published_head(
+    harness.clock,
+    { -> load_pr_signature_metadata(harness, candidate.repo, candidate.pr_number) },
+    new_head,
+  )
+  if !settled.settled {
+    throw "repair published but pull request head did not settle: " + settled.detail
+  }
+  if candidate.require_signed_head && len(unsigned_commits(settled.pr)) > 0 {
+    throw "repair published but exact pull request history is not fully signed"
+  }
+  const evidence: FleetRepairSourceMutationEvidence = {
+    before_head_sha: candidate.head_sha,
+    after_head_sha: new_head,
+    commit_created: publication.committed
+      && lowercase(candidate.head_sha)
+        != lowercase(new_head),
+    pushed_head_observed: settled.settled
+      && lowercase(settled.pr?.head_oid ?? "")
+        == lowercase(new_head),
+  }
+  if !candidate.auto_arm {
+    return evidence
+  }
+  const armed = github_enable_auto_merge_with_release_lease(
+    harness,
+    candidate.repo,
+    candidate.pr_number,
+    new_head,
+    "squash",
+  )
+  if is_err(armed) {
+    throw "repair published but auto-merge re-arm failed: " + to_string(unwrap_err(armed))
+  }
+  return evidence
+}
+
+/** Repair one exact downstream bump PR under a bounded validate/repair loop. */
+pub fn repair_fleet_candidate(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+  target: string,
+  policy: FleetRepairPolicy,
+) -> FleetRepairResult {
+  const checkout_error = prepare_checkout(harness.process, candidate)
+  if checkout_error != nil {
+    return {
+      repo: candidate.repo,
+      status: "refused",
+      reason: checkout_error ?? "checkout_refused",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  return repair_fleet_candidate_in_checkout(harness, candidate, target, policy)
+}
+
+fn deterministic_validation_evidence(
+  candidate: FleetRepairCandidate,
+  initial: dict,
+  formatted_paths: list<string>,
+  formatted: dict,
+) -> list<FleetRepairValidationEvidence> {
+  const initial_evidence = {
+    attempt: 0,
+    command: candidate.validation_command,
+    ok: initial.ok,
+    diagnostic: initial.output,
+  }
+  return if len(formatted_paths) == 0 {
+    [initial_evidence]
+  } else {
+    [
+      initial_evidence,
+      {
+        attempt: 1,
+        command: candidate.validation_command,
+        ok: formatted.ok,
+        diagnostic: formatted.output,
+      },
+    ]
+  }
+}
+
+/**
+ * Repair a checkout whose exact revision was already established by the caller.
+ *
+ * The production entry point above owns the Git fetch/detach/clean lease. This
+ * smaller operation exists for isolated historical replays, which establish
+ * their detached commit before they call the same agent, validator, and
+ * publisher sequence.
+ */
+pub fn repair_fleet_candidate_in_checkout(
+  harness: Harness,
+  candidate: FleetRepairCandidate,
+  target: string,
+  policy: FleetRepairPolicy,
+) -> FleetRepairResult {
+  const initial_validation = try {
+    validate_candidate({fs: harness.fs, process: harness.process}, candidate, target)
+  } catch (error) {
+    {
+      ok: false,
+      output: "validator could not start under prepared process authority: " + to_string(error),
+    }
+  }
+  if initial_validation.ok {
+    return {
+      repo: candidate.repo,
+      status: "no_change",
+      reason: "leased_checkout_already_valid",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validation_evidence(
+        candidate,
+        initial_validation,
+        [],
+        initial_validation,
+      ),
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const formatted = try {
+    format_candidate(harness.process, candidate)
+  } catch (error) {
+    {ok: false, output: "canonical formatter could not start: " + to_string(error)}
+  }
+  const formatted_paths = changed_paths(harness.process, candidate)
+  const formatted_validation = if len(formatted_paths) == 0 {
+    initial_validation
+  } else {
+    try {
+      validate_candidate({fs: harness.fs, process: harness.process}, candidate, target)
+    } catch (error) {
+      {
+        ok: false,
+        output: "validator could not start under prepared process authority: " + to_string(error),
+      }
+    }
+  }
+  const deterministic_validations = deterministic_validation_evidence(
+    candidate,
+    initial_validation,
+    formatted_paths,
+    formatted_validation,
+  )
+  if formatted_validation.ok && len(formatted_paths) > 0 {
+    const publication = try {
+      publish_candidate(harness, candidate)
+    } catch (error) {
+      return {
+        repo: candidate.repo,
+        status: "failed",
+        reason: to_string(error),
+        pr_number: candidate.pr_number,
+        old_head_sha: candidate.head_sha,
+        validation_evidence: deterministic_validations,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    }
+    return {
+      repo: candidate.repo,
+      status: "repaired",
+      reason: "canonical_format_validated_published_and_auto_merge_armed",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      new_head_sha: publication.after_head_sha,
+      validation_evidence: deterministic_validations,
+      source_mutation: publication,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const pre_agent_refusal = fleet_repair_pre_agent_refusal(policy, formatted_validation.output)
+  if pre_agent_refusal != nil {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: pre_agent_refusal ?? "agent_repair_required",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
+      attempts: [],
+      known_cost_usd: 0.0,
+      cost_status: "exact",
+    }
+  }
+  const initial_findings = fleet_repair_validation_findings(
+    false,
+    join(
+      [
+        if formatted.ok || trim(formatted.output) == "" {
+          ""
+        } else {
+          "canonical formatter failed:\n" + formatted.output
+        },
+        if len(formatted_paths) == 0 {
+          initial_validation.output
+        } else {
+          formatted_validation.output
+        },
+      ]
+        .filter({ finding -> trim(finding) != "" }),
+      "\n\n",
+    ),
+  )
+  const executor = { ctx ->
+    const findings = if len(ctx.prior_findings ?? []) > 0 {
+      ctx.prior_findings ?? []
+    } else {
+      initial_findings
+    }
+    const result = run_repair_agent(harness, candidate, target, ctx.attempt, findings, policy)
+    const validation = try {
+      validate_candidate({fs: harness.fs, process: harness.process}, candidate, target)
+    } catch (error) {
+      {
+        ok: false,
+        output: "validator could not start under prepared process authority: " + to_string(error),
+      }
+    }
+    return {
+      result: result.result,
+      verification: {
+        ok: validation.ok,
+        output: validation.output,
+        // `workflow_run_repair` carries this field into the next executor
+        // context. It drives the retry prompt and value-to-strong escalation.
+        findings: fleet_repair_validation_findings(validation.ok, validation.output),
+        agent_status: result.result?.status ?? "completed",
+        route: result.route,
+        planner: result.planner,
+        usage: harn_update_usage(result.planner.provider, result.planner.model, result.result),
+      },
+      findings: fleet_repair_validation_findings(validation.ok, validation.output),
+      branch: if validation.ok {
+        nil
+      } else {
+        "failed"
+      },
+      outcome: "completed",
+    }
+  }
+  const out = workflow_run_repair(
+    harness,
+    {
+      task: "repair downstream Harn update",
+      executor: executor,
+      max_attempts: policy.max_attempts_per_repository,
+    },
+  )
+  let attempts: list<FleetRepairAttempt> = []
+  for {index, value} in (out.attempts ?? out.run?.stages[0]?.attempts ?? []).enumerate() {
+    attempts = attempts
+      + [
+        {
+          attempt: index + 1,
+          validation_ok: value?.verification?.ok ?? false,
+          validation_output: value?.verification?.output ?? value?.error ?? "",
+          agent_status: value?.verification?.agent_status ?? "unknown",
+          route: value?.verification?.route?.tier ?? "value",
+          route_reason: value?.verification?.route?.reason ?? "unknown",
+          provider: value?.verification?.planner?.provider ?? "unknown",
+          model: value?.verification?.planner?.model ?? "unknown",
+          usage: value?.verification?.usage
+            ?? harn_update_usage("unknown", "unknown", {}),
+        },
+      ]
+  }
+  let known_cost_usd = 0.0
+  let cost_status = "exact"
+  for attempt in attempts {
+    known_cost_usd = known_cost_usd + attempt.usage.known_cost_usd
+    if attempt.usage.cost_status == "unknown" {
+      cost_status = "unknown"
+    } else if attempt.usage.cost_status == "lower_bound" && cost_status == "exact" {
+      cost_status = "lower_bound"
+    }
+  }
+  const accounting = {known_cost_usd: known_cost_usd, cost_status: cost_status}
+  if len(attempts) == 0 || !(attempts[len(attempts) - 1]?.validation_ok ?? false) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "validation_attempts_exhausted",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
+      attempts: attempts,
+      ...accounting,
+    }
+  }
+  const paths = changed_paths(harness.process, candidate)
+  if len(paths) == 0 {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: "red_checkout_received_no_repair_delta",
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
+      attempts: attempts,
+      ...accounting,
+    }
+  }
+  const publication = try {
+    publish_candidate(harness, candidate)
+  } catch (error) {
+    return {
+      repo: candidate.repo,
+      status: "failed",
+      reason: to_string(error),
+      pr_number: candidate.pr_number,
+      old_head_sha: candidate.head_sha,
+      validation_evidence: deterministic_validations,
+      attempts: attempts,
+      ...accounting,
+    }
+  }
+  return {
+    repo: candidate.repo,
+    status: "repaired",
+    reason: "validated_published_and_auto_merge_armed",
+    pr_number: candidate.pr_number,
+    old_head_sha: candidate.head_sha,
+    new_head_sha: publication.after_head_sha,
+    validation_evidence: deterministic_validations,
+    source_mutation: publication,
+    attempts: attempts,
+    ...accounting,
+  }
+}
+
+fn fleet_repair_selected_repositories(plan: FleetRepairPlan) -> list<string> {
+  return (plan.refused.map({ row -> row.repo }).to_list()
+    + plan.recoveries.map({ row -> row.repo }).to_list()
+    + plan.candidates.map({ row -> row.repo }).to_list())
+    .unique()
+}
+
+fn fleet_repair_before_head(plan: FleetRepairPlan, repo: string) -> string {
+  const recovery = plan.recoveries.find({ row -> row.repo == repo })
+  if recovery != nil {
+    return recovery.head_sha
+  }
+  const candidate = plan.candidates.find({ row -> row.repo == repo })
+  return candidate?.head_sha ?? ""
+}
+
+fn fleet_repair_validation_command(plan: FleetRepairPlan, repo: string) -> string {
+  return plan.candidates.find({ row -> row.repo == repo })?.validation_command ?? ""
+}
+
+/**
+ * Finalize one receipt without allowing a missing or ambiguous repository
+ * result to disappear into an aggregate success boolean.
+ */
+pub fn fleet_repair_receipt(
+  plan: FleetRepairPlan,
+  raw_results: list<FleetRepairResult>,
+  policy: FleetRepairPolicy,
+  stopped_reason: string? = nil,
+) -> FleetRepairReceipt {
+  let results: list<FleetRepairTerminalResult> = []
+  for repo in fleet_repair_selected_repositories(plan) {
+    const observed = raw_results.find({ result -> result.repo == repo })
+      ?? {
+        repo: repo,
+        status: "failed",
+        reason: "missing_terminal_outcome",
+        old_head_sha: fleet_repair_before_head(plan, repo),
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    results = results
+      + [
+        project_fleet_repair_terminal_result(
+          observed,
+          fleet_repair_before_head(plan, repo),
+          fleet_repair_validation_command(plan, repo),
+        ),
+      ]
+  }
+  const failed = results.filter(
+    { result ->
+      result.terminal_outcome != "mutated" && result.terminal_outcome != "already_repaired"
+    },
+  )
+    .to_list()
+  const cost_status: "exact" | "lower_bound" | "unknown" = if raw_results.any(
+    { result -> result.cost_status == "unknown" },
+  ) {
+    "unknown"
+  } else if raw_results.any(
+    { result -> result.cost_status == "lower_bound" },
+  ) {
+    "lower_bound"
+  } else {
+    "exact"
+  }
+  let known_cost_usd = 0.0
+  for result in raw_results {
+    known_cost_usd = known_cost_usd + result.known_cost_usd
+  }
+  const schema_version: "harn_bump_fleet.harn_update_repair.v4" =
+    "harn_bump_fleet.harn_update_repair.v4"
+  const receipt: FleetRepairReceipt = {
+    schema_version: schema_version,
+    target: plan.target,
+    ok: len(failed) == 0,
+    policy: policy,
+    runtime_provenance: policy.runtime_provenance,
+    authority: fleet_repair_authority_audit(plan, raw_results, policy),
+    results: results,
+    known_cost_usd: known_cost_usd,
+    cost_status: cost_status,
+    stopped_reason: stopped_reason,
+  }
+  return receipt
+}
+
+/** Execute one bounded plan and preserve every refusal in the typed receipt. */
+pub fn repair_fleet_plan(
+  harness: Harness,
+  plan: FleetRepairPlan,
+  policy: FleetRepairPolicy,
+) -> FleetRepairReceipt {
+  let results: list<FleetRepairResult> = plan.refused.map(
+    { row ->
+      {
+        repo: row.repo,
+        status: "refused",
+        reason: row.reason,
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    },
+  )
+    .to_list()
+  for recovery in plan.recoveries {
+    results = results + [recover_target_branch(harness, recovery)]
+  }
+  // Give every candidate the exact target formatter and local validator before
+  // any provider call. An opaque provider cost or one genuine source failure
+  // must not strand later deterministic migrations that cost nothing.
+  let agent_candidates: list<FleetRepairCandidate> = []
+  for candidate in plan.candidates {
+    const checkout_error = prepare_checkout(harness.process, candidate)
+    if checkout_error != nil {
+      results = results
+        + [
+          {
+            repo: candidate.repo,
+            status: "refused",
+            reason: checkout_error ?? "checkout_refused",
+            pr_number: candidate.pr_number,
+            old_head_sha: candidate.head_sha,
+            attempts: [],
+            known_cost_usd: 0.0,
+            cost_status: "exact",
+          },
+        ]
+      continue
+    }
+    const deterministic = repair_fleet_candidate_in_checkout(
+      harness,
+      candidate,
+      plan.target,
+      policy + {deterministic_only: true},
+    )
+    if deterministic.reason == "agent_repair_required" {
+      agent_candidates = agent_candidates + [candidate]
+    } else {
+      results = results + [deterministic]
+    }
+  }
+  let run_cost_usd = 0.0
+  let stopped_reason = nil
+  for candidate in agent_candidates {
+    if stopped_reason != nil {
+      results = results
+        + [
+          {
+            repo: candidate.repo,
+            status: "refused",
+            reason: stopped_reason ?? "run_stopped",
+            attempts: [],
+            known_cost_usd: 0.0,
+            cost_status: "exact",
+          },
+        ]
+      continue
+    }
+    const budget = harn_update_budget_decision(policy, 0, 0.0, run_cost_usd)
+    if !budget.allowed {
+      stopped_reason = budget.reason
+      results = results
+        + [
+          {
+            repo: candidate.repo,
+            status: "refused",
+            reason: budget.reason,
+            attempts: [],
+            known_cost_usd: 0.0,
+            cost_status: "exact",
+          },
+        ]
+      continue
+    }
+    const attempt_limit_usd = fleet_repair_safe_attempt_limit(policy, 0.0, run_cost_usd)
+    if attempt_limit_usd <= 0.0 {
+      stopped_reason = "reserved_attempt_budget_exhausted"
+      results = results
+        + [
+          {
+            repo: candidate.repo,
+            status: "refused",
+            reason: stopped_reason,
+            attempts: [],
+            known_cost_usd: 0.0,
+            cost_status: "exact",
+          },
+        ]
+      continue
+    }
+    const result = repair_fleet_candidate_in_checkout(
+      harness,
+      candidate,
+      plan.target,
+      policy
+        + {
+          deterministic_only: false,
+          max_cost_per_attempt_usd: min(budget.attempt_limit_usd, attempt_limit_usd),
+        },
+    )
+    results = results + [result]
+    run_cost_usd = run_cost_usd + result.known_cost_usd
+    if result.cost_status != "exact" {
+      stopped_reason = "run_cost_not_exact"
+    }
+  }
+  return fleet_repair_receipt(plan, results, policy, stopped_reason)
+}

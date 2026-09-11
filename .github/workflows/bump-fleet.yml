@@ -1,0 +1,835 @@
+name: Update repositories for a Harn release
+run-name: Update Harn fleet / ${{ inputs.version || 'latest' }} / chain ${{ inputs.chain_id || github.run_id }} / round ${{ inputs.update_round || '1' }} of ${{ inputs.max_rounds || '4' }}${{ inputs.scope_digest && format(' / scope {0}', inputs.scope_digest) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional exact Harn tag (vX.Y.Z). Defaults to latest release."
+        required: false
+        type: string
+      only:
+        description: "Optional owner/repo target."
+        required: false
+        type: string
+      repositories_json:
+        description: "Optional nonempty, compact, sorted JSON list of owner/repo targets."
+        required: false
+        type: string
+      scope_digest:
+        description: "Canonical scope SHA-256 supplied by the fleet dispatcher for explicit repository selection."
+        required: false
+        type: string
+      enable_repair:
+        description: "Allow bounded agent repair when a downstream update fails checks."
+        required: false
+        type: boolean
+        default: true
+      update_round:
+        description: "Automatic follow-up round; leave at 1 for a new update."
+        required: false
+        type: string
+        default: "1"
+      max_rounds:
+        description: "Maximum hosted rounds for one Harn version."
+        required: false
+        type: string
+        default: "4"
+      chain_id:
+        description: "Stable release-run ID shared by every automatic follow-up round."
+        required: false
+        type: string
+      predecessor_run_id:
+        description: "Exact prior controller run that published the dispatch continuation."
+        required: false
+        type: string
+      predecessor_run_attempt:
+        description: "Exact attempt of the prior controller run that published the dispatch continuation."
+        required: false
+        type: string
+  schedule:
+    - cron: "43 9 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'bump-harn-fleet-schedule' || format('bump-harn-fleet-chain-{0}', inputs.chain_id || github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # This protected-branch environment holds the two brokered provider
+    # references. Without it GitHub expands both secret expressions to empty
+    # strings, so a repair can never reach a model despite looking configured.
+    environment: release
+    timeout-minutes: 180
+    env:
+      # GitHub App installation tokens live for one hour. Keep each polling
+      # period comfortably below that boundary and mint a fresh token per wait.
+      FLEET_TOKEN_EPOCH_TIMEOUT_S: "3000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes or fetches with the checkout's own
+          # credential, and a persisted one leaves an `include.path` in
+          # .git/config pointing at a $RUNNER_TEMP file. Git treats an
+          # unreadable include as fatal, so any later step that reads git
+          # from a different temp root or under a sandbox dies on config,
+          # not on its own work. Run 30995854515 lost a release to exactly
+          # that; the release job has carried this setting ever since.
+          persist-credentials: false
+
+      # The chain lease is claimed by the predecessor round and released by this
+      # one, so its identity has to be resolvable before anything that can fail.
+      # It used to be read only from `update-plan`, which meant a round that died
+      # in or before that step skipped the release entirely and leaked the ref.
+      # The expression is the same one `run-name` and `concurrency` already use,
+      # so the three cannot disagree about which chain this round belongs to.
+      - name: Resolve the chain lease identity
+        id: chain-lease
+        env:
+          REQUESTED_CHAIN_ID: ${{ inputs.chain_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chain_id="${REQUESTED_CHAIN_ID:-$GITHUB_RUN_ID}"
+          if [[ ! "$chain_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "chain id must be a positive integer, got '$chain_id'" >&2
+            exit 1
+          fi
+          echo "chain_id=$chain_id" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve exact update target and bounded round
+        id: update-plan
+        env:
+          # Scheduled runs carry no version input, so this step asks the GitHub
+          # API for the latest Harn release. The Harn repository is public, so
+          # the job's own read-only token is sufficient; without any token the
+          # CLI refuses to call the API and every scheduled run fails here.
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TARGET: ${{ inputs.version }}
+          REQUESTED_ROUND: ${{ inputs.update_round || '1' }}
+          REQUESTED_MAX_ROUNDS: ${{ inputs.max_rounds || '4' }}
+          REQUESTED_REPAIR: ${{ inputs.enable_repair }}
+          REQUESTED_CHAIN_ID: ${{ steps.chain-lease.outputs.chain_id }}
+          REQUESTED_PREDECESSOR_RUN_ID: ${{ inputs.predecessor_run_id }}
+          REQUESTED_PREDECESSOR_RUN_ATTEMPT: ${{ inputs.predecessor_run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$REQUESTED_TARGET"
+          if [[ -z "$target" ]]; then
+            target="$(gh api repos/burin-labs/harn/releases/latest --jq .tag_name)"
+          fi
+          if [[ ! "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Harn target must be an exact vX.Y.Z release tag, got '$target'" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_ROUND" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$REQUESTED_MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] \
+            || (( REQUESTED_ROUND > REQUESTED_MAX_ROUNDS )); then
+            echo "update round must be a positive integer no greater than max rounds" >&2
+            exit 1
+          fi
+          if [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "controller run attempt must be a positive integer" >&2
+            exit 1
+          fi
+          predecessor_run_id="$REQUESTED_PREDECESSOR_RUN_ID"
+          predecessor_run_attempt="$REQUESTED_PREDECESSOR_RUN_ATTEMPT"
+          predecessor_round="$((REQUESTED_ROUND - 1))"
+          needs_predecessor=true
+          if (( GITHUB_RUN_ATTEMPT > 1 )); then
+            predecessor_run_id="$GITHUB_RUN_ID"
+            predecessor_run_attempt="$((GITHUB_RUN_ATTEMPT - 1))"
+            predecessor_round="$REQUESTED_ROUND"
+          elif [[ "$REQUESTED_ROUND" == "1" ]]; then
+            if [[ -n "$predecessor_run_id" || -n "$predecessor_run_attempt" ]]; then
+              echo "initial controller runs cannot declare a predecessor" >&2
+              exit 1
+            fi
+            needs_predecessor=false
+          elif [[ ! "$predecessor_run_id" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$predecessor_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo "continuation rounds require an exact positive predecessor run ID and attempt" >&2
+            exit 1
+          fi
+          repair="${REQUESTED_REPAIR:-true}"
+          if [[ "$repair" != "true" && "$repair" != "false" ]]; then
+            echo "enable_repair must resolve to true or false" >&2
+            exit 1
+          fi
+          {
+            echo "target=$target"
+            echo "round=$REQUESTED_ROUND"
+            echo "max_rounds=$REQUESTED_MAX_ROUNDS"
+            echo "repair_enabled=$repair"
+            echo "chain_id=$REQUESTED_CHAIN_ID"
+            echo "controller_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "needs_predecessor=$needs_predecessor"
+            echo "predecessor_round=$predecessor_round"
+            echo "predecessor_run_id=$predecessor_run_id"
+            echo "predecessor_run_attempt=$predecessor_run_attempt"
+            echo "predecessor_artifact_name=harn-update-dispatch-continuation-${predecessor_run_id}-${predecessor_run_attempt}"
+            echo "artifact_name=harn-update-dispatch-continuation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The fleet bootstraps the runtime it is rolling out, so this job cannot
+      # start until the target release has published its binaries. That made the
+      # readiness wait below unreachable in exactly the case it exists for: a
+      # dispatch between the tag and the assets died here, in a setup action,
+      # before any fleet code ran, and dispatched no repository at all. On
+      # v0.10.127 the tag published at 15:20Z, this job died at 15:45Z on a
+      # missing SHA256SUMS, and the first asset landed at 16:10Z.
+      #
+      # So install the runtime this repository is already pinned to first. It is
+      # a release that exists by definition, it is enough to run the readiness
+      # wait, and the exact target runtime is installed immediately afterwards.
+      - name: Read the pinned Harn runtime
+        id: pinned-harn
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned="$(tr -d '[:space:]' < .harn-version)"
+          if [ -z "$pinned" ]; then
+            echo "::error::.harn-version is empty; cannot bootstrap a readiness runtime" >&2
+            exit 1
+          fi
+          echo "version=${pinned#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned Harn runtime
+        uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+        with:
+          version: ${{ steps.pinned-harn.outputs.version }}
+
+      # The readiness wait reaches GitHub through lib/github.harn, which imports
+      # the installed harn-github-connector package, so the lockfile has to be
+      # installed before the wait rather than only before the fleet run.
+      - name: Install locked Harn dependencies for the readiness wait
+        run: harn install --locked
+
+      # One owner for "is this release ready": the same predicate the release
+      # tail's publication proof uses, which refuses while a required asset is
+      # missing. Reached here it names the missing assets and waits; unreached it
+      # let a setup action decide the question by failing.
+      - name: Wait for the target release to be ready
+        id: release-ready
+        env:
+          # Readiness observes only the public Harn release. Keep mutation
+          # authority out of a wait that can consume a full token lifetime.
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          harn run --no-sandbox wait_harn_release_ready.harn --
+          --tag "${{ steps.update-plan.outputs.target }}"
+
+      - name: Require positive target release readiness
+        id: require-release-ready
+        env:
+          RELEASE_READY: ${{ steps.release-ready.outputs.ready }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_READY" != "true" ]]; then
+            echo "target release readiness was not proven; repository updates remain blocked" >&2
+            exit 1
+          fi
+
+      - name: Install exact target Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+        with:
+          version: ${{ steps.update-plan.outputs.target }}
+
+      - name: Install locked Harn dependencies
+        run: harn install --locked
+
+      - name: Validate exact fleet scope identity
+        env:
+          SCOPE_DIGEST: ${{ inputs.scope_digest }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--require-canonical-repositories-json --scope-digest "$SCOPE_DIGEST")
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox validate_fleet_scope.harn -- "${args[@]}" >/dev/null
+
+      # Mint mutation authority only after the potentially long publication
+      # wait and exact-runtime setup. The first protected API call follows
+      # immediately, so the token begins its lifetime where it is consumed.
+      - name: Mint fleet GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: &fleet-app-token
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          permission-actions: write
+          # The update proof censuses the latest check runs at each consumer's
+          # exact default-branch head. That read needs `checks`, and the mint
+          # grants only what this block asks for, so without it the census gets
+          # HTTP 403 on every private consumer while public ones pass on public
+          # read alone. Read, not write: nothing here reports a check result.
+          permission-checks: read
+          # The bump workflows publish their first commit with their own
+          # repository token. This token can append only a validated repair,
+          # under the exact observed branch-head lease.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Preflight continuation controller authority
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHAIN_ID: ${{ steps.update-plan.outputs.chain_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-usage
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/continuation-preflight.json \
+            preflight_harn_update_continuation.harn -- \
+            --chain-id "$CHAIN_ID" \
+            --controller-revision "$GITHUB_SHA" \
+            --receipt fleet-update-continuation-authorization-receipt.json
+
+      - name: Restore predecessor dispatch continuation
+        if: steps.update-plan.outputs.needs_predecessor == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.update-plan.outputs.predecessor_artifact_name }}
+          repository: burin-labs/harn-bump-fleet
+          github-token: ${{ steps.app-token.outputs.token }}
+          run-id: ${{ steps.update-plan.outputs.predecessor_run_id }}
+          path: .
+
+      - name: Validate predecessor dispatch continuation
+        id: validate-dispatch-continuation
+        if: steps.update-plan.outputs.needs_predecessor == 'true'
+        env:
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          CHAIN_ID: ${{ steps.update-plan.outputs.chain_id }}
+          ROUND: ${{ steps.update-plan.outputs.round }}
+          PREDECESSOR_RUN_ID: ${{ steps.update-plan.outputs.predecessor_run_id }}
+          PREDECESSOR_RUN_ATTEMPT: ${{ steps.update-plan.outputs.predecessor_run_attempt }}
+          PREDECESSOR_ROUND: ${{ steps.update-plan.outputs.predecessor_round }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --receipt fleet-dispatch-continuation.json
+            --target "$TARGET"
+            --chain-id "$CHAIN_ID"
+            --predecessor-round "$PREDECESSOR_ROUND"
+            --predecessor-run-id "$PREDECESSOR_RUN_ID"
+            --predecessor-run-attempt "$PREDECESSOR_RUN_ATTEMPT"
+            --current-round "$ROUND"
+            --current-run-id "$GITHUB_RUN_ID"
+            --current-run-attempt "$GITHUB_RUN_ATTEMPT"
+          )
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox validate_fleet_dispatch_continuation.harn -- "${args[@]}"
+
+      - name: Admit initial or validated dispatch lineage
+        id: dispatch-lineage
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.require-release-ready.outcome == 'success'
+        env:
+          NEEDS_PREDECESSOR: ${{ steps.update-plan.outputs.needs_predecessor }}
+          VALIDATION_OUTCOME: ${{ steps.validate-dispatch-continuation.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$NEEDS_PREDECESSOR" == "false" || "$VALIDATION_OUTCOME" == "success" ]]; then
+            exit 0
+          fi
+          echo "controller lineage was not admitted; proof and side effects are blocked" >&2
+          exit 1
+
+      - name: Arm Git credentials for private fleet clones
+        if: steps.dispatch-lineage.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The helper reads the step-scoped token only when Git asks. The
+          # secret never enters an argument, URL, repository config, or log.
+          gh auth setup-git --hostname github.com
+
+      - name: Materialize manifest-owned fleet
+        if: steps.dispatch-lineage.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          FLEET_ROOT: ${{ github.workspace }}/.fleet
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-usage
+          args=(--root "$FLEET_ROOT")
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/materialize.json \
+            materialize_fleet.harn -- "${args[@]}" \
+            | tee fleet-checkout-receipt.json
+
+      - name: Mint repository update GitHub App token
+        id: converge-token
+        if: steps.dispatch-lineage.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      - name: Start Harn updates
+        # A downstream failure is the input to observe/repair, not the final
+        # job verdict. `Prove fleet convergence` remains the authoritative gate.
+        if: >-
+          steps.dispatch-lineage.outcome == 'success' &&
+          steps.update-plan.outputs.needs_predecessor == 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.converge-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.converge-token.outputs.token }}
+          FLEET_ROOT: ${{ github.workspace }}/.fleet
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          args+=(--fleet-root "$FLEET_ROOT" --harn-repo "$FLEET_ROOT/harn" --retry-failed 1 --no-chat --continuation-receipt fleet-dispatch-continuation.json --chain-id "${{ steps.update-plan.outputs.chain_id }}" --update-round "${{ steps.update-plan.outputs.round }}" --controller-run-id "$GITHUB_RUN_ID" --controller-run-attempt "$GITHUB_RUN_ATTEMPT")
+          args+=("$TARGET")
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/update.json \
+            bump_fleet.harn -- "${args[@]}" \
+            | tee fleet-bump-receipt.md
+
+      - name: Mint observation GitHub App token
+        id: observe-token
+        if: steps.dispatch-lineage.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      - name: Check Harn updates
+        id: observe-convergence
+        if: steps.dispatch-lineage.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.observe-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.observe-token.outputs.token }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--timeout-s "$FLEET_TOKEN_EPOCH_TIMEOUT_S" --interval-s 30 --continuation-receipt fleet-dispatch-continuation.json)
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          args+=("$TARGET")
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/observe.json \
+            wait_fleet_convergence.harn -- "${args[@]}" \
+            | tee fleet-convergence-receipt.json
+
+      - name: Persist repair launch receipt before provider credentials
+        if: >-
+          steps.dispatch-lineage.outcome == 'success' &&
+          steps.observe-convergence.outcome == 'failure' &&
+          steps.update-plan.outputs.repair_enabled == 'true'
+        env:
+          TARGET: ${{ steps.update-plan.outputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"schema_version":"harn_bump_fleet.harn_update_startup.v1","status":"launch_pending","requested_target":"'"$TARGET"'","runtime_provenance":{"expected_harn_version":"'"$TARGET"'","controller_revision":"${{ github.sha }}","repair_contract_revision":"harn-update-repair-v10"},"authority":{"decider":"hosted repair preparation","requested":["provider:repair-agent","process:canonical-formatter","process:validator","network:api.github.com:443","network:api.cerebras.ai:443"],"granted":[],"used":[],"denied":[],"unused":["provider:repair-agent","process:canonical-formatter","process:validator","network:api.github.com:443","network:api.cerebras.ai:443"]},"cost":{"status":"exact","usd":0.0}}' > fleet-repair-startup-receipt.json
+
+      - name: Mint repair GitHub App token
+        id: repair-token
+        if: >-
+          steps.dispatch-lineage.outcome == 'success' &&
+          steps.observe-convergence.outcome == 'failure' &&
+          steps.update-plan.outputs.repair_enabled == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      - name: Repair failed Harn updates
+        id: repair-convergence
+        if: >-
+          steps.dispatch-lineage.outcome == 'success' &&
+          steps.observe-convergence.outcome == 'failure' &&
+          steps.update-plan.outputs.repair_enabled == 'true'
+        env:
+          GH_TOKEN: ${{ steps.repair-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.repair-token.outputs.token }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          HARN_UPDATE_VALUE_PROVIDER: cerebras
+          HARN_UPDATE_VALUE_MODEL: gpt-oss-120b
+          HARN_UPDATE_STRONG_PROVIDER: cerebras
+          HARN_UPDATE_STRONG_MODEL: zai-glm-4.7
+          HARN_EGRESS_ALLOW: api.github.com:443,api.cerebras.ai:443
+          HARN_EGRESS_DEFAULT: deny
+          HARN_EGRESS_BLOCK_PRIVATE: private
+          FLEET_ROOT: ${{ github.workspace }}/.fleet
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--fleet-root "$FLEET_ROOT" --controller-revision "${{ github.sha }}" --provider-secret-reference CEREBRAS_API_KEY --max-attempts 3 --max-cost-per-attempt-usd 0.30 --max-cost-per-repository-usd 0.90 --max-cost-per-run-usd 4.00 --continuation-receipt fleet-dispatch-continuation.json)
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          args+=("$TARGET")
+          set +e
+          harn run \
+            --write-root "$FLEET_ROOT" \
+            --sandbox-write-root "$FLEET_ROOT" \
+            --allow-process-network \
+            --environment-policy granted \
+            --grant github_cli=env:GH_TOKEN,expose=GH_TOKEN \
+            --grant github_api=env:GITHUB_TOKEN,expose=GITHUB_TOKEN \
+            --grant repair_provider=env:CEREBRAS_API_KEY,expose=CEREBRAS_API_KEY \
+            --grant value_provider=env:HARN_UPDATE_VALUE_PROVIDER,expose=HARN_UPDATE_VALUE_PROVIDER \
+            --grant value_model=env:HARN_UPDATE_VALUE_MODEL,expose=HARN_UPDATE_VALUE_MODEL \
+            --grant strong_provider=env:HARN_UPDATE_STRONG_PROVIDER,expose=HARN_UPDATE_STRONG_PROVIDER \
+            --grant strong_model=env:HARN_UPDATE_STRONG_MODEL,expose=HARN_UPDATE_STRONG_MODEL \
+            --grant repair_egress_allow=env:HARN_EGRESS_ALLOW,expose=HARN_EGRESS_ALLOW \
+            --grant repair_egress_default=env:HARN_EGRESS_DEFAULT,expose=HARN_EGRESS_DEFAULT \
+            --grant repair_egress_private=env:HARN_EGRESS_BLOCK_PRIVATE,expose=HARN_EGRESS_BLOCK_PRIVATE \
+            --emit-summary-json \
+            --summary-file runtime-usage/repair.json \
+            repair_fleet_convergence.harn -- "${args[@]}" \
+            | tee fleet-repair-receipt.json
+          repair_status=${PIPESTATUS[0]}
+          set -e
+          startup_body=$(<fleet-repair-startup-receipt.json)
+          if (( repair_status != 0 )) && [[ "$startup_body" == *'"status":"launch_pending"'* ]]; then
+            printf '%s\n' '{"schema_version":"harn_bump_fleet.harn_update_bootstrap_failure.v1","status":"blocked","reason":"harn_startup_failed_before_controller_entry","exit_code":'"$repair_status"',"authority":{"decider":"hosted repair bootstrap","requested":["provider:repair-agent","process:validator"],"granted":[],"used":[],"denied":["provider:repair-agent","process:validator"],"unused":[]},"cost":{"status":"exact","usd":0.0}}' > fleet-repair-bootstrap-failure-receipt.json
+          fi
+          exit "$repair_status"
+
+      - name: Mint proof GitHub App token
+        id: proof-token
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      - name: Prove Harn updates
+        id: prove-convergence
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.proof-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.proof-token.outputs.token }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--timeout-s "$FLEET_TOKEN_EPOCH_TIMEOUT_S" --interval-s 30 --continuation-receipt fleet-dispatch-continuation.json)
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          args+=("$TARGET")
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/proof.json \
+            wait_fleet_convergence.harn -- "${args[@]}" \
+            | tee fleet-convergence-proof-receipt.json
+
+      - name: Upload dispatch continuation for successor
+        id: persist-dispatch-continuation
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.update-plan.outputs.artifact_name }}
+          path: |
+            fleet-dispatch-continuation.json
+            fleet-dispatch-continuation.json.d/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Schedule the next hosted round when proof is still incomplete
+        id: schedule-successor
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success' &&
+          steps.persist-dispatch-continuation.outcome == 'success' &&
+          steps.prove-convergence.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.proof-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.proof-token.outputs.token }}
+          TARGET: ${{ steps.update-plan.outputs.target }}
+          ROUND: ${{ steps.update-plan.outputs.round }}
+          MAX_ROUNDS: ${{ steps.update-plan.outputs.max_rounds }}
+          ENABLE_REPAIR: ${{ steps.update-plan.outputs.repair_enabled }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+          CHAIN_ID: ${{ steps.update-plan.outputs.chain_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--target "$TARGET" --proof-receipt fleet-convergence-proof-receipt.json --update-round "$ROUND" --max-rounds "$MAX_ROUNDS" --enable-repair "$ENABLE_REPAIR" --chain-id "$CHAIN_ID" --controller-revision "$GITHUB_SHA" --controller-run-id "$GITHUB_RUN_ID" --controller-run-attempt "$GITHUB_RUN_ATTEMPT")
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/continuation.json \
+            continue_harn_update.harn -- "${args[@]}" \
+            | tee fleet-update-continuation-receipt.json
+
+      - name: Mint projection verification GitHub App token
+        id: projection-token
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      # Deliberately AFTER dispatch. This step ran first under `set -euo
+      # pipefail`, so drift in a *projection* aborted the job and not one
+      # repository bumped. `[policy] bump_workflow` pins a SHA of a file that
+      # moved six times in two weeks, and every move puts all 26 fleet-owned
+      # adapters out of conformance at once -- so the check was red by
+      # construction and took the fleet down with it for three days
+      # (2026-08-01..03).
+      #
+      # The check is a report; dispatch is the job's purpose. Running it last
+      # keeps the alarm -- drift still fails the run, and the receipt is still
+      # written because `tee` flushes before the pipeline's exit status is
+      # taken -- without letting a stale pin decide whether the fleet may bump.
+      - name: Verify remote fleet projections
+        if: steps.dispatch-lineage.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.projection-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.projection-token.outputs.token }}
+          ONLY: ${{ inputs.only }}
+          REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$ONLY" ]]; then
+            args+=(--only "$ONLY")
+          fi
+          if [[ -n "$REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox --emit-summary-json \
+            --summary-file runtime-usage/policy.json \
+            check_fleet_policy.harn -- "${args[@]}" \
+            | tee fleet-policy-receipt.json
+
+      - name: Persist exact runtime cost receipt
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        env:
+          TARGET: ${{ steps.update-plan.outputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          records=(runtime-usage/*.json)
+          scripts/write_harn_cost_receipt.sh \
+            fleet-runtime-cost-receipt.json \
+            harn_bump_fleet.runtime_cost.v2 \
+            "$TARGET" \
+            "$GITHUB_SHA" \
+            "${records[@]}"
+
+      - name: Upload fleet receipts
+        if: always() && steps.dispatch-lineage.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harn-update-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            fleet-checkout-receipt.json
+            fleet-dispatch-continuation.json
+            fleet-dispatch-continuation.json.d/
+            fleet-convergence-receipt.json
+            fleet-convergence-proof-receipt.json
+            fleet-repair-receipt.json
+            fleet-repair-startup-receipt.json
+            fleet-repair-bootstrap-failure-receipt.json
+            fleet-update-continuation-authorization-receipt.json
+            fleet-update-continuation-receipt.json
+            fleet-runtime-cost-receipt.json
+            runtime-usage/
+            .harn-runs/fleet-repair/
+            fleet-policy-receipt.json
+            fleet-bump-receipt.md
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Require exact update proof
+        if: >-
+          always() &&
+          steps.update-plan.outcome == 'success' &&
+          steps.dispatch-lineage.outcome == 'success'
+        env:
+          PROOF_OUTCOME: ${{ steps.prove-convergence.outcome }}
+          OBSERVE_OUTCOME: ${{ steps.observe-convergence.outcome }}
+          REPAIR_ENABLED: ${{ steps.update-plan.outputs.repair_enabled }}
+          REPAIR_OUTCOME: ${{ steps.repair-convergence.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -s fleet-convergence-proof-receipt.json ]]; then
+            jq -r '"fleet proof: total=\(.total_count // "missing") pending=\(.pending_count // "missing") failing=\(.failing_count // "missing") unproven=\(.unproven_count // "missing")"' \
+              fleet-convergence-proof-receipt.json >&2
+            jq -r '(.unproven_repositories // [])[] | "unproven: \(.)"' \
+              fleet-convergence-proof-receipt.json >&2
+          fi
+          if [[ "$OBSERVE_OUTCOME" == "failure" && "$REPAIR_ENABLED" == "true" && "$REPAIR_OUTCOME" != "success" ]]; then
+            echo "Harn update repair stopped without a justified terminal outcome. Deterministic fleet proof still ran after paid repair stopped." >&2
+            if [[ -s fleet-repair-receipt.json ]]; then
+              jq -r '(.results // [])[] | select(.terminal_outcome != "mutated" and .terminal_outcome != "already_repaired") | "repair blocked: \(.repo) [\(.terminal_outcome)] \(.reason)"' \
+                fleet-repair-receipt.json >&2 || echo "repair outcomes could not be read from fleet-repair-receipt.json" >&2
+            fi
+          fi
+          if [[ "$PROOF_OUTCOME" == "success" ]] && ! jq -e \
+            '.scope_proven == true and .total_count > 0 and .unproven_count == 0 and ((.repositories // []) | length) == .total_count' \
+            fleet-convergence-proof-receipt.json >/dev/null; then
+            echo "Harn update proof receipt is absent, empty, or internally inconsistent; refusing a vacuous green." >&2
+            PROOF_OUTCOME=failure
+          fi
+          if [[ "$PROOF_OUTCOME" != "success" ]]; then
+            echo "Harn update is not proven in this hosted round; the bounded continuation receipt names any successor." >&2
+            if [[ -s fleet-convergence-proof-receipt.json ]]; then
+              jq -r '(.repositories // [])[] | select(.state != "proven") | "unproven: \(.repo) [\(.state)] \(.reason)"' \
+                fleet-convergence-proof-receipt.json >&2 || echo "unproven repositories could not be read from fleet-convergence-proof-receipt.json" >&2
+            fi
+            exit 1
+          fi
+
+      # A round that ends without dispatching a successor owns the chain lease
+      # and nothing else will ever release it. The v0.10.127 chain proved that:
+      # round 2 aborted before the scheduler could decide anything, its lease
+      # sat held at an exact OID that predates the fix, and a fresh chain had to
+      # be started around it. This runs last and always, including after the
+      # proof gate above exits 1, and it refuses to act when it cannot prove a
+      # successor was not dispatched.
+      #
+      # It is gated only on the chain identity, which the second step of the job
+      # resolves. Gating it on the update plan or on release readiness put the
+      # release behind the very failures it exists for: a round that dies in
+      # either place already holds the lease its predecessor claimed for it.
+      - name: Probe for a Harn runtime before releasing the chain lease
+        id: lease-runtime-probe
+        if: always() && steps.chain-lease.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v harn >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A round that died before the runtime install still owns the lease, so
+      # install a runtime here rather than leaving the ref held. The pinned
+      # version is empty when the round died before reading it, and the action
+      # then installs the latest release, which is enough for one ref delete.
+      - name: Install a Harn runtime for the chain lease release
+        id: lease-runtime
+        if: always() && steps.lease-runtime-probe.outputs.present == 'false'
+        uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+        with:
+          version: ${{ steps.pinned-harn.outputs.version }}
+
+      - name: Install locked Harn dependencies for the chain lease release
+        if: always() && steps.lease-runtime.outcome == 'success'
+        run: harn install --locked
+
+      - name: Mint chain lease release GitHub App token
+        id: lease-token
+        if: always() && steps.chain-lease.outcome == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with: *fleet-app-token
+
+      - name: Release the chain lease when this round ends without a successor
+        if: >-
+          always() &&
+          steps.chain-lease.outcome == 'success' &&
+          steps.lease-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.lease-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.lease-token.outputs.token }}
+          CHAIN_ID: ${{ steps.chain-lease.outputs.chain_id }}
+          SCHEDULER_OUTCOME: ${{ steps.schedule-successor.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The steps above install a runtime when the round died before one
+          # was set up. If even that failed, say so loudly and name the residue
+          # rather than exiting zero on a ref that is still held.
+          if ! command -v harn >/dev/null 2>&1; then
+            echo "::error::no Harn runtime is available, so refs/heads/harn-update-chain/${CHAIN_ID} is still held; reap_chain_refs.harn clears it once every run in this chain is terminal" >&2
+            exit 1
+          fi
+          harn run --no-sandbox release_harn_update_chain.harn -- \
+            --chain-id "$CHAIN_ID" \
+            --controller-revision "$GITHUB_SHA" \
+            --scheduler-outcome "$SCHEDULER_OUTCOME" \
+            --continuation-receipt fleet-update-continuation-receipt.json \
+            | tee fleet-chain-release-receipt.json

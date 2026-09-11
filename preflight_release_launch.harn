@@ -1,0 +1,800 @@
+#!/usr/bin/env harn
+/**
+ * preflight_release_launch.harn — ask every release precondition before the
+ * release takes a lease.
+ *
+ * Five hosted release attempts were lost in one day. Each died at a different
+ * gate, and each gate was first exercised between thirty seconds and
+ * sixty-five minutes into an attempt that could not be taken back. None of
+ * them needed the attempt to be answered.
+ *
+ * This runs first in every mode, asks each of those questions through the same
+ * code the cut uses, and stops before the lease if any answer is no. It takes
+ * no lease, writes no ref, and opens nothing. The one thing it does create is a
+ * GitHub App installation token, which is unavoidable: the question is whether
+ * the mint grants what the cut needs, and only the mint can answer it. The
+ * token is never printed -- `--describe` returns the grants and the expiry in
+ * its place.
+ *
+ * Usage:
+ *   harn run --no-sandbox preflight_release_launch.harn -- --mode ship-pr --bump patch
+ */
+import { ParserSpec } from "std/cli/argparse"
+import { env_str } from "std/config"
+import { cli_options } from "lib/cli_options"
+import {
+  hydrate_remote_consumer_manifest,
+  hydrate_remote_consumer_repositories,
+} from "lib/consumer_projection_manifest"
+import {
+  CONSUMER_REHEARSAL_WORKFLOW,
+  rehearsal_coverage,
+  rehearsal_proof_listing,
+  rehearsal_revision,
+  rehearsal_subjects,
+} from "lib/consumer_rehearsal"
+import { remote_pin_probe } from "lib/fleet_convergence"
+import {
+  harn_pin_watch_repositories,
+  read_fleet_manifest,
+  resolve_harn_update_spec,
+} from "lib/fleet_manifest"
+import {
+  github_file_text_at_ref,
+  github_is_transient_read_error,
+  github_latest_release_tag,
+} from "lib/github"
+import {
+  github_directory_entry_names,
+  github_large_file_text_at_ref,
+  github_resolve_commit,
+} from "lib/github_commits"
+import { harn_release_contract_from_text } from "lib/harn_release_contract"
+import {
+  ConsumerPinReading,
+  ReleaseCheckpointEvidence,
+  release_checkpoint_preconditions,
+  release_checkpoint_unavailable,
+} from "lib/release_checkpoint"
+import {
+  AtShaResolution,
+  PreflightPrecondition,
+  ReleaseLaunchInputs,
+  at_sha_preconditions,
+  consumer_contract_precondition,
+  credential_refresh_precondition,
+  hosted_release_refresh_interval_s,
+  preflight_fail,
+  preflight_pass,
+  preflight_scope_decision,
+  preflight_unavailable,
+  release_input_preconditions,
+  release_launch_preflight_lines,
+  release_launch_preflight_receipt,
+  token_description_preconditions,
+  workflow_mint_preconditions,
+} from "lib/release_launch_preflight"
+import { release_harness_root } from "lib/release_paths"
+import {
+  RELEASE_CREDENTIAL_LIFETIME_S,
+  RELEASE_CREDENTIAL_REFRESH_INTERVAL_S,
+  release_phase_budget_drift,
+} from "lib/release_phase_budgets"
+
+type Options = {
+  mode: string,
+  bump: string,
+  preid: string,
+  at_sha: string,
+  repositories_json: string,
+  skip_consumers: string,
+  consumer_proof_runs_json: string,
+  token_profile: string,
+  release_repo: string,
+  base: string,
+  checkpoint_commit: string,
+  scope: string,
+  offline: bool,
+  resolve_only: bool,
+  receipt: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "preflight-release-launch",
+  args: [
+    {kind: "flag", name: "mode", long: "--mode", default: "audit"},
+    {kind: "flag", name: "bump", long: "--bump", default: "patch"},
+    {kind: "flag", name: "preid", long: "--preid", default: ""},
+    {kind: "flag", name: "at_sha", long: "--at-sha", default: ""},
+    {kind: "flag", name: "repositories_json", long: "--repositories-json", default: ""},
+    {kind: "flag", name: "skip_consumers", long: "--skip-consumers-json", default: ""},
+    {
+      kind: "flag",
+      name: "consumer_proof_runs_json",
+      long: "--consumer-proof-runs-json",
+      default: "",
+    },
+    {kind: "flag", name: "token_profile", long: "--token-profile", default: "harn-release"},
+    {kind: "flag", name: "release_repo", long: "--release-repo", default: "burin-labs/harn"},
+    {kind: "flag", name: "base", long: "--base", default: "main"},
+    {kind: "flag", name: "checkpoint_commit", long: "--checkpoint-commit", default: ""},
+    {kind: "flag", name: "scope", long: "--scope", default: "release"},
+    {kind: "switch", name: "offline", long: "--offline"},
+    {kind: "switch", name: "resolve_only", long: "--resolve-only"},
+    {kind: "flag", name: "receipt", long: "--receipt", default: ""},
+  ],
+}
+
+const HOSTED_RELEASE_WORKFLOW = ".github/workflows/hosted-release.yml"
+
+const PROFILE_REGISTRY = "spec/github-app-token-profiles.json"
+
+type TokenProfile = {repository_names: list<string>?, permissions: dict<string, string>}
+
+type WorkflowMintBinding = {workflow: string, job: string, step: string, profile: string}
+
+type TokenProfileRegistry = {
+  schema_version: string,
+  profiles: dict<string, TokenProfile>,
+  workflow_mints: list<WorkflowMintBinding>,
+}
+
+fn read_profile_registry(fs: HarnessFs, root: string) -> TokenProfileRegistry {
+  return schema_expect(
+    json_parse(fs.read_text(path_join(root, PROFILE_REGISTRY))),
+    schema_of(TokenProfileRegistry),
+  )
+}
+
+fn workflow_step(document: any, job: string, step_name: string) -> any {
+  const steps = document?.get("jobs")?.get(job)?.get("steps") ?? []
+  return steps.find({ step -> return step?.get("name") == step_name })
+}
+
+/** `<workflow>#<job>` -> declared `timeout-minutes`, for every job that declares one. */
+fn workflow_job_timeouts(
+  fs: HarnessFs,
+  root: string,
+  workflows: list<string>,
+) -> dict<string, int> {
+  let timeouts: dict<string, int> = {}
+  for workflow in workflows {
+    const document = yaml_parse(fs.read_text(path_join(root, workflow)))
+    for job in (document?.get("jobs") ?? {}).keys() {
+      const declared = to_int(document?.get("jobs")?.get(job)?.get("timeout-minutes") ?? "")
+      if declared != nil {
+        timeouts["${workflow}#${job}"] = declared ?? 0
+      }
+    }
+  }
+  return timeouts
+}
+
+/**
+ * Which modes arm the credential refresher, read from the workflow itself.
+ *
+ * The refresher used to be armed for `ship-pr` alone, and a `prepare` run died
+ * on a 401 at sixty-five minutes because of it. Reading the arming back out of
+ * the step is what makes that regression fail here instead of there.
+ */
+fn credential_refresher_modes(document: any) -> list<string> {
+  const step = workflow_step(document, "release", "Run release harness")
+  if step == nil {
+    return []
+  }
+  const run = to_string(step?.get("run") ?? "")
+  if !contains(run, "refresh_hosted_release_credentials.sh") {
+    return []
+  }
+  const condition = to_string(step?.get("if") ?? "")
+  if condition == "" {
+    return ["audit", "prepare", "ship-pr"]
+  }
+  return ["audit", "prepare", "ship-pr"].filter({ mode -> return contains(condition, mode) })
+    .to_list()
+}
+
+/**
+ * Turn a commit prefix into the exact commit, or say why it was not asked.
+ *
+ * A transient read is reported as unasked rather than as a bad pin. The
+ * difference matters: one is an operator's typo and the other is GitHub having
+ * a bad minute, and a preflight that called them the same thing would send
+ * somebody looking for a commit that is there.
+ */
+fn resolve_at_sha(
+  harness: Harness,
+  slug: string,
+  requested: string,
+  offline: bool,
+) -> AtShaResolution {
+  const pinned = lowercase(trim(requested))
+  if pinned == "" || len(pinned) == 40 || offline {
+    return {
+      requested: pinned,
+      resolved: "",
+      asked: false,
+      reason: if offline {
+        "--offline"
+      } else {
+        "nothing to resolve"
+      },
+    }
+  }
+  const resolved = github_resolve_commit(harness, slug, pinned)
+  if is_err(resolved) {
+    const failure = unwrap_err(resolved)
+    if github_is_transient_read_error(failure) {
+      return {
+        requested: pinned,
+        resolved: "",
+        asked: false,
+        reason: "${slug} could not be read: " + to_string(failure.message ?? failure),
+      }
+    }
+    return {
+      requested: pinned,
+      resolved: "",
+      asked: true,
+      reason: to_string(failure.message ?? failure),
+    }
+  }
+  return {requested: pinned, resolved: unwrap(resolved).sha, asked: true, reason: ""}
+}
+
+/** The checkpoint's evidence, or the reason it could not be read. */
+type CheckpointEvidenceRead = {evidence: ReleaseCheckpointEvidence?, reason: string}
+
+/**
+ * Read, once, everything the pre-irreversible checkpoint decides on.
+ *
+ * The reads are deliberately all here and the decisions all in
+ * `lib/release_checkpoint.harn`. Nine releases in a row were damaged by stages
+ * that inferred a decision from something adjacent to it, and the cheapest way
+ * to keep that from recurring is for the code that fetches evidence to have no
+ * opinion about what it means.
+ *
+ * `commit` is the tree these facts are read at. At launch that is the base the
+ * cut will start from; the same gathering serves a pre-tag call given the
+ * commit about to be tagged.
+ */
+fn gather_checkpoint_evidence(
+  harness: Harness,
+  slug: string,
+  base: string,
+  commit: string,
+) -> CheckpointEvidenceRead {
+  const contract_text = try {
+    github_file_text_at_ref(harness, slug, "scripts/release_contract.json", base)
+  } catch (error) {
+    return {
+      evidence: nil,
+      reason: "scripts/release_contract.json could not be read at ${slug}@${base}: "
+        + to_string(error),
+    }
+  }
+  if contract_text == nil {
+    return {evidence: nil, reason: "${slug}@${base} has no scripts/release_contract.json"}
+  }
+  const contract = harn_release_contract_from_text(contract_text ?? "")
+  if contract == nil {
+    // Without the contract there is nothing to decide against, and guessing a
+    // default would answer a question this checkpoint was asked to read.
+    return {
+      evidence: nil,
+      reason: "scripts/release_contract.json at ${slug}@${base} did not parse as a release "
+        + "contract",
+    }
+  }
+  // The fragment count is a fact about the tree that will carry the tag, and at
+  // launch that tree does not exist yet: the cut folds the fragments and then
+  // tags. Asking the base would refuse every cut for fragments the cut itself
+  // is about to consume, so with no commit named the question is reported
+  // unasked rather than answered against the wrong tree.
+  const fragments = if trim(commit) == "" {
+    Ok(nil)
+  } else {
+    github_directory_entry_names(harness, slug, "changelog.d", commit)
+  }
+  const pins = read_consumer_pins(harness)
+  const evidence: ReleaseCheckpointEvidence = {
+    commit: commit,
+    base_ref: "${slug}@${base}",
+    latest_tag: github_latest_release_tag(harness, slug),
+    cargo_toml: github_file_text_at_ref(harness, slug, "Cargo.toml", base) ?? "",
+    changelog: read_release_changelog(harness, slug, base),
+    contract: contract ?? {},
+    fragment_entries: if trim(commit) == "" || is_err(fragments) {
+      nil
+    } else {
+      unwrap(fragments) ?? []
+    },
+    fragment_unread_reason: if trim(commit) == "" {
+      "no commit was named, and the tree that will be tagged does not exist until the fold "
+        + "lands; pass --checkpoint-commit at the pre-tag checkpoint"
+    } else if is_err(fragments) {
+      to_string(unwrap_err(fragments).message ?? unwrap_err(fragments))
+    } else {
+      ""
+    },
+    consumer_pins: pins.rows,
+    consumer_pins_unread_reason: pins.reason,
+  }
+  return {evidence: evidence, reason: ""}
+}
+
+/**
+ * The release changelog, whichever route can return a file of its size.
+ *
+ * The typed connector is asked first because it is the owner of every other
+ * read here. It cannot answer for this one file: the changelog passed both the
+ * contents API's inline ceiling and the connector's response cap, and the
+ * failure it raises names a schema, not a size. Falling through to the raw
+ * route keeps the fold assertion answerable instead of permanently unasked,
+ * which is the reading that would let an unfolded release through unremarked.
+ */
+fn read_release_changelog(harness: Harness, slug: string, base: string) -> string {
+  const typed = try {
+    github_file_text_at_ref(harness, slug, "CHANGELOG.md", base)
+  } catch (error) {
+    nil
+  }
+  if trim(typed ?? "") != "" {
+    return typed ?? ""
+  }
+  const raw = github_large_file_text_at_ref(harness.process, slug, "CHANGELOG.md", base)
+  if is_err(raw) {
+    return ""
+  }
+  return unwrap(raw)
+}
+
+/**
+ * Every manifest-watched consumer's pin, read from its own default branch.
+ *
+ * A repository whose pin cannot be read is kept as a row with no value rather
+ * than dropped, so the checkpoint can report it by name. Dropping it would make
+ * an unreadable consumer indistinguishable from a converged one, which is the
+ * failure this assertion exists to remove.
+ */
+fn read_consumer_pins(harness: Harness) -> {rows: list<ConsumerPinReading>?, reason: string} {
+  const manifest = try {
+    // A consumer that owns its own contract carries no pin path in the public
+    // manifest; the row has to be hydrated from that consumer's own default
+    // branch first. Reading the unhydrated row instead would report the two
+    // largest consumers unreadable on every run, which is a false alarm from
+    // the same family as a false all-clear.
+    const fleet = read_fleet_manifest(harness.fs)
+    hydrate_remote_consumer_manifest(harness, fleet, fleet.repositories, "main")
+  } catch (error) {
+    return {rows: nil, reason: "the fleet manifest could not be read: " + to_string(error)}
+  }
+  let rows: list<ConsumerPinReading> = []
+  for repo in harn_pin_watch_repositories(manifest) {
+    const reading = try {
+      const spec = resolve_harn_update_spec(manifest, repo, "")
+      const probe = remote_pin_probe(harness, spec)
+      {slug: repo.slug, pin: probe.pin, evidence: probe.evidence}
+    } catch (error) {
+      {slug: repo.slug, pin: nil, evidence: to_string(error)}
+    }
+    rows = rows + [reading]
+  }
+  return {rows: rows, reason: ""}
+}
+
+pipeline main(harness: Harness) {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const inputs: ReleaseLaunchInputs = {
+    mode: trim(options.mode),
+    bump: trim(options.bump),
+    prerelease_identifier: options.preid,
+    at_sha: options.at_sha,
+    repositories_json: options.repositories_json,
+    skip_consumers: options.skip_consumers,
+    consumer_proof_runs_json: options.consumer_proof_runs_json,
+  }
+  // Resolve the pin first. Everything downstream of this preflight requires a
+  // full forty-character commit, so this is the one place a short one is
+  // widened, and the receipt records both what was asked for and what it means.
+  const pin = resolve_at_sha(harness, trim(options.release_repo), options.at_sha, options.offline)
+  const resolved_at_sha = if trim(pin.resolved) != "" {
+    trim(pin.resolved)
+  } else if len(lowercase(trim(options.at_sha))) == 40 {
+    lowercase(trim(options.at_sha))
+  } else {
+    ""
+  }
+  let checks: list<PreflightPrecondition> = at_sha_preconditions(pin)
+  if options.resolve_only {
+    // The one stdout line is the resolved commit, so a shell step can capture
+    // it without parsing prose. Everything a person reads goes to stderr.
+    const partial = release_launch_preflight_receipt(
+      inputs,
+      options.token_profile,
+      checks,
+      resolved_at_sha,
+    )
+    for line in release_launch_preflight_lines(partial) {
+      harness.stdio.eprintln(line)
+    }
+    if trim(options.receipt) != "" {
+      harness.fs.write_text(trim(options.receipt), json_stringify_pretty(partial) + "\n")
+    }
+    if !partial.ok {
+      return 1
+    }
+    harness.stdio.println(resolved_at_sha)
+    return 0
+  }
+  checks = checks
+    + release_input_preconditions(
+      {
+        mode: inputs.mode,
+        bump: inputs.bump,
+        prerelease_identifier: inputs.prerelease_identifier,
+        at_sha: resolved_at_sha,
+        repositories_json: inputs.repositories_json,
+        skip_consumers: inputs.skip_consumers,
+        consumer_proof_runs_json: inputs.consumer_proof_runs_json,
+      },
+    )
+  const root = release_harness_root(harness.fs)
+  const registry = read_profile_registry(harness.fs, root)
+  const profile = registry.profiles.get(options.token_profile)
+  if profile == nil {
+    checks = checks
+      + [
+        preflight_fail(
+          "token.profile",
+          "unknown token profile ${options.token_profile}",
+          "name one of " + join(registry.profiles.keys().sort(), ", "),
+        ),
+      ]
+  }
+  const requested = (profile ?? {permissions: {}, repository_names: nil}).permissions
+  // Structural: each binding's own workflow against the registry. The loop and
+  // its reading live in the library so both can be driven by a test; the
+  // defect it replaced compared every binding against one fixed workflow.
+  checks = checks
+    + workflow_mint_preconditions(
+      registry.workflow_mints,
+      options.token_profile,
+      registry.profiles.get(options.token_profile)?.permissions ?? {},
+      fn(path: string) { return try {
+        yaml_parse(harness.fs.read_text(path_join(root, path)))
+      } catch (_error) {
+        nil
+      } },
+    )
+  // Structural: the phase-budget registry against the ceilings that enforce it.
+  const drift = release_phase_budget_drift(
+    workflow_job_timeouts(
+      harness.fs,
+      root,
+      [HOSTED_RELEASE_WORKFLOW, ".github/workflows/fleet-projection-convergence.yml"],
+    ),
+  )
+  checks = checks
+    + [
+      if len(drift) == 0 {
+        preflight_pass(
+          "phases.budgets",
+          "every declared phase budget matches the workflow ceiling that enforces it",
+        )
+      } else {
+        preflight_fail(
+          "phases.budgets",
+          join(drift, "; "),
+          "reconcile lib/release_phase_budgets.harn with the workflow's timeout-minutes",
+        )
+      },
+    ]
+  // The hosted release workflow specifically, for the two checks below that are
+  // about that workflow rather than about whatever a binding names.
+  const hosted = yaml_parse(harness.fs.read_text(path_join(root, HOSTED_RELEASE_WORKFLOW)))
+  // Structural: the credential arming this workflow declares, against the
+  // declared mint ceiling. Answerable with no credential, which is the point --
+  // a pull request that narrows the arming fails here.
+  const refresher_modes = credential_refresher_modes(hosted)
+  const refresh_interval = hosted_release_refresh_interval_s(
+    to_string(workflow_step(hosted, "release", "Run release harness")?.get("run") ?? ""),
+  )
+  checks = checks
+    + [
+      if refresh_interval == nil {
+        preflight_fail(
+          "credentials.refresh",
+          "the hosted release workflow arms no measurable credential refresh interval",
+          "restore the refresher loop in the 'Run release harness' step",
+        )
+      } else {
+        credential_refresh_precondition(
+          inputs.mode,
+          RELEASE_CREDENTIAL_LIFETIME_S,
+          refresh_interval ?? 0,
+          refresher_modes,
+        )
+      },
+    ]
+  // Credentialed: the mint itself, through the production mint path.
+  const has_credentials = (env_str(harness.env, "RELEASE_APP_CLIENT_ID") ?? "") != ""
+    && (env_str(harness.env, "RELEASE_APP_PRIVATE_KEY") ?? "") != ""
+  // The consumer contract gate reads public consumer branches, so it is gated
+  // on its own reachability rather than on the release App. Tying it to the
+  // App made it report itself unasked in every context that could in fact have
+  // asked it, which is the loudest way to answer a question with nothing.
+  const has_github_read = !options.offline
+    && ((env_str(harness.env, "GH_TOKEN") ?? "") != ""
+      || (env_str(harness.env, "GITHUB_TOKEN") ?? "") != "")
+  if options.offline || !has_credentials {
+    const reason = if options.offline {
+      "not asked: --offline"
+    } else {
+      "not asked: no release App credentials in this context"
+    }
+    checks = checks
+      + [
+        preflight_unavailable("token.permissions", reason),
+        preflight_unavailable("token.lifetime", reason),
+      ]
+    checks = checks
+      + [
+        consumer_contract_check(
+          harness.fs,
+          harness.process,
+          env_str(harness.env, "HARN_BIN") ?? "harn",
+          root,
+          inputs.mode,
+          options.repositories_json,
+          has_github_read,
+        ),
+        consumer_rehearsal_check(
+          harness,
+          inputs.mode,
+          has_github_read,
+          options.release_repo,
+          options.base,
+          resolved_at_sha,
+        ),
+      ]
+  } else {
+    const described = harness.process.run(
+      {
+        program: "node",
+        args: [path_join(root, "scripts", "mint_github_app_installation_token.mjs"), "--describe"],
+        env: {RELEASE_APP_TOKEN_PROFILE: options.token_profile},
+        cwd: root,
+      },
+    )
+    if (described.exit_code ?? 1) != 0 {
+      checks = checks
+        + [
+          preflight_fail(
+            "token.permissions",
+            "could not mint an installation token for profile ${options.token_profile}: "
+              + trim(described.stderr ?? ""),
+            "check the release App credentials and the installation",
+          ),
+          preflight_unavailable("token.lifetime", "not asked: the mint failed"),
+        ]
+    } else {
+      checks = checks
+        + token_description_preconditions(
+          options.token_profile,
+          requested,
+          json_parse(described.stdout ?? ""),
+          RELEASE_CREDENTIAL_LIFETIME_S,
+          refresh_interval ?? RELEASE_CREDENTIAL_REFRESH_INTERVAL_S,
+        )
+    }
+    checks = checks
+      + [
+        consumer_contract_check(
+          harness.fs,
+          harness.process,
+          env_str(harness.env, "HARN_BIN") ?? "harn",
+          root,
+          inputs.mode,
+          options.repositories_json,
+          has_github_read,
+        ),
+        consumer_rehearsal_check(
+          harness,
+          inputs.mode,
+          has_github_read,
+          options.release_repo,
+          options.base,
+          resolved_at_sha,
+        ),
+      ]
+  }
+  // The pre-irreversible checkpoint: what has to be true of the tree before
+  // anything is tagged, decided from evidence rather than from a workflow's
+  // conclusion.
+  if options.offline {
+    checks = checks + release_checkpoint_unavailable("--offline")
+  } else {
+    const at = trim(options.checkpoint_commit)
+    // A failed read reports its own reason. A checkpoint that cannot say why it
+    // did not ask is the absence-reads-as-success shape this receipt refuses.
+    const read: CheckpointEvidenceRead = try {
+      gather_checkpoint_evidence(harness, trim(options.release_repo), trim(options.base), at)
+    } catch (error) {
+      {evidence: nil, reason: "the checkpoint evidence read threw: " + to_string(error)}
+    }
+    checks = checks
+      + if read.evidence == nil {
+        release_checkpoint_unavailable(read.reason)
+      } else {
+        release_checkpoint_preconditions(read.evidence ?? {})
+      }
+  }
+  const receipt = release_launch_preflight_receipt(
+    inputs,
+    options.token_profile,
+    checks,
+    resolved_at_sha,
+  )
+  for line in release_launch_preflight_lines(receipt) {
+    harness.stdio.println(line)
+  }
+  const rendered = json_stringify_pretty(receipt)
+  if trim(options.receipt) != "" {
+    harness.fs.write_text(trim(options.receipt), rendered + "\n")
+  }
+  harness.stdio.eprintln(rendered)
+  // Whose failure blocks whose change. A pull request against this repository
+  // cannot repair an unfolded release or a consumer's drifted adapter, so
+  // refusing it on one tells its author to fix something they cannot reach.
+  // Those answers stay in the receipt and are announced here; only the exit
+  // status narrows, and only for that scope.
+  const decision = preflight_scope_decision(
+    receipt.failed,
+    if trim(options.scope) == "repository" {
+      "repository"
+    } else {
+      "release"
+    },
+  )
+  for name in decision.deferred {
+    harness.stdio.println(
+      "::warning title=Release state::${name} refused, and no commit in this repository "
+        + "can repair it. It does not block this change; it does block the next release.",
+    )
+  }
+  if len(decision.deferred) > 0 {
+    harness.stdio.println("deferred to the release owner: " + join(decision.deferred, ", "))
+  }
+  return if decision.refuses {
+    1
+  } else {
+    0
+  }
+}
+
+/**
+ * Has the consumer gate suite already passed against the revision being cut?
+ *
+ * The consumer contract gate above asks whether consumer projections have
+ * drifted right now, from this runner, in the seconds before a tag. This asks
+ * something the release cannot ask about itself: whether every consumer that
+ * declares a gate has actually built against this exact Harn revision. The two
+ * are not the same question, because a projection can be byte-identical while
+ * the consumer's build against that runtime is broken.
+ *
+ * It asks about the revision rather than about a clock. A rehearsal that
+ * passed an hour ago against a different tip says nothing about this
+ * candidate; one that passed last week against this exact tip and these exact
+ * consumer contracts says everything.
+ *
+ * Every path that is not full coverage refuses. A release admitted because the
+ * proof listing was unreadable, or because no consumer declared a gate at all,
+ * would be a gate reporting on its own silence.
+ */
+fn consumer_rehearsal_check(
+  harness: Harness,
+  mode: string,
+  reachable: bool,
+  release_repo: string,
+  base: string,
+  pinned: string,
+) -> PreflightPrecondition {
+  if !reachable {
+    return preflight_unavailable(
+      "consumers.rehearsal",
+      "not asked: this context holds no credential for reading the fleet manifest",
+    )
+  }
+  if mode != "ship-pr" {
+    return preflight_unavailable(
+      "consumers.rehearsal",
+      "not asked: the consumer gates gate publication, which ${mode} does not reach",
+    )
+  }
+  const head = rehearsal_revision(harness, trim(release_repo), trim(base), pinned)
+  if is_err(head) {
+    return preflight_fail(
+      "consumers.rehearsal",
+      "could not read the revision this release would cut: ${to_string(unwrap_err(head))}",
+      "check the token's contents: read scope, then re-run this preflight",
+    )
+  }
+  const revision = unwrap(head)
+  const manifest = read_fleet_manifest(harness.fs)
+  const subjects = rehearsal_subjects(
+    hydrate_remote_consumer_repositories(harness, manifest, manifest.repositories, "main"),
+  )
+  // A read that failed is not a fleet with no proofs. Saying which it was keeps
+  // an operator from dispatching a rehearsal to fix a credential, and keeps a
+  // silent remote from admitting a release.
+  const coverage = rehearsal_coverage(
+    revision,
+    subjects,
+    rehearsal_proof_listing(harness.process, revision),
+  )
+  if coverage.covered {
+    return preflight_pass("consumers.rehearsal", coverage.detail)
+  }
+  return preflight_fail(
+    "consumers.rehearsal",
+    coverage.detail + " (${to_string(coverage.considered)} consumers declare a gate)",
+    "dispatch ${CONSUMER_REHEARSAL_WORKFLOW} and let it conclude, then re-run this "
+      + "preflight; if the rehearsal itself is red, repair the consumer it names first, "
+      + "because another rehearsal will only fail again",
+  )
+}
+
+/**
+ * Run the publication-time consumer contract gate against live consumer mains.
+ *
+ * This is the same `check_fleet_policy.harn` the hosted release runs before
+ * publication, invoked the same way, so a drift it would refuse on is a drift
+ * this refuses on. Running the gate itself rather than a summary of it is the
+ * point: a preflight that agreed with the gate by construction would prove
+ * nothing about the gate.
+ */
+fn consumer_contract_check(
+  fs: HarnessFs,
+  process: HarnessProcess,
+  harn_bin: string,
+  root: string,
+  mode: string,
+  repositories_json: string,
+  reachable: bool,
+) -> PreflightPrecondition {
+  if !reachable {
+    return preflight_unavailable(
+      "consumers.contracts",
+      "not asked: this context holds no credential for reading consumer contracts",
+    )
+  }
+  if mode != "ship-pr" {
+    // The contract gates publication, and only ship-pr publishes. Saying so is
+    // not the same as passing: a mode that never asks must not read like one
+    // that asked and liked the answer.
+    return preflight_unavailable(
+      "consumers.contracts",
+      "not asked: consumer contracts gate publication, which ${mode} does not reach",
+    )
+  }
+  let args = ["run", "--no-sandbox", path_join(root, "check_fleet_policy.harn")]
+  if trim(repositories_json) != "" {
+    args = args + ["--", "--repositories-json", trim(repositories_json)]
+  }
+  const result = process.run({program: harn_bin, args: args, cwd: root})
+  // Keep the gate's own document, not just this verdict. The receipt names
+  // which repository drifted; the document says in what bytes, and a run that
+  // refused is exactly when someone wants the second answer.
+  const receipt_dir = path_join(root, ".harn-runs")
+  fs.mkdir(receipt_dir, true)
+  fs.write_text(
+    path_join(receipt_dir, "prepublication-fleet-policy.json"),
+    trim(result.stdout ?? "") + "\n",
+  )
+  const failures = split(trim(result.stderr ?? ""), "\n").filter(
+    { line -> return trim(line) != "" && !starts_with(trim(line), "note:") },
+  )
+    .to_list()
+  return consumer_contract_precondition((result.exit_code ?? 1) == 0, failures)
+}

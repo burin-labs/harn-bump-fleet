@@ -1,0 +1,1063 @@
+name: Hosted harn release
+
+# Runs release_harn.harn on a GitHub-hosted runner instead of an operator
+# laptop. Both burin-labs/harn and burin-labs/harn-bump-fleet are public, so
+# release work moves off the operator machine entirely. The job uses the same
+# eight-vCPU capacity class as Harn's heavy Rust CI lane: candidate source
+# certification has three independent heavy pools, and the release gate needs
+# at least two workers per pool before it can overlap them safely.
+#
+# Tags are signed by a dedicated release bot key held only in this workflow's
+# `release` environment. The maintainer's personal key is deliberately not
+# reachable from any runner. The trade is provenance: tags now carry the bot's
+# identity rather than the maintainer's, and because the tagger is a GitHub App
+# bot — which cannot hold SSH signing keys on GitHub — the web UI shows them as
+# unverified. The signature is real and anyone can check it from the Harn repo,
+# which owns the artifact-publication trust policy:
+#
+#   git -c gpg.ssh.allowedSignersFile=harn/.github/release-bot-allowed-signers \
+#     verify-tag v<version>
+#
+# Restoring the green badge would mean signing as a machine user account
+# instead of the App bot.
+#
+# The release *commit* is a different problem with a different answer. The
+# release repository's `main` ruleset requires signatures, and GitHub counts
+# only a signature it can attribute to the committer's account — so a commit
+# signed with this bot key is refused, and the release PR would sit blocked with
+# every check green (burin-labs/harn-bump-fleet#660). `--github-signed-commit`
+# has the harness create that commit through `createCommitOnBranch` instead,
+# which GitHub signs server-side under the App token already minted below. No
+# additional secret, and the tag path is untouched.
+#
+# Secret exposure controls, in layers, because both repos are public:
+#
+#   1. `workflow_dispatch` is the only trigger. GitHub restricts manual
+#      dispatch to actors with write access, so no fork, pull request, or
+#      outside contributor can start this run.
+#   2. The job binds to the `release` environment. Its protected-branch policy
+#      admits only `main`; there is deliberately no recurring reviewer prompt.
+#      The checked-in workflow's closed inputs and the Harn release harness are
+#      the unattended policy boundary, while main's ruleset prevents an
+#      unreviewed workflow rewrite from reaching environment secrets.
+#   3. Top-level `permissions` is read-only. Write access to burin-labs/harn
+#      comes from a separately scoped, short-lived GitHub App token.
+#   4. Free-text inputs never reach a shell as interpolated text; they cross
+#      into `run:` blocks through the environment so a crafted value cannot
+#      escape into the command line.
+#   5. Every third-party action is pinned by commit SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version bump for the next release.
+        type: choice
+        options: [patch, minor, major, premajor, preminor, prepatch, prerelease]
+        default: patch
+      prerelease_identifier:
+        description: >-
+          Required for prerelease bumps (for example rc or beta); blank for
+          stable bumps.
+        type: string
+        default: ""
+      mode:
+        description: >-
+          audit is read-only. prepare builds and certifies the candidate.
+          ship-pr opens the release PR; the watcher tags its merged-main commit.
+        type: choice
+        options: [audit, prepare, ship-pr]
+        default: audit
+      at_sha:
+        description: >-
+          Optional 40-character base pin. Blank pins the release at
+          origin/main when the run starts.
+        type: string
+        default: ""
+      expected_prs:
+        description: >-
+          Optional comma-separated PR numbers that must be present in the
+          selected release range.
+        type: string
+        default: ""
+      resume_tagged_release:
+        description: >-
+          Resume the tail of a release whose tag already published but whose
+          next-development-version bump has not merged yet. Without this a rerun
+          of that tail refuses immediately, because the run's own follow-up bump
+          is a prerequisite of its own rerun. Leave off for a first cut: the same
+          version pair is what a doomed fresh cut of an already-tagged version
+          looks like.
+        type: boolean
+        default: false
+      converge_fleet:
+        description: >-
+          After a successful ship-pr release, prove publication and converge
+          every manifest-owned Harn consumer on the new tag.
+        type: boolean
+        default: true
+      repositories_json:
+        description: >-
+          Optional nonempty JSON list of manifest-owned Harn consumers to
+          update after publication. Blank retains the full-fleet default.
+        type: string
+        default: ""
+      skip_consumers:
+        description: >-
+          Optional nonempty JSON list of consumers to leave unchanged after
+          publication. Blank means no exclusions. Do not enter []. Cannot be
+          combined with repositories_json.
+        type: string
+        default: ""
+      consumer_proof_runs_json:
+        description: >-
+          Optional JSON object mapping a consumer repository to one exact
+          pre-tag proof run ID for recovery. Blank dispatches or discovers proof normally.
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: hosted-harn-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: ${{ inputs.mode }} v-next (${{ inputs.bump }})
+    outputs:
+      tag: ${{ steps.shipped-release.outputs.tag }}
+      fleet_run_id: ${{ steps.published-tail.outputs.run_id }}
+      fleet_run_url: ${{ steps.published-tail.outputs.run_url }}
+      repositories_json: ${{ steps.release-scope.outputs.repositories_json }}
+      release_artifact_name: ${{ steps.release-artifact.outputs.name }}
+    # Source certification owns three internally parallel heavy lanes: Rust,
+    # Harn, and package audit. The release gate partitions a host with at least
+    # six CPUs into bounded per-lane pools; GitHub's four-vCPU runner correctly
+    # serializes those lanes and makes the local source proof a repeatable
+    # ~40-minute critical path. This capacity class is already exercised by
+    # Harn's heavy Rust CI and gives each lane two workers without
+    # oversubscription. The job-level ceiling remains a hang backstop.
+    # Keep release progress independent of one hosted capacity provider. The
+    # repository variable is an operator failover, not a release input, so a
+    # replayed release receipt preserves its exact semantic input tuple.
+    runs-on: ${{ vars.HARN_CI_DISABLE_BLACKSMITH_LINUX == 'true' && 'ubuntu-latest' || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 300
+    environment: release
+    env:
+      # Harn owns the test partition for this typed runner tier. Blacksmith's
+      # image does not expose Landlock; GitHub Ubuntu CI owns those exact
+      # process-sandbox assertions while this lane runs every neutral test.
+      HARN_RUNNER_TIER: ${{ vars.HARN_CI_DISABLE_BLACKSMITH_LINUX == 'true' && 'github-hosted' || 'blacksmith' }}
+
+    steps:
+      - name: Check out release harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: harn-bump-fleet
+          persist-credentials: false
+
+      - name: Install pinned Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+        with:
+          version-file: harn-bump-fleet/.harn-version
+
+      - name: Install Harn dependencies
+        working-directory: harn-bump-fleet
+        run: harn install --locked
+
+      # The Actions API does not report a workflow_dispatch run's inputs, so
+      # the run itself is the only thing that can name them afterwards. Record
+      # them before any validation, so a run that fails at its first gate still
+      # leaves the exact dispatch behind for the failure finalizer.
+      - name: Record the dispatched release inputs
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_BUMP: ${{ inputs.bump }}
+          RELEASE_PREID: ${{ inputs.prerelease_identifier }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_AT_SHA: ${{ inputs.at_sha }}
+          RELEASE_EXPECT_PRS: ${{ inputs.expected_prs }}
+          RELEASE_RESUME_TAGGED: ${{ inputs.resume_tagged_release }}
+          RELEASE_CONVERGE_FLEET: ${{ inputs.converge_fleet }}
+          RELEASE_REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+          RELEASE_SKIP_CONSUMERS: ${{ inputs.skip_consumers }}
+          RELEASE_CONSUMER_PROOF_RUNS_JSON: ${{ inputs.consumer_proof_runs_json }}
+        run: harn run --no-sandbox record_hosted_release_inputs.harn
+
+      # Its own artifact rather than a file inside the run bundle, so the
+      # failure finalizer can require it and treat absence as data.
+      - name: Upload the dispatched release inputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-inputs-${{ github.run_id }}
+          include-hidden-files: true
+          path: harn-bump-fleet/.harn-runs/hosted-release-inputs.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      # parse_release_args is the one owner of release argument syntax. Run it
+      # through the public harness before minting credentials, cloning Harn, or
+      # restoring build state; --help returns immediately after that parse.
+      - name: Validate release inputs
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_BUMP: ${{ inputs.bump }}
+          RELEASE_PREID: ${{ inputs.prerelease_identifier }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_AT_SHA: ${{ inputs.at_sha }}
+          RELEASE_EXPECT_PRS: ${{ inputs.expected_prs }}
+          RELEASE_RESUME_TAGGED: ${{ inputs.resume_tagged_release }}
+          RELEASE_CONSUMER_PROOF_RUNS_JSON: ${{ inputs.consumer_proof_runs_json }}
+          # Reading one commit from the public release repository. The scoped
+          # App token is not minted yet and is not needed for a public read.
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An operator types a short SHA; every step after this one requires
+          # forty characters, and a live cut was refused thirty seconds in for
+          # exactly that mismatch. Widen it once, here, through the same
+          # resolver the preflight uses, and export the exact commit so the
+          # dispatch receipt, the certification branch, and the tag all name
+          # one commit rather than an abbreviation nobody re-checked.
+          if [[ -n "${RELEASE_AT_SHA}" && ! "${RELEASE_AT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            if ! resolved="$(./scripts/preflight_release_launch.sh \
+              --at-sha "${RELEASE_AT_SHA}" --resolve-only)"; then
+              echo "at_sha ${RELEASE_AT_SHA} does not name one exact commit" >&2
+              exit 2
+            fi
+            resolved="${resolved//[[:space:]]/}"
+            if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ ]]; then
+              # An empty answer must not be exported as the pin.
+              echo "commit resolution returned '${resolved}', not a full commit SHA" >&2
+              exit 2
+            fi
+            echo "at_sha ${RELEASE_AT_SHA} resolved to ${resolved}"
+            RELEASE_AT_SHA="$resolved"
+          fi
+          echo "RELEASE_AT_SHA=${RELEASE_AT_SHA}" >> "$GITHUB_ENV"
+          args=(--help --bump "${RELEASE_BUMP}" --mode "${RELEASE_MODE}")
+          if [ -n "${RELEASE_PREID}" ]; then
+            args+=(--preid "${RELEASE_PREID}")
+          fi
+          if [ -n "${RELEASE_AT_SHA}" ]; then
+            args+=(--at-sha "${RELEASE_AT_SHA}")
+          fi
+          if [ -n "${RELEASE_EXPECT_PRS}" ]; then
+            args+=(--expect-pr "${RELEASE_EXPECT_PRS}")
+          fi
+          if [ "${RELEASE_RESUME_TAGGED}" = "true" ]; then
+            args+=(--resume-tagged-release)
+          fi
+          if [ -n "${RELEASE_CONSUMER_PROOF_RUNS_JSON}" ]; then
+            args+=(--consumer-proof-runs-json "${RELEASE_CONSUMER_PROOF_RUNS_JSON}")
+          fi
+          harn run release_harn.harn -- "${args[@]}" >/dev/null
+
+      - name: Validate and normalize the post-publication consumer scope
+        id: release-scope
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_REPOSITORIES_JSON: ${{ inputs.repositories_json }}
+          RELEASE_SKIP_CONSUMERS: ${{ inputs.skip_consumers }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$RELEASE_REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$RELEASE_REPOSITORIES_JSON")
+          fi
+          if [[ -n "$RELEASE_SKIP_CONSUMERS" ]]; then
+            args+=(--skip-consumers-json "$RELEASE_SKIP_CONSUMERS")
+          fi
+          repositories_json="$(harn run --no-sandbox validate_fleet_scope.harn -- --require-controller "${args[@]}")"
+          echo "repositories_json=$repositories_json" >> "$GITHUB_OUTPUT"
+
+      # Scoped to burin-labs/harn only. `audit` never writes, but the same
+      # token serves both modes so the checkout remote is uniform; the
+      # harness itself is what decides whether a write happens.
+      #
+      # These grants are the `harn-release` profile in
+      # spec/github-app-token-profiles.json, which is also what
+      # scripts/mint_github_app_installation_token.mjs remints from. They were
+      # two independent declarations and they drifted: the profile gained
+      # `workflows` and this step did not, so the token armed into the
+      # credential helper could not push a certification branch carrying a
+      # workflow change. preflight_release_launch.harn compares the two now.
+      - name: Mint scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          repositories: harn
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: write
+
+      # Full history: the harness reconciles tags, walks commit evidence back
+      # to the previous release, and adds a release worktree.
+      - name: Check out harn
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          path: harn
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          # This job is the one that both reads git under a Harn sandbox and
+          # pushes, so it is the one where persisted credentials cannot stay.
+          # `persist-credentials: true` leaves an `include.path` in .git/config
+          # pointing at a $RUNNER_TEMP file; git reads that include on every
+          # invocation and treats an unreadable one as fatal, and the sandbox
+          # jails reads to the workspace. Run 30995854515 lost the release to
+          # exactly that: `verify_release_metadata` could not resolve HEAD.
+          # The push half is armed below instead.
+          persist-credentials: false
+
+      # The credential helper is what makes the line above survivable. Git
+      # consults a helper only when a transport authenticates, never while
+      # parsing config, so the sandboxed audit scripts keep working and the
+      # harness still pushes `release-attempt/...`, the certify branch, and the
+      # signed tag.
+      - name: Arm git push credentials
+        uses: burin-labs/harn/.github/actions/git-push-credentials@a776aba61473102efdad448e6ae464c944e44af0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      # The github connector's allow_gh_auth_fallback reads `gh auth token` when
+      # GH_TOKEN is unset. Seed that store with the same mint the credential
+      # helper just got, so API calls and git pushes share one refreshable path.
+      - name: Arm gh auth for API calls
+        env:
+          RELEASE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # `gh auth login` refuses to store credentials while GH_TOKEN is set.
+          env -u GH_TOKEN -u GITHUB_TOKEN \
+            printf '%s\n' "${RELEASE_TOKEN}" \
+            | env -u GH_TOKEN -u GITHUB_TOKEN \
+              gh auth login --with-token --hostname github.com
+          env -u GH_TOKEN -u GITHUB_TOKEN \
+            gh auth token --hostname github.com >/dev/null
+
+      # The action proves the credential resolves. This proves the whole path:
+      # the remote, the transport, and write access on this repository.
+      #
+      # It has to be its own step because `prepare` never pushes — it stops
+      # after building the candidate — so a green prepare run says nothing about
+      # whether `ship-pr` can publish `release-attempt/...` and the tag. Without
+      # this, a broken push surfaces for the first time in the one mode where
+      # the release is already half-spent.
+      #
+      # `--dry-run` performs the full authenticated receive-pack handshake and
+      # sends no ref update, so the probe branch is never created. `--no-verify`
+      # skips hooks that this checkout does not install anyway.
+      - name: Prove the push path authenticates
+        working-directory: harn
+        run: |
+          set -euo pipefail
+          git push --dry-run --no-verify origin \
+            "HEAD:refs/heads/push-preflight-${GITHUB_RUN_ID}"
+
+      # The release gate creates the tag with `git tag -s` and then gates on
+      # `git verify-tag`, so the runner needs both halves of an identity: a
+      # private key to sign with, and an allowed-signers file to verify
+      # against. The key is the release bot's own, never the maintainer's —
+      # a personal signing key must not be reachable from a runner.
+      #
+      # The tagger is a GitHub App bot, and an App bot cannot hold SSH signing
+      # keys on GitHub, so GitHub's web UI will show these tags as unverified.
+      # The signature is real and checkable against the Harn-owned trust root:
+      # `git -c gpg.ssh.allowedSignersFile=harn/.github/release-bot-allowed-signers
+      # verify-tag v<version>`. Moving the badge back would mean signing as a
+      # machine user account instead of the App bot.
+      - name: Identify and arm the release signer
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          ALLOWED_SIGNERS: ${{ github.workspace }}/harn/.github/release-bot-allowed-signers
+        run: |
+          set -euo pipefail
+
+          # RUNNER_TEMP is outside both checkouts, so the key cannot be picked
+          # up by a status check, an archive step, or a stray `git add -A`.
+          key_path="${RUNNER_TEMP}/release-signing-key"
+          umask 077
+          printf '%s\n' "${RELEASE_SIGNING_KEY}" > "${key_path}"
+          chmod 600 "${key_path}"
+
+          # Global, not repository-scoped. The harness builds the candidate in a
+          # linked worktree under harn-worktrees/, and identity has to reach it
+          # and every git subprocess the gate spawns without depending on which
+          # config file a worktree happens to resolve.
+          git config --global user.name "harn-release-bot[bot]"
+          git config --global user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git config --global gpg.format ssh
+          git config --global user.signingkey "${key_path}"
+          git config --global gpg.ssh.allowedSignersFile "${ALLOWED_SIGNERS}"
+          # Deliberately not `commit.gpgsign`. The release commit is created
+          # through GitHub (`--github-signed-commit` below), because a signature
+          # made with this key is one GitHub cannot attribute to the App bot and
+          # the ruleset would refuse it. Signing it locally as well would only
+          # produce a second signature nothing checks.
+
+          # Prove the identity round-trips before spending a release on it.
+          # Run 30828370900 spent 21 minutes building a candidate it could not
+          # sign, because nothing checked the signer until the gate reached it.
+          #
+          # The tag is the only half this key still signs. The release commit is
+          # GitHub's, and its signature cannot be probed from here — the harness
+          # asks GitHub for the verdict on the exact commit instead, which is the
+          # same question the ruleset asks.
+          probe="${RUNNER_TEMP}/signing-probe"
+          rm -rf "${probe}" && mkdir -p "${probe}"
+          git -C "${probe}" init -q
+          git -C "${probe}" commit -q --allow-empty --no-gpg-sign -m probe
+          git -C "${probe}" tag -s probe-tag -m probe HEAD
+          git -C "${probe}" verify-tag probe-tag
+          rm -rf "${probe}"
+
+      # The probe in the step above runs OUTSIDE the sandbox the release runs
+      # in, so it proves the key material is well formed -- not that the
+      # release can reach it. Two live releases were lost to exactly that gap:
+      # the confined tagger could not read its signing key, and once that was
+      # fixed the confined push could not read its credential store. Both
+      # probes were green through both failures, and both failures surfaced
+      # only after the release commit had already merged to the default branch.
+      #
+      # This asks the same two questions inside the real sandbox, before the
+      # release spends anything. It creates no remote state: the probe tag is
+      # local and deleted, and the push is `--dry-run`.
+      - name: Prove the confined release identity
+        working-directory: harn-bump-fleet
+        run: |
+          set -euo pipefail
+          ./scripts/preflight_release_identity.sh --repo "${GITHUB_WORKSPACE}/harn"
+
+      # The release token above is deliberately confined to Harn. Fleet policy
+      # is a separate, read-only boundary: it resolves consumer-owned contracts
+      # from every repository in the App installation, including private ones.
+      # Keep that observation authority out of the long-lived release token so
+      # neither concern has to inherit the other's reach or permissions.
+      - name: Mint fleet policy read token
+        if: inputs.mode == 'ship-pr'
+        id: fleet-policy-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          permission-contents: read
+
+      # Every release precondition, asked here, before the Rust toolchain and
+      # the cache and the candidate build. Five hosted attempts were lost in one
+      # day at five different gates, each first exercised between thirty seconds
+      # and sixty-five minutes into a cut that could not be taken back. The
+      # gates were fine; when they were asked was not.
+      #
+      # It runs in every mode. The credentialed half mints through the same
+      # profile the certify push is armed from and asserts what was granted; the
+      # consumer half runs `check_fleet_policy.harn`, which is the publication
+      # gate this step replaced, so a drift that would refuse publication
+      # refuses here instead. Scope is deliberately not narrowed: a mandatory
+      # pre-publication check keeps its all-consumer reach.
+      - name: Run the release launch preflight
+        working-directory: harn-bump-fleet
+        env:
+          GH_TOKEN: ${{ steps.fleet-policy-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.fleet-policy-token.outputs.token }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          RELEASE_BUMP: ${{ inputs.bump }}
+          RELEASE_PREID: ${{ inputs.prerelease_identifier }}
+          RELEASE_MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .harn-runs
+          # RELEASE_AT_SHA comes from the job environment, where input
+          # validation exported the resolved forty-character commit.
+          args=(--mode "${RELEASE_MODE}" --bump "${RELEASE_BUMP}")
+          if [ -n "${RELEASE_PREID}" ]; then
+            args+=(--preid "${RELEASE_PREID}")
+          fi
+          if [ -n "${RELEASE_AT_SHA}" ]; then
+            args+=(--at-sha "${RELEASE_AT_SHA}")
+          fi
+          ./scripts/preflight_release_launch.sh "${args[@]}" \
+            --receipt .harn-runs/release-launch-preflight.json
+
+      # Kept as headroom, not as a fix. The runner image measured 145 GB with
+      # ~86 GB already free, so this reclaim currently no-ops. The release gate
+      # is still the heaviest consumer in the fleet — it builds the workspace in
+      # its own target directory and again in a separate package-check target —
+      # and the step costs a second, so it stays ahead of that growth. See the
+      # footprint measurement after the harness for the number it guards.
+      - name: Free runner disk space
+        uses: burin-labs/harn/.github/actions/free-disk-space@a776aba61473102efdad448e6ae464c944e44af0
+
+      - name: Install the pinned Rust toolchain
+        uses: burin-labs/harn/.github/actions/rust-toolchain@a776aba61473102efdad448e6ae464c944e44af0
+
+      # The release audit's `rust-audit` lane runs `make test`, which uses
+      # nextest when it is installed and otherwise falls back to `cargo test
+      # --workspace`. Those two runners do not just differ in coverage — they
+      # differ in isolation. nextest runs one process per test; cargo test runs
+      # tests as threads in one process, so a test that sets a process-global
+      # env var (`TMPDIR` in the harn-hostlib command-artifact tests) leaks into
+      # whatever runs beside it. Without nextest this job failed on
+      # `completed_artifacts_from_a_live_foreign_pid_do_not_starve_fresh_output`
+      # and `cancel_handle_can_wait_for_timed_out_result`, neither of which is
+      # broken under the runner harn's own CI uses.
+      #
+      # Pinned to the version ci.yml installs, so the release gate and CI agree
+      # on what "the tests pass" means.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: nextest@0.9.132
+
+      # `release_gate.sh` greps with ripgrep in the security/trust boundary
+      # audit, but the hosted runner image does not provide it. Install the
+      # immutable upstream binary instead of entering the mutable Ubuntu apt
+      # path: a mirror stall there used the whole bootstrap budget before the
+      # release harness could start. The checksums are from the upstream v15.2.0
+      # release assets.
+      - name: Install pinned release-gate ripgrep
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=15.2.0
+          case "$RUNNER_ARCH" in
+            X64)
+              target=x86_64-unknown-linux-musl
+              checksum=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+              ;;
+            ARM64)
+              target=aarch64-unknown-linux-musl
+              checksum=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+              ;;
+            *)
+              printf '::error::unsupported runner architecture: %s\n' "$RUNNER_ARCH"
+              exit 1
+              ;;
+          esac
+          archive="${RUNNER_TEMP}/ripgrep-${version}-${target}.tar.gz"
+          bin_dir="${RUNNER_TEMP}/ripgrep-${version}-${target}"
+          curl --proto '=https' --tlsv1.2 --location --retry 5 --retry-all-errors \
+            --connect-timeout 15 --max-time 30 --fail --silent --show-error \
+            --output "$archive" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${version}/ripgrep-${version}-${target}.tar.gz"
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar --extract --gzip --file "$archive" --directory "$bin_dir" \
+            --strip-components=1 "ripgrep-${version}-${target}/rg"
+          printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+          "$bin_dir/rg" --version
+
+      # sccache is deliberately absent. `release_prepare_env` exports
+      # `RUSTC_WRAPPER= SCCACHE_DISABLE=1` into every release build, so an
+      # installed sccache records `compile_requests: 0` and only makes the job
+      # look cached when it is not.
+      #
+      # Expect this cache to restore dependencies and nothing else, and expect
+      # that to stay true here even after issue #656 closes. #672 already gave a
+      # lane-owning release a stable workspace path, which is what #656 asked
+      # for; a live release on this runner takes that path. It buys nothing on a
+      # hosted runner, because Cargo fingerprints a source file by mtime and the
+      # worktree is created fresh on a new machine every run. Every workspace
+      # crate therefore looks newer than any artifact restored from the cache.
+      # Only a surviving checkout switched to a new pin leaves untouched files
+      # untouched, and nothing survives here. The ~3m20s `release-cli-aot`
+      # spends on 19 workspace crates is not reachable from a cache at all —
+      # only from caching the worktree with its mtimes, which this does not do.
+      #
+      # `workspaces` fixes the cache *key*, which is computed from a Cargo.lock
+      # and would otherwise be read from the checkout root — the fleet repo,
+      # which has none. `target-dir` names the directory the harness actually
+      # compiles into; without it Swatinem caches `harn/target`, which this job
+      # never writes. Both inputs arrived in burin-labs/harn#6112.
+      - name: Restore the Rust build cache
+        uses: burin-labs/harn/.github/actions/rust-cache@a776aba61473102efdad448e6ae464c944e44af0
+        continue-on-error: true
+        with:
+          shared-key: hosted-release
+          workspaces: harn
+          target-dir: ~/.cache/harn-bump-fleet/release-harn-target
+          save: "true"
+          # A release that fails after compiling still warmed the dependencies,
+          # and most of this job's history is failed runs.
+          cache-on-failure: "true"
+
+      # Inputs cross into the shell as environment values, never as
+      # interpolated command text.
+      #
+      # The Cargo target directory is deliberately left at its default. The
+      # knob is now HARN_EXT_RELEASE_CARGO_TARGET_DIR (issue #636 moved the
+      # harness's own names into the HARN_EXT_ namespace, so it is no longer
+      # rejected at startup the way HARN_RELEASE_CARGO_TARGET_DIR was), but
+      # the runner's HOME-derived default is ephemeral anyway, so there is
+      # nothing to gain by pointing it elsewhere.
+      - name: Run release harness
+        id: release
+        working-directory: harn-bump-fleet
+        env:
+          # Deliberately omit GH_TOKEN. A process-env token is pinned for the
+          # whole `harn run` and cannot be refreshed; long ship-pr runs can
+          # outlive the App installation mint (1h). The connector falls back to
+          # `gh auth token`, and git push uses the credential.helper store —
+          # both rewritten by scripts/refresh_hosted_release_credentials.sh.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          RELEASE_BUMP: ${{ inputs.bump }}
+          RELEASE_PREID: ${{ inputs.prerelease_identifier }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          # RELEASE_AT_SHA is deliberately absent here. "Validate release inputs"
+          # widens an abbreviated pin and exports the exact forty-character
+          # commit through GITHUB_ENV; a step-level `env:` entry would override
+          # that with the abbreviation the dispatch was given.
+          RELEASE_EXPECT_PRS: ${{ inputs.expected_prs }}
+          RELEASE_RESUME_TAGGED: ${{ inputs.resume_tagged_release }}
+          RELEASE_CONSUMER_PROOF_RUNS_JSON: ${{ inputs.consumer_proof_runs_json }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Remint before the App token's 1h ceiling, in every mode. The
+          # refresher used to run only for ship-pr on the theory that prepare
+          # was short; a prepare whose harn-linked suite took 51m then hit the
+          # ceiling inside certification and died on a 401 at 65m (run
+          # 34147744034). The mint's lifetime is the ceiling, not the mode.
+          # Prove the remint path before the long audit.
+          ./scripts/refresh_hosted_release_credentials.sh
+          (
+            while true; do
+              sleep 2400
+              ./scripts/refresh_hosted_release_credentials.sh \
+                || echo "::warning::credential refresh failed; next git/API call may auth-fail"
+            done
+          ) &
+          refresher=$!
+          trap 'kill "${refresher}" 2>/dev/null || true' EXIT
+
+          # `--github-signed-commit`: the committer here is an App bot, and
+          # GitHub cannot attribute a signing key to one. See the header.
+          args=(--repo "${GITHUB_WORKSPACE}/harn" --bump "${RELEASE_BUMP}" --mode "${RELEASE_MODE}" --agent --no-chat --github-signed-commit)
+          if [ -n "${RELEASE_PREID}" ]; then
+            args+=(--preid "${RELEASE_PREID}")
+          fi
+          # Only a mutating mode carries the live-release acknowledgement.
+          if [ "${RELEASE_MODE}" != "audit" ]; then
+            args+=(--yes-live-release)
+          fi
+          if [ -n "${RELEASE_AT_SHA}" ]; then
+            args+=(--at-sha "${RELEASE_AT_SHA}")
+          fi
+          if [ -n "${RELEASE_EXPECT_PRS}" ]; then
+            args+=(--expect-pr "${RELEASE_EXPECT_PRS}")
+          fi
+          if [ "${RELEASE_RESUME_TAGGED}" = "true" ]; then
+            args+=(--resume-tagged-release)
+          fi
+          if [ -n "${RELEASE_CONSUMER_PROOF_RUNS_JSON}" ]; then
+            args+=(--consumer-proof-runs-json "${RELEASE_CONSUMER_PROOF_RUNS_JSON}")
+          fi
+          # The self-check below fetches current fleet main before doing any
+          # release work. Keep this workflow-owned transcript in the existing
+          # ignored run-artifact root so opening `tee` cannot make the checkout
+          # dirty and prevent a safe fast-forward after an approval wait.
+          mkdir -p .harn-runs/runtime-usage
+          ./scripts/with_env.sh harn run --no-sandbox --emit-summary-json \
+            --summary-file .harn-runs/runtime-usage/release.json \
+            release_harn.harn -- "${args[@]}" \
+            2>&1 | tee .harn-runs/hosted-release.md
+
+      - name: Persist exact release runtime cost receipt
+        if: always()
+        working-directory: harn-bump-fleet
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary=.harn-runs/runtime-usage/release.json
+          receipt=.harn-runs/hosted-release-runtime-cost-receipt.json
+          records=()
+          if [[ -f "$summary" ]]; then
+            records+=("$summary")
+          fi
+          scripts/write_harn_cost_receipt.sh \
+            "$receipt" \
+            harn_bump_fleet.hosted_release_runtime_cost.v1 \
+            "${{ inputs.mode }}:${{ inputs.bump }}" \
+            "$GITHUB_SHA" \
+            "${records[@]}"
+
+      - name: Resolve shipped release receipt
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        id: shipped-release
+        working-directory: harn-bump-fleet
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t receipts < <(find .harn-runs/release-harn/watches -type f -name 'v*.json' -print)
+          if [[ "${#receipts[@]}" -ne 1 ]]; then
+            echo "expected one shipped release watch receipt, found ${#receipts[@]}" >&2
+            exit 1
+          fi
+          tag="$(jq -er '.tag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$"))' "${receipts[0]}")"
+          printf 'tag=%s\nreceipt=%s\n' "$tag" "${receipts[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Prove hosted release publication
+        id: publish-prover
+        if: inputs.mode == 'ship-pr' && inputs.converge_fleet
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_TAG: ${{ steps.shipped-release.outputs.tag }}
+          RELEASE_RECEIPT: ${{ steps.shipped-release.outputs.receipt }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/watch_hosted_harn_release.sh \
+            --tag "$RELEASE_TAG" \
+            --receipt "$RELEASE_RECEIPT" \
+            --repo "${GITHUB_WORKSPACE}/harn" \
+            --github-app-signer \
+            --yes-live-release \
+            --json \
+            | tee .harn-runs/hosted-release-watch.json
+
+      # The owner proves publication independently of the watcher's conclusion,
+      # records proposal failures, and persists intent before the fleet handoff.
+      - name: Reconcile published release and hand off fleet update
+        id: published-tail
+        if: ${{ !cancelled() && inputs.mode == 'ship-pr' && inputs.converge_fleet && steps.shipped-release.outputs.tag != '' }}
+        working-directory: harn-bump-fleet
+        env:
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          RELEASE_APP_TOKEN_PROFILE: fleet-orchestration
+          RELEASE_TAG: ${{ steps.shipped-release.outputs.tag }}
+          RELEASE_CHAIN_ID: ${{ github.run_id }}
+          RELEASE_REPOSITORIES_JSON: ${{ steps.release-scope.outputs.repositories_json }}
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN
+          ./scripts/refresh_hosted_release_credentials.sh
+          (
+            while sleep 2700; do
+              ./scripts/refresh_hosted_release_credentials.sh
+            done
+          ) &
+          refresher_pid="$!"
+          trap 'kill "$refresher_pid" 2>/dev/null || true' EXIT
+          args=(
+            --resume-published --tag "$RELEASE_TAG"
+            --receipt ".harn-runs/release-harn/watches/${RELEASE_TAG}.json"
+            --state-root .harn-runs --chain-id "$RELEASE_CHAIN_ID"
+            --repo "${GITHUB_WORKSPACE}/harn" --yes-live-release --no-wait
+          )
+          if [[ -n "$RELEASE_REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$RELEASE_REPOSITORIES_JSON")
+          fi
+          ./scripts/with_env.sh harn run --no-sandbox release_chain.harn -- "${args[@]}" \
+            | tee .harn-runs/hosted-published-tail.json
+          # A tail that handed itself to automatic recovery exits zero without
+          # ever reaching a proven repin, so the fleet handoff identity is read
+          # only when the receipt actually carries one. The absent branch is
+          # explicit: no output is written, and the fleet job's own guard skips.
+          tail=.harn-runs/hosted-published-tail.json
+          if jq -e '[.receipt.stages[] | select(.stage == "repin" and .status == "proven")] | length > 0' "$tail" > /dev/null; then
+            run_id="$(jq -er '[.receipt.stages[] | select(.stage == "repin" and .status == "proven")] | last | .evidence[0].observed | tonumber | select(. > 0)' "$tail")"
+            run_url="$(jq -er '[.receipt.stages[] | select(.stage == "repin" and .status == "proven")] | last | .evidence[0].identity | select(startswith("https://github.com/"))' "$tail")"
+            printf 'run_id=%s\nrun_url=%s\n' "$run_id" "$run_url" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no proven fleet dispatch in the published tail receipt"
+          fi
+
+      - name: Report published release tail handoff
+        if: ${{ !cancelled() && inputs.mode == 'ship-pr' && inputs.converge_fleet && steps.shipped-release.outputs.tag != '' }}
+        working-directory: harn-bump-fleet
+        env:
+          TAIL_OUTCOME: ${{ steps.published-tail.outcome }}
+          RELEASE_TAG: ${{ steps.shipped-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Past the tag the release is irreversible, so a red tail step is not
+          # the verdict: the recovery supervisor's own receipt is. It records
+          # every attempt with the cause it read and the action it took. An
+          # absent or unreadable receipt fails here rather than passing, because
+          # an unreadable publication state is not a published release.
+          recovery=".harn-runs/release-tail-recovery/${RELEASE_TAG}.json"
+          test -f "$recovery"
+          jq -er '
+            "Published tail recovery: \(.terminal_action) after \(.attempts | length) attempt(s) "
+            + "(ceiling \(.ceiling))",
+            (.attempts[] | "- attempt \(.attempt): cause \(.cause) at \(.stage // "n/a") "
+              + "-> \(.action): \(.reason)")
+          ' "$recovery" >> "$GITHUB_STEP_SUMMARY"
+          jq -er '.receipt | "Published tail: \(.status); next proof: \(.current_stage)"' \
+            .harn-runs/hosted-published-tail.json >> "$GITHUB_STEP_SUMMARY"
+          settled="$(jq -er '
+            .terminal_action as $a
+            | ((.attempts | length) > 0
+               and ($a == "complete" or $a == "handoff" or $a == "dispatch_recovery"))
+          ' "$recovery")"
+          if [[ "$settled" != true ]]; then
+            echo "::error::published tail escalated; see the recovery receipt above" >&2
+            exit 1
+          fi
+          if [[ "$TAIL_OUTCOME" != success ]]; then
+            echo "::warning::the tail step exited ${TAIL_OUTCOME}; recovery settled it as $(jq -r .terminal_action "$recovery")"
+          fi
+
+      # A warm Rust cache is the only lever left on this job's wall clock that
+      # costs nothing, and GitHub caps a repository at 10 GB. Whether the
+      # release build fits under that cap is a question about this workspace on
+      # this runner, so measure it here rather than extrapolate from a
+      # developer machine whose target directory has accumulated across runs.
+      - name: Measure release build footprint
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '## Release build footprint'
+            echo
+            echo "cores: $(nproc)"
+            echo
+            echo '```'
+            du -sh "${HOME}/.cache/harn-bump-fleet"/* 2>/dev/null || echo 'no release target directory'
+            du -sh "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish run summary
+        if: always()
+        working-directory: harn-bump-fleet
+        run: |
+          set -euo pipefail
+          if [ -f .harn-runs/hosted-release.md ]; then
+            cat .harn-runs/hosted-release.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # A workflow_run finalizer executes only after this run is terminal, so
+      # it cannot share process memory with the release harness. Preserve the
+      # exact distributed claim as its typed handoff. `ignore` is correct for
+      # audit and for cancellation before lane acquisition; the finalizer reads
+      # the exact release-step state before deciding whether absence is valid.
+      - name: Upload exact release lane claim
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-lane-claim-${{ github.run_id }}
+          include-hidden-files: true
+          path: harn-bump-fleet/.harn-runs/hosted-release-lane-claim.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # The event stream and live logs are the durable record of why a step
+      # failed; they are the first thing an operator reads on a red run.
+      #
+      # `include-hidden-files` is load-bearing, not hygiene. The run directory
+      # is `.harn-runs`, and upload-artifact has skipped dot-prefixed paths by
+      # default since v4.4. Run 30824705839 failed after 40 minutes and shipped
+      # an artifact containing only the hosted-release transcript: every lane
+      # log and the event stream were silently dropped, and
+      # `if-no-files-found: warn` had nothing to warn about because one file did
+      # match.
+      - name: Resolve release artifact identity
+        id: release-artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'name=release-run-%s-attempt-%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release run artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release-artifact.outputs.name }}
+          include-hidden-files: true
+          path: harn-bump-fleet/.harn-runs/**
+          retention-days: 14
+          if-no-files-found: warn
+
+  fleet:
+    name: Prove Harn repository updates
+    needs: release
+    # A failed publication watcher can still leave a proved, accepted handoff.
+    # Keep its terminal owner running, but never infer a dispatch from absence.
+    if: ${{ !cancelled() && inputs.mode == 'ship-pr' && inputs.converge_fleet && needs.release.outputs.tag != '' && needs.release.outputs.fleet_run_id > 0 && needs.release.outputs.fleet_run_url != '' }}
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out release harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes or fetches with the checkout's own
+          # credential, and a persisted one leaves an `include.path` in
+          # .git/config pointing at a $RUNNER_TEMP file. Git treats an
+          # unreadable include as fatal, so any later step that reads git
+          # from a different temp root or under a sandbox dies on config,
+          # not on its own work. Run 30995854515 lost a release to exactly
+          # that; the release job has carried this setting ever since.
+          persist-credentials: false
+
+      - name: Install pinned Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+
+      - name: Install locked Harn dependencies
+        run: harn install --locked
+
+      - name: Prove exact fleet convergence run
+        id: watch-fleet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          FLEET_RUN_ID: ${{ needs.release.outputs.fleet_run_id }}
+          FLEET_RUN_URL: ${{ needs.release.outputs.fleet_run_url }}
+          RELEASE_CHAIN_ID: ${{ github.run_id }}
+          RELEASE_REPOSITORIES_JSON: ${{ needs.release.outputs.repositories_json }}
+        run: |
+          set -euo pipefail
+          args=(
+            --run-id "$FLEET_RUN_ID" --run-url "$FLEET_RUN_URL"
+            --chain-id "$RELEASE_CHAIN_ID"
+          )
+          if [[ -n "$RELEASE_REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$RELEASE_REPOSITORIES_JSON")
+          fi
+          args+=("$RELEASE_TAG")
+          harn run --no-sandbox watch_fleet_convergence_run.harn -- "${args[@]}" \
+            | tee hosted-fleet-convergence.json
+          for index in 0 1 2 3; do
+            run_id="$(jq -r --argjson index "$index" '.runs[$index].run_id // ""' hosted-fleet-convergence.json)"
+            printf 'run_%s=%s\n' "$((index + 1))" "$run_id" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Download release cost receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.release.outputs.release_artifact_name }}
+          path: hosted-cost-receipts/release
+
+      - name: Check out Harn tag-verification policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          path: published-harn
+          persist-credentials: false
+
+      - name: Mint read-only fleet proof token
+        id: fleet-proof-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: burin-labs
+          permission-actions: read
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Reconcile terminal published-tail journal from consumer main
+        env:
+          GH_TOKEN: ${{ steps.fleet-proof-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.fleet-proof-token.outputs.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          RELEASE_CHAIN_ID: ${{ github.run_id }}
+          RELEASE_REPOSITORIES_JSON: ${{ needs.release.outputs.repositories_json }}
+        run: |
+          set -euo pipefail
+          args=(
+            --resume-published --reconcile-only --tag "$RELEASE_TAG"
+            --receipt "hosted-cost-receipts/release/release-harn/watches/${RELEASE_TAG}.json"
+            --state-root hosted-cost-receipts/release --chain-id "$RELEASE_CHAIN_ID"
+            --repo "${GITHUB_WORKSPACE}/published-harn" --yes-live-release
+          )
+          if [[ -n "$RELEASE_REPOSITORIES_JSON" ]]; then
+            args+=(--repositories-json "$RELEASE_REPOSITORIES_JSON")
+          fi
+          harn run --no-sandbox release_chain.harn -- "${args[@]}" \
+            | tee hosted-published-tail-terminal.json
+
+      - name: Download fleet round 1 cost receipt
+        if: steps.watch-fleet.outputs.run_1 != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harn-update-receipts
+          repository: burin-labs/harn-bump-fleet
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.watch-fleet.outputs.run_1 }}
+          path: hosted-cost-receipts/round-1
+
+      - name: Download fleet round 2 cost receipt
+        if: steps.watch-fleet.outputs.run_2 != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harn-update-receipts
+          repository: burin-labs/harn-bump-fleet
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.watch-fleet.outputs.run_2 }}
+          path: hosted-cost-receipts/round-2
+
+      - name: Download fleet round 3 cost receipt
+        if: steps.watch-fleet.outputs.run_3 != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harn-update-receipts
+          repository: burin-labs/harn-bump-fleet
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.watch-fleet.outputs.run_3 }}
+          path: hosted-cost-receipts/round-3
+
+      - name: Download fleet round 4 cost receipt
+        if: steps.watch-fleet.outputs.run_4 != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harn-update-receipts
+          repository: burin-labs/harn-bump-fleet
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.watch-fleet.outputs.run_4 }}
+          path: hosted-cost-receipts/round-4
+
+      - name: Persist exact release and repository-update cost
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t receipts < <(find hosted-cost-receipts -type f \( \
+            -name hosted-release-runtime-cost-receipt.json -o \
+            -name fleet-runtime-cost-receipt.json \) -print | sort)
+          scripts/combine_harn_cost_receipts.sh \
+            hosted-release-and-update-cost-receipt.json \
+            harn_bump_fleet.hosted_release_and_update_cost.v1 \
+            "$RELEASE_TAG" "$GITHUB_SHA" "${receipts[@]}"
+          jq -e '.cost_status == "exact" and (.cost_usd | type == "number")' \
+            hosted-release-and-update-cost-receipt.json >/dev/null
+
+      - name: Upload fleet convergence receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-fleet-convergence-${{ github.run_id }}
+          path: |
+            hosted-fleet-convergence.json
+            hosted-release-and-update-cost-receipt.json
+            hosted-published-tail-terminal.json
+            hosted-cost-receipts/release/release-chain/**
+          if-no-files-found: error

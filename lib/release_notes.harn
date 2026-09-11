@@ -1,0 +1,1229 @@
+import { changelog_find_section } from "std/changelog"
+import { command_result_fail, command_result_ok } from "std/command"
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { GitRemoteRef, git_merge_base } from "std/git"
+import {
+  changelog_bullet_count,
+  changelog_fixup_release_body,
+  changelog_promote_pin_time_unreleased,
+  changelog_release_section_valid,
+  changelog_repair_post_merge_drift,
+  changelog_replace_top_section,
+} from "./changelog"
+import { pr_title_changelog_paperwork } from "./pr_title_convention"
+import { agent_result_text } from "./release_audit"
+import { ReleasePublishedBodySource } from "./release_body_contracts"
+import {
+  ReleaseRecordedStep,
+  recorded_step,
+  release_tag_verify_git_args,
+} from "./release_execution"
+import {
+  ReleaseFixupState,
+  recovered_checkpoint_tooling_drift,
+  recovered_checkpoint_tooling_integrity,
+  registry_adjusted_checkpoint_flags,
+  registry_preferred_attempt_oid,
+  release_recovery_checkpoint_route,
+  release_recovery_is_pre_tag_resume,
+  release_recovery_pin_decision,
+  release_recovery_preference,
+  require_registry_immutability_gate,
+} from "./release_fixup"
+import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
+import { release_notes_draft_path } from "./release_note_draft"
+import {
+  apply_deterministic_candidate_tree_release_notes,
+  assemble_fragment_records,
+  candidate_tree_fragment_section,
+  candidate_tree_release_note_fold,
+  fold_candidate_release_note_text,
+  persist_candidate_tree_release_note_result,
+} from "./release_note_fold"
+import {
+  ReleasePublication,
+  ReleasePullRequestIdentity,
+  release_recovery_pull_requests,
+  release_recovery_source,
+} from "./release_publication"
+import { harn_crate_published, probe_registry_version_immutability } from "./release_readiness"
+import { remote_tag_sha, remote_tag_target_sha } from "./release_repin"
+import { release_tag_identity_verification } from "./release_tag_identity"
+import {
+  RunSessionViewGate,
+  RunSessionViewReleaseNoteStatus,
+  run_session_view_gate,
+  run_session_view_mock_gate,
+  run_session_view_release_command_env,
+  run_session_view_release_note_status,
+} from "./run_session_view_gate"
+import { ReleaseAgentReviewResult, run_recovery_agent_loop } from "release_agent"
+import { ReleaseAnalysis, changelog_top, last_published_release_version } from "release_analysis"
+import {
+  ReleaseCommandResult,
+  ReleaseConfig,
+  ReleaseRepoConfig,
+  prompt_asset,
+  read_repo_file,
+  release_git_remote_refs,
+  release_github_mergeability,
+  release_github_open_pr,
+  release_github_pr_create,
+  release_github_pr_list,
+  release_log_event,
+  run_git,
+} from "release_runtime"
+import { release_asset_snapshot } from "release_tag"
+
+/**
+ * Changelog facts read from observed exact Git objects after release availability and
+ * open-PR gates have already passed. Keeping this boundary typed makes the
+ * published-tag authority rule executable against a disposable real remote.
+ */
+pub type ReleasePostMergeDriftEvidence = {
+  tag: string,
+  version: string,
+  original_pin: string,
+  pin_unreleased: string,
+  current_section: string,
+  published_tag_section: string,
+  paperwork_branch: string,
+}
+
+pub type ReleaseGitBaseConfig = {repo: string, base: string, ...rest}
+
+pub type ReleasePostMergeDrift = {
+  kind: "drift",
+  tag: string,
+  version: string,
+  original_pin: string,
+  pin_unreleased: string,
+  current_section: string,
+  paperwork_branch: string,
+}
+
+pub type ReleasePaperworkPrOpen = {
+  kind: "paperwork_pr_open",
+  pr_url: string,
+  paperwork_branch: string,
+}
+
+pub type ReleasePostMergeState = ReleasePostMergeDrift | ReleasePaperworkPrOpen
+
+pub type ReleasePostMergeNoDriftDecision = {action: "no_drift", reason: string, drift: nil}
+
+pub type ReleasePostMergeDriftDecision = {
+  action: "drift",
+  reason: string,
+  drift: ReleasePostMergeDrift,
+}
+
+pub type ReleasePostMergeDecision = ReleasePostMergeNoDriftDecision | ReleasePostMergeDriftDecision
+
+pub type ReleaseRunSessionViewGate = RunSessionViewGate \
+  & {release_note: RunSessionViewReleaseNoteStatus, findings: list<string>}
+
+fn release_recovery_handoff_url(
+  immutable_pr: ReleasePullRequestIdentity?,
+  tagged_fixup: ReleasePullRequestIdentity?,
+) -> string {
+  if immutable_pr != nil {
+    return immutable_pr.url
+  }
+  if tagged_fixup != nil {
+    return tagged_fixup.url
+  }
+  return ""
+}
+
+fn changelog_section_body(text: any, heading: any) {
+  const section = changelog_find_section(text, heading)
+  return is_ok(section) ? unwrap(section).body : ""
+}
+
+pub type ReleaseRecoveryVerification = {immutable_ref: string, tag_object_oid: string}
+
+/** Fetch the exact durable recovery object and verify a release tag before trusting it. */
+pub fn verify_release_recovery_source(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseRepoConfig,
+  tag: string,
+  publication: ReleasePublication,
+  tag_refs: list<GitRemoteRef>,
+) -> ReleaseRecoveryVerification {
+  const immutable_ref = "refs/heads/${publication.remote_ref}"
+  if len(tag_refs) == 0 {
+    const fetched = run_git(harness, cfg, ["fetch", "--quiet", "origin", immutable_ref])
+    if !fetched.success {
+      throw "could not fetch release recovery source ${immutable_ref}: ${trim(fetched.stderr ?? "")}"
+    }
+    const fetched_head = run_git(harness, cfg, ["rev-parse", "FETCH_HEAD^{}"])
+    if !fetched_head.success || lowercase(trim(fetched_head.stdout ?? "")) != publication.head_oid {
+      throw "fetched release recovery source ${immutable_ref} does not resolve to ${publication.head_oid}"
+    }
+    return {immutable_ref: immutable_ref, tag_object_oid: ""}
+  }
+  const tag_ref = "refs/tags/${tag}"
+  const fetched_tag = run_git(harness, cfg, ["fetch", "--quiet", "origin", tag_ref])
+  if !fetched_tag.success {
+    throw "could not fetch release recovery tag ${tag}: ${trim(fetched_tag.stderr ?? "")}"
+  }
+  const fetched_tag_object = run_git(harness, cfg, ["rev-parse", "FETCH_HEAD"])
+  const fetched_tag_target = run_git(harness, cfg, ["rev-parse", "FETCH_HEAD^{}"])
+  const tag_object_oid = lowercase(trim(fetched_tag_object.stdout ?? ""))
+  const tag_contents = run_git(harness, cfg, ["cat-file", "tag", tag_object_oid])
+  const verified_tag = run_git(harness, cfg, release_tag_verify_git_args(tag_object_oid))
+  const identity = release_tag_identity_verification(
+    tag,
+    remote_tag_sha(tag_refs),
+    publication.head_oid,
+    if fetched_tag_object.success {
+      tag_object_oid
+    } else {
+      ""
+    },
+    if fetched_tag_target.success {
+      fetched_tag_target.stdout ?? ""
+    } else {
+      ""
+    },
+    if tag_contents.success {
+      tag_contents.stdout ?? ""
+    } else {
+      ""
+    },
+    verified_tag.success,
+  )
+  if !identity.success {
+    throw "remote release tag ${tag} failed immutable identity verification: ${identity.reason}"
+  }
+  return {immutable_ref: tag_ref, tag_object_oid: tag_object_oid}
+}
+
+/**
+ * F1b: fold the CHANGELOG deterministically, then recover if the result is
+ * malformed. The deterministic fold is the normal path. If the resulting
+ * `## v${next_version}` section is invalid (wrong heading, no bullets, or an
+ * unrepresented fragment), first retry the deterministic fold (idempotent); only
+ * if that still fails does a bounded agent_loop massage the section — with a
+ * deterministic validation gate afterward so the model can neither invent
+ * content nor drop a fragment. Fragments are deleted only once a valid state is
+ * reached; on unrecoverable failure the fold fails loud and leaves fragments in
+ * place.
+ */
+fn apply_candidate_tree_release_notes(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  notes_path: string?,
+  run_id: string,
+) -> ReleaseCommandResult {
+  const deterministic = apply_deterministic_candidate_tree_release_notes(
+    {fs: harness.fs, process: harness.process},
+    cfg,
+    analysis.next_version,
+    notes_path,
+  )
+  if deterministic.success {
+    return deterministic
+  }
+  const folded = candidate_tree_release_note_fold(
+    {fs: harness.fs, process: harness.process},
+    cfg,
+    analysis.next_version,
+    notes_path,
+  )
+  if !folded.success {
+    return deterministic
+  }
+  let final_text = folded.text
+  let recovery_note = ""
+  if !folded.valid {
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "changelog_fold_invalid",
+      {version: analysis.next_version, findings: folded.findings},
+    )
+    // Deterministic-first recovery: re-run the idempotent fold once.
+    const refold = fold_candidate_release_note_text(
+      folded.text,
+      folded.fragment_section,
+      analysis.next_version,
+      folded.agent_notes,
+    )
+    const regate = if refold.success {
+      changelog_release_section_valid(refold.text, analysis.next_version, folded.fragments)
+    } else {
+      {valid: false, findings: [refold.message]}
+    }
+    if regate.valid {
+      final_text = refold.text
+      recovery_note = "; recovered via deterministic re-fold"
+      release_log_event(
+        {clock: harness.clock, fs: harness.fs},
+        run_id,
+        "changelog_fold_recovered",
+        {via: "deterministic-refold"},
+      )
+    } else if !cfg.mock {
+      // Last resort: bounded agent massage with a deterministic post-gate.
+      const massage = run_changelog_massage_recovery(
+        harness,
+        cfg,
+        analysis,
+        run_id,
+        folded.text,
+        folded.fragments,
+      )
+      if massage.valid {
+        final_text = massage.text
+        recovery_note = "; recovered via bounded agent massage"
+        release_log_event(
+          {clock: harness.clock, fs: harness.fs},
+          run_id,
+          "changelog_fold_recovered",
+          {via: "agent-massage"},
+        )
+      } else {
+        return command_result_fail(
+          1,
+          "changelog fold produced an invalid `## v${analysis.next_version}` section and recovery failed:\n"
+            + join(folded.findings + (massage.findings ?? []), "\n"),
+        )
+      }
+    } else {
+      return command_result_fail(
+        1,
+        "changelog fold produced an invalid `## v${analysis.next_version}` section:\n"
+          + join(folded.findings, "\n"),
+      )
+    }
+  }
+  let persisted = folded
+  persisted["text"] = final_text
+  persisted["valid"] = true
+  persisted["findings"] = []
+  return persist_candidate_tree_release_note_result(harness.fs, cfg, persisted, recovery_note)
+}
+
+/**
+ * Bounded agent recovery for a malformed changelog fold. Reuses the release
+ * recovery agent loop to reorganize the AUTHORITATIVE fragment bullets into a
+ * valid `## v${next_version}` Keep-a-Changelog section, then splices that
+ * section deterministically and re-validates with the same gate. The model may
+ * not invent content: the gate requires every fragment to be represented, and a
+ * failing gate returns `{valid: false}` so the caller fails loud rather than
+ * writing model slop. Returns `{valid, text, findings}`.
+ */
+fn run_changelog_massage_recovery(
+  harness: Harness,
+  cfg: any,
+  analysis: any,
+  run_id: any,
+  base_text: any,
+  fragment_records: any,
+) {
+  const fragments_section = assemble_fragment_records(fragment_records)
+  const prompt = harness.fs.render_prompt(
+    prompt_asset(harness.fs, "release_changelog_massage_prompt.harn.prompt"),
+    {
+      target_version: analysis.next_version,
+      fragments_section: fragments_section,
+      current_section: changelog_section_body(base_text, "v${analysis.next_version}"),
+    },
+  )
+  const result = run_recovery_agent_loop(
+    harness,
+    cfg,
+    analysis,
+    prompt,
+    run_id,
+    "changelog-massage",
+  )
+  const text = agent_result_text(result)
+  const section = changelog_section_body(text, "v${analysis.next_version}")
+  const section_markdown = if trim(section) == "" {
+    ""
+  } else {
+    "## v${analysis.next_version}\n\n" + trim(section)
+  }
+  if section_markdown == "" {
+    return {
+      valid: false,
+      text: base_text,
+      findings: ["agent massage did not produce a `## v${analysis.next_version}` section"],
+    }
+  }
+  const spliced = changelog_replace_top_section(base_text, section_markdown)
+  const gate = changelog_release_section_valid(spliced, analysis.next_version, fragment_records)
+  return {valid: gate.valid, text: spliced, findings: gate.findings}
+}
+
+/**
+ * Promote recovered pin/attempt notes without a model, smart-subtracting them
+ * from current Unreleased so post-pin base changes remain future-release work.
+ */
+fn apply_fixup_release_notes(
+  harness: {stdio: HarnessStdio, fs: HarnessFs},
+  cfg: any,
+  analysis: any,
+) {
+  const changelog_path = path_join(cfg.repo, "CHANGELOG.md")
+  if !cfg.mock && !harness.fs.exists(changelog_path) {
+    return command_result_fail(1, "missing CHANGELOG.md")
+  }
+  const release_body = trim(cfg.fixup_pin_unreleased ?? "")
+  if release_body == "" {
+    return command_result_fail(
+      1,
+      "fixup mode set but no release-note body cached; the pin SHA and existing release branch may be unreadable",
+    )
+  }
+  const original = read_repo_file(harness.fs, cfg, "CHANGELOG.md")
+  const update = changelog_promote_pin_time_unreleased(
+    original,
+    analysis.next_version,
+    release_body,
+  )
+  if !update.success {
+    return command_result_fail(1, update.message)
+  }
+  if update.changed && !cfg.mock {
+    harness.fs.write_text(changelog_path, update.text)
+  }
+  // The inline step printer renders only the step name (`✓ name`), so a
+  // step whose only signal is a multi-line stdout body is effectively
+  // silent during a live run. Surface the duplicate-bullets state loudly
+  // so the operator can't merge the PR without first deduping by hand.
+  if (update.subtract_path ?? "") == "fallback" {
+    const pin_count = changelog_bullet_count(release_body)
+    harness.stdio.println(
+      "!! drift: smart-subtract fell back to verbatim-preserve; ${pin_count} pin-time bullets are duplicated between `## Unreleased` and `## v${analysis.next_version}` and need manual dedupe before merge",
+    )
+  }
+  return command_result_ok("ok: " + update.message + "\n")
+}
+
+/**
+ * Detect live recovery of an open immutable attempt or its shipped tag.
+ * Both cases recover pin-time `## Unreleased` through the attempt/base merge
+ * base, so later base-branch notes remain future-release work. Mock, audit,
+ * non-live, and unreadable-pin cases never enter fixup mode.
+ */
+@complexity(allow)
+pub fn detect_fixup_state(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+) -> ReleaseFixupState? {
+  if cfg.mock {
+    return nil
+  }
+  if cfg.mode != "ship-pr" || !(cfg.yes_live_release ?? false) {
+    return nil
+  }
+  const version = trim(analysis.next_version ?? "")
+  if version == "" {
+    return nil
+  }
+  const tag = "v${version}"
+  const tag_check = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"],
+  )
+  if !tag_check.success {
+    throw "could not inspect remote release tag ${tag}: ${tag_check.stderr}"
+  }
+  const tag_exists = len(tag_check.refs) > 0
+  const tag_target = remote_tag_target_sha(tag_check.refs)
+  if tag_exists && tag_target == "" {
+    throw "remote release tag ${tag} exists but its commit target could not be resolved"
+  }
+  const attempt_refs = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/heads/release-attempt/v${version}/*"],
+  )
+  if !attempt_refs.success {
+    throw "could not inspect immutable release attempts for v${version}: ${attempt_refs.stderr}"
+  }
+  let pull_requests = release_github_pr_list(
+    harness,
+    cfg,
+    {base: cfg.base, state: "open", limit: 100},
+  )
+  // The bounded general listing is only a convenience for immutable-attempt
+  // metadata. Probe the retired mutable head exactly so an old PR can never
+  // age beyond a page and evade the fail-loud cutover.
+  const legacy_pr = release_github_open_pr(harness, cfg, "release/v${version}")
+  if legacy_pr != nil {
+    pull_requests = [legacy_pr] + pull_requests
+  }
+  const recovery_pull_requests = release_recovery_pull_requests(version, pull_requests, tag_target)
+  const recovery_preference = release_recovery_preference(
+    {env: harness.env, process: harness.process},
+    cfg,
+    version,
+    recovery_pull_requests.immutable_attempts,
+    attempt_refs.refs,
+    tag_target,
+  )
+  // crates.io is authoritative for "has this version already shipped?", even
+  // when every GitHub tag/attempt/PR signal was deleted.
+  const registry_probe = probe_registry_version_immutability(harness, version)
+  const recovery = release_recovery_source(
+    version,
+    recovery_pull_requests.immutable_attempts,
+    attempt_refs.refs,
+    tag_target,
+    registry_preferred_attempt_oid(registry_probe, recovery_preference?.attempt_oid ?? ""),
+  )
+  if recovery == nil {
+    require_registry_immutability_gate(registry_probe, cfg.pin_sha_input, cfg.pin_sha, "", false)
+    return nil
+  }
+  const publication = recovery.publication
+  const tagged_fixup = recovery_pull_requests.tagged_fixup
+  const pr_url = release_recovery_handoff_url(recovery.pull_request, tagged_fixup)
+  if registry_probe.identity_state == "matched"
+    && publication.head_oid == registry_probe.source_oid {
+    harness.stdio.println(
+      "   registry    : crates.io v${version} packages ${registry_probe.source_oid}; recovering that immutable source",
+    )
+  }
+  if recovery_preference != nil {
+    harness.stdio.println(
+      "   recovery default: selected ${publication.remote_ref} at source pin ${recovery_preference.pin_oid} (${recovery_preference.reason})",
+    )
+  }
+  verify_release_recovery_source(
+    {env: harness.env, process: harness.process},
+    cfg,
+    tag,
+    publication,
+    tag_check.refs,
+  )
+  if tagged_fixup != nil {
+    const verified_fixup = verify_tagged_fixup_handoff(
+      {env: harness.env, process: harness.process},
+      cfg,
+      publication,
+      tagged_fixup,
+    )
+    harness.stdio.println(
+      "   recovery handoff: adopting open tagged fixup PR ${tagged_fixup.url} on release/v${version}; signed head ${verified_fixup.head_oid} matches ${verified_fixup.remote_ref} and preserves the immutable v${verified_fixup.version} release body",
+    )
+  }
+  // Recover the original pin SHA: the common ancestor of the existing
+  // immutable attempt and the current base. That commit was `<base>` HEAD
+  // when the original run started, and is the point we want pin-time
+  // Unreleased read from.
+  const merge_base = git_merge_base(
+    harness.process,
+    publication.head_oid,
+    "origin/" + cfg.base,
+    cfg.repo,
+  )
+  if !merge_base.success {
+    throw "could not recover release pin from immutable attempt ${publication.remote_ref}: ${merge_base.stderr.inline}"
+  }
+  const original_pin = merge_base.data.oid
+  if original_pin == "" {
+    throw "immutable release attempt ${publication.remote_ref} has no merge base with origin/${cfg.base}"
+  }
+  const pre_tag_checkpoint = release_recovery_is_pre_tag_resume(tag_exists, pr_url)
+  const pin_decision = release_recovery_pin_decision(cfg.pin_sha_input, cfg.pin_sha, original_pin)
+  const checkpoint_route = release_recovery_checkpoint_route(pre_tag_checkpoint, pin_decision)
+  const registry_gate = require_registry_immutability_gate(
+    registry_probe,
+    cfg.pin_sha_input,
+    cfg.pin_sha,
+    publication.head_oid,
+    checkpoint_route == "supersede_pre_tag",
+  )
+  if registry_gate.action == "recover_published" && trim(registry_gate.message) != "" {
+    harness.stdio.println("   registry    : ${registry_gate.message}")
+  }
+  // A registry accept means the version already shipped. Do not resume it as a
+  // pre-tag checkpoint (that path would certify and tag again).
+  const checkpoint_flags = registry_adjusted_checkpoint_flags(checkpoint_route, registry_gate)
+  const pre_tag_resume = checkpoint_flags.pre_tag_resume
+  const pre_tag_supersede = checkpoint_flags.pre_tag_supersede
+  const tooling_drift = recovered_checkpoint_tooling_drift(
+    {env: harness.env, process: harness.process},
+    cfg,
+    original_pin,
+    pre_tag_resume,
+  )
+  const tooling_integrity = recovered_checkpoint_tooling_integrity(
+    {env: harness.env, process: harness.process},
+    cfg,
+    original_pin,
+    publication.head_oid,
+    pre_tag_resume,
+  )
+  const pin_show = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["show", original_pin + ":CHANGELOG.md"],
+  )
+  if !pin_show.success {
+    throw "could not read pin-time CHANGELOG.md at ${original_pin}: ${trim(pin_show.stderr ?? "")}"
+  }
+  let release_body_ref = if tag_exists {
+    tag
+  } else {
+    publication.head_oid
+  }
+  let release_show = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["show", release_body_ref + ":CHANGELOG.md"],
+  )
+  if !release_show.success && tag_exists {
+    release_body_ref = publication.head_oid
+    release_show = run_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["show", release_body_ref + ":CHANGELOG.md"],
+    )
+  }
+  if !release_show.success {
+    throw "could not read prepared CHANGELOG.md from immutable attempt ${publication.remote_ref}"
+  }
+  const release_body = changelog_fixup_release_body(pin_show.stdout, release_show.stdout, version)
+  if !release_body.success {
+    throw "could not recover release notes from immutable attempt ${publication.remote_ref}"
+  }
+  const release_body_source = if release_body.source == "release-section" {
+    if release_body_ref == tag {
+      "tag-release-section"
+    } else {
+      "attempt-release-section"
+    }
+  } else {
+    release_body.source
+  }
+  const release_assets = release_asset_snapshot(harness, cfg, tag)
+  // GitHub assets or an independent crates.io accept both prove the version
+  // already shipped; either one routes paperwork away from retagging.
+  const release_exists = release_assets.ready || registry_gate.action == "recover_published"
+  // Conflict state on the existing PR. After other PRs land on `<base>`
+  // and touch CHANGELOG.md, the immutable attempt collides at the top of
+  // CHANGELOG. The repair pass resolves this by recreating the local branch
+  // on fresh `<base>` and smart-subtracting pin-time
+  // bullets — surface the conflict explicitly so the operator can see
+  // the rerun is doing conflict-resolution work.
+  let conflicting = false
+  if pr_url != "" {
+    const mergeability = release_github_mergeability(harness, cfg, pr_url)
+    conflicting = !is_err(mergeability) && mergeability.is_conflict
+  }
+  return {
+    publication: publication,
+    tag: tag,
+    pr_url: pr_url,
+    original_pin: original_pin,
+    pin_unreleased: release_body.body,
+    release_body_source: release_body_source,
+    tag_exists: tag_exists,
+    release_exists: release_exists,
+    missing_assets: release_assets.missing_assets,
+    conflicting: conflicting,
+    pre_tag_resume: pre_tag_resume,
+    pre_tag_supersede: pre_tag_supersede,
+    tooling_drift: tooling_drift,
+    tooling_integrity: tooling_integrity,
+    tagged_fixup_pr: tagged_fixup,
+  }
+}
+
+pub fn post_merge_drift_deterministic_findings(findings: list<string>) -> list<string> {
+  return (findings ?? []).filter({ finding -> !starts_with(finding, "release scope ") }).to_list()
+}
+
+pub fn post_merge_paperwork_push_args(
+  paperwork_branch: string,
+  remote_branch_exists: bool,
+) -> list<string> {
+  const base = ["push", "-u", "origin", paperwork_branch]
+  if remote_branch_exists {
+    return base + ["--force-with-lease"]
+  }
+  return base
+}
+
+fn remote_branch_exists(process: HarnessProcess, cfg: any, branch: any) {
+  const refs = release_git_remote_refs(process, cfg, ["refs/heads/" + branch])
+  return refs.success && len(refs.refs) > 0
+}
+
+/** Fetch one observed remote tag and return its verified commit target. */
+fn fetch_observed_remote_tag_target(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: any,
+  tag: string,
+  refs: list<GitRemoteRef>,
+) -> string {
+  const observed_object = lowercase(trim(remote_tag_sha(refs)))
+  const observed_target = lowercase(trim(remote_tag_target_sha(refs)))
+  if observed_object == "" || observed_target == "" {
+    return ""
+  }
+  const fetched = run_git(harness, cfg, ["fetch", "--quiet", "origin", "refs/tags/" + tag])
+  if !fetched.success {
+    return ""
+  }
+  const fetched_object = run_git(harness, cfg, ["rev-parse", "FETCH_HEAD"])
+  const fetched_target = run_git(harness, cfg, ["rev-parse", "FETCH_HEAD^{}"])
+  if !fetched_object.success || !fetched_target.success {
+    return ""
+  }
+  if lowercase(trim(fetched_object.stdout ?? "")) != observed_object
+    || lowercase(trim(fetched_target.stdout ?? ""))
+      != observed_target {
+    return ""
+  }
+  return observed_target
+}
+
+/** Derive the published description from the immutable tag's pin-time input. */
+pub fn published_release_body_source_from_git(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseGitBaseConfig,
+  version: string,
+) -> ReleasePublishedBodySource? {
+  const tag = "v${version}"
+  const tag_check = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/tags/" + tag, "refs/tags/" + tag + "^{}"],
+  )
+  if !tag_check.success || len(tag_check.refs) == 0 {
+    return nil
+  }
+  const tag_ref_oid = remote_tag_sha(tag_check.refs)
+  const tag_target_oid = fetch_observed_remote_tag_target(harness, cfg, tag, tag_check.refs)
+  if tag_ref_oid == "" || tag_target_oid == "" {
+    return nil
+  }
+  const merge_base = git_merge_base(harness.process, tag_target_oid, "origin/" + cfg.base, cfg.repo)
+  if !merge_base.success || merge_base.data.oid == "" {
+    return nil
+  }
+  const original_pin = merge_base.data.oid
+  const pin_show = run_git(harness, cfg, ["show", original_pin + ":CHANGELOG.md"])
+  if !pin_show.success {
+    return nil
+  }
+  // Prefer pin-time ## Unreleased (pre-fold). When the release was crystallized
+  // from changelog.d fragments against an empty Unreleased (or the orphaned
+  // release-commit lineage is not on main), fall back to ## vX.Y.Z on the
+  // immutable tagged release commit — that is the body that actually shipped.
+  let body = changelog_section_body(pin_show.stdout, "Unreleased")
+  if body == "" {
+    const tag_show = run_git(harness, cfg, ["show", tag_target_oid + ":CHANGELOG.md"])
+    if tag_show.success {
+      body = changelog_section_body(tag_show.stdout, "v" + version)
+    }
+  }
+  if body == "" {
+    return nil
+  }
+  return {
+    tag: tag,
+    version: version,
+    original_pin: original_pin,
+    body: body,
+    tag_ref_oid: tag_ref_oid,
+    tag_target_oid: tag_target_oid,
+  }
+}
+
+/**
+ * Gather the Git-only evidence for post-merge drift. The outer detector owns
+ * release availability and GitHub PR gates; this helper owns immutable tag,
+ * merge-base, and changelog facts and is deliberately usable by a real Git
+ * fixture without provider credentials.
+ */
+pub fn post_merge_drift_evidence_from_git(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseGitBaseConfig,
+  version: string,
+) -> ReleasePostMergeDriftEvidence? {
+  const source = published_release_body_source_from_git(harness, cfg, version)
+  if source == nil {
+    return nil
+  }
+  const main_show = run_git(harness, cfg, ["show", "origin/" + cfg.base + ":CHANGELOG.md"])
+  if !main_show.success {
+    return nil
+  }
+  const current_section = changelog_section_body(main_show.stdout, "v" + version)
+  if trim(current_section) == "" {
+    return nil
+  }
+  const tag_show = run_git(harness, cfg, ["show", source.tag_target_oid + ":CHANGELOG.md"])
+  const published_tag_section = if tag_show.success {
+    changelog_section_body(tag_show.stdout, "v" + version)
+  } else {
+    ""
+  }
+  return {
+    tag: source.tag,
+    version: version,
+    original_pin: source.original_pin,
+    pin_unreleased: source.body,
+    current_section: current_section,
+    published_tag_section: published_tag_section,
+    paperwork_branch: "paperwork/v${version}-changelog-fix",
+  }
+}
+
+pub fn post_merge_drift_decision(
+  evidence: ReleasePostMergeDriftEvidence,
+) -> ReleasePostMergeDecision {
+  if trim(evidence.current_section) == trim(evidence.pin_unreleased) {
+    return {
+      action: "no_drift",
+      reason: "main already matches the pin-time release body",
+      drift: nil,
+    }
+  }
+  if trim(evidence.published_tag_section) != ""
+    && trim(evidence.current_section)
+      == trim(evidence.published_tag_section) {
+    return {
+      action: "no_drift",
+      reason: "main matches the published tag's release section",
+      drift: nil,
+    }
+  }
+  return {
+    action: "drift",
+    reason: "main differs from both the pin-time and published release sections",
+    drift: {
+      kind: "drift",
+      tag: evidence.tag,
+      version: evidence.version,
+      original_pin: evidence.original_pin,
+      pin_unreleased: evidence.pin_unreleased,
+      current_section: evidence.current_section,
+      paperwork_branch: evidence.paperwork_branch,
+    },
+  }
+}
+
+/** Evaluate only the production Git evidence and policy portion of drift detection. */
+pub fn detect_post_merge_drift_from_git(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseGitBaseConfig,
+  version: string,
+) -> ReleasePostMergeDrift? {
+  const evidence = post_merge_drift_evidence_from_git(harness, cfg, version)
+  if evidence == nil {
+    return nil
+  }
+  return post_merge_drift_decision(evidence).drift
+}
+
+/**
+ * Detect a fully published release whose merged changelog absorbed post-pin
+ * notes. Only a clean live ship-pr run with complete assets and no recovery PR
+ * may open the paperwork repair; an existing paperwork PR is returned as the
+ * idempotent terminal state.
+ */
+pub fn detect_post_merge_drift(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+) -> ReleasePostMergeState? {
+  if cfg.mock {
+    return nil
+  }
+  if cfg.mode != "ship-pr" || !(cfg.yes_live_release ?? false) {
+    return nil
+  }
+  if (analysis.dirty_files ?? 0) > 0 {
+    return nil
+  }
+  // Drift is measured against the release that is already published, which the
+  // workspace version stops naming once main is cut to the next patch's `-dev`.
+  const version = trim(
+    last_published_release_version(analysis.current_version ?? "", analysis.latest_tag ?? ""),
+  )
+  if version == "" {
+    return nil
+  }
+  const tag = "v${version}"
+  const branch = "release/" + tag
+  const paperwork_branch = "paperwork/v${version}-changelog-fix"
+  const release_assets = release_asset_snapshot(harness, cfg, tag)
+  if !release_assets.ready {
+    return nil
+  }
+  if !harn_crate_published({clock: harness.clock, net: harness.net}, version) {
+    return nil
+  }
+  const release_pr = release_github_open_pr(harness, cfg, branch)
+  if release_pr != nil {
+    return nil
+  }
+  const paperwork_pr = release_github_open_pr(harness, cfg, paperwork_branch)
+  if paperwork_pr != nil {
+    return {kind: "paperwork_pr_open", pr_url: paperwork_pr.url, paperwork_branch: paperwork_branch}
+  }
+  return detect_post_merge_drift_from_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    version,
+  )
+}
+
+/** Restore shipped notes and return later drift to Unreleased in a review-only paperwork PR. */
+pub fn run_post_merge_paperwork_pr(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  drift: ReleasePostMergeDrift,
+  run_id: string,
+) -> int {
+  const version = drift.version
+  const tag = drift.tag
+  const paperwork_branch = drift.paperwork_branch
+  const pin_short = drift.original_pin[0:10]
+  harness.stdio.println("== post-merge paperwork mode (CHANGELOG drift detected for ${tag})")
+  harness.stdio.println("   pin SHA   : ${drift.original_pin}")
+  harness.stdio.println("   branch    : ${paperwork_branch}")
+  harness.stdio.println(
+    "   plan      : restore `## ${tag}` to pin-time Unreleased; move drift bullets back into `## Unreleased`; publish a paperwork PR for manual review.",
+  )
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "post_merge_drift_detected",
+    {
+      tag: tag,
+      version: version,
+      original_pin: drift.original_pin,
+      paperwork_branch: paperwork_branch,
+    },
+  )
+  const fetch_result = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["fetch", "origin", cfg.base],
+  )
+  if !fetch_result.success {
+    harness.stdio.println("!! fetch ${cfg.base} failed: ${trim(fetch_result.stderr)}")
+    return 1
+  }
+  const branch_create = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["checkout", "-B", paperwork_branch, "origin/" + cfg.base],
+  )
+  if !branch_create.success {
+    harness.stdio.println("!! branch create failed: ${trim(branch_create.stderr)}")
+    return 1
+  }
+  const changelog_path = path_join(cfg.repo, "CHANGELOG.md")
+  const original = harness.fs.read_text(changelog_path)
+  const update = changelog_repair_post_merge_drift(original, version, drift.pin_unreleased)
+  if !update.success {
+    harness.stdio.println("!! post-merge repair failed: ${update.message}")
+    return 1
+  }
+  if !update.changed {
+    harness.stdio.println(
+      "== post-merge paperwork: no changes needed (CHANGELOG matches pin-time already)",
+    )
+    return 0
+  }
+  harness.fs.write_text(changelog_path, update.text)
+  harness.stdio.println("== ${update.message}")
+  const stage = run_git({env: harness.env, process: harness.process}, cfg, ["add", "CHANGELOG.md"])
+  if !stage.success {
+    harness.stdio.println("!! git add failed: ${trim(stage.stderr)}")
+    return 1
+  }
+  const commit_subject = "changelog: restore ${tag} shipped content after drift"
+  const commit_body =
+    "The ${tag} release branch merged with drift in `## ${tag}`:\nbullets that landed on `${cfg.base}` between the pin SHA ${pin_short}\nand the release PR merge were absorbed by GitHub's 3-way merge into\nthe ${tag} section. The shipped binary (tag ${tag} pinned at\n${pin_short}) does not contain these post-pin bullets; only the\nCHANGELOG entry lies.\n\nThis paperwork PR restores `## ${tag}` to the pin-time `## Unreleased`\ncontent and moves the absorbed drift bullets back to `## Unreleased`,\nwhere they will ship in the next release.\n\nAuto-generated by release_harn.harn post-merge drift detection.\n\nAllow-Retroactive-Changelog: post-merge drift cleanup: bullets did not\nship in ${tag}'s binary (tag is parented before the post-pin commits);\nthis PR aligns the published `${tag}` section with what shipped."
+  const full_commit = commit_subject + "\n\n" + commit_body
+  const commit = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["commit", "-m", full_commit],
+    {env: {ALLOW_CHANGELOG_RETROACTIVE_EDIT: "1"}},
+  )
+  if !commit.success {
+    harness.stdio.println("!! git commit failed: ${trim(commit.stderr)}")
+    return 1
+  }
+  const push_args = post_merge_paperwork_push_args(
+    paperwork_branch,
+    remote_branch_exists(harness.process, cfg, paperwork_branch),
+  )
+  const push = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    push_args,
+    {env: {ALLOW_CHANGELOG_RETROACTIVE_EDIT: "1"}},
+  )
+  if !push.success {
+    harness.stdio.println("!! git push failed: ${trim(push.stderr)}")
+    return 1
+  }
+  const pr_title = pr_title_changelog_paperwork(tag)
+  const pr_body =
+    "## Summary\n- Post-merge drift detected on `${cfg.base}` for shipped tag `${tag}` (pin SHA ${pin_short}). Bullets that landed during the release PR window were absorbed by GitHub's 3-way merge into `## ${tag}`, but did not ship in the binary.\n- This PR restores `## ${tag}` to the pin-time `## Unreleased` content and moves the absorbed drift bullets back to `## Unreleased` where they belong.\n\nPure paperwork: no source changes, no version bumps, no retagging.\n\n## Auto-generated\nOpened by `release_harn.harn` post-merge drift detection. Re-running `release_harn.harn -- --mode ship-pr --yes-live-release` after this lands will be a no-op because the auto-detector exits when `## ${tag}` already matches pin-time."
+  const pr_create = release_github_pr_create(
+    harness,
+    cfg,
+    pr_title,
+    paperwork_branch,
+    cfg.base,
+    pr_body,
+  )
+  if is_err(pr_create) {
+    harness.stdio.println("!! GitHub PR create failed: " + to_string(unwrap_err(pr_create)))
+    return 1
+  }
+  const pr_url = pr_create.url
+  harness.stdio.println("== paperwork PR opened: ${pr_url}")
+  // Retroactive changelog edits are never auto-merged. The operator must
+  // review the published-tag evidence before this corrective paperwork lands.
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "post_merge_paperwork_pr_opened",
+    {pr_url: pr_url, paperwork_branch: paperwork_branch, tag: tag},
+  )
+  return 0
+}
+
+/**
+ * Report whether release notes can be built without an agent-authored draft.
+ *
+ * The deterministic notes builder promotes `## Unreleased` (plus any
+ * commits-since-tag bullets) into `## v${next_version}`. Fragment-based
+ * releases are equivalent because prepare folds `changelog.d` into
+ * `## Unreleased` before promotion.
+ *
+ * Two callers ask this question: the non-agent blocker below, and the
+ * agent-review availability path, which may proceed on deterministic notes
+ * when the review model returns nothing at all.
+ */
+pub fn deterministic_release_notes_available(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+) -> bool {
+  const unreleased_bullets = changelog_bullet_count(analysis.changelog_unreleased_section ?? "")
+  const fragment_section = candidate_tree_fragment_section(
+    {fs: harness.fs, process: harness.process},
+    cfg,
+  )
+  const fragment_bullets = changelog_bullet_count(fragment_section)
+  return unreleased_bullets + fragment_bullets > 0
+}
+
+pub fn live_release_notes_blocker(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+) -> ReleaseRecordedStep? {
+  if cfg.mode == "audit" || cfg.agent || analysis.changelog_top == analysis.next_version {
+    return nil
+  }
+  if cfg.release_notes_scope == "frozen_artifact"
+    || cfg.release_notes_scope
+      == "immutable_checkpoint" {
+    return nil
+  }
+  if deterministic_release_notes_available(harness, cfg, analysis) {
+    return nil
+  }
+  return recorded_step(
+    "release-notes-agent-required",
+    "require agent-authored or manually prepared release notes before live release side effects",
+    command_result_fail(
+      2,
+      "live ${cfg.mode} would need to draft CHANGELOG.md v${analysis.next_version}, but --agent was not enabled and `## Unreleased` is empty. Rerun with --agent so the harness can inspect PR bodies/files/diffs, add bullets to `## Unreleased`, or manually add a ## v${analysis.next_version} section before running live release.",
+    ),
+  )
+}
+
+pub fn release_run_session_view_gate(
+  harness: Harness,
+  cfg: dict,
+  analysis: dict,
+) -> ReleaseRunSessionViewGate {
+  const gate = if cfg.mock {
+    run_session_view_mock_gate()
+  } else {
+    const command_env = run_session_view_release_command_env(
+      harness,
+      cfg.repo,
+      cfg.release_cargo_target_dir,
+    )
+    run_session_view_gate(harness, cfg.repo, nil, command_env)
+  }
+  const note_status = if cfg.mock {
+    {changed: false, paths: [], required: false, present: false, ok: true}
+  } else {
+    run_session_view_release_note_status(
+      harness.fs,
+      cfg.repo,
+      {
+        diff_names: analysis.diff_names,
+        commit_file_changes_since_latest_tag: analysis.commit_file_changes_since_latest_tag,
+        commit_stats_since_latest_tag: analysis.commit_stats_since_latest_tag,
+        changelog_section: analysis.changelog_section,
+        changelog_unreleased_section: analysis.changelog_unreleased_section,
+      },
+    )
+  }
+  let findings = []
+  if !gate.ok {
+    findings = findings
+      + [
+        "run/session view fixture gate failed: ${trim(gate.check.stderr ?? gate.check.stdout ?? "")}",
+      ]
+  }
+  if note_status.required && !note_status.present {
+    findings = findings
+      + [
+        "run/session view contract files changed without a CHANGELOG.md or changelog.d note: "
+          + join(note_status.paths, ", "),
+      ]
+  }
+  return {
+    ok: gate.ok,
+    check: gate.check,
+    cargo_target_dir: gate.cargo_target_dir,
+    metadata_ok: gate.metadata_ok,
+    expected_json_count: gate.expected_json_count,
+    parse_errors: gate.parse_errors,
+    schemas: gate.schemas,
+    summary_line: gate.summary_line,
+    release_note: note_status,
+    findings: findings,
+  }
+}
+
+pub fn run_session_view_release_blocker(
+  cfg: dict,
+  view_gate: ReleaseRunSessionViewGate,
+) -> ReleaseRecordedStep? {
+  if cfg.mode == "audit" {
+    return nil
+  }
+  if view_gate.ok && view_gate.release_note.ok {
+    return nil
+  }
+  const check_msg = if view_gate.ok {
+    ""
+  } else {
+    "fixture check failed (`${view_gate.check.command}` exit ${view_gate.check.exit_code}): "
+      + trim(view_gate.check.stderr ?? view_gate.check.stdout ?? "")
+  }
+  const note_msg = if view_gate.release_note.required && !view_gate.release_note.present {
+    "run/session view contract files changed without a human-readable CHANGELOG.md or changelog.d note: "
+      + join(view_gate.release_note.paths, ", ")
+  } else {
+    ""
+  }
+  const message = trim(join([check_msg, note_msg].filter({ line -> trim(line) != "" }), "\n"))
+  return recorded_step(
+    "run-session-view-fixture-gate",
+    "make check-run-view-fixtures and require release notes for run/session view schema changes",
+    command_result_fail(2, message),
+  )
+}
+
+pub fn ensure_release_notes_with_run_id(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  agent_review_result: ReleaseAgentReviewResult,
+  run_id: string,
+) -> list<ReleaseRecordedStep> {
+  const current_top = changelog_top(harness.fs, cfg)
+  if current_top == analysis.next_version {
+    return [
+      recorded_step(
+        "release-notes-current",
+        "CHANGELOG.md already starts with v${analysis.next_version}",
+        command_result_ok("CHANGELOG.md already starts with v${analysis.next_version}\n"),
+      ),
+    ]
+  }
+  if cfg.release_notes_scope == "frozen_artifact" {
+    const r = apply_fixup_release_notes({stdio: harness.stdio, fs: harness.fs}, cfg, analysis)
+    return [
+      recorded_step(
+        "fixup-promote-pin-time-unreleased",
+        "promote pin-time `## Unreleased` to v${analysis.next_version}; smart-subtract from current Unreleased to preserve post-pin drift",
+        r,
+      ),
+    ]
+  }
+  const draft_path = release_notes_draft_path(harness.fs, run_id, analysis, agent_review_result)
+  const r = apply_candidate_tree_release_notes(harness, cfg, analysis, draft_path, run_id)
+  const step_name = if cfg.fixup_mode ?? false {
+    "fixup-fold-fresh-candidate-notes"
+  } else {
+    "draft-release-notes"
+  }
+  const detail = if cfg.fixup_mode ?? false {
+    "fold current `## Unreleased` and every candidate-tree fragment into v${analysis.next_version}"
+  } else {
+    "insert draft CHANGELOG.md section for v${analysis.next_version}"
+  }
+  return [recorded_step(step_name, detail, r)]
+}
+
+fn prepared_release_findings(raw: any, original: any) {
+  let findings = []
+  if raw.changelog_top != original.next_version {
+    findings = findings
+      + [
+        "CHANGELOG.md top entry is v${raw.changelog_top}; expected v${original.next_version} for this prepared release",
+      ]
+  }
+  if raw.branch != original.expected_branch {
+    findings = findings
+      + [
+        "current branch is ${raw.branch}; expected prepared release branch ${original.expected_branch}",
+      ]
+  }
+  if !raw.release_scripts.release_ship || !raw.release_scripts.release_gate {
+    findings = findings + ["release scripts are missing or not executable"]
+  }
+  if !raw.workflows.publish_release || !raw.workflows.build_release_binaries {
+    findings = findings + ["release cascade workflows are missing"]
+  }
+  return findings
+}
+
+pub fn prepared_release_analysis(
+  raw: ReleaseAnalysis,
+  original: ReleaseAnalysis,
+) -> ReleaseAnalysis {
+  let out = raw
+  out["current_version"] = original.current_version
+  out["next_version"] = original.next_version
+  out["expected_branch"] = original.expected_branch
+  out["operator_focus"] = original.operator_focus
+  out["pin_sha"] = original.pin_sha
+  out["deterministic_findings"] = prepared_release_findings(raw, original)
+  out["run_session_view"] = original.run_session_view ?? raw.run_session_view
+  out["fixup_mode"] = original.fixup_mode
+  out["release_notes_scope"] = original.release_notes_scope
+  out["fixup_tag"] = original.fixup_tag
+  out["fixup_pr_url"] = original.fixup_pr_url
+  return out
+}

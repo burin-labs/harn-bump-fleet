@@ -1,0 +1,1280 @@
+import {
+  RELEASE_LAUNCH_PRECONDITION_NAMES,
+  RELEASE_LAUNCH_RECEIPT_PATH,
+} from "./release_launch_preflight"
+import { ReleaseLandingAdmission, ReleaseLandingReceipt } from "./release_merge_lease"
+
+//
+// What a failed hosted release run leaves behind.
+//
+// A red release run today is a workflow conclusion and a log. Someone has to
+// notice it, open the job page, read the failing step, decide whether the
+// failure is mechanical, and reconstruct the dispatch by hand. The evidence
+// needed for all four is already structured: the failing step is a named field
+// on the job, and the dispatch inputs are a closed set the run recorded when it
+// started.
+//
+// This module turns that evidence into one typed receipt naming the
+// precondition that failed and the exact re-dispatch that would retry it. It
+// dispatches on the step name, which is structured, never on the log text,
+// which is prose and is frequently mislabeled. A step the registry does not
+// name escalates; it never falls through to a retry.
+/** Why the run failed, at the granularity a repair decision needs. */
+pub type HostedReleaseFailureCause = "environment" \
+  | "invalid_inputs" \
+  | "credential" \
+  | "consumer_contract_drift" \
+  | "release_harness" \
+  | "publication" \
+  | "fleet_convergence" \
+  | "bookkeeping" \
+  | "unclassified"
+
+/** One step of the run, as the API reports it. */
+pub type HostedReleaseRunStep = {job: string, name: string, conclusion: string, number: int}
+
+/**
+ * One registry row: the exact step name, what its failure means, and what a
+ * repair may do about it.
+ *
+ * `redispatchable` is the safety bit. A run that failed on its own inputs, or
+ * on drift another repository owns, is not repaired by sending the same inputs
+ * again; those escalate with the classification instead. Some of them do have a
+ * mechanical repair, just not this one, so `repair` names it in the escalation
+ * rather than leaving a reader with only "this needs a change".
+ *
+ * One step may fail several distinct preconditions, and they do not share a
+ * repair: drift another repository owns wants a convergence dispatch, a missing
+ * cutover wants a re-dispatch of the bump, and an unreadable pin wants a person
+ * because nothing automatic makes a repository readable. `repairs` names the
+ * repair per cause the step's own receipt reports. A receipt commonly names
+ * several at once, so the repairs come back as a list in the order the receipt
+ * named them, never as whichever happened to be first. `repair` stays as the
+ * row-level fallback so a cause with no entry still says what to do rather than
+ * only where to look.
+ *
+ * Whether a step runs before or after the release is tagged is deliberately not
+ * a field here. It is read from the workflow, from the step's position relative
+ * to the harness that does the tagging, because a hand-kept boolean drifts from
+ * the file the moment a step moves and the drift is invisible.
+ */
+pub type HostedReleaseFailureRow = {
+  job: string,
+  step: string,
+  cause: HostedReleaseFailureCause,
+  redispatchable: bool,
+  precondition: string,
+  repair?: string,
+  repairs?: list<HostedReleaseCauseRepair>,
+}
+
+/**
+ * One cause a step's own receipt may report, and the repair that cause wants.
+ *
+ * The cause is the receipt's own key, not this module's coarse
+ * `HostedReleaseFailureCause`: the coarse cause answers what class of thing
+ * broke, and this answers which precondition inside the step broke.
+ */
+pub type HostedReleaseCauseRepair = {cause: string, repair: string}
+
+/**
+ * Every repair the row names for the causes the step's own receipt reported.
+ *
+ * It takes the causes as a list because a step that asks every precondition
+ * commonly refuses on several at once. Taking one cause would mean someone
+ * ranking them, and the ranking nothing tests is the one that quietly becomes
+ * list order: an owner told to fix the cheapest thing while the expensive one
+ * stays invisible. The repairs come back in the order the receipt named its
+ * causes, deduplicated, because two causes wanting the same repair is one piece
+ * of work rather than two.
+ *
+ * A reported cause with no entry falls back to the row-level repair rather than
+ * to nothing, so an unmapped cause is still actionable. The fallback is
+ * appended, never substituted, so a mapped repair is never dropped in favour of
+ * the generic line. A run that reported no cause takes the row-level repair.
+ */
+pub fn hosted_release_repairs_for(
+  row: HostedReleaseFailureRow,
+  reported_causes: list<string>,
+) -> list<string> {
+  let repairs: list<string> = []
+  let unmapped = false
+  for reported in reported_causes {
+    const wanted = trim(reported)
+    if wanted == "" {
+      continue
+    }
+    let matched: string? = nil
+    for entry in row.repairs ?? [] {
+      if entry.cause == wanted && matched == nil {
+        matched = entry.repair
+      }
+    }
+    if matched == nil {
+      unmapped = true
+      continue
+    }
+    // The receipt may name two causes that want the same repair. Saying it
+    // twice would read as two pieces of work.
+    if !contains(repairs, unwrap(matched)) {
+      repairs = repairs + [unwrap(matched)]
+    }
+  }
+  // The row-level repair covers a cause the map does not name, and a run that
+  // reported no cause at all. It is appended rather than substituted, so a
+  // mapped repair is never dropped in favour of the generic one.
+  if (unmapped || len(repairs) == 0) && row.repair != nil {
+    const fallback = unwrap(row.repair)
+    if !contains(repairs, fallback) {
+      repairs = repairs + [fallback]
+    }
+  }
+  return repairs
+}
+
+/** The repair list as one line, in the order the receipt named its causes. */
+pub fn hosted_release_repair_line(
+  row: HostedReleaseFailureRow,
+  reported_causes: list<string>,
+) -> string? {
+  const repairs = hosted_release_repairs_for(row, reported_causes)
+  if len(repairs) == 0 {
+    return nil
+  }
+  return join(repairs, "; then ")
+}
+
+/** The closed input set a run was dispatched with, recorded by the run itself. */
+pub type HostedReleaseRecordedInputs = {
+  mode: string,
+  bump: string,
+  prerelease_identifier: string,
+  at_sha: string,
+  expected_prs: string,
+  resume_tagged_release: bool,
+  converge_fleet: bool,
+  repositories_json: string,
+  skip_consumers: string,
+  consumer_proof_runs_json: string,
+}
+
+/** The run being judged, named once so no two identifiers can be swapped. */
+pub type HostedReleaseRunIdentity = {
+  repo: string,
+  workflow: string,
+  ref: string,
+  run_id: int,
+  run_url: string,
+  run_attempt: int,
+}
+
+/** The exact dispatch that retries this run. */
+pub type HostedReleaseRedispatch = {
+  repo: string,
+  workflow: string,
+  ref: string,
+  inputs: HostedReleaseRecordedInputs,
+}
+
+/**
+ * Everything the finalizer read and everything it decided.
+ *
+ * `state` is the part that must not collapse. A run whose steps could not be
+ * read reports `unreadable`, never a clean classification, because a failed
+ * run with no failing step in hand is a failed instrument rather than a run
+ * that repaired itself.
+ */
+pub type HostedReleaseFailureReceipt = {
+  schema_version: "harn_bump_fleet.hosted_release_failure.v1",
+  state: "classified" | "escalated" | "unreadable",
+  repo: string,
+  run_id: int,
+  run_url: string,
+  run_attempt: int,
+  cause: HostedReleaseFailureCause,
+  failed_precondition: string,
+  failed_steps: list<HostedReleaseRunStep>,
+  unmapped_steps: list<string>,
+  landing?: ReleaseLandingReceipt?,
+  landing_admission?: ReleaseLandingAdmission?,
+  redispatch?: HostedReleaseRedispatch,
+  escalation_reason?: string,
+}
+
+const RELEASE_JOB = "release"
+
+const FLEET_JOB = "fleet"
+
+/**
+ * Every step of the hosted release workflow, with what its failure means.
+ *
+ * The registry is the policy. `check_hosted_release_failure_coverage.harn`
+ * proves it names exactly the workflow's steps in both directions, so a step
+ * added or renamed without a cause is a red gate on the pull request that
+ * renames it rather than an unclassified escalation during a release.
+ */
+/**
+ * Where the rows live, so a finding can say where to go.
+ *
+ * A finding that names only the offending step tells a reader what is wrong
+ * and not what to do, and the two situations this check reports have opposite
+ * repairs: a step gained without a row, and a row left behind by a step that
+ * went away. A rename is both at once, which is why each message says so.
+ */
+pub const HOSTED_RELEASE_REGISTRY_PATH = "lib/hosted_release_failure.harn"
+
+pub const HOSTED_RELEASE_FAILURE_REGISTRY: list<HostedReleaseFailureRow> = [
+  {
+    job: RELEASE_JOB,
+    step: "Check out release harness",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the release harness checkout",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Install pinned Harn",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the pinned Harn runtime install",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Install Harn dependencies",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the locked dependency install",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Record the dispatched release inputs",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the record of the inputs this run was dispatched with",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Upload the dispatched release inputs",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the upload of the recorded dispatch inputs",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Validate release inputs",
+    cause: "invalid_inputs",
+    redispatchable: false,
+    precondition: "the dispatch inputs themselves",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Validate and normalize the post-publication consumer scope",
+    cause: "invalid_inputs",
+    redispatchable: false,
+    precondition: "the consumer scope named in the dispatch inputs",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Mint scoped release token",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the scoped release token mint",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Check out harn",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the Harn source checkout",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Arm git push credentials",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the git push credential",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Arm gh auth for API calls",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the API credential",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Prove the push path authenticates",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the proof that the push path authenticates",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Identify and arm the release signer",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the release signing identity",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Prove the confined release identity",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the proof that the release identity is confined",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Mint fleet policy read token",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the fleet policy read token",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Run the release launch preflight",
+    cause: "invalid_inputs",
+    redispatchable: false,
+    precondition: "every release precondition, asked before anything is leased",
+    // The step asks many questions and its receipt names which ones refused,
+    // so the repair is keyed on the receipt's own precondition rather than on
+    // this row's coarse cause. Sending the same inputs again repeats every one
+    // of these, which is why no arm of it is a re-dispatch.
+    repair: "read ${RELEASE_LAUNCH_RECEIPT_PATH}, repair the preconditions it "
+      + "names, then dispatch a fresh release; a repair that lands on the default branch "
+      + "makes the recorded commit unusable, so do not re-send it",
+    repairs: [
+      {
+        cause: "consumers.contracts",
+        repair: "dispatch fleet-projection-convergence.yml with apply true, merge what it "
+          + "opens, then dispatch a fresh release from the new default-branch head; merging "
+          + "moves that branch past the commit this run carried, which the release refuses",
+      },
+      {
+        cause: "consumers.rehearsal",
+        repair: "dispatch consumer-rehearsal.yml and wait for it to conclude, then "
+          + "re-dispatch this release unchanged; if the rehearsal itself is red, repair "
+          + "the consumer it names first, because another rehearsal will only fail again",
+      },
+      {
+        cause: "checkpoint.development_version",
+        repair: "land the post-release development cutover on the release repository's "
+          + "default branch, then dispatch a fresh release from the new head; the cutover "
+          + "moves that branch past the commit this run carried, which the release refuses",
+      },
+      {
+        cause: "checkpoint.release_contract",
+        repair: "fold the previous release's notes so the contract is green, then dispatch "
+          + "a fresh release from the new default-branch head; the fold moves that branch "
+          + "past the commit this run carried, which the release refuses",
+      },
+      {
+        cause: "checkpoint.changelog_fragments",
+        repair: "open a fold pull request for the fragments the receipt names and merge "
+          + "it before the tag, then dispatch a fresh release from the new default-branch "
+          + "head; a tag carrying a fragment is refused at publication, and merging the "
+          + "fold moves that branch past the commit this run carried",
+      },
+      {
+        cause: "checkpoint.consumer_pins",
+        repair: "make each consumer the receipt names readable; no automatic repair can "
+          + "do this, and an unread pin cannot be proven to have moved afterwards",
+      },
+      {
+        cause: "token.permissions",
+        repair: "add the missing permission to the release token profile in "
+          + "spec/github-app-token-profiles.json and to the workflow mint that reads it",
+      },
+      {
+        cause: "token.lifetime",
+        repair: "shorten the refresh interval or the phase budget until the credential "
+          + "outlives every phase this mode reaches",
+      },
+    ],
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Free runner disk space",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the runner disk space reclaim",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Install the pinned Rust toolchain",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the pinned Rust toolchain install",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Restore the Rust build cache",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the Rust build cache restore",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Install cargo-nextest",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the cargo-nextest install",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Install pinned release-gate ripgrep",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the pinned release-gate ripgrep install",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Run release harness",
+    cause: "release_harness",
+    redispatchable: false,
+    precondition: "a gate inside the release harness itself",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Persist exact release runtime cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the runtime cost receipt",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Resolve shipped release receipt",
+    cause: "publication",
+    redispatchable: true,
+    precondition: "the shipped release receipt",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Prove hosted release publication",
+    cause: "publication",
+    redispatchable: true,
+    precondition: "the proof that the release published",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Reconcile published release and hand off fleet update",
+    cause: "fleet_convergence",
+    redispatchable: true,
+    precondition: "the fleet update handoff",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Report published release tail handoff",
+    cause: "fleet_convergence",
+    redispatchable: true,
+    precondition: "the published release tail handoff report",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Measure release build footprint",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the release build footprint measurement",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Publish run summary",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the run summary",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Upload exact release lane claim",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the release lane claim upload",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Resolve release artifact identity",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the attempt-qualified release artifact identity",
+  },
+  {
+    job: RELEASE_JOB,
+    step: "Upload release run artifacts",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the run artifact upload",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Check out release harness",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the release harness checkout for the fleet proof",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Install pinned Harn",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the pinned Harn runtime install for the fleet proof",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Install locked Harn dependencies",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the locked dependency install for the fleet proof",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Prove exact fleet convergence run",
+    cause: "fleet_convergence",
+    redispatchable: true,
+    precondition: "the proof that the fleet convergence run is the exact one",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Download release cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the release cost receipt download",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Check out Harn tag-verification policy",
+    cause: "environment",
+    redispatchable: true,
+    precondition: "the tag-verification policy checkout",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Mint read-only fleet proof token",
+    cause: "credential",
+    redispatchable: true,
+    precondition: "the read-only fleet proof token",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Reconcile terminal published-tail journal from consumer main",
+    cause: "fleet_convergence",
+    redispatchable: true,
+    precondition: "the terminal published-tail journal",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Download fleet round 1 cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the round 1 cost receipt download",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Download fleet round 2 cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the round 2 cost receipt download",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Download fleet round 3 cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the round 3 cost receipt download",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Download fleet round 4 cost receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the round 4 cost receipt download",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Persist exact release and repository-update cost",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the release and repository-update cost receipt",
+  },
+  {
+    job: FLEET_JOB,
+    step: "Upload fleet convergence receipt",
+    cause: "bookkeeping",
+    redispatchable: true,
+    precondition: "the fleet convergence receipt upload",
+  },
+]
+
+/**
+ * The step after which the release may already be published.
+ *
+ * The harness is what cuts and ships. Every step the workflow runs after it,
+ * and every job that waits on that job, executes in a world where the version
+ * may already exist, so re-dispatching those inputs would attempt a fresh cut
+ * of something already released.
+ */
+pub const HOSTED_RELEASE_TAG_BOUNDARY_STEP = "Run release harness"
+
+/** One workflow job as declared: its key, what it waits on, and its steps in order. */
+pub type HostedReleaseWorkflowJob = {job: string, needs: list<string>, steps: list<string?>}
+
+/** One step in workflow order, with the side of the tag boundary it falls on. */
+pub type HostedReleaseOrderedStep = {job: string, step: string, post_tag: bool}
+
+pub type HostedReleaseStepOrder = {
+  steps: list<HostedReleaseOrderedStep>,
+  boundary_job: string,
+  refusals: list<string>,
+}
+
+fn job_waits_on(jobs: list<HostedReleaseWorkflowJob>, job: string, target: string) -> bool {
+  if job == target {
+    return true
+  }
+  for entry in jobs {
+    if entry.job != job {
+      continue
+    }
+    for need in entry.needs {
+      if job_waits_on(jobs, need, target) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Read every step's side of the tag boundary out of the workflow.
+ *
+ * This is derived rather than declared on purpose. The registry used to carry a
+ * boolean per row saying whether a step ran after the tag, and four steps that
+ * sit after the harness were recorded as running before it. Nothing could
+ * notice, because the boolean and the file it described were never compared.
+ *
+ * A job that neither contains the boundary nor waits on the job that does has
+ * no answer here, and an unanswerable step is a refusal rather than a guess in
+ * either direction.
+ */
+pub fn hosted_release_step_order(jobs: list<HostedReleaseWorkflowJob>) -> HostedReleaseStepOrder {
+  let refusals: list<string> = []
+  let boundary_job = ""
+  let boundary_index = -1
+  let seen = 0
+  for entry in jobs {
+    let index = 0
+    for name in entry.steps {
+      if name != nil && trim(unwrap(name)) == HOSTED_RELEASE_TAG_BOUNDARY_STEP {
+        seen = seen + 1
+        boundary_job = entry.job
+        boundary_index = index
+      }
+      index = index + 1
+    }
+  }
+  if seen == 0 {
+    refusals = refusals
+      + [
+        "no step is named `${HOSTED_RELEASE_TAG_BOUNDARY_STEP}`, so nothing marks where "
+          + "the release becomes irreversible",
+      ]
+  }
+  if seen > 1 {
+    refusals = refusals
+      + [
+        "${seen} steps are named `${HOSTED_RELEASE_TAG_BOUNDARY_STEP}`, so the boundary "
+          + "is ambiguous",
+      ]
+  }
+  let ordered: list<HostedReleaseOrderedStep> = []
+  if seen == 1 {
+    for entry in jobs {
+      const waits = job_waits_on(jobs, entry.job, boundary_job)
+      if !waits && entry.job != boundary_job {
+        refusals = refusals
+          + [
+            "job `${entry.job}` neither runs the release nor waits on `${boundary_job}`, "
+              + "so its steps have no side of the tag boundary",
+          ]
+        continue
+      }
+      let index = 0
+      for name in entry.steps {
+        if name != nil {
+          ordered = ordered
+            + [
+              {
+                job: entry.job,
+                step: trim(unwrap(name)),
+                post_tag: if entry.job == boundary_job {
+                  index > boundary_index
+                } else {
+                  true
+                },
+              },
+            ]
+        }
+        index = index + 1
+      }
+    }
+  }
+  return {steps: ordered, boundary_job: boundary_job, refusals: refusals.sort()}
+}
+
+/** Whether this step runs in a world where the release may already exist. */
+pub fn hosted_release_step_is_post_tag(
+  order: HostedReleaseStepOrder,
+  job: string,
+  step: string,
+) -> bool? {
+  const key = hosted_release_registry_key(job, step)
+  for entry in order.steps {
+    if hosted_release_registry_key(entry.job, entry.step) == key {
+      return entry.post_tag
+    }
+  }
+  return nil
+}
+
+pub fn hosted_release_registry_key(job: string, step: string) -> string {
+  return trim(job) + "\\u{1}" + trim(step)
+}
+
+/** The registry row for one step, or nil when the registry does not name it. */
+pub fn hosted_release_failure_row(job: string, step: string) -> HostedReleaseFailureRow? {
+  const key = hosted_release_registry_key(job, step)
+  for row in HOSTED_RELEASE_FAILURE_REGISTRY {
+    if hosted_release_registry_key(row.job, row.step) == key {
+      return row
+    }
+  }
+  return nil
+}
+
+/** Every step the run reported as failed, in the order the run ran them. */
+pub fn hosted_release_failed_steps(
+  steps: list<HostedReleaseRunStep>,
+) -> list<HostedReleaseRunStep> {
+  return steps.filter({ step -> return trim(step.conclusion) == "failure" }).to_list()
+}
+
+fn steps_without_a_row(steps: list<HostedReleaseRunStep>) -> list<string> {
+  let unmapped: list<string> = []
+  for step in steps {
+    if hosted_release_failure_row(step.job, step.name) == nil {
+      const label = "${step.job}: ${step.name}"
+      if !contains(unmapped, label) {
+        unmapped = unmapped + [label]
+      }
+    }
+  }
+  return unmapped.sort()
+}
+
+/**
+ * The causes whose repair moves the default branch forward.
+ *
+ * Repairing any of these lands a commit on the release repository's default
+ * branch: a convergence pull request, a development cutover, a fold. The
+ * commit the failed run was dispatched at is then no longer an ancestor of
+ * that branch, and the release refuses a re-dispatch carrying it with
+ * `--at-sha ... is not an ancestor of refreshed origin/main`.
+ *
+ * That refusal is permanent, not transient. Re-sending the same inputs cannot
+ * succeed however many times it is tried, and two dispatches were spent
+ * discovering that.
+ *
+ * This set governs the advice, not the replay. Every one of these causes is
+ * reported by the preflight step, whose row is not redispatchable and which
+ * therefore escalates without building a replay at all. Dropping the commit
+ * from a replay nothing constructs would be a safeguard with no caller: it
+ * would read as protection while protecting nothing, and the first row that
+ * became redispatchable would inherit the false assurance rather than the
+ * protection. What a reader is handed is the repair text, so that is what this
+ * set is asserted against.
+ */
+pub const RELEASE_REPAIRS_THAT_MOVE_MAIN: list<string> = [
+  "consumers.contracts",
+  "checkpoint.development_version",
+  "checkpoint.release_contract",
+  "checkpoint.changelog_fragments",
+]
+
+/** Whether any reported cause is repaired by moving the default branch. */
+pub fn release_repair_moves_main(reported_causes: list<string>) -> bool {
+  for reported in reported_causes {
+    if contains(RELEASE_REPAIRS_THAT_MOVE_MAIN, trim(reported)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn redispatch_for(
+  run: HostedReleaseRunIdentity,
+  inputs: HostedReleaseRecordedInputs,
+) -> HostedReleaseRedispatch {
+  // A step that runs only after the tag exists cannot be retried as a fresh
+  // cut: the run's own follow-up bump is a prerequisite of its own rerun, so
+  // the retry has to resume the tagged release instead.
+  return {
+    repo: run.repo,
+    workflow: run.workflow,
+    ref: run.ref,
+    // Rebuilt field by field rather than spread, so nothing the recorded
+    // document carries for its own sake can leak into a dispatch as an input
+    // the workflow does not declare.
+    inputs: {
+      mode: inputs.mode,
+      bump: inputs.bump,
+      prerelease_identifier: inputs.prerelease_identifier,
+      at_sha: inputs.at_sha,
+      expected_prs: inputs.expected_prs,
+      resume_tagged_release: inputs.resume_tagged_release,
+      converge_fleet: inputs.converge_fleet,
+      repositories_json: inputs.repositories_json,
+      skip_consumers: inputs.skip_consumers,
+      consumer_proof_runs_json: inputs.consumer_proof_runs_json,
+    },
+  }
+}
+
+/**
+ * Decide one failed run from its steps and the inputs it recorded.
+ *
+ * The first failed step the run reports is the one that decides, because every
+ * later step either did not run or ran only to upload evidence. A run with no
+ * failed step at all is unreadable rather than clean: something reported a
+ * failure, and a finalizer that answered "nothing failed" would turn every
+ * unreadable run into a silent success.
+ */
+pub fn hosted_release_failure_receipt(
+  run: HostedReleaseRunIdentity,
+  order: HostedReleaseStepOrder,
+  steps: list<HostedReleaseRunStep>,
+  inputs: HostedReleaseRecordedInputs?,
+  reported_causes: list<string> = [],
+  landing: ReleaseLandingReceipt? = nil,
+  landing_admission: ReleaseLandingAdmission? = nil,
+) -> HostedReleaseFailureReceipt {
+  const failed = hosted_release_failed_steps(steps)
+  const base = {
+    schema_version: "harn_bump_fleet.hosted_release_failure.v1",
+    state: "unreadable",
+    repo: run.repo,
+    run_id: run.run_id,
+    run_url: run.run_url,
+    run_attempt: run.run_attempt,
+    cause: "unclassified",
+    failed_precondition: "",
+    failed_steps: failed,
+    unmapped_steps: steps_without_a_row(failed),
+    landing: landing,
+    landing_admission: landing_admission,
+  }
+  if len(steps) == 0 {
+    return base
+      + {
+        failed_precondition: "the run reported no steps at all",
+        escalation_reason: "the run's steps could not be read, so nothing names what failed",
+      }
+  }
+  if len(failed) == 0 {
+    return base
+      + {
+        failed_precondition: "the run failed but reports no failed step",
+        escalation_reason: "the run concluded in failure while every step it reports "
+          + "concluded otherwise, which is a failed reading rather than a repaired run",
+      }
+  }
+  const deciding = failed[0]
+  const row = hosted_release_failure_row(deciding.job, deciding.name)
+  if row == nil {
+    return base
+      + {
+        state: "escalated",
+        failed_precondition: "an unregistered step: ${deciding.job} / ${deciding.name}",
+        escalation_reason: "no registry row names this step, and an unrecognised failure "
+          + "escalates rather than defaulting to a retry",
+      }
+  }
+  const matched = unwrap(row)
+  // Read the side of the tag boundary before anything else about the repair.
+  // Once the release is out, no dispatch of this workflow is the answer: a
+  // re-dispatch would attempt a fresh cut of a version that already exists.
+  // An unanswerable position escalates too, because the safe reading and the
+  // dangerous one are not the same and absence is not the safe one.
+  const post_tag = hosted_release_step_is_post_tag(order, deciding.job, deciding.name)
+  if post_tag == nil {
+    return base
+      + {
+        state: "escalated",
+        cause: matched.cause,
+        failed_precondition: matched.precondition,
+        escalation_reason: "the workflow does not place ${deciding.job} / ${deciding.name} "
+          + "relative to `${HOSTED_RELEASE_TAG_BOUNDARY_STEP}`, so whether the release is "
+          + "already out is unknown and no re-dispatch may be named",
+      }
+  }
+  if unwrap(post_tag) {
+    return base
+      + {
+        state: "escalated",
+        cause: matched.cause,
+        failed_precondition: matched.precondition,
+        escalation_reason: "this step runs after the release harness, so the release may "
+          + "already be published and re-dispatching would attempt a fresh cut of it; "
+          + "recover with recover-release-publication.yml instead",
+      }
+  }
+  if !matched.redispatchable {
+    return base
+      + {
+        state: "escalated",
+        cause: matched.cause,
+        failed_precondition: matched.precondition,
+        escalation_reason: "sending the same inputs again would repeat this failure; "
+          + (hosted_release_repair_line(matched, reported_causes)
+            ?? "it needs a change, not a retry"),
+      }
+  }
+  if inputs == nil {
+    return base
+      + {
+        state: "escalated",
+        cause: matched.cause,
+        failed_precondition: matched.precondition,
+        escalation_reason: "the run did not record the inputs it was dispatched with, "
+          + "so no exact re-dispatch can be named",
+      }
+  }
+  return base
+    + {
+      state: "classified",
+      cause: matched.cause,
+      failed_precondition: matched.precondition,
+      redispatch: redispatch_for(run, unwrap(inputs)),
+    }
+}
+
+/** Render the receipt for a run summary, leading with what a person must decide. */
+pub fn hosted_release_failure_summary(receipt: HostedReleaseFailureReceipt) -> string {
+  let lines = [
+    "## Hosted release run ${receipt.run_id} failed",
+    "",
+    "- State: `${receipt.state}` (cause `${receipt.cause}`)",
+    "- What failed: ${receipt.failed_precondition}",
+  ]
+  for step in receipt.failed_steps {
+    lines = lines + ["- Failed step: ${step.job} / ${step.name}"]
+  }
+  if receipt.landing_admission != nil {
+    const admission = unwrap(receipt.landing_admission)
+    lines = lines
+      + ["- Release landing: `${to_string(admission.valid)}` (${admission.reason})"]
+  }
+  if receipt.escalation_reason != nil {
+    lines = lines + ["- Escalated because ${unwrap(receipt.escalation_reason)}"]
+  }
+  for entry in receipt.unmapped_steps {
+    lines = lines + ["- Unregistered step: ${entry}"]
+  }
+  if receipt.redispatch != nil {
+    const plan = unwrap(receipt.redispatch)
+    lines = lines
+      + [
+        "",
+        "### Exact re-dispatch",
+        "",
+        "Workflow `${plan.workflow}` on `${plan.ref}` in `${plan.repo}` with:",
+        "",
+        "```json",
+        json_stringify_pretty(plan.inputs),
+        "```",
+      ]
+  }
+  return join(lines, "\n") + "\n"
+}
+
+/** A registry row and a workflow step that do not correspond. */
+pub type HostedReleaseRegistryFinding = {kind: string, job: string, step: string, detail: string}
+
+/**
+ * Prove the registry names exactly the workflow's steps, in both directions.
+ *
+ * A step added or renamed without a cause would otherwise surface as an
+ * unclassified escalation during a release, hours after the change that caused
+ * it. A row for a step the workflow no longer has is the same defect facing the
+ * other way: it makes the registry look complete while naming nothing. An
+ * unnamed step is refused outright, because the run reports a display name this
+ * registry cannot predict.
+ */
+pub fn hosted_release_registry_findings(
+  jobs: list<{job: string, steps: list<string?>}>,
+) -> list<HostedReleaseRegistryFinding> {
+  let findings: list<HostedReleaseRegistryFinding> = []
+  let seen: list<string> = []
+  for entry in jobs {
+    let position = 0
+    for name in entry.steps {
+      position = position + 1
+      if name == nil || trim(unwrap(name)) == "" {
+        findings = findings
+          + [
+            {
+              kind: "unnamed_step",
+              job: entry.job,
+              step: "step ${position}",
+              detail:
+                "give the step a name; the run reports a display name the registry cannot predict",
+            },
+          ]
+        continue
+      }
+      const step = trim(unwrap(name))
+      seen = seen + [hosted_release_registry_key(entry.job, step)]
+      if hosted_release_failure_row(entry.job, step) == nil {
+        findings = findings
+          + [
+            {
+              kind: "unregistered_step",
+              job: entry.job,
+              step: step,
+              detail: "a workflow step was added or renamed and no row names it; add its "
+                + "row to ${HOSTED_RELEASE_REGISTRY_PATH}, or rename the row that covered "
+                + "the step this one replaced",
+            },
+          ]
+      }
+    }
+  }
+  for row in HOSTED_RELEASE_FAILURE_REGISTRY {
+    if !contains(seen, hosted_release_registry_key(row.job, row.step)) {
+      findings = findings
+        + [
+          {
+            kind: "stale_row",
+            job: row.job,
+            step: row.step,
+            detail: "a workflow step was removed or renamed and this row still names it; "
+              + "delete the row from ${HOSTED_RELEASE_REGISTRY_PATH}, or point it at the "
+              + "step that replaced it",
+          },
+        ]
+    }
+  }
+  findings = findings
+    + hosted_release_repair_map_findings(
+      HOSTED_RELEASE_FAILURE_REGISTRY,
+      RELEASE_LAUNCH_PRECONDITION_NAMES,
+    )
+  return findings.sort_by({ finding -> return "${finding.kind} ${finding.job} ${finding.step}" })
+}
+
+/**
+ * Name every repair map that answers nothing.
+ *
+ * A cause named twice answers only its first entry, so the second is dead text
+ * that reads as coverage. A cause or repair that is blank makes the map look
+ * populated while handing a release owner an empty line. A cause no producer
+ * can emit is the same failure with no visible symptom at all: the lookup
+ * always misses, the row-level fallback always answers, and the map reads as
+ * seven repairs while delivering one generic line. Nothing about a release
+ * looks wrong until someone is holding a half-published version.
+ *
+ * All three are caught here rather than at the release. `emitted` is the set of
+ * names some producer can actually report, passed in rather than read, so the
+ * check can be proven against a set that omits a name without one ever being
+ * removed from the producer.
+ */
+pub fn hosted_release_repair_map_findings(
+  rows: list<HostedReleaseFailureRow>,
+  emitted: list<string>,
+) -> list<HostedReleaseRegistryFinding> {
+  let findings: list<HostedReleaseRegistryFinding> = []
+  for row in rows {
+    let causes: list<string> = []
+    for entry in row.repairs ?? [] {
+      if trim(entry.cause) == "" || trim(entry.repair) == "" {
+        findings = findings
+          + [
+            {
+              kind: "empty_cause_repair",
+              job: row.job,
+              step: row.step,
+              detail: "a repair entry has an empty cause or an empty repair",
+            },
+          ]
+        continue
+      }
+      if contains(causes, entry.cause) {
+        findings = findings
+          + [
+            {
+              kind: "duplicate_cause_repair",
+              job: row.job,
+              step: row.step,
+              detail: "cause `${entry.cause}` is named twice, so only the first is ever read",
+            },
+          ]
+      }
+      if !contains(emitted, entry.cause) {
+        findings = findings
+          + [
+            {
+              kind: "unemitted_cause",
+              job: row.job,
+              step: row.step,
+              detail: "cause `${entry.cause}` is one no producer reports, so this repair "
+                + "can never be selected and the row-level repair answers in its place; "
+                + "name a cause the step's receipt emits, or delete the entry",
+            },
+          ]
+      }
+      causes = causes + [entry.cause]
+    }
+  }
+  return findings
+}
+
+/**
+ * Refuse a census that measured nothing. A workflow read as zero jobs, or a job
+ * read as zero steps, produces an empty finding list that is indistinguishable
+ * from a registry in perfect agreement.
+ */
+pub fn hosted_release_registry_refusals(
+  jobs: list<{job: string, steps: list<string?>}>,
+) -> list<string> {
+  let refusals: list<string> = []
+  if len(jobs) == 0 {
+    refusals = refusals + ["the workflow was read as having no jobs at all"]
+  }
+  for entry in jobs {
+    if len(entry.steps) == 0 {
+      refusals = refusals + ["job `${entry.job}` was read as having no steps"]
+    }
+  }
+  if len(HOSTED_RELEASE_FAILURE_REGISTRY) == 0 {
+    refusals = refusals + ["the failure registry is empty"]
+  }
+  return refusals
+}
+
+/**
+ * Refuse a workflow whose tag boundary cannot be read.
+ *
+ * Without it, every step's side of the boundary is a guess, and the guess that
+ * costs a released version is the one that reads "safe to re-dispatch".
+ */
+pub fn hosted_release_order_refusals(jobs: list<HostedReleaseWorkflowJob>) -> list<string> {
+  return hosted_release_step_order(jobs).refusals
+}
+
+/** A job as the workflow declares it: its key and the name template it renders. */
+pub type HostedReleaseJobTemplate = {key: string, name: string}
+
+/**
+ * Split a workflow job name template into the literal text around every
+ * `${{ ... }}` expression. The expressions are the only part that varies per
+ * run, so the literals are what a rendered name must still contain.
+ */
+pub fn job_name_literals(template: string) -> list<string> {
+  const marker = "\${{"
+  let literals: list<string> = []
+  let rest = template
+  while true {
+    const open = index_of(rest, marker)
+    if open < 0 {
+      return literals + [rest]
+    }
+    literals = literals + [rest[0:open]]
+    const tail = rest[open + 3:len(rest)]
+    const shut = index_of(tail, "}}")
+    if shut < 0 {
+      return literals
+    }
+    rest = tail[shut + 2:len(tail)]
+  }
+}
+
+fn literals_match(literals: list<string>, observed: string) -> bool {
+  let cursor = 0
+  let position = 0
+  for literal in literals {
+    position = position + 1
+    if literal == "" {
+      continue
+    }
+    const remainder = observed[cursor:len(observed)]
+    const found = index_of(remainder, literal)
+    if found < 0 {
+      return false
+    }
+    // The first literal is anchored at the start and the last at the end, so a
+    // template of pure wildcards cannot match every name it is shown.
+    if position == 1 && found != 0 {
+      return false
+    }
+    cursor = cursor + found + len(literal)
+  }
+  const tail = literals[len(literals) - 1] ?? ""
+  if tail != "" && !ends_with(observed, tail) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Resolve the job key behind a rendered job name.
+ *
+ * The registry keys on the job as the workflow declares it, while a run reports
+ * the name the job rendered, which for the release job embeds its inputs.
+ * Exactly one template must match; zero and more than one are both nil, because
+ * an ambiguous match would attribute a failure to the wrong job's registry rows
+ * and classify it as something it is not.
+ */
+pub fn hosted_release_job_key(
+  templates: list<HostedReleaseJobTemplate>,
+  observed: string,
+) -> string? {
+  let matched: list<string> = []
+  for template in templates {
+    if literals_match(job_name_literals(template.name), trim(observed)) {
+      if !contains(matched, template.key) {
+        matched = matched + [template.key]
+      }
+    }
+  }
+  return if len(matched) == 1 {
+    matched[0]
+  } else {
+    nil
+  }
+}
+
+/**
+ * Reduce one run's jobs to the registry's step vocabulary.
+ *
+ * A job whose key cannot be resolved keeps its rendered name, so its steps
+ * surface as unregistered rather than being dropped or attributed to a job that
+ * did not run them.
+ */
+pub fn hosted_release_run_steps(
+  templates: list<HostedReleaseJobTemplate>,
+  jobs: list<{name: string, steps: list<{number: int, name: string, conclusion: string?}>}>,
+) -> list<HostedReleaseRunStep> {
+  let steps: list<HostedReleaseRunStep> = []
+  for job in jobs {
+    const key = hosted_release_job_key(templates, job.name) ?? trim(job.name)
+    for step in job.steps {
+      steps = steps
+        + [
+          {
+            job: key,
+            name: trim(step.name),
+            conclusion: trim(step.conclusion ?? ""),
+            number: step.number,
+          },
+        ]
+    }
+  }
+  return steps
+}

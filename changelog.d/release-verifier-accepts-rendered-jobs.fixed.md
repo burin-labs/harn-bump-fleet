@@ -1,0 +1,1 @@
+The release's consumer-contract gate now accepts the jobs the fleet renderer emits beside the delegated bump job, instead of counting jobs and refusing every consumer that carries the contract gate the renderer added.
