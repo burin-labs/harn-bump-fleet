@@ -41,6 +41,14 @@ runs. The wrapper verifies the repo-pinned runtime before Harn parses the
 program and loads the configured provider environment. Mock release runs can
 stay sandboxed.
 
+To recover a completed consumer rehearsal, pass its exact workflow run ID to
+`rehearse_consumers.harn` with `--consumer-proof-runs-json '{"owner/repository":123}'`
+and `--only owner/repository` through the supported `scripts/with_env.sh harn run
+--no-sandbox` launcher. The existing certification gate verifies the selected run's
+candidate, workflow, source commit, and result before recording proof. A selected
+run does not bypass a failed or missing check, and recovery does not dispatch a
+replacement for that consumer.
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It
