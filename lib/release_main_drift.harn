@@ -1,0 +1,183 @@
+import { fleet_release_required_contexts, read_fleet_manifest } from "./fleet_manifest"
+/**
+ * The drift evidence a merged-main recovery decides on.
+ *
+ * Split out of `release_main_tag` because the two answer different questions.
+ * That module owns the recovery's actions: tag, merge, unfold, wait. This one
+ * owns the single reading those actions are taken from, which is what every
+ * commit between the certified base and the observed tip did with the contexts
+ * the release requires.
+ *
+ * The required set is a union, not the ruleset set alone. Rulesets say what may
+ * merge; they are not the authority for what may ship, and a lane that runs on
+ * every default-branch push is branch-covered by the release-only classifier
+ * and ruleset-optional at the same time, which puts it in neither set the
+ * release already computes. `lib/release_context_declaration` resolves the
+ * union and owns what absence means in it.
+ */
+import { github_repository_rulesets } from "./github"
+import { github_commit_check_runs, github_commit_pull_requests } from "./github_commits"
+import { release_context_set } from "./release_context_declaration"
+import {
+  ReleaseDriftCommit,
+  ReleaseDriftEvidence,
+  release_drift_commit_evidence,
+  release_drift_evidence,
+  release_drift_lane_contexts,
+  release_required_contexts_from_rulesets,
+} from "./release_drift_evidence"
+import { release_certification_bearing_paths } from "./release_merge_gate"
+import { run_git } from "./release_runtime"
+import {
+  ReleaseWorkflowInventory,
+  release_workflow_inventory_at_revision,
+} from "./release_workflow_inventory"
+
+/**
+ * Lanes a drifted commit can be held to, because its own pull request runs them.
+ *
+ * Empty until those lanes gain a pull-request trigger. That is what lets this
+ * reader land before or after the workflow change without a window in which
+ * every code drift waits for a lane that was never going to report.
+ */
+fn release_main_pull_request_lanes(
+  inventory: ReleaseWorkflowInventory,
+  required: list<string>,
+) -> list<string> {
+  return inventory.pull_request.checks.filter({ lane -> !required.contains(lane) }).to_list()
+}
+
+/**
+ * Read every commit that landed since certification and resolve each one
+ * against the branch's required checks.
+ *
+ * Nil, never a partial answer: a commit whose checks could not be read is not a
+ * commit that passed them, and the gate must not see a shortened list.
+ */
+pub fn release_main_drift_evidence(
+  harness: Harness,
+  cfg: dict,
+  slug: string,
+  certified_base: string,
+  observed_main: string,
+) -> ReleaseDriftEvidence? {
+  const rulesets = github_repository_rulesets(harness, slug)
+  if is_err(rulesets) {
+    return nil
+  }
+  const ruleset_required = release_required_contexts_from_rulesets(unwrap(rulesets))
+  // Read once, used twice: the lanes a drifted commit can be held to, and the
+  // complete set of check names some workflow at this exact revision can emit.
+  // The second is what lets a declared context that no longer exists be named
+  // as a refusal instead of quietly dropped.
+  const inventory = try {
+    release_workflow_inventory_at_revision(
+      {env: harness.env, process: harness.process},
+      cfg,
+      observed_main,
+    )
+  }
+  if is_err(inventory) {
+    return nil
+  }
+  // The declaration is repository-owned policy, read from the fleet manifest.
+  // A read that fails is recorded as `unreadable` rather than folded into "this
+  // repository declares nothing": both fall back to the ruleset set, which is
+  // the behavior that shipped before this list existed, but only one of them is
+  // a measurement and the receipt has to say which happened.
+  const declared = try {
+    fleet_release_required_contexts(read_fleet_manifest(harness.fs), slug)
+  }
+  const context_set = release_context_set(
+    ruleset_required,
+    if is_err(declared) {
+      []
+    } else {
+      unwrap(declared)
+    },
+    unwrap(inventory).all.checks,
+    if is_err(declared) {
+      "unreadable"
+    } else {
+      "manifest"
+    },
+  )
+  const required = context_set.contexts
+  const pull_request_lanes = try {
+    release_main_pull_request_lanes(unwrap(inventory), required)
+  }
+  if is_err(pull_request_lanes) {
+    return nil
+  }
+  const git = {env: harness.env, process: harness.process}
+  const listed = run_git(git, cfg, ["log", "--format=%H", "${certified_base}..${observed_main}"])
+  if !listed.success {
+    return nil
+  }
+  const shas = split(trim(listed.stdout), "\n").filter({ sha -> trim(sha) != "" }).to_list()
+  let commits: list<ReleaseDriftCommit> = []
+  for sha in shas {
+    // Which lanes this commit owes an answer for depends on what it changed,
+    // not on what the whole drift changed. A documentation commit alongside a
+    // code one must not inherit the code one's obligation and wait for a lane
+    // its own pull request never triggered.
+    const changed = run_git(git, cfg, ["show", "--no-commit-id", "--name-only", "--format=", sha])
+    if !changed.success {
+      return nil
+    }
+    const changed_paths = split(trim(changed.stdout), "\n").filter({ path -> trim(path) != "" })
+      .to_list()
+    const lanes = release_drift_lane_contexts(
+      unwrap(pull_request_lanes),
+      changed_paths,
+      release_certification_bearing_paths(changed_paths),
+    )
+    const commit_runs = github_commit_check_runs(harness, slug, sha)
+    if is_err(commit_runs) {
+      return nil
+    }
+    const pulls = github_commit_pull_requests(harness, slug, sha)
+    if is_err(pulls) {
+      return nil
+    }
+    const owning =
+      unwrap(pulls).filter({ pr -> to_string(pr?.base?.ref ?? "") == "main" }).to_list()
+    const head_sha = if len(owning) > 0 {
+      lowercase(trim(to_string(owning[0]?.head?.sha ?? "")))
+    } else {
+      ""
+    }
+    const head_runs = if head_sha == "" {
+      []
+    } else {
+      const observed = github_commit_check_runs(harness, slug, head_sha)
+      if is_err(observed) {
+        return nil
+      }
+      unwrap(observed)
+    }
+    commits = commits
+      + [
+        release_drift_commit_evidence(
+          sha,
+          if len(owning) > 0 {
+            to_int(owning[0]?.number ?? 0)
+          } else {
+            0
+          },
+          required,
+          unwrap(commit_runs),
+          head_runs,
+          lanes,
+        ),
+      ]
+  }
+  return release_drift_evidence(
+    certified_base,
+    observed_main,
+    required,
+    commits,
+    harness.clock.date_iso(),
+    context_set,
+  )
+}

@@ -1,0 +1,709 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { github_commit_signature, github_release_ref, github_worktree_commit } from "./github"
+import {
+  ReleaseAgentReviewResult,
+  logged_command_step,
+  logged_github_operation_step,
+  maybe_recovery_advice_step,
+  retry_commands_after_agent_repair,
+  run_release_generated_content_checks,
+  run_retry_commands_after_agent_repair,
+} from "./release_agent"
+import { ReleaseAnalysis, analyze_release } from "./release_analysis"
+import { execution_failed, recorded_step, release_commit_verify_args } from "./release_execution"
+import { prepared_release_analysis } from "./release_notes"
+import {
+  ReleasePublication,
+  publish_release_publication,
+  release_attempt_for_version,
+  release_publication,
+} from "./release_publication"
+import {
+  ReleaseConfig,
+  append_command_step,
+  release_git_remote_refs,
+  release_github_open_pr,
+  release_log_event,
+  release_repo_slug,
+} from "./release_runtime"
+import { pre_prepare_cutoff_gate } from "./release_tag"
+
+pub type ReleaseShipPrepareStopped = {proceed: bool, steps: list<dict>}
+
+pub type ReleaseShipPrepareReady = {
+  proceed: bool,
+  steps: list<dict>,
+  analysis: ReleaseAnalysis,
+  version: string,
+  publication: ReleasePublication,
+}
+
+pub type ReleaseShipPrepareResult = ReleaseShipPrepareStopped | ReleaseShipPrepareReady
+
+/**
+ * `stage` runs before the commit and `commands` after it, because who creates
+ * the commit is no longer fixed: see `release_signed_commit_phase`. `commit` is
+ * the local-commit command that route does not use, kept here so its exact argv
+ * has one owner -- the agent repair path replays it verbatim.
+ */
+pub type ReleaseCommitPlan = {
+  already_complete: bool,
+  needs_commit: bool,
+  stage: list<dict>,
+  commit: dict,
+  commands: list<dict>,
+}
+
+type AgentReview = ReleaseAgentReviewResult
+
+pub type PrepareFn = fn(Harness, ReleaseConfig, ReleaseAnalysis, AgentReview, string) -> list<dict>
+
+/** Build the deterministic commit/fetch sequence before any side effects run. */
+pub fn release_commit_plan(cfg: dict, analysis: dict, version: string) -> ReleaseCommitPlan {
+  const local_branch = "release/v${version}"
+  const already_complete = trim(analysis.status ?? "") == ""
+    && trim(analysis.diff_names ?? "")
+      != ""
+    && analysis.branch == local_branch
+  const stage = if already_complete {
+    []
+  } else {
+    [{name: "stage-tracked-release-content", argv: ["git", "add", "-u"]}]
+  }
+  let commands = []
+  // Fetch tags without rebasing: the release branch must remain parented at
+  // cfg.pin_sha so later base-branch commits cannot enter the tagged artifact.
+  commands = commands + [{name: "fetch-base", argv: ["git", "fetch", "origin", "--tags", cfg.base]}]
+  // A local shipped fixup uses the tag as ancestry evidence. The hosted route
+  // cannot do that safely: its release commit is GitHub-signed, while a later
+  // local merge commit is unknown to GitHub until push and cannot satisfy the
+  // required-signatures ruleset under the App bot. Hosted recovery instead
+  // keeps the GitHub-signed release commit as the publication head; the
+  // immutable tag target was already proved by the recovery boundary.
+  if release_fixup_uses_ancestry_merge(cfg) {
+    commands = commands
+      + [
+        {
+          name: "merge-shipped-tag-ours",
+          argv: [
+            "git",
+            "merge",
+            "-S",
+            "--no-ff",
+            "-s",
+            "ours",
+            cfg.fixup_tag,
+            "-m",
+            "Tie release/v${version} to shipped tag ${cfg.fixup_tag} (ours)",
+          ],
+        },
+      ]
+  }
+  return {
+    already_complete: already_complete,
+    needs_commit: !already_complete,
+    stage: stage,
+    commit: {name: "commit", argv: ["git", "commit", "-m", "Release v${version}"]},
+    commands: commands,
+  }
+}
+
+/**
+ * Prove the release commit carries a signature that will let it merge.
+ *
+ * Two different questions look like one. `git verify-commit` asks whether *this
+ * machine* can check the signature; the `required_signatures` ruleset asks
+ * whether GitHub can attribute it to the committer's account. They diverge in
+ * both directions, and each divergence is a release that fails at the wrong
+ * moment: a commit GitHub signed server-side has no signer any local
+ * allowed-signers file lists, and a commit signed by a bot's key verifies
+ * locally and is refused at the merge queue -- which is #660.
+ *
+ * So the gate asks whoever will actually decide. A locally made commit still
+ * answers to `git verify-commit`, because the local key is exactly what GitHub
+ * will check and a laptop can answer without a round trip.
+ */
+fn verify_release_commit_signature(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  steps: list<dict>,
+  oid: string,
+  run_id: string,
+) -> dict {
+  if !github_signed_commit_route(cfg) {
+    return logged_command_step(
+      harness,
+      cfg,
+      steps,
+      "verify-release-commit-signature",
+      release_commit_verify_args(oid),
+      run_id,
+    )
+  }
+  const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  const looked_up = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "verify-release-commit-signature",
+    "ask GitHub whether ${oid} is signed",
+    run_id,
+    fn() { return github_commit_signature(harness, slug, oid) },
+  )
+  if !looked_up.success {
+    return looked_up
+  }
+  const signature = unwrap(looked_up.value)
+  if signature.verified {
+    return looked_up
+  }
+  return {
+    steps: looked_up.steps
+      + [
+        recorded_step(
+          "reject-unverified-release-commit",
+          "require GitHub to count ${oid} as signed",
+          command_result_fail(
+            2,
+            "GitHub reports ${oid} as unverified (${signature.reason}); a ruleset requiring signatures will refuse the release PR",
+          ),
+        ),
+      ],
+    success: false,
+  }
+}
+
+/** Run one release command list, letting the agent repair a failure once. */
+fn run_commit_commands(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  initial: list<dict>,
+  commands: list<dict>,
+  analysis: ReleaseAnalysis,
+  run_id: string,
+) -> dict {
+  let steps = initial
+  for step in commands {
+    const result = logged_command_step(harness, cfg, steps, step.name, step.argv, run_id)
+    steps = result.steps
+    if !result.success {
+      const failed_step = steps[len(steps) - 1] ?? {}
+      steps = maybe_recovery_advice_step(harness, cfg, analysis, steps, failed_step, run_id)
+      const retry_commands = retry_commands_after_agent_repair(step)
+      if len(retry_commands) > 0 {
+        const repair_retry = run_retry_commands_after_agent_repair(
+          harness,
+          cfg,
+          steps,
+          retry_commands,
+          run_id,
+        )
+        steps = repair_retry.steps
+        if repair_retry.success {
+          continue
+        }
+      }
+      return {steps: steps, success: false}
+    }
+  }
+  return {steps: steps, success: true}
+}
+
+/**
+ * A mock run has no remote to sign against, and mock mode already fakes both
+ * `git commit` and `git verify-commit`, so it keeps the local route rather than
+ * inventing an object id GitHub never issued.
+ */
+fn github_signed_commit_route(cfg: ReleaseConfig) -> bool {
+  return (cfg.github_signed_commit ?? false) && !(cfg.mock ?? false)
+}
+
+/** Whether recovery must add the shipped tag as a second parent locally. */
+pub fn release_fixup_uses_ancestry_merge(cfg: dict) -> bool {
+  return (cfg.fixup_mode ?? false)
+    && (cfg.skip_tag ?? false)
+    && trim(cfg.fixup_tag ?? "")
+      != ""
+    && !((cfg.github_signed_commit ?? false) && !(cfg.mock ?? false))
+}
+
+/** The scratch branch a GitHub-signed release commit is created on. */
+pub fn release_candidate_branch(version: string) -> string {
+  return "release-candidate/v" + trim(version)
+}
+
+/**
+ * Local argv that adopts a GitHub-signed release commit onto `release/vX.Y.Z`.
+ *
+ * Must not use `git reset --hard`: Harn's catastrophic floor hard-denies it.
+ */
+pub fn adopt_signed_release_commit_argv(version: string, oid: string) -> list<string> {
+  return ["git", "checkout", "--force", "-B", "release/v" + trim(version), lowercase(trim(oid))]
+}
+
+/**
+ * Create the release commit through GitHub rather than with local `git commit`.
+ *
+ * `main` on the release repository requires signatures, and GitHub counts only
+ * a signature it can attribute to the committer's account. A hosted release
+ * commits as a GitHub App bot, and an App bot cannot register a signing key of
+ * any kind, so a locally signed release commit is real, checkable from the
+ * repository, and still refused: the release PR sits blocked with every check
+ * green (#660). `createCommitOnBranch` signs server-side under the identity of
+ * the token already in hand, which is the one signature the ruleset accepts
+ * from a bot.
+ *
+ * The commit is made on a scratch branch because the immutable attempt ref is
+ * named for the oid GitHub is about to choose, and nothing can name it earlier.
+ * Once the local `release/vX.Y.Z` branch is force-checked out onto that commit,
+ * every gate below -- parent proof, size, certification, tag -- reads the
+ * exact commit that will be published, so this changes who writes the commit
+ * and nothing else.
+ *
+ * Opt-in rather than the only path, for now. A release from a machine whose
+ * signing key GitHub already accepts works today and has shipped every release
+ * so far; this route adds failure modes that one does not have, chiefly the
+ * transport's refusal to carry a new executable file or a mode change. It
+ * should become the only path once a hosted release has shipped through it.
+ */
+fn release_signed_commit_phase(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  steps: list<dict>,
+  version: string,
+  run_id: string,
+) -> dict {
+  const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  const branch = release_candidate_branch(version)
+  const published = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "publish-signed-release-commit",
+    "create Release v${version} as a GitHub-signed commit on ${branch}",
+    run_id,
+    fn() { return github_worktree_commit(
+      harness,
+      {
+        slug: slug,
+        branch: branch,
+        headline: "Release v${version}",
+        repo_dir: cfg.repo,
+        // The index, which `stage-tracked-release-content` just filled. The
+        // working tree would also sweep in anything untracked the release
+        // build left behind.
+        source: "index",
+        // The worktree's HEAD, asserted rather than assumed: the connector
+        // refuses if the local head is anything else, so a branch that is not
+        // parented at the frozen source fails here instead of at the parent
+        // proof below.
+        base_oid: cfg.pin_sha,
+        create_branch: true,
+        reset_branch: true,
+      },
+    ) },
+  )
+  if !published.success {
+    return {steps: published.steps, success: false, oid: ""}
+  }
+  const receipt = published.value
+  const oid = lowercase(trim(to_string(unwrap(receipt).commit_oid)))
+  if oid == "" {
+    return {
+      steps: published.steps
+        + [
+          recorded_step(
+            "reject-empty-signed-release-commit",
+            "require a published commit for Release v${version}",
+            command_result_fail(
+              2,
+              "the release content produced no delta against ${cfg.pin_sha}, so there was nothing to sign",
+            ),
+          ),
+        ],
+      success: false,
+      oid: "",
+    }
+  }
+  let local = published.steps
+  for command in [
+    {name: "fetch-signed-release-commit", argv: ["git", "fetch", "origin", "refs/heads/" + branch]},
+    // Move `release/vX.Y.Z` onto the commit GitHub made. Harn's catastrophic
+    // floor hard-denies `git reset --hard` (hosted ship-pr 31069565698), so
+    // force-checkout -B is the allowed equivalent that updates the branch tip
+    // and discards the staged local tree that already matches this oid.
+    {name: "adopt-signed-release-commit", argv: adopt_signed_release_commit_argv(version, oid)},
+  ] {
+    const result = logged_command_step(harness, cfg, local, command.name, command.argv, run_id)
+    local = result.steps
+    if !result.success {
+      return {steps: local, success: false, oid: ""}
+    }
+  }
+  // The scratch branch has served its purpose the moment the oid is known, and
+  // leaving it would put a second mutable ref beside the immutable attempt.
+  const dropped = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    local,
+    "drop-release-candidate-branch",
+    "release scratch branch ${branch}",
+    run_id,
+    fn() { return github_release_ref(harness, slug, "refs/heads/" + branch, oid) },
+  )
+  return {steps: dropped.steps, success: dropped.success, oid: oid}
+}
+
+/** Prove the prepared release commit has exactly the frozen source as its sole parent. */
+pub fn release_commit_parent_matches(row: string, frozen_source_sha: string) -> bool {
+  const fields = split(trim(row), " ").filter({ field -> field != "" }).to_list()
+  return len(fields) == 2 && lowercase(fields[1]) == lowercase(trim(frozen_source_sha))
+}
+
+pub fn release_fixup_commit_parents_match(
+  merge_row: string,
+  release_row: string,
+  frozen_source_sha: string,
+  shipped_tag_target_sha: string,
+) -> bool {
+  const merge_fields = split(trim(merge_row), " ").filter({ field -> field != "" }).to_list()
+  const release_fields = split(trim(release_row), " ").filter({ field -> field != "" }).to_list()
+  if len(merge_fields) != 3 || len(release_fields) != 2 {
+    return false
+  }
+  return lowercase(merge_fields[1] ?? "") == lowercase(release_fields[0] ?? "")
+    && lowercase(merge_fields[2] ?? "")
+      == lowercase(trim(shipped_tag_target_sha))
+    && release_commit_parent_matches(release_row, frozen_source_sha)
+}
+
+pub fn release_ship_prepare_route(cfg: dict) -> "prepare" | "resume_pre_tag" {
+  if cfg.pre_tag_resume ?? false {
+    return "resume_pre_tag"
+  }
+  return "prepare"
+}
+
+fn resume_pre_tag_publication(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  run_id: string,
+  initial_steps: list<dict>,
+) -> ReleaseShipPrepareResult {
+  let steps = initial_steps
+  const publication = cfg.fixup_publication
+  if publication == nil || publication.version != analysis.next_version {
+    steps = steps
+      + [
+        recorded_step(
+          "resume-immutable-release-attempt",
+          "validate pre-tag recovery publication",
+          command_result_fail(2, "pre-tag recovery is missing its exact immutable publication"),
+        ),
+      ]
+    return {proceed: false, steps: steps}
+  }
+  const remote = release_git_remote_refs(
+    harness.process,
+    cfg,
+    ["refs/heads/${publication.remote_ref}"],
+  )
+  const remote_oid = if remote.success && len(remote.refs) == 1 {
+    lowercase(remote.refs[0]?.oid ?? "")
+  } else {
+    ""
+  }
+  const remote_result = if remote_oid == publication.head_oid {
+    command_result_ok("origin/${publication.remote_ref} still targets ${publication.head_oid}\n")
+  } else {
+    command_result_fail(
+      2,
+      "origin/${publication.remote_ref} no longer targets ${publication.head_oid}",
+    )
+  }
+  steps = steps
+    + [
+      recorded_step(
+        "resume-immutable-release-attempt",
+        "verify origin/${publication.remote_ref} at ${publication.head_oid}",
+        remote_result,
+      ),
+    ]
+  if !remote_result.success {
+    return {proceed: false, steps: steps}
+  }
+  // Same two questions as the fresh path, and the resumed commit was made by
+  // whichever of them applied when it was created.
+  const verified = verify_release_commit_signature(
+    harness,
+    cfg,
+    steps,
+    publication.head_oid,
+    run_id,
+  )
+  steps = verified.steps
+  if !verified.success {
+    return {proceed: false, steps: steps}
+  }
+  const parent = append_command_step(
+    harness,
+    cfg,
+    steps,
+    "verify-resumed-frozen-source-parent",
+    ["git", "rev-list", "--parents", "-n", "1", publication.head_oid],
+  )
+  steps = parent.steps
+  if !parent.success || !release_commit_parent_matches(parent.stdout ?? "", cfg.pin_sha) {
+    steps = steps
+      + [
+        recorded_step(
+          "reject-resumed-release-parent",
+          "require resumed release commit sole parent ${cfg.pin_sha}",
+          command_result_fail(
+            2,
+            "resumed release commit was not parented solely at frozen source ${cfg.pin_sha}",
+          ),
+        ),
+      ]
+    return {proceed: false, steps: steps}
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "pre_tag_checkpoint_resumed",
+    {remote_ref: publication.remote_ref, head_oid: publication.head_oid, pin_sha: cfg.pin_sha},
+  )
+  return {
+    proceed: true,
+    steps: steps,
+    analysis: analysis,
+    version: publication.version,
+    publication: publication,
+  }
+}
+
+@complexity(allow)
+pub fn release_ship_prepare_phase(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  analysis: ReleaseAnalysis,
+  agent_review_result: ReleaseAgentReviewResult,
+  run_id: string,
+  initial_steps: list<dict>,
+  prepare: PrepareFn,
+) -> ReleaseShipPrepareResult {
+  let steps = initial_steps
+  const pre_prepare_gate = pre_prepare_cutoff_gate(harness, cfg, analysis, steps, run_id)
+  steps = pre_prepare_gate.steps
+  if !pre_prepare_gate.proceed {
+    return {proceed: false, steps: steps}
+  }
+  if release_ship_prepare_route(cfg) == "resume_pre_tag" {
+    return resume_pre_tag_publication(harness, cfg, analysis, run_id, steps)
+  }
+  steps = steps + prepare(harness, cfg, analysis, agent_review_result, run_id)
+  if execution_failed(steps) {
+    return {proceed: false, steps: steps}
+  }
+  const validation_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const validation = run_release_generated_content_checks(
+    harness,
+    cfg,
+    validation_analysis,
+    steps,
+    run_id,
+  )
+  steps = validation.steps
+  if !validation.success {
+    return {proceed: false, steps: steps}
+  }
+  const post_prepare_analysis = prepared_release_analysis(analyze_release(harness, cfg), analysis)
+  const version = post_prepare_analysis.next_version
+  const local_branch = "release/v${version}"
+  const commit_plan = release_commit_plan(cfg, post_prepare_analysis, version)
+  if commit_plan.already_complete {
+    steps = steps
+      + [
+        recorded_step(
+          "commit-already-complete",
+          "release branch already has v${version} commit content",
+          command_result_ok(
+            "skipped commit because the working tree is clean and ${local_branch} already differs from pin ${cfg.pin_sha}",
+          ),
+        ),
+      ]
+  }
+  const staged = run_commit_commands(
+    harness,
+    cfg,
+    steps,
+    commit_plan.stage,
+    post_prepare_analysis,
+    run_id,
+  )
+  steps = staged.steps
+  if !staged.success {
+    return {proceed: false, steps: steps}
+  }
+  if commit_plan.needs_commit {
+    // Between the two command lists, because who writes the commit is the one
+    // thing that differs between a release from a machine GitHub trusts and one
+    // from a bot it cannot attribute a key to.
+    const committed = if github_signed_commit_route(cfg) {
+      release_signed_commit_phase(harness, cfg, steps, version, run_id)
+    } else {
+      run_commit_commands(harness, cfg, steps, [commit_plan.commit], post_prepare_analysis, run_id)
+    }
+    steps = committed.steps
+    if !committed.success {
+      return {proceed: false, steps: steps}
+    }
+  }
+  const after_commit = run_commit_commands(
+    harness,
+    cfg,
+    steps,
+    commit_plan.commands,
+    post_prepare_analysis,
+    run_id,
+  )
+  steps = after_commit.steps
+  if !after_commit.success {
+    return {proceed: false, steps: steps}
+  }
+  const parent = append_command_step(
+    harness,
+    cfg,
+    steps,
+    "verify-frozen-source-parent",
+    ["git", "rev-list", "--parents", "-n", "1", "HEAD"],
+  )
+  steps = parent.steps
+  if !parent.success {
+    return {proceed: false, steps: steps}
+  }
+  let parent_matches = release_commit_parent_matches(parent.stdout ?? "", cfg.pin_sha)
+  if release_fixup_uses_ancestry_merge(cfg) {
+    const release_parent = append_command_step(
+      harness,
+      cfg,
+      steps,
+      "verify-fixup-release-parent",
+      ["git", "rev-list", "--parents", "-n", "1", "HEAD^1"],
+    )
+    steps = release_parent.steps
+    if !release_parent.success {
+      return {proceed: false, steps: steps}
+    }
+    parent_matches = release_fixup_commit_parents_match(
+      parent.stdout ?? "",
+      release_parent.stdout ?? "",
+      cfg.pin_sha,
+      cfg.fixup_publication?.head_oid ?? "",
+    )
+  }
+  if !parent_matches {
+    const requirement = if release_fixup_uses_ancestry_merge(cfg) {
+      "require fixup merge first parent at frozen source ${cfg.pin_sha} and second parent at shipped tag ${cfg.fixup_publication?.head_oid ?? ""}"
+    } else {
+      "require release commit sole parent ${cfg.pin_sha}"
+    }
+    const failure = if release_fixup_uses_ancestry_merge(cfg) {
+      "release fixup merge ancestry did not match the frozen source and immutable tag contract"
+    } else {
+      "release commit was not parented solely at frozen source ${cfg.pin_sha}"
+    }
+    steps = steps
+      + [recorded_step("reject-release-parent", requirement, command_result_fail(2, failure))]
+    return {proceed: false, steps: steps}
+  }
+  const head = append_command_step(
+    harness,
+    cfg,
+    steps,
+    "resolve-release-publication-head",
+    ["git", "rev-parse", "HEAD"],
+  )
+  steps = head.steps
+  if !head.success {
+    return {proceed: false, steps: steps}
+  }
+  const publication = release_publication(version, trim(head.stdout ?? ""))
+  const verified_publication = verify_release_commit_signature(
+    harness,
+    cfg,
+    steps,
+    publication.head_oid,
+    run_id,
+  )
+  steps = verified_publication.steps
+  if !verified_publication.success {
+    return {proceed: false, steps: steps}
+  }
+  const legacy_pr = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "reject-legacy-release-pr",
+    "prove no open mutable release/v${version} PR remains",
+    run_id,
+    fn() {
+      const pull_request = release_github_open_pr(harness, cfg, "release/v${version}")
+      if pull_request != nil {
+        release_attempt_for_version(version, [pull_request])
+      }
+      return {found: false}
+    },
+  )
+  steps = legacy_pr.steps
+  if !legacy_pr.success {
+    return {proceed: false, steps: steps}
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "immutable_publication_started",
+    {remote_ref: publication.remote_ref, head_oid: publication.head_oid},
+  )
+  const published = publish_release_publication(
+    harness.process,
+    {repo: cfg.repo, mock: cfg.mock},
+    publication,
+  )
+  const publish_result = if published.success {
+    command_result_ok(published.reason + "\n")
+  } else {
+    command_result_fail(2, published.reason)
+  }
+  steps = steps
+    + [
+      recorded_step(
+        "publish-immutable-release-attempt",
+        "std/git push origin ${publication.head_oid}:refs/heads/${publication.remote_ref}",
+        publish_result,
+      )
+        + {
+          publication: publication,
+          push_git_receipt: published.push_git_receipt,
+          remote_git_receipt: published.remote_git_receipt,
+        },
+    ]
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "immutable_publication_finished",
+    {
+      remote_ref: publication.remote_ref,
+      head_oid: publication.head_oid,
+      success: published.success,
+      action: published.action,
+    },
+  )
+  if !published.success {
+    return {proceed: false, steps: steps}
+  }
+  return {
+    proceed: true,
+    steps: steps,
+    analysis: post_prepare_analysis,
+    version: version,
+    publication: publication,
+  }
+}

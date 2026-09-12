@@ -1,0 +1,278 @@
+import { env_str } from "std/config"
+import { strip_v } from "std/semver"
+import { BumpWorkflowPromotionRequest, run_bump_workflow_promotion } from "../promote_bump_workflow"
+import { run_release_binary_size_baseline } from "../refresh_release_binary_size_baseline"
+import { operation_harn_bump_repositories, read_fleet_manifest } from "./fleet_manifest"
+import { fleet_operation_scope, require_release_controller_scope } from "./fleet_operation_scope"
+import {
+  ReleaseChainReceipt,
+  release_chain_latest_stage,
+  release_chain_replay,
+} from "./release_chain_state"
+import { claim_release_lane, finish_release_lane } from "./release_lane_lock"
+import {
+  PublishedTailRead,
+  PublishedTailRequest,
+  published_tail_identity,
+} from "./release_published_tail"
+import { published_tail_live_adapter } from "./release_published_tail_live"
+import {
+  RELEASE_TAIL_RECOVERY_CEILING,
+  run_published_tail_with_recovery,
+} from "./release_tail_recovery"
+import { release_tail_recovery_live_adapter } from "./release_tail_recovery_live"
+import { release_watch_guard_acquire, release_watch_guard_finish } from "./release_watch_guard"
+
+pub type PublishedTailEntryOptions = {repo: string, no_wait: bool, reconcile_only: bool}
+
+fn baseline(
+  harness: Harness,
+  request: PublishedTailRequest,
+  repo: string,
+  apply: bool,
+) -> PublishedTailRead {
+  const result = run_release_binary_size_baseline(
+    harness,
+    {
+      tag: request.tag,
+      repo: repo,
+      slug: request.watch.slug,
+      release_commit_oid: request.watch.release_commit_oid,
+      apply: apply,
+      auto_merge: true,
+    },
+  )
+  const now = harness.clock.date_iso()
+  return {
+    state: result.state,
+    detail: result.detail,
+    effect_absent: result.effect_absent,
+    evidence: [
+      {
+        subject: "release size baseline",
+        kind: "baseline_policy",
+        status: if result.state == "proven" {
+          "observed"
+        } else {
+          "broken"
+        },
+        expected: result.expected_version + "@" + result.expected_source_sha,
+        observed: result.observed_version + "@" + result.observed_source_sha,
+        source: request.watch.slug,
+        ref: "main",
+        identity: result.base_oid,
+        observed_at: now,
+      },
+    ],
+  }
+}
+
+fn promotion(harness: Harness, request: PublishedTailRequest, apply: bool) -> PublishedTailRead {
+  let promotion_request: BumpWorkflowPromotionRequest = {
+    commit_oid: request.watch.release_commit_oid,
+    timeout_s: 10800,
+    interval_s: 20,
+    apply: apply,
+  }
+  if request.repositories_json != nil {
+    promotion_request.repositories_json = request.repositories_json
+  }
+  const result = run_bump_workflow_promotion(harness, promotion_request)
+  return {
+    state: result.state,
+    detail: result.detail,
+    effect_absent: result.effect_absent,
+    evidence: [
+      {
+        subject: "fleet workflow projections",
+        kind: "projection_census",
+        status: if result.state == "proven" && result.expected_target_count > 0
+          && result.expected_target_count == result.observed_clean_count {
+          "observed"
+        } else {
+          "broken"
+        },
+        expected: to_string(result.expected_target_count),
+        observed: to_string(result.observed_clean_count),
+        source: "fleet.toml",
+        ref: "main",
+        identity: result.effective_commit_oid,
+        observed_at: harness.clock.date_iso(),
+      },
+    ],
+  }
+}
+
+/**
+ * Run the tail under its recovery supervisor.
+ *
+ * A reconcile-only lane observes a journal it does not own, so it gets one
+ * attempt and an adapter that refuses the recovery effect. The publishing lane
+ * gets the bounded per-tag ceiling.
+ */
+fn run_owned_tail(
+  harness: Harness,
+  request: PublishedTailRequest,
+  options: PublishedTailEntryOptions,
+) -> ReleaseChainReceipt {
+  const adapter = published_tail_live_adapter(
+    harness,
+    request,
+    options.repo,
+    fn(actual, apply) { return baseline(harness, actual, options.repo, apply) },
+    fn(actual, apply) { return promotion(harness, actual, apply) },
+    {no_wait: options.no_wait, reconcile_only: options.reconcile_only},
+  )
+  const outcome = run_published_tail_with_recovery(
+    harness,
+    request,
+    adapter,
+    release_tail_recovery_live_adapter(harness, request, options.repo, options.reconcile_only),
+    {
+      ceiling: if options.reconcile_only {
+        1
+      } else {
+        RELEASE_TAIL_RECOVERY_CEILING
+      },
+      hosted_run: trim(env_str(harness.env, "GITHUB_RUN_ID") ?? ""),
+    },
+  )
+  const receipt = outcome.receipt
+  if receipt == nil {
+    throw "published tail produced no receipt: "
+      + (outcome.recovery.attempts[len(outcome.recovery.attempts) - 1]?.reason
+        ?? "no recovery attempt was recorded")
+  }
+  return receipt
+}
+
+/**
+ * Run cleanup on ordinary control after capturing the body's exact outcome.
+ *
+ * Harn 0.10.129 does not execute a `finally` block when a called function
+ * throws into it. The published tail must release both of its leases on that
+ * path, so this boundary cannot depend on `finally` until the fleet's minimum
+ * runtime contains the language fix.
+ */
+pub fn run_published_tail_cleanup<T>(body: fn() -> T, cleanup: fn() -> nil) -> T {
+  const outcome: Result<T, unknown> = try {
+    Ok(body())
+  } catch (error) {
+    Err(error)
+  }
+  const cleanup_outcome: Result<nil, unknown> = try {
+    cleanup()
+    Ok(nil)
+  } catch (error) {
+    Err(error)
+  }
+  if is_err(outcome) {
+    throw unwrap_err(outcome)
+  }
+  if is_err(cleanup_outcome) {
+    throw unwrap_err(cleanup_outcome)
+  }
+  return unwrap(outcome)
+}
+
+/** Local single-writer protection plus the existing cross-host exact-ref lease owner. */
+pub fn run_published_tail_entry(
+  harness: Harness,
+  request: PublishedTailRequest,
+  options: PublishedTailEntryOptions,
+) -> ReleaseChainReceipt {
+  published_tail_identity(request)
+  require_release_controller_scope(fleet_operation_scope(nil, request.repositories_json))
+  operation_harn_bump_repositories(
+    read_fleet_manifest(harness.fs),
+    fleet_operation_scope(nil, request.repositories_json),
+  )
+  if trim(options.repo) == "" {
+    throw "published tail requires --repo for signed-tag proof"
+  }
+  if options.reconcile_only {
+    const history = release_chain_replay(harness.fs, request.state_root, request.chain_id)
+    if len(history) == 0 {
+      throw "read-only reconciliation requires the original tail journal"
+    }
+  }
+  const local_guard = release_watch_guard_acquire(
+    harness.host_lease,
+    {tag: request.tag, receipt_path: request.state_root, domain: "release-published-tail"},
+  )
+  return run_published_tail_cleanup(
+    fn() {
+      // A read-only handoff consumer changes only its journal, not remote release state.
+      if options.reconcile_only {
+        return run_owned_tail(harness, request, options)
+      }
+      const host = harness.process.run({program: "hostname", args: []})
+      if !host.success || trim(host.stdout) == "" {
+        throw "cannot identify published-tail lease owner"
+      }
+      const workflow_id = to_int(env_str(harness.env, "GITHUB_RUN_ID") ?? "") ?? 0
+      const workflow_attempt = to_int(env_str(harness.env, "GITHUB_RUN_ATTEMPT") ?? "") ?? 0
+      const claim = claim_release_lane(
+        harness,
+        {
+          slug: "burin-labs/harn-bump-fleet",
+          base_branch: "main",
+          version: strip_v(request.tag),
+          holder: {
+            run_id: "published-tail-" + harness.random.uuid_v7(),
+            host: trim(host.stdout),
+            mode: "published-tail",
+            started_at: harness.clock.date_iso(),
+            workflow_run_id: workflow_id,
+            workflow_run_attempt: workflow_attempt,
+          },
+          now: harness.clock.date_iso(),
+        },
+      )
+      if claim.state != "acquired" {
+        throw "published tail lease refused: ${claim.message}"
+      }
+      return run_published_tail_cleanup(
+        fn() { return run_owned_tail(harness, request, options) },
+        fn() {
+          const finished = finish_release_lane(harness, "burin-labs/harn-bump-fleet", claim)
+          if !finished.released {
+            harness.stdio.eprintln("published tail lease cleanup remains ${finished.reason}")
+          }
+        },
+      )
+    },
+    fn() {
+      release_watch_guard_finish(harness.host_lease, local_guard)
+      return nil
+    },
+  )
+}
+
+/**
+ * Handoff is successful admission, never terminal completion or a hidden
+ * baseline success.
+ *
+ * An accepted automatic recovery is the third success shape. Past the tag the
+ * release is irreversible, so a tail that handed its exact tag and run identity
+ * to the workflow that owns finishing the publication has done the right thing
+ * and needs no person. Every other unfinished tail is still a failure.
+ */
+pub fn published_tail_exit_code(
+  receipt: ReleaseChainReceipt,
+  no_wait: bool,
+  recovery_dispatched: bool = false,
+) -> int {
+  if receipt.status == "complete" {
+    return 0
+  }
+  if recovery_dispatched {
+    return 0
+  }
+  const accepted = release_chain_latest_stage(receipt, "repin")
+  return if no_wait && receipt.status == "active" && accepted?.status == "proven" {
+    0
+  } else {
+    1
+  }
+}

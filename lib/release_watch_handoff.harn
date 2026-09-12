@@ -1,0 +1,152 @@
+import { release_redact_secrets } from "./release_step_output"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt_path,
+  release_watch_receipt_read,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+
+pub type HostedReleaseWatchDownload = {success: bool, message: string}
+
+pub type HostedReleaseWatchAdapter = {download: fn(int, string) -> HostedReleaseWatchDownload}
+
+const HOSTED_RELEASE_WATCH_DOWNLOAD_ATTEMPTS = 3
+
+fn safe_download_detail(message: string) -> string {
+  const without_queries = regex_replace(
+    "(https://[^ ?\\n]+)[?][^ \\n]+",
+    "$1?[redacted-query]",
+    message ?? "",
+  )
+  return release_redact_secrets(without_queries)
+}
+
+pub type HostedReleaseWatchImport = {
+  repo_root: string,
+  tag: string,
+  run_id: int,
+  destination: string,
+}
+
+fn production_adapter(process: HarnessProcess, cwd: string) -> HostedReleaseWatchAdapter {
+  return {
+    download: fn(run_id, destination) {
+      const attempted = process.run(
+        {
+          program: path_join(cwd, "scripts", "download_github_artifact.sh"),
+          args: [to_string(run_id), "release-run-${run_id}-attempt-*", destination],
+          cwd: cwd,
+        },
+      )
+      const result = if attempted.success {
+        attempted
+      } else {
+        process.run(
+          {
+            program: path_join(cwd, "scripts", "download_github_artifact.sh"),
+            args: [to_string(run_id), "release-run-${run_id}", destination],
+            cwd: cwd,
+          },
+        )
+      }
+      const message = if trim(result.stderr) != "" {
+        trim(result.stderr)
+      } else {
+        trim(result.stdout)
+      }
+      return {success: result.success, message: message}
+    },
+  }
+}
+
+fn hosted_receipt_roots(fs: HarnessFs, staging_root: string, run_id: int) -> list<string> {
+  const prefix = "release-run-${run_id}-attempt-"
+  const attempts = fs.list_dir(staging_root).filter({ name -> starts_with(name, prefix) }).sort_by(
+    { name -> 0 - (to_int(name.substring(len(prefix))) ?? 0) },
+  )
+    .map({ name -> path_join(staging_root, name) })
+    .to_list()
+  return attempts + [staging_root]
+}
+
+/**
+ * Import the typed watch receipt uploaded by one exact hosted release run.
+ *
+ * An existing valid receipt wins because the local watcher may have advanced
+ * it beyond the immutable handoff captured by the hosted job.
+ */
+pub fn import_hosted_release_watch_receipt(
+  harness: Harness,
+  input: HostedReleaseWatchImport,
+  adapter: HostedReleaseWatchAdapter? = nil,
+) -> ReleaseWatchReceipt {
+  if input.run_id < 1 {
+    throw "--hosted-run must be a positive GitHub Actions run ID"
+  }
+  const existing = release_watch_receipt_read(harness.fs, input.destination)
+  if existing != nil {
+    if existing.tag != input.tag {
+      throw "receipt tag ${existing.tag} does not match requested ${input.tag}"
+    }
+    return existing
+  }
+  if harness.fs.exists(input.destination) {
+    throw "existing release watch receipt is invalid: " + input.destination
+  }
+  const downloader = adapter ?? production_adapter(harness.process, input.repo_root)
+  let staging_root = ""
+  let last_download_error = ""
+  let download_attempt = 0
+  while download_attempt < HOSTED_RELEASE_WATCH_DOWNLOAD_ATTEMPTS && staging_root == "" {
+    download_attempt = download_attempt + 1
+    const attempt_root = harness.fs.mkdtemp_in_workspace("hosted-release-watch-")
+    const downloaded = downloader.download(input.run_id, attempt_root)
+    if downloaded.success {
+      staging_root = attempt_root
+    } else {
+      last_download_error = safe_download_detail(downloaded.message)
+      harness.fs.delete(attempt_root)
+    }
+  }
+  if staging_root == "" {
+    throw "could not download release-run-${input.run_id} after ${download_attempt} attempts: "
+      + last_download_error
+  }
+  return try {
+    // `upload-artifact` stores the contents matched by `.harn-runs/**` at the
+    // artifact root, while older fixtures and manually assembled archives may
+    // preserve the `.harn-runs` directory itself. Resolve that packaging seam
+    // once here; the persisted receipt has only one canonical local path.
+    for root in hosted_receipt_roots(harness.fs, staging_root, input.run_id) {
+      const sources = [
+        release_watch_receipt_path(path_join(root, "release-harn"), input.tag),
+        release_watch_receipt_path(path_join(root, ".harn-runs", "release-harn"), input.tag),
+      ]
+      const present = sources.filter({ source -> harness.fs.exists(source) }).to_list()
+      if len(present) > 1 {
+        const uploaded = release_watch_receipt_read(harness.fs, present[0])
+        const nested = release_watch_receipt_read(harness.fs, present[1])
+        if uploaded == nil || nested == nil || uploaded != nested {
+          throw "hosted release run ${input.run_id} contained conflicting watch receipts for ${input.tag}"
+        }
+      }
+      if len(present) > 0 {
+        const receipt = release_watch_receipt_read(harness.fs, present[0])
+        if receipt != nil {
+          if receipt.tag != input.tag {
+            throw "hosted release receipt tag ${receipt.tag} does not match requested ${input.tag}"
+          }
+          release_watch_receipt_write(
+            {fs: harness.fs, random: harness.random},
+            input.destination,
+            receipt,
+          )
+          return receipt
+        }
+      }
+    }
+    throw "hosted release run ${input.run_id} did not contain a valid watch receipt for ${input.tag}"
+  } finally {
+    harness.fs.delete(staging_root)
+  }
+}

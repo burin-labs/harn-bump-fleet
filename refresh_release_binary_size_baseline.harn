@@ -1,0 +1,989 @@
+#!/usr/bin/env harn
+//
+// refresh_release_binary_size_baseline.harn — record what the release that just
+// shipped actually weighs.
+//
+// harn's `.github/release-binary-size-policy.json` holds the bytes a release was
+// accepted at. Nothing moved it automatically, so it stayed at 0.10.118 while
+// releases shipped past it, and the growth those releases accumulated was
+// carried instead by an `accepted_growth` allowance whose own reason said
+// "remove after the released baseline refresh". The refresh never ran, the
+// allowance ran out, and the v0.10.126 cut spent two full Linux builds being
+// refused by the difference.
+//
+// The refresh is arithmetic over the release's own build, not a judgement, so
+// it belongs in the tail.
+//
+// It runs off the publication proof and nothing else. Fleet convergence is
+// skipped whenever an earlier tail phase fails, and a baseline that only
+// refreshes after a flawless release is a baseline that goes stale exactly
+// when the release process is having a bad week.
+//
+// Usage:
+//   harn run refresh_release_binary_size_baseline.harn -- --tag vX.Y.Z --repo PATH [--apply]
+import { ParserSpec } from "std/cli/argparse"
+import { compare_release, is_v_release_semver, strip_v } from "std/semver"
+import {
+  GithubWorkflowJobs,
+  GithubWorkflowRun,
+  GithubWorkflowRuns,
+} from "harn-github-connector/default"
+import { cli_options } from "lib/cli_options"
+import {
+  github_actions_run_jobs,
+  github_branch_commit,
+  github_branch_head,
+  github_claim_ref,
+  github_connector_options,
+  github_file_text_at_ref_result,
+  github_pr_list,
+  github_pr_upsert,
+  github_ref_snapshot,
+  github_workflow_runs,
+} from "lib/github"
+import { github_commit_pull_requests } from "lib/github_commits"
+import { pr_title_size_baseline } from "lib/pr_title_convention"
+import { pre_tag_binary_size_report_artifact } from "lib/release_execution"
+import { github_enable_auto_merge_with_release_lease } from "lib/release_merge_lease"
+import { run_git } from "lib/release_runtime"
+import {
+  BaselineRefreshSummary,
+  BinarySizePolicy,
+  baseline_refresh_pull_request_body,
+  refresh_binary_size_baseline,
+} from "lib/release_size_baseline"
+import {
+  ReleaseSizeReport,
+  read_release_size_report,
+  release_size_report_rejection,
+} from "lib/release_size_report"
+
+type Options = {
+  tag: string,
+  repo: string,
+  slug: string,
+  apply: bool,
+  json: bool,
+  no_auto_merge: bool,
+}
+
+pub type ReleaseBinarySizeBaselineRequest = {
+  tag: string,
+  repo: string,
+  slug: string,
+  release_commit_oid: string,
+  apply: bool,
+  auto_merge: bool,
+}
+
+pub type ReleaseBinarySizeBaselineReceipt = {
+  state: "proven" | "pending" | "failed",
+  ok: bool,
+  changed: bool,
+  applied: bool,
+  tag: string,
+  slug: string,
+  expected_version: string,
+  expected_source_sha: string,
+  observed_version: string,
+  observed_source_sha: string,
+  base_oid: string,
+  detail: string,
+  summary?: BaselineRefreshSummary,
+  pull_request?: int,
+  url?: string,
+  commit?: string,
+  auto_merge_state?: string,
+  effect_absent: bool,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "refresh-release-binary-size-baseline",
+  args: [
+    {kind: "flag", name: "tag", long: "--tag", default: ""},
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "flag", name: "slug", long: "--slug", default: "burin-labs/harn"},
+    {kind: "switch", name: "apply", long: "--apply"},
+    {kind: "switch", name: "json", long: "--json"},
+    {kind: "switch", name: "no_auto_merge", long: "--no-auto-merge"},
+  ],
+}
+
+const POLICY_PATH = ".github/release-binary-size-policy.json"
+
+const SIZE_TARGET = "x86_64-unknown-linux-gnu"
+
+const RELEASE_WORKFLOW = "build-release-binaries.yml"
+
+const DEFAULT_BRANCH = "main"
+
+const BRANCH = "automation/release-binary-size-baseline"
+
+const HEADLINE = "Refresh the release binary-size baseline"
+
+/** Downloading one run artifact, behind a seam a test can stand in for. */
+pub type SizeReportAdapter = {download: fn(int, string, string) -> {success: bool, message: string}}
+
+pub type BaselineMainPolicyRead = {head_oid: string, text?: string}
+
+pub type BaselineMainPolicyAdapter = {read: fn(string) -> Result<BaselineMainPolicyRead, string>}
+
+pub type BaselineExistingProposalRead = {
+  state: "absent" | "different" | "pending" | "failed",
+  detail: string,
+  observed_version: string,
+  observed_source_sha: string,
+  pull_request?: int,
+  url?: string,
+  commit?: string,
+  effect_absent: bool,
+}
+
+pub type BaselineExistingProposalAdapter = {
+  read: fn(ReleaseBinarySizeBaselineRequest) -> Result<BaselineExistingProposalRead, string>,
+}
+
+pub type BaselineProposalWrite = {
+  pull_request: int,
+  url: string,
+  commit: string,
+  auto_merge_state: string,
+}
+
+pub type BaselineProposalRequest = {
+  slug: string,
+  base_oid: string,
+  text: string,
+  body: string,
+  version: string,
+  auto_merge: bool,
+}
+
+pub type BaselineProposalAdapter = {
+  publish: fn(BaselineProposalRequest) -> Result<BaselineProposalWrite, string>,
+}
+
+fn production_adapter(process: HarnessProcess, cwd: string) -> SizeReportAdapter {
+  return {
+    download: fn(run_id, artifact, destination) {
+      const result = process.run(
+        {
+          program: "gh",
+          args: ["run", "download", to_string(run_id), "--name", artifact, "--dir", destination],
+          cwd: cwd,
+        },
+      )
+      const message = if trim(result.stderr) != "" {
+        trim(result.stderr)
+      } else {
+        trim(result.stdout)
+      }
+      return {success: result.success, message: message}
+    },
+  }
+}
+
+fn production_policy_adapter(harness: Harness) -> BaselineMainPolicyAdapter {
+  return {
+    read: fn(slug) {
+      const connector = github_connector_options()
+      const head = github_branch_head(harness, slug, DEFAULT_BRANCH, connector)
+      if is_err(head) {
+        return Err("could not read ${DEFAULT_BRANCH}: " + to_string(unwrap_err(head)))
+      }
+      const base_oid = lowercase(trim(to_string(unwrap(head)?.oid ?? "")))
+      if regex_match("^[0-9a-f]{40}$", base_oid) == nil {
+        return Err("${DEFAULT_BRANCH} omitted its exact head")
+      }
+      const current = github_file_text_at_ref_result(harness, slug, POLICY_PATH, base_oid)
+      if is_err(current) {
+        return Err("could not read ${POLICY_PATH}: " + to_string(unwrap_err(current)))
+      }
+      return Ok({head_oid: base_oid, text: unwrap(current)})
+    },
+  }
+}
+
+/**
+ * Find any historical proposal whose immutable head already carried this exact
+ * release baseline. The stable branch is reused across releases, so its absence
+ * alone cannot prove a prior same-target proposal never existed.
+ */
+fn same_target_baseline_proposals(
+  harness: Harness,
+  request: ReleaseBinarySizeBaselineRequest,
+) -> Result<list<dict>, string> {
+  const connector = github_connector_options()
+  const pulls = github_pr_list(
+    harness,
+    request.slug,
+    {head: BRANCH, base: DEFAULT_BRANCH, state: "all", per_page: 100},
+    connector,
+  )
+  if is_err(pulls) {
+    return Err("could not census historical baseline proposals: " + to_string(unwrap_err(pulls)))
+  }
+  if len(unwrap(pulls)) >= 100 {
+    return Err("historical baseline proposal census may be truncated")
+  }
+  let matching: list<dict> = []
+  for pull in unwrap(pulls) {
+    const head_oid = lowercase(trim(pull.head.sha))
+    if regex_match("^[0-9a-f]{40}$", head_oid) == nil {
+      return Err("historical baseline pull request #${pull.number} omitted its exact head")
+    }
+    const text = github_file_text_at_ref_result(
+      harness,
+      request.slug,
+      POLICY_PATH,
+      head_oid,
+      connector,
+    )
+    if is_err(text) || unwrap(text) == nil {
+      return Err(
+        "could not inspect ${POLICY_PATH} at historical baseline pull request #${pull.number}",
+      )
+    }
+    const policy = try {
+      Ok(schema_expect(json_parse(unwrap(text) ?? ""), BinarySizePolicy))
+    } catch (error) {
+      Err(
+        "historical baseline pull request #${pull.number} has invalid policy: " + to_string(error),
+      )
+    }
+    if is_err(policy) {
+      return Err(unwrap_err(policy))
+    }
+    if reconcile_release_binary_size_baseline(unwrap(policy), request).state == "proven" {
+      matching = matching
+        + [
+          {
+            number: pull.number,
+            url: pull.url,
+            commit: head_oid,
+            state: pull.state,
+            merged: pull.merged,
+          },
+        ]
+    }
+  }
+  return Ok(matching)
+}
+
+/** Reconcile the raw REST records returned by the commit pull-request endpoint. */
+pub fn reconcile_exact_baseline_proposal(
+  branch_oid: string,
+  reconciled: ReleaseBinarySizeBaselineReceipt,
+  pulls: list,
+) -> Result<BaselineExistingProposalRead, string> {
+  if len(pulls) >= 100 {
+    return Err("existing baseline pull request census may be truncated")
+  }
+  const exact = pulls.filter(
+    { pull ->
+      lowercase(trim(to_string(pull?.head?.sha ?? ""))) == branch_oid
+        && to_string(pull?.head?.ref ?? "")
+          == BRANCH
+        && to_string(pull?.base?.ref ?? "")
+          == DEFAULT_BRANCH
+    },
+  )
+    .to_list()
+  if len(exact) != 1 {
+    return Ok(
+      {
+        state: "failed",
+        detail:
+          "existing ${BRANCH} names the requested baseline but has ${len(exact)} exact-head pull requests",
+        observed_version: reconciled.observed_version,
+        observed_source_sha: reconciled.observed_source_sha,
+        commit: branch_oid,
+        effect_absent: false,
+      },
+    )
+  }
+  const pull = exact[0]
+  const number = to_int(pull?.number ?? 0)
+  const url = trim(to_string(pull?.html_url ?? ""))
+  if number <= 0 || url == "" {
+    return Ok(
+      {
+        state: "failed",
+        detail: "existing exact baseline pull request omitted its positive number or HTML URL",
+        observed_version: reconciled.observed_version,
+        observed_source_sha: reconciled.observed_source_sha,
+        commit: branch_oid,
+        effect_absent: false,
+      },
+    )
+  }
+  const open = lowercase(trim(to_string(pull?.state ?? ""))) == "open"
+  const merged = trim(to_string(pull?.merged_at ?? "")) != ""
+  return Ok(
+    {
+      state: if open || merged {
+        "pending"
+      } else {
+        "failed"
+      },
+      detail: if open {
+        "existing exact baseline proposal remains open; observe it without recommitting or rearming"
+      } else if merged {
+        "existing exact baseline proposal merged but is not yet visible on the observed main head"
+      } else {
+        "existing exact baseline proposal is closed; refusing to recommit or rearm it"
+      },
+      observed_version: reconciled.observed_version,
+      observed_source_sha: reconciled.observed_source_sha,
+      pull_request: number,
+      url: url,
+      commit: branch_oid,
+      effect_absent: false,
+    },
+  )
+}
+
+fn exact_baseline_proposal(
+  harness: Harness,
+  request: ReleaseBinarySizeBaselineRequest,
+  branch_oid: string,
+  reconciled: ReleaseBinarySizeBaselineReceipt,
+) -> Result<BaselineExistingProposalRead, string> {
+  const pulls = github_commit_pull_requests(
+    harness,
+    request.slug,
+    branch_oid,
+    github_connector_options(),
+  )
+  if is_err(pulls) {
+    return Err(
+      "could not inspect the existing baseline pull request: " + to_string(unwrap_err(pulls)),
+    )
+  }
+  return reconcile_exact_baseline_proposal(branch_oid, reconciled, unwrap(pulls))
+}
+
+fn production_existing_proposal_adapter(harness: Harness) -> BaselineExistingProposalAdapter {
+  return {
+    read: fn(request) {
+      const connector = github_connector_options()
+      const branch = github_ref_snapshot(harness, request.slug, "refs/heads/${BRANCH}", connector)
+      if is_err(branch) {
+        return Err("could not inspect ${BRANCH}: " + to_string(unwrap_err(branch)))
+      }
+      if unwrap(branch).state == "absent" {
+        if !request.apply {
+          const history = same_target_baseline_proposals(harness, request)
+          if is_err(history) {
+            return Err(unwrap_err(history))
+          }
+          if len(unwrap(history)) > 0 {
+            const prior = unwrap(history)[0]
+            return Ok(
+              {
+                state: "failed",
+                detail:
+                  "a historical pull request already carried this exact baseline; refusing to recreate or rearm it",
+                observed_version: strip_v(request.tag),
+                observed_source_sha: request.release_commit_oid,
+                pull_request: to_int(prior.number),
+                url: to_string(prior.url),
+                commit: to_string(prior.commit),
+                effect_absent: false,
+              },
+            )
+          }
+        }
+        return Ok(
+          {
+            state: "absent",
+            detail: "no existing baseline proposal branch",
+            observed_version: "",
+            observed_source_sha: "",
+            effect_absent: !request.apply,
+          },
+        )
+      }
+      const branch_oid = unwrap(branch).oid
+      const text = github_file_text_at_ref_result(
+        harness,
+        request.slug,
+        POLICY_PATH,
+        branch_oid,
+        connector,
+      )
+      if is_err(text) || unwrap(text) == nil {
+        return Err("existing ${BRANCH} does not expose a readable ${POLICY_PATH}")
+      }
+      const parsed_policy = try {
+        Ok(json_parse(unwrap(text) ?? ""))
+      } catch (error) {
+        Err("existing ${BRANCH} has an invalid ${POLICY_PATH}: " + to_string(error))
+      }
+      if is_err(parsed_policy) {
+        return Err(unwrap_err(parsed_policy))
+      }
+      const branch_policy: BinarySizePolicy = unwrap(parsed_policy)
+      const reconciled = reconcile_release_binary_size_baseline(branch_policy, request)
+      if reconciled.state == "failed" {
+        return Ok(
+          {
+            state: "failed",
+            detail: "existing ${BRANCH} cannot be superseded: ${reconciled.detail}",
+            observed_version: reconciled.observed_version,
+            observed_source_sha: reconciled.observed_source_sha,
+            commit: branch_oid,
+            effect_absent: false,
+          },
+        )
+      }
+      if reconciled.state == "pending" {
+        if !request.apply && reconciled.observed_version != reconciled.expected_version {
+          const history = same_target_baseline_proposals(harness, request)
+          if is_err(history) {
+            return Err(unwrap_err(history))
+          }
+          if len(unwrap(history)) > 0 {
+            const prior = unwrap(history)[0]
+            return Ok(
+              {
+                state: "failed",
+                detail:
+                  "a historical pull request already carried this exact baseline; refusing to recreate or rearm it",
+                observed_version: reconciled.expected_version,
+                observed_source_sha: request.release_commit_oid,
+                pull_request: to_int(prior.number),
+                url: to_string(prior.url),
+                commit: to_string(prior.commit),
+                effect_absent: false,
+              },
+            )
+          }
+        }
+        return Ok(
+          {
+            state: if reconciled.observed_version == reconciled.expected_version {
+              "failed"
+            } else {
+              "different"
+            },
+            detail: if reconciled.observed_version == reconciled.expected_version {
+              "existing ${BRANCH} names the requested version with the wrong source commit"
+            } else {
+              "existing ${BRANCH} belongs to baseline ${reconciled.observed_version}"
+            },
+            observed_version: reconciled.observed_version,
+            observed_source_sha: reconciled.observed_source_sha,
+            commit: branch_oid,
+            effect_absent: !request.apply
+              && reconciled.observed_version != reconciled.expected_version,
+          },
+        )
+      }
+      return exact_baseline_proposal(harness, request, branch_oid, reconciled)
+    },
+  }
+}
+
+fn production_proposal_adapter(harness: Harness) -> BaselineProposalAdapter {
+  return {
+    publish: fn(request) {
+      const connector = github_connector_options()
+      const claim = github_claim_ref(
+        harness,
+        request.slug,
+        "refs/heads/${BRANCH}",
+        {oid: request.base_oid},
+        connector,
+      )
+      if is_err(claim) {
+        return Err("could not claim ${BRANCH}: " + to_string(unwrap_err(claim)))
+      }
+      const branch_oid = to_string(unwrap(claim)?.oid ?? "")
+      if regex_match("^[0-9a-f]{40}$", lowercase(trim(branch_oid))) == nil {
+        return Err("${BRANCH} claim omitted its exact head")
+      }
+      const committed = github_branch_commit(
+        harness,
+        {
+          slug: request.slug,
+          branch: BRANCH,
+          expected_head_oid: branch_oid,
+          headline: HEADLINE,
+          body: request.body,
+          files: [{path: POLICY_PATH, contents: request.text}],
+        },
+        connector,
+      )
+      if is_err(committed) {
+        return Err("could not commit the refresh: " + to_string(unwrap_err(committed)))
+      }
+      const head_oid = to_string(unwrap(committed)?.oid ?? "")
+      if regex_match("^[0-9a-f]{40}$", lowercase(trim(head_oid))) == nil {
+        return Err("baseline commit omitted its exact head")
+      }
+      const pull = github_pr_upsert(
+        harness,
+        {
+          slug: request.slug,
+          head: BRANCH,
+          base: DEFAULT_BRANCH,
+          title: pr_title_size_baseline(request.version),
+          body: request.body,
+          expected_head_oid: head_oid,
+        },
+        connector,
+      )
+      if is_err(pull) {
+        return Err("could not open the refresh pull request: " + to_string(unwrap_err(pull)))
+      }
+      const pull_number = to_int(unwrap(pull)?.number) ?? 0
+      if pull_number < 1 {
+        return Err("baseline pull request upsert omitted its number")
+      }
+      const armed = if !request.auto_merge {
+        "held"
+      } else {
+        const enabled = github_enable_auto_merge_with_release_lease(
+          harness,
+          request.slug,
+          pull_number,
+          head_oid,
+          "squash",
+          connector,
+        )
+        if is_err(enabled) {
+          return Err(
+            "could not arm baseline pull request #${pull_number}: "
+              + to_string(unwrap_err(enabled)),
+          )
+        } else {
+          "armed"
+        }
+      }
+      return Ok(
+        {
+          pull_request: pull_number,
+          url: to_string(unwrap(pull)?.url ?? ""),
+          commit: head_oid,
+          auto_merge_state: armed,
+        },
+      )
+    },
+  }
+}
+
+/** Select the exact source build independently of later publication jobs. */
+pub fn release_baseline_build_evidence(
+  slug: string,
+  tag: string,
+  commit: string,
+  listed: GithubWorkflowRuns,
+  read_jobs: fn(int) -> Result<GithubWorkflowJobs, string>,
+) -> Result<GithubWorkflowRun, string> {
+  if listed.repo != slug || listed.page != 1 || listed.total_count != len(listed.runs) {
+    return Err("release build run census is incomplete or belongs to another repository")
+  }
+  const candidates = listed.runs.filter(
+    { run ->
+      run.repo == slug && run.head_branch == tag
+        && run.head_sha == commit
+        && run.event == "push"
+        && run.workflow_path == ".github/workflows/" + RELEASE_WORKFLOW
+    },
+  )
+    .to_list()
+  if len(candidates) == 0 {
+    return Err("no exact-source ${RELEASE_WORKFLOW} run is recorded for ${tag}@${commit}")
+  }
+  const run = candidates.sort_by({ item -> -item.id })[0]
+  if run.id < 1 || run.status != "completed" {
+    return Err("exact release build run is not completed")
+  }
+  const read = read_jobs(run.id)
+  if is_err(read) {
+    return Err(unwrap_err(read))
+  }
+  const jobs = unwrap(read)
+  if jobs.repo != slug || jobs.run_id != run.id || jobs.page != 1
+    || jobs.total_count != len(jobs.jobs) {
+    return Err("release build job census is incomplete or belongs to another run")
+  }
+  const builds = jobs.jobs.filter({ job -> job.name == "Build " + SIZE_TARGET }).to_list()
+  if len(builds) != 1 {
+    return Err("release build requires exactly one ${SIZE_TARGET} job")
+  }
+  const build = builds[0]
+  if build.id < 1 || build.run_id != run.id || build.head_sha != commit
+    || build.status != "completed"
+    || build.conclusion != "success" {
+    return Err("exact ${SIZE_TARGET} build job is not proven successful")
+  }
+  return Ok(run)
+}
+
+pub fn released_build_run(
+  harness: Harness,
+  slug: string,
+  tag: string,
+  commit: string,
+) -> Result<GithubWorkflowRun, string> {
+  const listed = github_workflow_runs(
+    harness,
+    slug,
+    RELEASE_WORKFLOW,
+    {event: "push", branch: tag},
+    50,
+  )
+  if is_err(listed) {
+    return Err(
+      "could not list ${RELEASE_WORKFLOW} runs for ${tag}: " + to_string(unwrap_err(listed)),
+    )
+  }
+  return release_baseline_build_evidence(
+    slug,
+    tag,
+    commit,
+    unwrap(listed),
+    fn(run_id) {
+      const jobs = github_actions_run_jobs(harness, slug, run_id, "latest")
+      return if is_err(jobs) {
+        Err("could not read exact build jobs: " + to_string(unwrap_err(jobs)))
+      } else {
+        Ok(unwrap(jobs))
+      }
+    },
+  )
+}
+
+fn released_commit(
+  git: {env: HarnessEnv, process: HarnessProcess},
+  repo: string,
+  tag: string,
+) -> string {
+  const resolved = run_git(git, {repo: repo, mock: false}, ["rev-list", "-n", "1", tag])
+  return lowercase(trim(resolved.stdout ?? ""))
+}
+
+/** Read immutable size evidence without opening or changing a baseline proposal. */
+pub fn read_release_baseline_report(
+  harness: Harness,
+  input: {slug: string, tag: string, commit: string, repo: string},
+  adapter: SizeReportAdapter? = nil,
+) -> Result<{run: GithubWorkflowRun, report: ReleaseSizeReport}, string> {
+  const selected = released_build_run(harness, input.slug, input.tag, input.commit)
+  if is_err(selected) {
+    return Err(unwrap_err(selected))
+  }
+  const run = unwrap(selected)
+  const report = download_release_baseline_report(
+    harness.fs,
+    run,
+    input.commit,
+    adapter ?? production_adapter(harness.process, input.repo),
+  )
+  if is_err(report) {
+    return Err(unwrap_err(report))
+  }
+  return Ok({run: run, report: unwrap(report)})
+}
+
+/** Validate a selected build's exact artifact before its bytes can enter policy. */
+pub fn download_release_baseline_report(
+  fs: HarnessFs,
+  run: GithubWorkflowRun,
+  commit: string,
+  adapter: SizeReportAdapter,
+) -> Result<ReleaseSizeReport, string> {
+  const artifact = pre_tag_binary_size_report_artifact(commit)
+  const destination = fs.mkdtemp_in_workspace("release-size-report")
+  const downloaded = adapter.download(run.id, artifact, destination)
+  if !downloaded.success {
+    return Err("could not download ${artifact} from run ${run.id}: ${downloaded.message}")
+  }
+  const parsed = read_release_size_report(fs, "${destination}/binary-size.json")
+  if is_err(parsed) {
+    return Err(
+      "run ${run.id} published ${artifact} without a readable binary-size.json: "
+        + json_stringify(unwrap_err(parsed)),
+    )
+  }
+  const report = unwrap(parsed)
+  const rejection = release_size_report_rejection(report, SIZE_TARGET, commit)
+  if rejection != nil {
+    return Err("refusing to refresh: ${rejection}")
+  }
+  return Ok(report)
+}
+
+fn baseline_receipt(
+  request: ReleaseBinarySizeBaselineRequest,
+  state: "proven" | "pending" | "failed",
+  detail: string,
+  observed_version: string = "",
+  observed_source_sha: string = "",
+) -> ReleaseBinarySizeBaselineReceipt {
+  return {
+    state: state,
+    ok: state != "failed",
+    changed: state != "proven",
+    applied: false,
+    tag: request.tag,
+    slug: request.slug,
+    expected_version: strip_v(request.tag),
+    expected_source_sha: request.release_commit_oid,
+    observed_version: observed_version,
+    observed_source_sha: observed_source_sha,
+    base_oid: "",
+    detail: detail,
+    effect_absent: false,
+  }
+}
+
+/** Decide whether main proves, still needs, or has superseded one release baseline. */
+pub fn reconcile_release_binary_size_baseline(
+  policy: BinarySizePolicy,
+  request: ReleaseBinarySizeBaselineRequest,
+) -> ReleaseBinarySizeBaselineReceipt {
+  if !is_v_release_semver(request.tag) {
+    throw "baseline refresh requires a stable release tag"
+  }
+  if regex_match("^[0-9a-f]{40}$", request.release_commit_oid) == nil {
+    throw "baseline refresh requires the immutable release commit"
+  }
+  const matches = policy.targets.filter({ target -> target.target == SIZE_TARGET }).to_list()
+  if len(matches) != 1 {
+    return baseline_receipt(
+      request,
+      "failed",
+      "${POLICY_PATH} must declare exactly one ${SIZE_TARGET} target",
+    )
+  }
+  const baseline = matches[0].baseline
+  const observed_tag = "v${baseline.version}"
+  const relation = try {
+    compare_release(observed_tag, request.tag)
+  } catch (error) {
+    return baseline_receipt(
+      request,
+      "failed",
+      "cannot compare baseline ${baseline.version} with ${request.tag}: " + to_string(error),
+      baseline.version,
+      baseline.source_sha,
+    )
+  }
+  if relation > 0 {
+    return baseline_receipt(
+      request,
+      "failed",
+      "baseline ${baseline.version} is newer than requested ${strip_v(request.tag)}; refusing downgrade",
+      baseline.version,
+      baseline.source_sha,
+    )
+  }
+  if relation == 0 && baseline.source_sha == request.release_commit_oid {
+    return baseline_receipt(
+      request,
+      "proven",
+      "${POLICY_PATH} already records ${request.tag} at ${request.release_commit_oid}",
+      baseline.version,
+      baseline.source_sha,
+    )
+  }
+  return baseline_receipt(
+    request,
+    "pending",
+    if relation == 0 {
+      "baseline ${baseline.version} names a different source commit; an exact repair is required"
+    } else {
+      "baseline ${baseline.version} predates requested ${strip_v(request.tag)}"
+    },
+    baseline.version,
+    baseline.source_sha,
+  )
+}
+
+/** Observe or propose one exact release baseline under the current-main head lease. */
+pub fn run_release_binary_size_baseline(
+  harness: Harness,
+  request: ReleaseBinarySizeBaselineRequest,
+  injected_report_adapter: SizeReportAdapter? = nil,
+  injected_policy_adapter: BaselineMainPolicyAdapter? = nil,
+  injected_existing_adapter: BaselineExistingProposalAdapter? = nil,
+  injected_proposal_adapter: BaselineProposalAdapter? = nil,
+) -> ReleaseBinarySizeBaselineReceipt {
+  if trim(request.repo) == "" || trim(request.slug) == "" {
+    throw "baseline refresh requires repo and slug"
+  }
+  // Bind the policy read to the exact main head later used to claim the proposal branch.
+  const current = (injected_policy_adapter ?? production_policy_adapter(harness)).read(request.slug)
+  if is_err(current) {
+    return baseline_receipt(request, "failed", unwrap_err(current))
+  }
+  const current_read = unwrap(current)
+  const base_oid = current_read.head_oid
+  if regex_match("^[0-9a-f]{40}$", base_oid) == nil {
+    return baseline_receipt(request, "failed", "${DEFAULT_BRANCH} omitted its exact head")
+  }
+  const current_text = current_read.text
+  if current_text == nil {
+    return baseline_receipt(
+      request,
+      "failed",
+      "${request.slug} has no ${POLICY_PATH} on ${DEFAULT_BRANCH}",
+    )
+      + {base_oid: base_oid}
+  }
+  const parsed_policy = try {
+    Ok(json_parse(current_text ?? ""))
+  } catch (error) {
+    Err("${POLICY_PATH} on ${base_oid} is invalid: " + to_string(error))
+  }
+  if is_err(parsed_policy) {
+    return baseline_receipt(request, "failed", unwrap_err(parsed_policy)) + {base_oid: base_oid}
+  }
+  const policy: BinarySizePolicy = unwrap(parsed_policy)
+  const observed = reconcile_release_binary_size_baseline(policy, request) + {base_oid: base_oid}
+  if observed.state != "pending" {
+    return observed
+  }
+  const existing = (injected_existing_adapter ?? production_existing_proposal_adapter(harness))
+    .read(request)
+  if is_err(existing) {
+    return observed + {state: "failed", ok: false, detail: unwrap_err(existing)}
+  }
+  const prior = unwrap(existing)
+  if prior.state == "pending" || prior.state == "failed" {
+    return observed
+      + {
+        state: prior.state,
+        ok: prior.state != "failed",
+        detail: prior.detail,
+        observed_version: prior.observed_version,
+        observed_source_sha: prior.observed_source_sha,
+        pull_request: prior.pull_request,
+        url: prior.url,
+        commit: prior.commit,
+        effect_absent: false,
+      }
+  }
+  if !request.apply {
+    return observed + {effect_absent: prior.effect_absent}
+  }
+  // Mutation may proceed only after the current policy has proved it is not newer.
+  const commit = released_commit(
+    {env: harness.env, process: harness.process},
+    request.repo,
+    request.tag,
+  )
+  if commit == "" || commit != request.release_commit_oid {
+    return observed
+      + {
+        state: "failed",
+        ok: false,
+        detail:
+          "local ${request.tag} resolves to ${commit}; expected ${request.release_commit_oid}",
+      }
+  }
+  const evidence = read_release_baseline_report(
+    harness,
+    {slug: request.slug, tag: request.tag, commit: commit, repo: request.repo},
+    injected_report_adapter,
+  )
+  if is_err(evidence) {
+    return observed + {state: "failed", ok: false, detail: unwrap_err(evidence)}
+  }
+  const build_run = unwrap(evidence).run
+  const report = unwrap(evidence).report
+  const refreshed = refresh_binary_size_baseline(
+    policy,
+    {
+      version: strip_v(request.tag),
+      source_sha: commit,
+      bytes: report.bytes,
+      observed_at: harness.clock.date_iso(),
+      target: SIZE_TARGET,
+      build_identity: report.build_identity,
+    },
+  )
+  if is_err(refreshed) {
+    return observed + {state: "failed", ok: false, detail: unwrap_err(refreshed)}
+  }
+  const result = unwrap(refreshed)
+  const summary = result.summary
+  const body = baseline_refresh_pull_request_body(summary, to_string(build_run.url ?? ""))
+  const proposal = (injected_proposal_adapter ?? production_proposal_adapter(harness)).publish(
+    {
+      slug: request.slug,
+      base_oid: base_oid,
+      text: result.text,
+      body: body,
+      version: strip_v(request.tag),
+      auto_merge: request.auto_merge,
+    },
+  )
+  if is_err(proposal) {
+    return observed + {state: "failed", ok: false, detail: unwrap_err(proposal)}
+  }
+  const published = unwrap(proposal)
+  return observed
+    + {
+      state: "pending",
+      ok: true,
+      changed: true,
+      applied: true,
+      detail:
+        "opened ${request.slug}#${published.pull_request} refreshing the baseline to ${summary.bytes} bytes for ${strip_v(request.tag)}; merge remains pending",
+      summary: summary,
+      pull_request: published.pull_request,
+      url: published.url,
+      commit: published.commit,
+      auto_merge_state: published.auto_merge_state,
+    }
+}
+
+fn report_outcome(stdio: HarnessStdio, options: Options, record: dict) -> int {
+  if options.json {
+    stdio.println(json_stringify(record))
+  } else {
+    stdio.println(to_string(record.detail ?? ""))
+  }
+  return if record.ok ?? false {
+    0
+  } else {
+    1
+  }
+}
+
+pipeline main(harness: Harness) -> int {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const tag = trim(options.tag)
+  const repo = trim(options.repo)
+  if tag == "" || repo == "" {
+    harness.stdio.eprintln(
+      "usage: harn run refresh_release_binary_size_baseline.harn -- --tag vX.Y.Z --repo PATH [--apply]",
+    )
+    return 2
+  }
+  const slug = trim(options.slug)
+  const commit = released_commit({env: harness.env, process: harness.process}, repo, tag)
+  if commit == "" {
+    return report_outcome(
+      harness.stdio,
+      options,
+      {ok: false, detail: "could not resolve the commit ${tag} names in ${repo}"},
+    )
+  }
+  const result = run_release_binary_size_baseline(
+    harness,
+    {
+      tag: tag,
+      repo: repo,
+      slug: slug,
+      release_commit_oid: commit,
+      apply: options.apply,
+      auto_merge: !options.no_auto_merge,
+    },
+  )
+  return report_outcome(harness.stdio, options, result)
+}

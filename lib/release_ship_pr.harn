@@ -1,0 +1,396 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { ReleaseAgentReviewResult, logged_github_operation_step } from "./release_agent"
+import { execution_failed, recorded_step } from "./release_execution"
+import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
+import { claim_release_merge_lease } from "./release_merge_lease"
+import {
+  ReleasePublication,
+  release_publication_pr_decision,
+  superseded_release_attempts,
+} from "./release_publication"
+import { write_pr_body } from "./release_reporting"
+import {
+  ReleaseConfig,
+  release_github_open_pr,
+  release_github_pr_close,
+  release_github_pr_create,
+  release_github_pr_edit,
+  release_github_pr_list,
+  release_log_event,
+  release_repo_slug,
+  release_run_root,
+  run_git,
+} from "./release_runtime"
+import { ReleaseShipCertified } from "./release_ship_certify"
+import {
+  ReleaseWatchReceipt,
+  release_watch_receipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_path,
+  release_watch_receipt_read,
+  release_watch_receipt_retarget_pr,
+  release_watch_receipt_write,
+} from "./release_watch_state"
+
+pub type ReleaseShipPrResult = {steps: list<dict>, handed_off: bool, pr_url: string}
+
+/** Paperwork changes the PR identity, never the publication or its proof. */
+pub fn release_fixup_watch_handoff(
+  original: ReleaseWatchReceipt,
+  publication: ReleasePublication,
+  tag_target: string,
+  pr_url: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  if original.publication != publication {
+    throw "post-publish fixup cannot replace the certified publication identity"
+  }
+  const published_oid = if trim(tag_target) != "" {
+    trim(tag_target)
+  } else if original.release_commit_oid != "" {
+    original.release_commit_oid
+  } else {
+    publication.head_oid
+  }
+  const bound = release_watch_receipt_bind_main_commit(original, published_oid, observed_at)
+  return release_watch_receipt_retarget_pr(bound, pr_url, observed_at)
+}
+
+/** Persist the handoff that lets another process wait for merge, tag, and publish. */
+fn persist_release_watch_receipt(
+  harness: Harness,
+  cfg: dict,
+  version: string,
+  publication: ReleasePublication,
+  steps: list<dict>,
+  run_id: string,
+  pr_url: string,
+  merge_lease_generation: string,
+) -> list<dict> {
+  if cfg.mock {
+    return steps
+  }
+  const tag = "v${version}"
+  const slug = release_repo_slug({env: harness.env, process: harness.process}, cfg)
+  const path = release_watch_receipt_path(release_run_root(harness.fs), tag)
+  let receipt = release_watch_receipt(
+    {
+      tag: tag,
+      slug: slug,
+      pin_sha: cfg.pin_sha,
+      publication: publication,
+      pr_url: pr_url,
+      merge_lease_generation: merge_lease_generation,
+      merge_lease_method: "squash",
+      created_at: harness.clock.date_iso(),
+    },
+  )
+  if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false) {
+    const original_publication = cfg.fixup_publication
+    if original_publication == nil {
+      throw "published fixup has no certified publication"
+    }
+    const git = {env: harness.env, process: harness.process}
+    const target = run_git(git, cfg, ["rev-parse", "--verify", "${tag}^{commit}"])
+    const parent = run_git(
+      git,
+      cfg,
+      ["rev-parse", "--verify", "${original_publication.head_oid}^1"],
+    )
+    if !parent.success {
+      throw "cannot recover published fixup tag and pinned parent"
+    }
+    const existing = release_watch_receipt_read(harness.fs, path)
+    if existing == nil && harness.fs.exists(path) {
+      throw "existing published watch receipt is invalid"
+    }
+    const original = existing
+      ?? release_watch_receipt(
+        {
+          tag: tag,
+          slug: slug,
+          pin_sha: trim(parent.stdout),
+          publication: original_publication,
+          pr_url: pr_url,
+          created_at: harness.clock.date_iso(),
+        },
+      )
+    receipt = release_fixup_watch_handoff(
+      original,
+      original_publication,
+      if target.success {
+        trim(target.stdout)
+      } else {
+        ""
+      },
+      pr_url,
+      harness.clock.date_iso(),
+    )
+  }
+  const written = try {
+    release_watch_receipt_write({fs: harness.fs, random: harness.random}, path, receipt)
+  }
+  const result = if is_ok(written) {
+    command_result_ok("durable release watch receipt: " + unwrap(written) + "\n")
+  } else {
+    command_result_fail(
+      2,
+      "could not persist release watch receipt: " + to_string(unwrap_err(written)),
+    )
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_watch_receipt_written",
+    {
+      tag: tag,
+      path: path,
+      success: result.success,
+      pr_url: pr_url,
+      remote_ref: publication.remote_ref,
+    },
+  )
+  return steps
+    + [recorded_step("persist-release-watch", "persist resumable merge/tag watch receipt", result)]
+}
+
+@complexity(allow)
+pub fn release_ship_pr_phase(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  certified: ReleaseShipCertified,
+  agent_review_result: ReleaseAgentReviewResult,
+  run_id: string,
+  release_generation: string = "",
+) -> ReleaseShipPrResult {
+  let steps = certified.steps
+  const version = certified.version
+  const publication = certified.publication
+  const body_path = write_pr_body(
+    harness.fs,
+    run_id,
+    certified.analysis,
+    agent_review_result,
+    steps,
+    publication,
+  )
+  const existing_pr = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "find-existing-pr",
+    "find open release PR for " + publication.remote_ref,
+    run_id,
+    fn() {
+      const pr = release_github_open_pr(harness, cfg, publication.remote_ref)
+      return {found: pr != nil, pull_request: pr}
+    },
+  )
+  steps = existing_pr.steps
+  if !existing_pr.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const existing_found = existing_pr.value.found
+  let pull_request = existing_pr.value.pull_request
+  const body = harness.fs.read_text(body_path)
+  if !existing_found {
+    const created = logged_github_operation_step(
+      {clock: harness.clock, fs: harness.fs},
+      steps,
+      "create-pr",
+      "create Release v${version} PR from " + publication.remote_ref,
+      run_id,
+      fn() { return release_github_pr_create(
+        harness,
+        cfg,
+        "Release v${version}",
+        publication.remote_ref,
+        cfg.base,
+        body,
+      ) },
+    )
+    steps = created.steps
+    if !created.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+    pull_request = created.value
+  }
+  const publication_decision = release_publication_pr_decision(publication, pull_request)
+  steps = steps
+    + [
+      recorded_step(
+        "verify-release-pr-publication",
+        "verify release PR targets ${publication.remote_ref} at ${publication.head_oid}",
+        if publication_decision.action == "accept" {
+          command_result_ok(publication_decision.reason + "\n")
+        } else {
+          command_result_fail(2, publication_decision.reason)
+        },
+      ),
+    ]
+  if publication_decision.action != "accept" {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const pr_url = pull_request.url
+  if existing_found {
+    const edited = logged_github_operation_step(
+      {clock: harness.clock, fs: harness.fs},
+      steps,
+      "refresh-existing-pr-body",
+      "refresh Release v${version} PR metadata",
+      run_id,
+      fn() { return release_github_pr_edit(
+        harness,
+        cfg,
+        pr_url,
+        {title: "Release v${version}", body: body},
+      ) },
+    )
+    steps = edited.steps
+    if !edited.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+  }
+  const prior_attempts = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "find-superseded-release-attempt-prs",
+    "find older immutable release attempts for v${version}",
+    run_id,
+    fn() { return release_github_pr_list(harness, cfg, {base: cfg.base, state: "open", limit: 100}) },
+  )
+  steps = prior_attempts.steps
+  if !prior_attempts.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const obsolete_fixup_url = if (cfg.fixup_mode ?? false) && (cfg.skip_tag ?? false)
+    && cfg.fixup_pr_url != pr_url {
+    cfg.fixup_pr_url
+  } else {
+    ""
+  }
+  for prior in superseded_release_attempts(publication, prior_attempts.value, obsolete_fixup_url) {
+    if prior.head.ref == "release/v${version}" {
+      const original_publication = cfg.fixup_publication
+      if original_publication == nil {
+        throw "obsolete paperwork has no certified publication"
+      }
+      verify_tagged_fixup_handoff(
+        {env: harness.env, process: harness.process},
+        {repo: cfg.repo, mock: cfg.mock},
+        original_publication,
+        prior,
+      )
+    }
+    const closed = logged_github_operation_step(
+      {clock: harness.clock, fs: harness.fs},
+      steps,
+      "supersede-release-attempt-pr-" + to_string(prior.number),
+      "close obsolete immutable release attempt " + prior.url,
+      run_id,
+      fn() { return release_github_pr_close(
+        harness,
+        cfg,
+        prior.number,
+        "Superseded by ${pr_url}. This immutable attempt remains an audit record; the current release content is ${publication.remote_ref} at ${publication.head_oid}.",
+      ) },
+    )
+    steps = closed.steps
+    if !closed.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+  }
+  const final_body_path = write_pr_body(
+    harness.fs,
+    run_id,
+    certified.analysis,
+    agent_review_result,
+    steps,
+    publication,
+  )
+  const final_body = harness.fs.read_text(final_body_path)
+  const final_edit = logged_github_operation_step(
+    {clock: harness.clock, fs: harness.fs},
+    steps,
+    "refresh-pr-body-final",
+    "write final Release v${version} PR receipt",
+    run_id,
+    fn() { return release_github_pr_edit(
+      harness,
+      cfg,
+      pr_url,
+      {title: "Release v${version}", body: final_body},
+    ) },
+  )
+  steps = final_edit.steps
+  if !final_edit.success {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  const merge_lease = if cfg.mock {
+    nil
+  } else if trim(release_generation) == "" {
+    Err(
+      {
+        code: "release_merge_lease_generation_missing",
+        category: "schema_drift",
+        message: "live ship-pr has no release-lane generation for its merge lease",
+      },
+    )
+  } else {
+    claim_release_merge_lease(
+      harness,
+      {
+        repo: release_repo_slug({env: harness.env, process: harness.process}, cfg),
+        base_branch: cfg.base,
+        base_oid: cfg.pin_sha,
+        candidate_pr: pull_request.number,
+        candidate_head: publication.head_oid,
+        generation: release_generation,
+        tag: "v${version}",
+        merge_method: "squash",
+      },
+    )
+  }
+  if merge_lease != nil {
+    const lease_step = logged_github_operation_step(
+      {clock: harness.clock, fs: harness.fs},
+      steps,
+      "claim-release-merge-lease",
+      "reserve ${cfg.base} merge authority for exact release candidate ${pr_url}",
+      run_id,
+      fn() { return merge_lease },
+    )
+    steps = lease_step.steps
+    if !lease_step.success {
+      return {steps: steps, handed_off: false, pr_url: ""}
+    }
+  }
+  // Persist recovery state before handing the merge on. The watcher receipt
+  // must already be durable so a squash cannot strand an untagged release
+  // commit after a local write failure.
+  steps = persist_release_watch_receipt(
+    harness,
+    cfg,
+    version,
+    publication,
+    steps,
+    run_id,
+    pr_url,
+    release_generation,
+  )
+  if execution_failed(steps) {
+    return {steps: steps, handed_off: false, pr_url: ""}
+  }
+  // Full candidate certification has succeeded before this phase. The watcher
+  // publishes that immutable candidate, then arms the independent release PR.
+  steps = steps
+    + [
+      recorded_step(
+        "hold-merge-until-candidate-tag",
+        "leave the release PR unarmed until the watch publishes the certified candidate",
+        command_result_ok(
+          "release PR ${pr_url} stays unarmed; the merge is released by the tag watch\n",
+        ),
+      ),
+    ]
+  return {steps: steps, handed_off: true, pr_url: pr_url}
+}

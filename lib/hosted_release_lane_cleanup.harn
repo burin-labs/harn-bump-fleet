@@ -1,0 +1,615 @@
+import { env_str } from "std/config"
+import { read_json_typed_result, write_json } from "std/fs"
+import {
+  GithubRefSnapshot,
+  github_actions_run,
+  github_actions_run_jobs,
+  github_connector_options,
+  github_ref_snapshot,
+  github_release_ref,
+} from "./github"
+import {
+  ReleaseLaneClaim,
+  ReleaseLaneHolder,
+  parse_release_lane_headline,
+  release_lane_ref,
+} from "./release_lane_lock"
+import {
+  GithubClientOptions,
+  GithubRefRelease,
+  GithubWorkflowJobs,
+  GithubWorkflowRun,
+} from "harn-github-connector/default"
+
+pub const HOSTED_RELEASE_WORKFLOW_REPO = "burin-labs/harn-bump-fleet"
+
+pub const HOSTED_RELEASE_WORKFLOW_NAME = "Hosted harn release"
+
+pub const HOSTED_RELEASE_WORKFLOW_PATH = ".github/workflows/hosted-release.yml"
+
+pub const HOSTED_RELEASE_LANE_CLAIM_PATH = ".harn-runs/hosted-release-lane-claim.json"
+
+pub const HOSTED_RELEASE_LANE_CLEANUP_PATH = ".harn-runs/hosted-release-lane-cleanup.json"
+
+pub type HostedReleaseLaneClaimReceipt = {
+  schema_version: "harn_bump_fleet.hosted_release_lane_claim.v1",
+  release_repo: string,
+  version: string,
+  ref: string,
+  oid: string,
+  holder: ReleaseLaneHolder,
+  workflow_repo: string,
+  workflow_name: string,
+  workflow_run_id: int,
+  workflow_run_attempt: int,
+  workflow_head_sha: string,
+  claimed_at: string,
+}
+
+pub type HostedReleaseLaneCleanupDecision = "released" \
+  | "already_absent" \
+  | "not_reached" \
+  | "not_applicable" \
+  | "rejected"
+
+pub type HostedReleaseLaneCleanupRequest = {
+  workflow_repo: string,
+  workflow_name: string,
+  workflow_path: string,
+  workflow_run_id: int,
+  workflow_run_attempt: int,
+  workflow_head_sha: string,
+  artifact_outcome: string,
+  updated_at: string,
+}
+
+pub type HostedReleaseLaneCleanupReceipt = {
+  schema_version: "harn_bump_fleet.hosted_release_lane_cleanup.v1",
+  decision: HostedReleaseLaneCleanupDecision,
+  reason: string,
+  workflow_repo: string,
+  workflow_name: string,
+  workflow_path: string,
+  workflow_run_id: int,
+  workflow_run_attempt: int,
+  workflow_head_sha: string,
+  workflow_status: string,
+  workflow_conclusion: string,
+  release_mode: string,
+  release_step_reached: bool,
+  artifact_outcome: string,
+  lane_ref: string,
+  expected_oid: string,
+  observed_oid: string,
+  lane_run_id: string,
+  observed_lane_run_id: string,
+  released: bool,
+  release_reason: string,
+  updated_at: string,
+}
+
+pub type HostedReleaseLaneCleanupAdapter = {
+  run: fn(int) -> Result<GithubWorkflowRun, unknown>,
+  jobs: fn(int) -> Result<GithubWorkflowJobs, unknown>,
+  lane: fn(string, string) -> Result<GithubRefSnapshot, unknown>,
+  release: fn(string, string, string) -> Result<GithubRefRelease, unknown>,
+}
+
+fn valid_oid(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", lowercase(trim(value)))) == 1
+}
+
+fn atomic_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  value: any,
+) -> string {
+  harness.fs.mkdir(dirname(path), true)
+  const temporary = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temporary, value, {pretty: true})
+  harness.fs.rename(temporary, path)
+  return path
+}
+
+fn positive_env_int(env: HarnessEnv, name: string) -> int? {
+  const value = to_int(env_str(env, name) ?? "")
+  return if value != nil && value > 0 {
+    value
+  } else {
+    nil
+  }
+}
+
+/**
+ * Persist the hosted identity immediately after the distributed ref claim.
+ * Operator-driven releases have no GitHub run identity and intentionally do
+ * not create this hosted-only artifact.
+ */
+pub fn hosted_release_lane_claim_write(
+  harness: Harness,
+  release_repo: string,
+  claim: ReleaseLaneClaim,
+  holder: ReleaseLaneHolder,
+) -> string? {
+  const workflow_run_id = positive_env_int(harness.env, "GITHUB_RUN_ID")
+  const workflow_run_attempt = positive_env_int(harness.env, "GITHUB_RUN_ATTEMPT")
+  if workflow_run_id == nil && workflow_run_attempt == nil {
+    return nil
+  }
+  const workflow_repo = trim(env_str(harness.env, "GITHUB_REPOSITORY") ?? "")
+  const workflow_name = trim(env_str(harness.env, "GITHUB_WORKFLOW") ?? "")
+  const workflow_head_sha = lowercase(trim(env_str(harness.env, "GITHUB_SHA") ?? ""))
+  if workflow_run_id == nil || workflow_run_attempt == nil
+    || workflow_repo
+      != HOSTED_RELEASE_WORKFLOW_REPO
+    || workflow_name != HOSTED_RELEASE_WORKFLOW_NAME
+    || !valid_oid(workflow_head_sha)
+    || holder.workflow_run_id
+      != workflow_run_id
+    || holder.workflow_run_attempt != workflow_run_attempt
+    || claim.state != "acquired"
+    || !valid_oid(claim.oid) {
+    throw "hosted release lane claim omitted exact workflow or ref identity"
+  }
+  const schema_version: "harn_bump_fleet.hosted_release_lane_claim.v1" =
+    "harn_bump_fleet.hosted_release_lane_claim.v1"
+  const receipt: HostedReleaseLaneClaimReceipt = {
+    schema_version: schema_version,
+    release_repo: release_repo,
+    version: claim.version,
+    ref: claim.ref,
+    oid: lowercase(claim.oid),
+    holder: holder,
+    workflow_repo: workflow_repo,
+    workflow_name: workflow_name,
+    workflow_run_id: workflow_run_id,
+    workflow_run_attempt: workflow_run_attempt,
+    workflow_head_sha: workflow_head_sha,
+    claimed_at: holder.started_at,
+  }
+  return atomic_write(
+    {fs: harness.fs, random: harness.random},
+    HOSTED_RELEASE_LANE_CLAIM_PATH,
+    receipt,
+  )
+}
+
+pub fn hosted_release_lane_claim_read(
+  fs: HarnessFs,
+  path: string,
+) -> HostedReleaseLaneClaimReceipt? {
+  const loaded = read_json_typed_result<HostedReleaseLaneClaimReceipt>(
+    fs,
+    path,
+    schema_of(HostedReleaseLaneClaimReceipt),
+  )
+  if is_ok(loaded) {
+    return unwrap(loaded)
+  }
+  const failure = unwrap_err(loaded)
+  if failure.kind == "absent" {
+    return nil
+  }
+  throw "invalid hosted release lane claim receipt: ${failure.kind}: ${failure.detail}"
+}
+
+pub fn hosted_release_lane_cleanup_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  receipt: HostedReleaseLaneCleanupReceipt,
+) -> string {
+  return atomic_write(harness, path, receipt)
+}
+
+fn receipt(
+  request: HostedReleaseLaneCleanupRequest,
+  decision: HostedReleaseLaneCleanupDecision,
+  reason: string,
+  fields: {
+    workflow_status?: string,
+    workflow_conclusion?: string,
+    release_mode?: string,
+    release_step_reached?: bool,
+    lane_ref?: string,
+    expected_oid?: string,
+    observed_oid?: string,
+    lane_run_id?: string,
+    observed_lane_run_id?: string,
+    released?: bool,
+    release_reason?: string,
+  } = {},
+) -> HostedReleaseLaneCleanupReceipt {
+  const schema_version: "harn_bump_fleet.hosted_release_lane_cleanup.v1" =
+    "harn_bump_fleet.hosted_release_lane_cleanup.v1"
+  return {
+    schema_version: schema_version,
+    decision: decision,
+    reason: reason,
+    workflow_repo: request.workflow_repo,
+    workflow_name: request.workflow_name,
+    workflow_path: request.workflow_path,
+    workflow_run_id: request.workflow_run_id,
+    workflow_run_attempt: request.workflow_run_attempt,
+    workflow_head_sha: lowercase(request.workflow_head_sha),
+    workflow_status: fields.workflow_status ?? "",
+    workflow_conclusion: fields.workflow_conclusion ?? "",
+    release_mode: fields.release_mode ?? "",
+    release_step_reached: fields.release_step_reached ?? false,
+    artifact_outcome: request.artifact_outcome,
+    lane_ref: fields.lane_ref ?? "",
+    expected_oid: fields.expected_oid ?? "",
+    observed_oid: fields.observed_oid ?? "",
+    lane_run_id: fields.lane_run_id ?? "",
+    observed_lane_run_id: fields.observed_lane_run_id ?? "",
+    released: fields.released ?? false,
+    release_reason: fields.release_reason ?? "",
+    updated_at: request.updated_at,
+  }
+}
+
+fn exact_terminal_run(request: HostedReleaseLaneCleanupRequest, run: GithubWorkflowRun) -> string? {
+  if request.workflow_repo != HOSTED_RELEASE_WORKFLOW_REPO
+    || request.workflow_name
+      != HOSTED_RELEASE_WORKFLOW_NAME
+    || request.workflow_path != HOSTED_RELEASE_WORKFLOW_PATH
+    || request.workflow_run_id <= 0
+    || request.workflow_run_attempt <= 0
+    || !valid_oid(request.workflow_head_sha) {
+    return "cleanup request omitted the canonical hosted workflow identity"
+  }
+  if run.repo != request.workflow_repo || run.id != request.workflow_run_id
+    || run.run_attempt
+      != request.workflow_run_attempt
+    || run.name != request.workflow_name
+    || run.workflow_path != request.workflow_path
+    || run.event != "workflow_dispatch"
+    || lowercase(run.head_sha) != lowercase(request.workflow_head_sha) {
+    return "fetched workflow run does not match the terminal trigger identity"
+  }
+  if lowercase(run.status) != "completed" || lowercase(run.conclusion ?? "") != "cancelled" {
+    return "exact workflow run is not terminal cancelled"
+  }
+  return nil
+}
+
+fn release_mode_from_job(name: string) -> string? {
+  const captured = regex_captures("^(audit|prepare|ship-pr) v-next \\(.*\\)$", trim(name))
+  return if len(captured) == 1 {
+    captured[0].groups[0]
+  } else {
+    nil
+  }
+}
+
+fn release_job(jobs: GithubWorkflowJobs) -> dict? {
+  let found = []
+  for job in jobs.jobs {
+    if job.steps.any({ step -> step.name == "Run release harness" }) {
+      found = found + [job]
+    }
+  }
+  if len(found) != 1 {
+    return nil
+  }
+  const job = found[0]
+  const step = job.steps.filter({ item -> item.name == "Run release harness" }).to_list()[0]
+  return {job: job, step: step, mode: release_mode_from_job(job.name)}
+}
+
+fn claim_error(
+  request: HostedReleaseLaneCleanupRequest,
+  claim: HostedReleaseLaneClaimReceipt,
+  mode: string,
+) -> string? {
+  if claim.workflow_repo != request.workflow_repo
+    || claim.workflow_name
+      != request.workflow_name
+    || claim.workflow_run_id != request.workflow_run_id
+    || claim.workflow_run_attempt != request.workflow_run_attempt
+    || lowercase(claim.workflow_head_sha) != lowercase(request.workflow_head_sha) {
+    return "lane claim receipt does not belong to the exact canceled workflow run"
+  }
+  if claim.release_repo != "burin-labs/harn" || claim.ref != release_lane_ref(claim.version)
+    || !valid_oid(claim.oid)
+    || claim.holder.run_id
+      == ""
+    || claim.holder.mode != mode
+    || claim.holder.workflow_run_id != request.workflow_run_id
+    || claim.holder.workflow_run_attempt != request.workflow_run_attempt {
+    return "lane claim receipt omitted the exact lease claimant identity"
+  }
+  return nil
+}
+
+fn rejected_for_claim(
+  request: HostedReleaseLaneCleanupRequest,
+  reason: string,
+  run: GithubWorkflowRun,
+  mode: string,
+  claim: HostedReleaseLaneClaimReceipt,
+  observed: GithubRefSnapshot? = nil,
+) -> HostedReleaseLaneCleanupReceipt {
+  const observed_holder = parse_release_lane_headline(observed?.holder_headline ?? "")
+  return receipt(
+    request,
+    "rejected",
+    reason,
+    {
+      workflow_status: run.status,
+      workflow_conclusion: run.conclusion ?? "",
+      release_mode: mode,
+      release_step_reached: true,
+      lane_ref: claim.ref,
+      expected_oid: claim.oid,
+      observed_oid: observed?.oid ?? "",
+      lane_run_id: claim.holder.run_id,
+      observed_lane_run_id: observed_holder?.run_id ?? "",
+    },
+  )
+}
+
+/**
+ * Release one canceled hosted run's lane only after exact terminal workflow,
+ * artifact, ref OID, and claimant identities all agree.
+ *
+ * The branches are the closed receipt reasons. Keeping them together makes it
+ * impossible for a new early return to bypass the final mutation preconditions.
+ */
+@complexity(allow)
+pub fn cleanup_cancelled_hosted_release_lane(
+  request: HostedReleaseLaneCleanupRequest,
+  claim: HostedReleaseLaneClaimReceipt?,
+  adapter: HostedReleaseLaneCleanupAdapter,
+) -> HostedReleaseLaneCleanupReceipt {
+  const fetched = adapter.run(request.workflow_run_id)
+  if is_err(fetched) {
+    return receipt(request, "rejected", "could not fetch the exact workflow run")
+  }
+  const run = unwrap(fetched)
+  const terminal_error = exact_terminal_run(request, run)
+  if terminal_error != nil {
+    return receipt(
+      request,
+      "rejected",
+      terminal_error,
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+    )
+  }
+  const fetched_jobs = adapter.jobs(request.workflow_run_id)
+  if is_err(fetched_jobs) {
+    return receipt(
+      request,
+      "rejected",
+      "could not fetch jobs for the exact terminal workflow run",
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+    )
+  }
+  const jobs = unwrap(fetched_jobs)
+  if jobs.repo != request.workflow_repo || jobs.run_id != request.workflow_run_id {
+    return receipt(
+      request,
+      "rejected",
+      "workflow job page does not belong to the exact terminal run",
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+    )
+  }
+  const selected = release_job(jobs)
+  if selected == nil {
+    if claim != nil || request.artifact_outcome == "success" {
+      return receipt(
+        request,
+        "rejected",
+        "claim evidence exists but the release harness step was not uniquely observed",
+        {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+      )
+    }
+    return receipt(
+      request,
+      "not_reached",
+      "terminal cancellation occurred before the release harness step existed",
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+    )
+  }
+  const mode = selected.mode
+  if mode == nil || selected.job.head_sha != request.workflow_head_sha {
+    return receipt(
+      request,
+      "rejected",
+      "release job omitted its canonical mode or exact workflow head",
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? ""},
+    )
+  }
+  const reached = selected.step.started_at != nil
+    && lowercase(selected.step.conclusion ?? "") != "skipped"
+  if !reached {
+    if claim != nil || request.artifact_outcome == "success" {
+      return receipt(
+        request,
+        "rejected",
+        "claim evidence exists although the release harness step was not reached",
+        {
+          workflow_status: run.status,
+          workflow_conclusion: run.conclusion ?? "",
+          release_mode: mode,
+        },
+      )
+    }
+    return receipt(
+      request,
+      "not_reached",
+      "terminal cancellation occurred before the release harness step started",
+      {workflow_status: run.status, workflow_conclusion: run.conclusion ?? "", release_mode: mode},
+    )
+  }
+  if mode == "audit" {
+    if claim != nil || request.artifact_outcome == "success" {
+      return receipt(
+        request,
+        "rejected",
+        "read-only audit unexpectedly produced a release lane claim",
+        {
+          workflow_status: run.status,
+          workflow_conclusion: run.conclusion ?? "",
+          release_mode: mode,
+          release_step_reached: true,
+        },
+      )
+    }
+    return receipt(
+      request,
+      "not_applicable",
+      "read-only hosted audit never claims a distributed release lane",
+      {
+        workflow_status: run.status,
+        workflow_conclusion: run.conclusion ?? "",
+        release_mode: mode,
+        release_step_reached: true,
+      },
+    )
+  }
+  if request.artifact_outcome != "success" || claim == nil {
+    return receipt(
+      request,
+      "rejected",
+      "mutating release reached the harness but its exact lane claim receipt is unavailable",
+      {
+        workflow_status: run.status,
+        workflow_conclusion: run.conclusion ?? "",
+        release_mode: mode,
+        release_step_reached: true,
+      },
+    )
+  }
+  const invalid_claim = claim_error(request, claim, mode)
+  if invalid_claim != nil {
+    return rejected_for_claim(request, invalid_claim, run, mode, claim)
+  }
+  const observed_result = adapter.lane(claim.release_repo, claim.ref)
+  if is_err(observed_result) {
+    return rejected_for_claim(request, "could not read the exact release lane", run, mode, claim)
+  }
+  const observed = unwrap(observed_result)
+  if observed.state == "absent" {
+    return receipt(
+      request,
+      "already_absent",
+      "the canceled run's exact lane is already absent",
+      {
+        workflow_status: run.status,
+        workflow_conclusion: run.conclusion ?? "",
+        release_mode: mode,
+        release_step_reached: true,
+        lane_ref: claim.ref,
+        expected_oid: claim.oid,
+        lane_run_id: claim.holder.run_id,
+        released: true,
+        release_reason: "already_absent",
+      },
+    )
+  }
+  if observed.ref != claim.ref || lowercase(observed.oid) != lowercase(claim.oid) {
+    return rejected_for_claim(
+      request,
+      "release lane changed after the canceled run recorded its exact OID",
+      run,
+      mode,
+      claim,
+      observed,
+    )
+  }
+  const current_holder = parse_release_lane_headline(observed.holder_headline)
+  if current_holder == nil || current_holder != claim.holder {
+    return rejected_for_claim(
+      request,
+      "release lane OID does not carry the recorded exact claimant identity",
+      run,
+      mode,
+      claim,
+      observed,
+    )
+  }
+  const released_result = adapter.release(claim.release_repo, claim.version, claim.oid)
+  if is_err(released_result) {
+    return rejected_for_claim(
+      request,
+      "exact-OID release request failed",
+      run,
+      mode,
+      claim,
+      observed,
+    )
+  }
+  const released = unwrap(released_result)
+  if !(released.released || released.reason == "already_absent") {
+    return rejected_for_claim(
+      request,
+      "exact-OID release refused because the lane is no longer owned",
+      run,
+      mode,
+      claim,
+      observed,
+    )
+  }
+  const decision: HostedReleaseLaneCleanupDecision = if released.reason == "already_absent" {
+    "already_absent"
+  } else {
+    "released"
+  }
+  return receipt(
+    request,
+    decision,
+    "terminal canceled hosted run released its exact distributed lane",
+    {
+      workflow_status: run.status,
+      workflow_conclusion: run.conclusion ?? "",
+      release_mode: mode,
+      release_step_reached: true,
+      lane_ref: claim.ref,
+      expected_oid: claim.oid,
+      observed_oid: observed.oid,
+      lane_run_id: claim.holder.run_id,
+      observed_lane_run_id: current_holder.run_id,
+      released: true,
+      release_reason: released.reason,
+    },
+  )
+}
+
+/** Production adapter keeps workflow reads and release-repo mutation on separate credentials. */
+pub fn live_hosted_release_lane_cleanup_adapter(
+  harness: Harness,
+  workflow_options: GithubClientOptions,
+  release_options: GithubClientOptions,
+) -> HostedReleaseLaneCleanupAdapter {
+  return {
+    run: fn(run_id) { return github_actions_run(
+      harness,
+      HOSTED_RELEASE_WORKFLOW_REPO,
+      run_id,
+      workflow_options,
+    ) },
+    jobs: fn(run_id) { return github_actions_run_jobs(
+      harness,
+      HOSTED_RELEASE_WORKFLOW_REPO,
+      run_id,
+      "latest",
+      workflow_options,
+    ) },
+    lane: fn(slug, ref) { return github_ref_snapshot(harness, slug, ref, release_options) },
+    release: fn(slug, version, oid) { return github_release_ref(
+      harness,
+      slug,
+      release_lane_ref(version),
+      oid,
+      release_options,
+    ) },
+  }
+}
+
+pub fn hosted_release_lane_cleanup_options(token: string) -> GithubClientOptions {
+  if trim(token) == "" {
+    throw "hosted release lane cleanup requires a scoped GitHub token"
+  }
+  return github_connector_options()
+    + {installation_token: token, allow_gh_auth_fallback: false}
+}

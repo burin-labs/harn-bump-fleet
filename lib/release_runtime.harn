@@ -1,0 +1,1433 @@
+import { CommandResult, command_result_fail, command_result_ok } from "std/command"
+import { argv_label } from "std/command"
+import { env_bool, env_str } from "std/config"
+import { GitLsRemoteReceipt, GitRemoteRef, git_ls_remote, git_run } from "std/git"
+import { BumpKind, is_prerelease_identifier } from "std/semver"
+import { end_timing, start_timing } from "std/timing"
+import { base_ref_fetch_args, base_ref_fetch_command } from "./checkout_cleanup"
+pub import { parse_pull_request_numbers } from "./cli_options"
+import {
+  ConsumerPretagProofRuns,
+  parse_consumer_pretag_proof_runs_json,
+} from "./consumer_pretag_dispatch"
+import {
+  github_authenticated_user,
+  github_pr_close,
+  github_pr_create,
+  github_pr_edit,
+  github_pr_files,
+  github_pr_list,
+  github_pr_mergeability,
+  github_pr_view,
+  github_release_at_tag,
+  github_release_body_edit,
+  github_user_ssh_signing_keys,
+} from "./github"
+import { hand_tag_evidence_from_git, hand_tagged_candidate_verdict } from "./hand_tagged_candidate"
+import { planner_defaults, planner_defaults_with } from "./llm_defaults"
+import { parse_release_cli_options } from "./release_cli_spec"
+import {
+  ReleaseCommandStepResult,
+  append_std_command_step,
+  resolve_release_cargo_target_dir,
+} from "./release_commands"
+import { execution_failed, mock_release_tag_command, recorded_step } from "./release_execution"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+pub import {
+  prompt_asset,
+  release_harness_root,
+  release_run_dir,
+  release_run_root,
+  run_output_dir,
+} from "./release_paths"
+import { ReleasePublication } from "./release_publication"
+import { require_release_repo_path } from "./release_repo_guard"
+import { release_step_failure_detail } from "./release_step_output"
+import { latest_release_tag_from_remote_refs } from "./release_versions"
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { GithubReleaseLease } from "harn-github-connector/default"
+
+fn is_prerelease_bump(bump: BumpKind) -> bool {
+  return bump == "premajor" || bump == "preminor" || bump == "prepatch"
+    || bump == "prerelease"
+}
+
+// Defaults route through `lib/llm_defaults::planner_defaults` so the
+// cloud/local cell decision (and `HARN_RELEASE_*` env overrides) live in
+// one place across every harness in this repo. See `lib/llm_defaults` for
+// the empirical-best planner/binder pair (PR burin-labs/harn#1814).
+pub const DEFAULT_PLANNER = planner_defaults_with({}, "HARN_RELEASE")
+
+const _ = "claude-sonnet-4-7"
+
+pub type ReleaseGitRunOptions = {env?: dict}
+
+pub type ReleaseCommandResult = CommandResult
+
+pub type ReleaseGithubPrFilters = {
+  base?: string,
+  head?: string,
+  state?: "open" | "closed" | "merged" | "all",
+  limit?: int,
+}
+
+pub type ReleaseGithubPrEdits = {title?: string, body?: string}
+
+/**
+ * The connector owns the release mutation lease: it is the party that reads
+ * the release and returns one. A second local declaration only had the power to
+ * drop a field the value already carried, which is how `tag_target_type` went
+ * missing from a head-sensitive mutation without anything noticing.
+ */
+pub type ReleaseGithubReleaseLease = GithubReleaseLease
+
+pub type ReleaseGithubPullRequestRef = {ref: string, sha: string, repo: string, owner: string}
+
+pub type ReleaseGithubPullRequest = {
+  repo: string,
+  number: int,
+  title: string,
+  url: string,
+  state: string,
+  github_state: string,
+  draft: bool,
+  merged: bool,
+  merged_at: string?,
+  merge_commit_oid: string?,
+  mergeable: bool?,
+  mergeable_state: string,
+  base: ReleaseGithubPullRequestRef,
+  head: ReleaseGithubPullRequestRef,
+  labels: list<string>,
+  auto_merge_armed: bool,
+  in_merge_queue: bool?,
+  body?: string,
+  user?: dict?,
+  created_at?: string?,
+  updated_at?: string?,
+  closed_at?: string?,
+  branch_protection?: dict,
+  queue_membership?: dict,
+  created?: bool,
+  updated?: bool,
+  ok?: bool,
+}
+
+pub type ReleaseStepStatus = {success: bool, status: string, exit_code: int?, ...rest}
+
+pub type ReleaseGitRemoteObservation = {
+  success: bool,
+  exit_code: int,
+  refs: list<GitRemoteRef>,
+  receipt: GitLsRemoteReceipt?,
+  stderr: string,
+  attempts?: int,
+  transient_retries?: int,
+}
+
+pub type ReleaseRemoteRefsStep = {
+  name: string,
+  command: string | list<string>,
+  success: bool,
+  status: string,
+  exit_code: int,
+  stdout: string,
+  stderr: string,
+  classification: string,
+  recovery_hint: string,
+  git_receipt: GitLsRemoteReceipt?,
+  remote_refs: list<GitRemoteRef>,
+}
+
+pub type ReleaseStepsCallback = fn() -> list<dict>
+
+fn timing_status(success: any) {
+  return if success {
+    "ok"
+  } else {
+    "error"
+  }
+}
+
+pub fn finish_release_run_timing(
+  clock: HarnessClock,
+  handle: dict,
+  outcome: string,
+  success: bool,
+) -> dict {
+  return end_timing(clock, handle, {status: timing_status(success), outcome: outcome})
+}
+
+pub fn timed_release_steps(
+  clock: HarnessClock,
+  name: string,
+  attrs: dict,
+  callback: ReleaseStepsCallback,
+) -> list<dict> {
+  const handle = start_timing(clock, name, attrs)
+  try {
+    const steps = callback()
+    const failed = execution_failed(steps)
+    end_timing(
+      clock,
+      handle,
+      {
+        status: timing_status(!failed),
+        outcome: if failed {
+          "failed"
+        } else {
+          "ok"
+        },
+        step_count: len(steps ?? []),
+      },
+    )
+    return steps
+  } catch (e) {
+    end_timing(clock, handle, {status: "error", outcome: "exception", error: to_string(e)})
+    throw e
+  }
+}
+
+// Mock-mode placeholder for the pinned base SHA. 40 hex chars so it
+// looks like a real commit SHA in audit reports, fixtures, and tests.
+const MOCK_PIN_SHA = "abcdef1234567890abcdef1234567890abcdef12"
+
+const _ = [
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+  ["git", "branch"],
+  ["git", "rev-parse"],
+  ["git", "diff-tree"],
+  ["git", "ls-files"],
+  ["git", "describe"],
+  ["git", "tag"],
+  ["git", "verify-tag"],
+  ["gh", "pr", "list"],
+  ["gh", "pr", "view"],
+  ["gh", "pr", "checks"],
+  ["gh", "run", "list"],
+  ["gh", "run", "view"],
+  ["gh", "workflow", "list"],
+  ["gh", "workflow", "view"],
+  ["gh", "release", "list"],
+  ["gh", "release", "view"],
+  ["make", "lint-md"],
+  ["make", "-s", "lint-md"],
+  ["npx", "markdownlint-cli2"],
+  ["rg"],
+  ["grep"],
+  ["sed", "-n"],
+  ["head"],
+  ["cat"],
+  ["ls"],
+  ["test"],
+]
+
+pub type ReleaseRepoConfig = {repo: string, mock: bool}
+
+pub type ReleaseNotesScope = "candidate_tree" | "frozen_artifact" | "immutable_checkpoint"
+
+pub type ReleaseAnalysisSnapshot = {
+  kind: "unresolved" | "mock" | "detached_worktree",
+  requested_sha: string,
+  resolved_sha: string,
+  analysis_head: string,
+  analysis_root: string,
+  source_repo: string,
+}
+
+pub type ReleaseConfig = {
+  repo: string,
+  source_repo: string,
+  release_workspace: string,
+  release_workspace_managed: bool,
+  release_workspace_shared: bool,
+  release_workspace_lease_domain?: string,
+  release_workspace_lease_wait_ms?: int,
+  base: string,
+  bump: BumpKind,
+  preid: string,
+  mode: "audit" | "prepare" | "ship-pr",
+  agent: bool,
+  model: string,
+  provider: string,
+  mock: bool,
+  help: bool,
+  bootstrap_new_crates: bool,
+  release_cargo_target_dir: string,
+  package_test_compatibility_root: string,
+  release_focus: string,
+  yes_live_release: bool,
+  pin_sha_input: string,
+  pin_sha: string,
+  analysis_snapshot: ReleaseAnalysisSnapshot,
+  planner_source: string,
+  planner_preflight: dict?,
+  fixup_mode: bool,
+  skip_tag: bool,
+  fixup_tag: string,
+  fixup_pr_url: string,
+  fixup_publication: ReleasePublication?,
+  fixup_pin_unreleased: string,
+  fixup_release_body_source: string,
+  release_notes_scope: ReleaseNotesScope,
+  pre_tag_resume: bool,
+  pre_tag_supersede: bool,
+  allow_base_drift: bool,
+  github_signed_commit: bool,
+  expected_prs: list<int>,
+  rejected_prs: list<int>,
+  queue_critical_prs: list<int>,
+  queue_live_prs: list<int>,
+  queue_noncritical_live_prs: list<int>,
+  local_audit: bool,
+  resume_tagged_release: bool,
+  no_chat: bool,
+  chat_only: bool,
+  chat_run: string,
+  chat_timeout_s: int,
+  self_update: bool,
+  wait_build_lock: bool,
+  consumer_proof_runs?: ConsumerPretagProofRuns,
+}
+
+pub type ReleasePinConfig = {
+  mock: bool,
+  repo: string,
+  base: string,
+  mode: "audit" | "prepare" | "ship-pr",
+  yes_live_release: bool,
+  pin_sha_input: string,
+  allow_base_drift: bool,
+  /**
+   * Whether this run is resuming an already-published tag.
+   *
+   * Read here, not just downstream, because it is what scopes the hand-tagged
+   * admission below. Optional so a caller that predates the field gets the
+   * refusing answer rather than the admitting one.
+   */
+  resume_tagged_release?: bool,
+}
+
+pub type ReleaseLiveConfirmationConfig = {
+  mock: bool,
+  yes_live_release: bool,
+  mode: "audit" | "prepare" | "ship-pr",
+}
+
+pub fn parse_release_args(env: HarnessEnv, args: list<string>) -> ReleaseConfig {
+  let parsed = parse_release_cli_options(args)
+  const prerelease_bump = is_prerelease_bump(parsed.bump)
+  const preid = trim(parsed.preid)
+  if prerelease_bump && preid == "" {
+    throw "--preid is required for --bump ${parsed.bump}"
+  }
+  if !prerelease_bump && preid != "" {
+    throw "--preid is only valid with premajor, preminor, prepatch, or prerelease"
+  }
+  if preid != "" {
+    if !is_prerelease_identifier(preid) {
+      throw "invalid prerelease identifier `${preid}`"
+    }
+  }
+  if trim(parsed.repo) == "" {
+    parsed.repo = path_join(env_str(env, "HOME") ?? "", "projects/harn")
+  }
+  if trim(parsed.base) == "" {
+    parsed.base = env_str(env, "HARN_EXT_RELEASE_BASE") ?? "main"
+  }
+  const planner = planner_defaults(env, "HARN_RELEASE")
+  if trim(parsed.model) == "" {
+    parsed.model = planner.model
+  }
+  if trim(parsed.provider) == "" {
+    parsed.provider = planner.provider
+  }
+  const bootstrap = parsed.bootstrap_new_crates
+    || env_bool(env, "HARN_EXT_RELEASE_BOOTSTRAP_NEW_CRATES", false)
+  const release_focus = if parsed.release_focus != "" {
+    parsed.release_focus
+  } else {
+    env_str(env, "HARN_EXT_RELEASE_FOCUS") ?? ""
+  }
+  const pin_sha_input = if parsed.pin_sha_input != "" {
+    parsed.pin_sha_input
+  } else {
+    env_str(env, "HARN_EXT_RELEASE_PIN_SHA") ?? ""
+  }
+  const expected_prs = parse_pull_request_numbers(
+    "expected_prs",
+    (parsed.expect_pr ?? []) + [env_str(env, "HARN_EXT_RELEASE_EXPECT_PRS") ?? ""],
+  )
+  const rejected_prs = parse_pull_request_numbers(
+    "rejected_prs",
+    (parsed.reject_pr ?? []) + [env_str(env, "HARN_EXT_RELEASE_REJECT_PRS") ?? ""],
+  )
+  const queue_critical_prs = parse_pull_request_numbers(
+    "queue_critical_prs",
+    parsed.queue_critical_pr ?? [],
+  )
+  const queue_live_prs = parse_pull_request_numbers("queue_live_prs", parsed.queue_live_pr ?? [])
+  const queue_noncritical_live_prs = parse_pull_request_numbers(
+    "queue_noncritical_live_prs",
+    parsed.queue_noncritical_live_pr ?? [],
+  )
+  const release_cargo_target_dir = resolve_release_cargo_target_dir(
+    env_str(env, "HARN_EXT_RELEASE_CARGO_TARGET_DIR") ?? "",
+    env_str(env, "HOME") ?? "",
+    env_str(env, "XDG_CACHE_HOME") ?? "",
+  )
+  const consumer_proof_runs = parse_consumer_pretag_proof_runs_json(parsed.consumer_proof_runs_json)
+  const package_test_compatibility_root = trim(
+    env_str(env, "HARN_EXT_PACKAGE_TEST_COMPATIBILITY_ROOT") ?? "",
+  )
+  const cfg: ReleaseConfig = {
+    repo: expand_home(env, parsed.repo),
+    source_repo: expand_home(env, parsed.repo),
+    release_workspace: "",
+    release_workspace_managed: false,
+    release_workspace_shared: false,
+    base: parsed.base,
+    bump: parsed.bump,
+    preid: preid,
+    mode: parsed.mode,
+    agent: parsed.agent,
+    model: parsed.model,
+    provider: parsed.provider,
+    mock: parsed.mock,
+    help: parsed.help,
+    bootstrap_new_crates: bootstrap,
+    release_cargo_target_dir: release_cargo_target_dir,
+    package_test_compatibility_root: package_test_compatibility_root,
+    release_focus: release_focus,
+    yes_live_release: parsed.yes_live_release,
+    pin_sha_input: pin_sha_input,
+    pin_sha: "",
+    analysis_snapshot: {
+      kind: if parsed.mock {
+        "mock"
+      } else {
+        "unresolved"
+      },
+      requested_sha: pin_sha_input,
+      resolved_sha: "",
+      analysis_head: "",
+      analysis_root: expand_home(env, parsed.repo),
+      source_repo: expand_home(env, parsed.repo),
+    },
+    planner_source: DEFAULT_PLANNER.source,
+    planner_preflight: nil,
+    fixup_mode: false,
+    skip_tag: false,
+    fixup_tag: "",
+    fixup_pr_url: "",
+    fixup_publication: nil,
+    fixup_pin_unreleased: "",
+    fixup_release_body_source: "",
+    release_notes_scope: "candidate_tree",
+    pre_tag_resume: false,
+    pre_tag_supersede: false,
+    allow_base_drift: parsed.allow_base_drift,
+    github_signed_commit: parsed.github_signed_commit,
+    expected_prs: expected_prs,
+    rejected_prs: rejected_prs,
+    queue_critical_prs: queue_critical_prs,
+    queue_live_prs: queue_live_prs,
+    queue_noncritical_live_prs: queue_noncritical_live_prs,
+    local_audit: parsed.local_audit || env_bool(env, "HARN_EXT_RELEASE_LOCAL_AUDIT", false),
+    resume_tagged_release: parsed.resume_tagged_release
+      || env_bool(env, "HARN_EXT_RELEASE_RESUME_TAGGED", false),
+    no_chat: parsed.no_chat,
+    chat_only: parsed.chat_only,
+    chat_run: parsed.chat_run,
+    chat_timeout_s: parsed.chat_timeout_s,
+    self_update: parsed.self_update || env_bool(env, "FLEET_SELF_UPDATE", false),
+    wait_build_lock: parsed.wait_build_lock
+      || env_bool(env, "HARN_EXT_RELEASE_WAIT_BUILD_LOCK", false),
+    consumer_proof_runs: consumer_proof_runs,
+  }
+  if cfg.help {
+    return cfg
+  }
+  return cfg
+}
+
+pub fn expand_home(env: HarnessEnv, path: string) -> string {
+  if path == "~" {
+    return env.get_or("HOME", "")
+  }
+  if starts_with(path, "~/") {
+    return env.get_or("HOME", "") + path[1:len(path)]
+  }
+  return path
+}
+
+/**
+ * Resolve `cfg.pin_sha_input` (or `origin/<base>` when no input is given)
+ * to a concrete 40-char commit SHA. Frozen here so every downstream step
+ * — branch creation, audit ranges, PR body, tag push — uses the same
+ * commit even if `origin/<base>` advances mid-run.
+ */
+pub fn resolve_pin_sha(process: HarnessProcess, cfg: ReleasePinConfig) -> string {
+  if cfg.mock {
+    if cfg.pin_sha_input != "" {
+      return cfg.pin_sha_input
+    }
+    return MOCK_PIN_SHA
+  }
+  const refresh_base = cfg.mode != "audit" || cfg.yes_live_release
+  // Read-only explicit-pin audits retain their local-only contract. Every
+  // mutating release, including an explicit pin, refreshes and proves the
+  // requested base before any release work starts.
+  const base_head = if cfg.pin_sha_input != "" && !refresh_base {
+    ""
+  } else {
+    release_base_head(process, cfg, refresh_base)
+  }
+  if cfg.pin_sha_input != "" {
+    const raw = trim(cfg.pin_sha_input)
+    const r = git_run(process, ["rev-parse", "--verify", raw + "^{commit}"], {repo: cfg.repo})
+    if !r.success {
+      throw "--at-sha did not resolve to a commit: ${raw}\n${trim(r.stderr)}"
+    }
+    const pin_sha = trim(r.stdout)
+    if refresh_base && !(cfg.allow_base_drift ?? false) {
+      const ancestry = git_run(
+        process,
+        ["merge-base", "--is-ancestor", pin_sha, base_head],
+        {repo: cfg.repo},
+      )
+      if !ancestry.success {
+        // Ancestry is a proxy for "this commit is the candidate this release
+        // certified". A release tagged by hand fails the proxy while satisfying
+        // the thing it stands for: the tag itself names the candidate and the
+        // certification branch proves the harness produced it. That evidence is
+        // stronger than ancestry, so it is allowed to answer instead -- but
+        // only for a resume, and only when every part of it holds.
+        const verdict = hand_tagged_candidate_verdict(
+          hand_tag_evidence_from_git(process, cfg.repo, pin_sha),
+          cfg.resume_tagged_release ?? false,
+        )
+        if !verdict.admitted {
+          throw "--at-sha ${pin_sha} is not an ancestor of refreshed origin/${cfg.base} and is not an admissible hand-tagged candidate (${to_string(verdict.refusal)}): ${verdict.detail}; use --allow-base-drift only for an intentional divergent release"
+        }
+      }
+    }
+    return pin_sha
+  }
+  return base_head
+}
+
+/**
+ * Resolve the release base after optionally refreshing only its exact
+ * remote-tracking ref. Never inherit a recovery checkout's remote refspec:
+ * it can name a deleted release branch unrelated to the requested base.
+ */
+fn release_base_head(process: HarnessProcess, cfg: any, refresh: any) {
+  if refresh {
+    const fetch_args = base_ref_fetch_args(cfg.base)
+    const fetched = git_run(process, fetch_args, {repo: cfg.repo})
+    if !fetched.success {
+      throw "failed to fetch required origin/${cfg.base} with explicit refspec ${base_ref_fetch_command(cfg.base)}; checkout remote.origin.fetch was not used:\n${trim(fetched.stderr)}"
+    }
+  }
+  const r = git_run(
+    process,
+    ["rev-parse", "--verify", "origin/${cfg.base}^{commit}"],
+    {repo: cfg.repo},
+  )
+  if !r.success {
+    throw "failed to resolve origin/${cfg.base} after release base-ref preflight:\n${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
+}
+
+fn release_command_result(result: any) -> ReleaseCommandResult {
+  return {
+    success: result.success,
+    ok: result.ok ?? result.success,
+    status: result.status
+      ?? if result.success {
+        "completed"
+      } else {
+        "failed"
+      },
+    exit_code: result.exit_code,
+    cwd: result.cwd ?? "",
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  }
+}
+
+pub fn run_cmd(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  command: string,
+) -> ReleaseCommandResult {
+  if cfg.mock {
+    return release_command_result(fake_command(harness.env, command, cfg))
+  }
+  return release_command_result(harness.process.shell_at(cfg.repo, command))
+}
+
+/**
+ * Run a local git command in argv form, scoped to `cfg.repo`.
+ *
+ * Routes through `fake_command` in mock mode so the legacy substring-keyed
+ * mock fixtures continue to match; otherwise dispatches to `std/git`
+ * `git_run`, which executes argv without shell quoting and strips ambient
+ * GIT_* env.
+ */
+pub fn run_git(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  args: list<string>,
+  options: ReleaseGitRunOptions = {},
+) -> ReleaseCommandResult {
+  if cfg.mock {
+    return release_command_result(fake_command(harness.env, argv_label(["git"] + args), cfg))
+  }
+  return release_command_result(git_run(harness.process, args, options + {repo: cfg.repo}))
+}
+
+pub fn release_git_remote_refs(
+  process: HarnessProcess,
+  cfg: dict,
+  refs: list<string>,
+  tags: bool = false,
+) -> ReleaseGitRemoteObservation {
+  if cfg.mock {
+    let mock_refs: list<GitRemoteRef> = []
+    if refs.contains("refs/tags/v*") {
+      mock_refs = [
+        {
+          oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          ref: "refs/tags/v0.7.51",
+          name: "refs/tags/v0.7.51",
+          peeled: false,
+        },
+        {
+          oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          ref: "refs/tags/v0.7.52",
+          name: "refs/tags/v0.7.52",
+          peeled: false,
+        },
+      ]
+    }
+    return {success: true, exit_code: 0, refs: mock_refs, receipt: nil, stderr: ""}
+  }
+  const observed = git_ls_remote(process, "origin", {repo: cfg.repo, refs: refs, tags: tags})
+  return {
+    success: observed.success,
+    exit_code: observed.exit_code,
+    refs: observed.data.refs,
+    receipt: observed,
+    stderr: observed.stderr.inline,
+  }
+}
+
+pub fn recorded_remote_refs_step(
+  name: string,
+  label: string,
+  observed: ReleaseGitRemoteObservation,
+) -> ReleaseRemoteRefsStep {
+  const result = if observed.success {
+    command_result_ok("")
+  } else {
+    command_result_fail(observed.exit_code, observed.stderr)
+  }
+  const step = recorded_step(name, label, result)
+  return {
+    name: step.name,
+    command: step.command,
+    success: step.success,
+    status: step.status,
+    exit_code: step.exit_code,
+    stdout: step.stdout,
+    stderr: step.stderr,
+    classification: step.classification,
+    recovery_hint: step.recovery_hint,
+    git_receipt: observed.receipt,
+    remote_refs: observed.refs,
+  }
+}
+
+/** Run a local git command, throwing on failure and returning trimmed stdout. */
+pub fn checked_git(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  args: list<string>,
+  options: ReleaseGitRunOptions = {},
+) -> string {
+  const r = run_git(harness, cfg, args, options)
+  if !r.success {
+    throw "git command failed (${r.exit_code}): " + argv_label(["git"] + args)
+      + "\n${trim(r.stderr)}"
+  }
+  return trim(r.stdout)
+}
+
+/** Boolean probe over a local git command. */
+pub fn probe_git_ok(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  args: list<string>,
+  options: ReleaseGitRunOptions = {},
+) -> bool {
+  return run_git(harness, cfg, args, options).success
+}
+
+fn github_slug_from_remote_url(url: any) {
+  const cleaned = regex_replace("[.]git$", "", trim(url ?? ""))
+  const matches = regex_captures("github[.]com[:/]([^/]+/[^/]+)$", cleaned)
+  if len(matches) == 0 {
+    return ""
+  }
+  return matches[0].groups[0]
+}
+
+fn mock_release_pr(number: any = 999, branch: any = "release/v0.7.53") {
+  const immutable = regex_captures(
+    "^release-attempt/v[0-9]+[.][0-9]+[.][0-9]+/([0-9a-f]{40})$",
+    branch,
+  )
+  const head_oid = if len(immutable) == 1 {
+    immutable[0].groups[0]
+  } else {
+    MOCK_PIN_SHA
+  }
+  return {
+    repo: "burin-labs/harn",
+    number: number,
+    title: "Release v0.7.53",
+    body: "Mock PR body describing the one-PR release handoff.",
+    url: "https://github.com/burin-labs/harn/pull/${number}",
+    state: "open",
+    github_state: "open",
+    draft: false,
+    merged: false,
+    mergeable: true,
+    mergeable_state: "clean",
+    base: {ref: "main", sha: MOCK_PIN_SHA, repo: "burin-labs/harn", owner: "burin-labs"},
+    head: {ref: branch, sha: head_oid, repo: "burin-labs/harn", owner: "burin-labs"},
+    labels: [],
+    auto_merge_armed: false,
+    in_merge_queue: false,
+  }
+}
+
+fn release_github_pull_request(value: any) -> ReleaseGithubPullRequest {
+  return {
+    repo: value.repo,
+    number: value.number,
+    title: value.title,
+    url: value.url,
+    state: value.state,
+    github_state: value.github_state,
+    draft: value.draft,
+    merged: value.merged,
+    merged_at: value.merged_at,
+    merge_commit_oid: value.merge_commit_oid,
+    mergeable: value.mergeable,
+    mergeable_state: value.mergeable_state,
+    base: value.base,
+    head: value.head,
+    labels: value.labels,
+    auto_merge_armed: value.auto_merge_armed,
+    in_merge_queue: value.in_merge_queue,
+    body: value.body,
+    user: value.user,
+    created_at: value.created_at,
+    updated_at: value.updated_at,
+    closed_at: value.closed_at,
+    branch_protection: value.branch_protection,
+    queue_membership: value.queue_membership,
+    created: value.created,
+    updated: value.updated,
+    ok: value.ok,
+  }
+}
+
+pub fn release_github_pr_list(
+  harness: Harness,
+  cfg: dict,
+  filters: ReleaseGithubPrFilters,
+) -> list<ReleaseGithubPullRequest> {
+  if cfg.mock {
+    const pulls = if filters.state == "merged" {
+      [
+        mock_release_pr(998)
+          + {
+            state: "merged",
+            github_state: "closed",
+            merged: true,
+            merged_at: "2026-05-03T00:00:00Z",
+            merge_commit_oid: MOCK_PIN_SHA,
+          },
+      ]
+    } else {
+      []
+    }
+    return pulls.map({ pull -> release_github_pull_request(pull) }).to_list()
+  }
+  const result = github_pr_list(
+    harness,
+    release_repo_slug({env: harness.env, process: harness.process}, cfg),
+    filters,
+  )
+  if is_err(result) {
+    throw "GitHub PR list failed: " + to_string(unwrap_err(result))
+  }
+  return unwrap(result).map({ pull -> release_github_pull_request(pull) }).to_list()
+}
+
+pub fn release_github_open_pr(
+  harness: Harness,
+  cfg: dict,
+  branch: string,
+) -> ReleaseGithubPullRequest? {
+  const prs = release_github_pr_list(
+    harness,
+    cfg,
+    {base: cfg.base, head: branch, state: "open", limit: 1},
+  )
+  return if len(prs) == 0 {
+    nil
+  } else {
+    prs[0]
+  }
+}
+
+pub fn release_github_pr_view(
+  harness: Harness,
+  cfg: dict,
+  pr_ref: int | string,
+  expected_head: string = "",
+) -> ReleaseGithubPullRequest {
+  if cfg.mock {
+    const branch = if trim(expected_head) == "" {
+      "release/v0.7.53"
+    } else {
+      expected_head
+    }
+    return release_github_pull_request(mock_release_pr(to_int(pr_ref) ?? 999, branch))
+  }
+  const result = github_pr_view(
+    harness,
+    release_repo_slug({env: harness.env, process: harness.process}, cfg),
+    pr_ref,
+  )
+  if is_err(result) {
+    throw "GitHub PR view failed: " + to_string(unwrap_err(result))
+  }
+  return release_github_pull_request(unwrap(result))
+}
+
+pub fn release_github_pr_files(harness: Harness, cfg: dict, pr_ref: int | string) -> dict {
+  if cfg.mock {
+    return {
+      pull_number: to_int(pr_ref) ?? 999,
+      files: [{filename: "CHANGELOG.md"}, {filename: "scripts/release_ship.sh"}],
+    }
+  }
+  const result = github_pr_files(
+    harness,
+    release_repo_slug({env: harness.env, process: harness.process}, cfg),
+    pr_ref,
+  )
+  if is_err(result) {
+    throw "GitHub PR files failed: " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+fn release_github_result(result: any) {
+  return if is_err(result) {
+    result
+  } else {
+    unwrap(result)
+  }
+}
+
+/** Public GitHub trust material for the credential driving a local release. */
+pub fn release_github_ssh_signing_keys(harness: Harness, cfg: dict) -> dict {
+  if cfg.mock {
+    const key = if cfg.mock_unknown_github_signing_key ?? false {
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB60zaJI1YRp31GcmMTPiJ7fQxrE9kUf5M2KWWo7kIj"
+    } else {
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIALiGUi5b6TVIbzfFNniz7bfPbXJcbzWjLguThg5EpKw"
+    }
+    return {
+      success: true,
+      login: "mock-release-operator",
+      keys: [{id: 1, key: key, title: "release", created_at: "2026-01-01T00:00:00Z"}],
+    }
+  }
+  const user = github_authenticated_user(harness)
+  if is_err(user) {
+    return {success: false, error: unwrap_err(user), login: "", keys: []}
+  }
+  const login = trim(unwrap(user).login)
+  const keys = github_user_ssh_signing_keys(harness, login)
+  if is_err(keys) {
+    return {success: false, error: unwrap_err(keys), login: login, keys: []}
+  }
+  return {success: true, login: login, keys: unwrap(keys)}
+}
+
+pub fn release_github_pr_create(
+  harness: Harness,
+  cfg: dict,
+  title: string,
+  head: string,
+  base: string,
+  body: string,
+) -> dict {
+  if cfg.mock {
+    return mock_release_pr(999, head) + {title: title, body: body, created: true}
+  }
+  return release_github_result(
+    github_pr_create(
+      harness,
+      {
+        slug: release_repo_slug({env: harness.env, process: harness.process}, cfg),
+        title: title,
+        head: head,
+        base: base,
+        body: body,
+      },
+    ),
+  )
+}
+
+pub fn release_github_pr_edit(
+  harness: Harness,
+  cfg: dict,
+  pr_ref: int | string,
+  edits: ReleaseGithubPrEdits,
+) -> dict {
+  if cfg.mock {
+    return mock_release_pr(to_int(pr_ref) ?? 999) + edits + {ok: true, updated: true}
+  }
+  return release_github_result(
+    github_pr_edit(
+      harness,
+      release_repo_slug({env: harness.env, process: harness.process}, cfg),
+      pr_ref,
+      edits,
+    ),
+  )
+}
+
+/** Close an obsolete immutable-attempt PR after its replacement is durable. */
+pub fn release_github_pr_close(harness: Harness, cfg: dict, pr_ref: int, comment: string) -> dict {
+  if cfg.mock {
+    return mock_release_pr(to_int(pr_ref) ?? 998)
+      + {state: "closed", github_state: "closed", closed: true, comment: comment}
+  }
+  return github_pr_close(
+    harness,
+    release_repo_slug({env: harness.env, process: harness.process}, cfg),
+    pr_ref,
+    comment,
+  )
+}
+
+pub fn release_github_release(harness: Harness, cfg: dict, tag: string) -> dict {
+  if cfg.mock {
+    return {repo: "burin-labs/harn", tag: tag, state: "absent", found: false, release: nil}
+  }
+  return release_github_result(
+    github_release_at_tag(
+      harness,
+      release_repo_slug({env: harness.env, process: harness.process}, cfg),
+      tag,
+    ),
+  )
+}
+
+pub fn release_github_release_body_edit(
+  harness: Harness,
+  cfg: dict,
+  tag: string,
+  body: string,
+  lease: ReleaseGithubReleaseLease,
+) -> dict {
+  if cfg.mock {
+    return {
+      repo: "burin-labs/harn",
+      tag: tag,
+      state: "edited",
+      release_id: lease.release_id,
+      tag_ref_oid: lease.tag_ref_oid,
+      tag_target_oid: lease.tag_target_oid,
+      body: body,
+    }
+  }
+  return release_github_result(
+    github_release_body_edit(
+      harness,
+      release_repo_slug({env: harness.env, process: harness.process}, cfg),
+      tag,
+      body,
+      lease,
+    ),
+  )
+}
+
+pub fn release_github_mergeability(harness: Harness, cfg: dict, pr_ref: int | string) -> dict {
+  if cfg.mock {
+    return {mergeable: true, mergeable_state: "clean", is_conflict: false}
+  }
+  return release_github_result(
+    github_pr_mergeability(
+      harness,
+      release_repo_slug({env: harness.env, process: harness.process}, cfg),
+      pr_ref,
+    ),
+  )
+}
+
+pub fn release_github_enable_auto_merge(
+  harness: Harness,
+  cfg: dict,
+  pr: ReleaseGithubPullRequest,
+) -> dict {
+  if cfg.mock {
+    return {state: "enabled", expected_head_oid: pr.head.sha, observed_head_oid: pr.head.sha}
+  }
+  return release_github_result(
+    github_enable_auto_merge_with_release_lease(
+      harness,
+      release_repo_slug({env: harness.env, process: harness.process}, cfg),
+      pr.number,
+      pr.head.sha,
+      "squash",
+    ),
+  )
+}
+
+pub fn read_repo_file(fs: HarnessFs, cfg: ReleaseRepoConfig, path: string) -> string {
+  if cfg.mock {
+    return fake_file(path)
+  }
+  require_release_repo_path(fs, cfg, "reading repo file " + path)
+  const full = path_join(cfg.repo, path)
+  if !fs.exists(full) {
+    return ""
+  }
+  return fs.read_text(full)
+}
+
+fn fake_file(path: any) {
+  if path == "CHANGELOG.md" {
+    return """
+# Changelog
+
+## v0.7.53
+
+- Added merge-queue-safe release orchestration that ships from one release PR.
+- Tightened release metadata verification and changelog drift checks.
+- Documented the harn-release-bot workflow cascade.
+
+## v0.7.52
+
+- Previous release baseline.
+"""
+  }
+  if path == "Cargo.toml" {
+    return """
+[workspace.package]
+version = "0.7.52"
+"""
+  }
+  if path == "README.md" {
+    return "# Harn\n\nAgent harness language.\n"
+  }
+  return ""
+}
+
+@complexity(allow)
+fn fake_command(env: HarnessEnv, command: any, cfg: any) {
+  const mock_stale_local_tag = env_str(env, "HARN_EXT_RELEASE_MOCK_STALE_LOCAL_TAG") == "1"
+  // Lets the mock ship path prove signature failure halts before tag publication.
+  const mock_tag_verify_fail = env_str(env, "HARN_EXT_RELEASE_MOCK_TAG_VERIFY_FAIL") == "1"
+  const tag_command = mock_release_tag_command(command, mock_tag_verify_fail)
+  if tag_command != nil {
+    return tag_command
+  }
+  if contains(command, "git branch --show-current") {
+    return command_result_ok("release/v0.7.53\n")
+  }
+  if contains(command, "git status --porcelain") {
+    return command_result_ok("")
+  }
+  if contains(command, "git config --show-origin --show-scope --get-all user.signingkey") {
+    return command_result_ok(
+      "global\tfile:/mock/.gitconfig\t/mock/registered-signing-key.pub\nlocal\tfile:.git/config\t/mock/unknown-signing-key.pub\n",
+    )
+  }
+  if contains(command, "git diff") && contains(command, "--stat") {
+    return command_result_ok(
+      " CHANGELOG.md             | 12 ++++++++++++\n README.md                |  4 ++++\n scripts/release_ship.sh  |  8 ++++++++\n 3 files changed, 24 insertions(+)\n",
+    )
+  }
+  if contains(command, "git diff") && contains(command, "--name-only") {
+    return command_result_ok("CHANGELOG.md\nREADME.md\nscripts/release_ship.sh\n")
+  }
+  if contains(command, "git tag --list") && contains(command, "--sort=-v:refname") {
+    return command_result_ok("v0.7.52\n")
+  }
+  if contains(command, "git describe --tags") {
+    return command_result_ok("v0.7.51\n")
+  }
+  if contains(command, "git log --name-status") {
+    return command_result_ok(
+      "commit abc1234 release: consolidate harn release PR flow\nM\tCHANGELOG.md\nM\tscripts/release_ship.sh\n\ncommit bcd2345 ci: publish release from tag drift\nM\t.github/workflows/publish-release.yml\n\ncommit cde3456 docs: clarify local developer loop\nM\tREADME.md\n",
+    )
+  }
+  if contains(command, "git log --stat") {
+    return command_result_ok(
+      "abc1234 release: consolidate harn release PR flow\n CHANGELOG.md            | 12 ++++++++++++\n scripts/release_ship.sh |  8 ++++++++\n\nbcd2345 ci: publish release from tag drift\n .github/workflows/publish-release.yml | 5 +++++\n\ncde3456 docs: clarify local developer loop\n README.md | 4 ++++\n",
+    )
+  }
+  if contains(command, "git log --oneline") {
+    return command_result_ok(
+      "abc1234 release: consolidate harn release PR flow\nbcd2345 ci: publish release from tag drift\ncde3456 docs: clarify local developer loop\n",
+    )
+  }
+  if contains(command, "git verify-commit --raw") {
+    return command_result_ok(
+      "Good git signature for release commit with ED25519 key mock-release-key\n",
+    )
+  }
+  if contains(command, "test -x scripts/release_ship.sh") {
+    return command_result_ok("release_ship=ok\n")
+  }
+  if contains(command, "test -x scripts/release_gate.sh") {
+    return command_result_ok("release_gate=ok\n")
+  }
+  if contains(command, "test -f .github/workflows/publish-release.yml") {
+    return command_result_ok("publish_workflow=ok\n")
+  }
+  if contains(command, "test -f .github/workflows/build-release-binaries.yml") {
+    return command_result_ok("binary_workflow=ok\n")
+  }
+  if contains(command, "cargo build -p harn-cli --bin harn --locked") {
+    if (cfg.mock_pin_warm_fail ?? false)
+      || env_bool(env, "HARN_EXT_RELEASE_MOCK_PIN_WARM_FAIL", false) {
+      return command_result_fail(1, "mock exact-pin Harn CLI warm failure\n")
+    }
+    return command_result_ok("exact-pin Harn CLI warm complete\n")
+  }
+  if contains(command, "./scripts/release_gate.sh audit --receipt") {
+    return command_result_ok("=== Residual release audit ===\nAudit complete\n")
+  }
+  if contains(command, "./scripts/release_ship.sh --prepare --materialize-candidate") {
+    return command_result_ok(
+      "=== Stage release content ===\nUncertified release candidate staged on release/v0.7.53:\n  Previous version: 0.7.52\n  Next version:     0.7.53\n",
+    )
+  }
+  if contains(command, "./scripts/release_ship.sh --prepare") {
+    return command_result_ok(
+      "=== Release audit ===\n=== Publish dry run ===\n=== Stage release content ===\nRelease content staged on release/v0.7.53:\n  Previous version: 0.7.52\n  Next version:     0.7.53\n",
+    )
+  }
+  if contains(command, "git commit -m") {
+    return command_result_ok("[release/v0.7.53 9999999] Release v0.7.53\n")
+  }
+  if contains(command, "git add -u") {
+    return command_result_ok("")
+  }
+  if contains(command, "git fetch origin") || contains(command, "git rebase") {
+    return command_result_ok("Current branch release/v0.7.53 is up to date.\n")
+  }
+  if contains(command, "git rev-parse HEAD") {
+    return command_result_ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git rev-parse --verify") && contains(command, "origin/") {
+    return command_result_ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-parse -q --verify refs/tags/") {
+    if mock_stale_local_tag {
+      return command_result_ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
+    return command_result_fail(1, "")
+  }
+  if contains(command, "git rev-parse refs/tags/") {
+    return command_result_ok("8888888888888888888888888888888888888888\n")
+  }
+  if contains(command, "git rev-parse 8888888888888888888888888888888888888888^{}") {
+    return command_result_ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git cat-file tag 8888888888888888888888888888888888888888") {
+    return command_result_ok(
+      "object 9999999999999999999999999999999999999999\ntype commit\ntag v0.7.53\ntagger Mock <mock@example.com> 1 +0000\n\nRelease v0.7.53\n",
+    )
+  }
+  if contains(command, "git rev-parse --verify") {
+    return command_result_ok(MOCK_PIN_SHA + "\n")
+  }
+  if contains(command, "git rev-list --parents -n 1 HEAD") {
+    return command_result_ok("9999999999999999999999999999999999999999 ${MOCK_PIN_SHA}\n")
+  }
+  if contains(command, "git rev-list -n 1") {
+    if mock_stale_local_tag {
+      return command_result_ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+    }
+    return command_result_ok("9999999999999999999999999999999999999999\n")
+  }
+  if contains(command, "git tag -d") {
+    return command_result_ok("Deleted tag 'v0.7.53' (was eeeeeee)\n")
+  }
+  if contains(command, ":refs/tags/v") {
+    return command_result_ok(
+      "To github.com:burin-labs/harn.git\n * [new tag]         v0.7.53 -> v0.7.53\n",
+    )
+  }
+  if contains(command, "git reset --hard")
+    || contains(command, "git checkout --force -B") {
+    return command_result_ok("HEAD is now at abc1234 main\n")
+  }
+  if contains(command, "make -s lint-md") || contains(command, "make lint-md")
+    || contains(command, "npx markdownlint-cli2") {
+    return command_result_ok("markdownlint-cli2 v0.22.1\nSummary: 0 error(s)\n")
+  }
+  if contains(command, "make check-cli-aot") {
+    return command_result_ok("CLI AOT artifacts are current.\n")
+  }
+  // The only `push -u origin` the harness makes is the post-merge paperwork
+  // branch. It used to be answered with a fabricated pre-push budget timeout,
+  // modelling a release-branch push that no longer exists; the classifier for
+  // that failure is exercised directly in tests/release_execution.harn.
+  if contains(command, "git push -u origin") {
+    const branch = trim(split(command, " ")[-1] ?? "")
+    return command_result_ok("branch '${branch}' set up to track 'origin/${branch}'.\n")
+  }
+  if contains(command, "rg ") {
+    return command_result_ok(
+      "CHANGELOG.md:3:## v0.7.53\nscripts/release_ship.sh:82:Release vX.Y.Z\n",
+    )
+  }
+  return command_result_fail(127, "mock has no response for command: ${command}")
+}
+
+pub fn require_live_confirmation(cfg: ReleaseLiveConfirmationConfig) -> nil {
+  if !cfg.mock && !cfg.yes_live_release {
+    throw "live ${cfg.mode} mode requires --yes-live-release"
+  }
+}
+
+fn run_events_path(fs: HarnessFs, run_id: any) {
+  return path_join(release_run_dir(fs, run_id), "run-events.jsonl")
+}
+
+fn live_logs_dir(fs: HarnessFs, run_id: any) {
+  return path_join(release_run_dir(fs, run_id), "live-logs")
+}
+
+pub fn command_live_log_path(fs: HarnessFs, run_id: string, name: string) -> string {
+  const safe_name = regex_replace("[^A-Za-z0-9_.-]+", "-", name)
+  return path_join(live_logs_dir(fs, run_id), safe_name + ".log")
+}
+
+pub fn release_log_event(
+  harness: {clock: HarnessClock, fs: HarnessFs},
+  run_id: string,
+  event_type: string,
+  data: dict,
+) -> string {
+  const path = run_events_path(harness.fs, run_id)
+  harness.fs.mkdir(dirname(path), true)
+  harness.fs.append(
+    path,
+    json_stringify(
+      {
+        schema_version: "release_harn.run_event.v1",
+        timestamp: harness.clock.date_iso(),
+        event_type: event_type,
+        data: data,
+      },
+    )
+      + "\n",
+  )
+  return path
+}
+
+pub fn release_timed_phase<T>(
+  harness: {clock: HarnessClock, fs: HarnessFs},
+  run_id: string,
+  phase: string,
+  timing_name: string,
+  attrs: dict,
+  callback: fn() -> T,
+) -> T {
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "phase_started",
+    {phase: phase, timing: timing_name} + (attrs ?? {}),
+  )
+  // start/end rather than `timed`, so the failing branch reports a duration
+  // too. A stage that ends in a refusal is exactly the stage whose elapsed time
+  // an operator wants, and `timed` throws before it can hand one back.
+  const timing = start_timing(harness.clock, timing_name, attrs ?? {})
+  const outcome = try {
+    callback()
+  }
+  if is_err(outcome) {
+    const error = unwrap_err(outcome)
+    const failed = end_timing(harness.clock, timing, {status: "error", error: to_string(error)})
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "phase_finished",
+      {
+        phase: phase,
+        timing: timing_name,
+        status: "error",
+        error: to_string(error),
+        duration_ms: failed.duration_ms ?? 0,
+      },
+    )
+    throw error
+  }
+  const report = end_timing(harness.clock, timing, {status: "ok"})
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "phase_finished",
+    {phase: phase, timing: timing_name, status: "ok", duration_ms: report.duration_ms ?? 0},
+  )
+  return unwrap(outcome)
+}
+
+fn command_label(command: any) {
+  if command?.argv != nil {
+    return argv_label(command.argv)
+  }
+  if command?.command != nil {
+    return command.command
+  }
+  if type_of(command) == "list" {
+    return argv_label(command)
+  }
+  return command
+}
+
+pub fn log_step_started<T>(
+  harness: {clock: HarnessClock, fs: HarnessFs},
+  run_id: string,
+  name: string,
+  command: T,
+  extra: dict? = nil,
+) -> string {
+  const extra_fields = extra ?? {}
+  return release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_started",
+    {step: name, command: command_label(command)} + extra_fields,
+  )
+}
+
+pub fn log_step_finished(
+  harness: {clock: HarnessClock, fs: HarnessFs},
+  run_id: string,
+  name: string,
+  result: ReleaseStepStatus,
+  extra: dict?,
+) -> string {
+  const base = {
+    step: name,
+    success: result.success,
+    status: result.status,
+    exit_code: result.exit_code,
+  }
+    + release_step_failure_detail(result)
+  const extra_fields = extra ?? {}
+  return release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "step_finished",
+    base + extra_fields,
+  )
+}
+
+fn release_command_runner(env: HarnessEnv, cfg: any) {
+  if !cfg.mock {
+    return nil
+  }
+  return { spec, _options ->
+    const label = if spec?.argv != nil {
+      join(spec.argv.map({ a -> to_string(a) }), " ")
+    } else {
+      spec?.command ?? ""
+    }
+    fake_command(env, label, cfg)
+  }
+}
+
+pub fn append_command_step<T>(
+  harness: Harness,
+  cfg: dict,
+  steps: list<dict>,
+  name: string,
+  command: T,
+  extra: dict? = nil,
+) -> ReleaseCommandStepResult {
+  return append_std_command_step(
+    harness,
+    cfg,
+    steps,
+    name,
+    command,
+    release_command_runner(harness.env, cfg),
+    extra,
+  )
+}
+
+pub fn release_open_pr_count(harness: Harness, cfg: dict, branch: string) -> int {
+  const result = try {
+    release_github_pr_list(harness, cfg, {head: branch, state: "open"})
+  } catch (_e) {
+    nil
+  }
+  if result == nil {
+    // Unknown PR state is not known-safe: report a nonzero count so the
+    // remediation refuses to delete the branch.
+    return 1
+  }
+  return len(result)
+}
+
+pub fn release_repo_slug(harness: {env: HarnessEnv, process: HarnessProcess}, cfg: dict) -> string {
+  const remote = run_git(harness, cfg, ["remote", "get-url", "origin"])
+  if !remote.success {
+    return ""
+  }
+  return github_slug_from_remote_url(remote.stdout)
+}
+
+pub fn probe_ok(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  command: string,
+) -> bool {
+  return run_cmd(harness, cfg, command).success
+}
+
+pub fn latest_release_tag(process: HarnessProcess, cfg: dict) -> string {
+  const remote = release_git_remote_refs(process, cfg, ["refs/tags/v*"], true)
+  if !remote.success {
+    throw "could not list origin release tags; refusing to derive release history from local-only tags:\n"
+      + trim(remote.stderr)
+  }
+  return latest_release_tag_from_remote_refs(remote.refs)
+}
+/**
+ * F6a: resolve the advisory local build-lock path. A fixed machine-wide path so
+ * concurrent releases/builds serialize on the shared Cargo build dir.
+ */

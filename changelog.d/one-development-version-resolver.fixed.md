@@ -1,0 +1,1 @@
+Release gates now resolve development versions through one owner in `release_analysis`, so a change to the target repo's version scheme can no longer break the fold, body-integrity, and release-target gates independently.

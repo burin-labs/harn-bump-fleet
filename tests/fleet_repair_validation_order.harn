@@ -1,0 +1,176 @@
+import { shell_quote } from "std/runtime"
+import { render_bump_workflow } from "../lib/bump_workflow_projection"
+import { bump_validation_command, read_fleet_manifest } from "../lib/fleet_manifest"
+import { fleet_repair_validate_candidate } from "../lib/fleet_repair"
+import { pinned_test_runtime } from "./pinned_runtime"
+
+pipeline test_repair_formats_only_after_source_validation_with_prepared_runtime(harness: Harness) {
+  const repository = dirname(harness.fs.cwd())
+  const runtime = pinned_test_runtime({fs: harness.fs, process: harness.process}, repository)
+  const root = harness.fs.mkdtemp_in_workspace("repair-format-order")
+  const checkout = path_join(root, "consumer")
+  const bin = path_join(root, "bin")
+  const trace = path_join(root, "trace")
+  harness.fs.mkdir(checkout)
+  harness.fs.mkdir(bin)
+  harness.fs.write_text(path_join(checkout, "sample.harn"), "fn main(){return 1}\n")
+  const setup = harness.process.shell(
+    "git -C " + shell_quote(checkout) + " init -q && git -C " + shell_quote(checkout)
+      + " add sample.harn && git -C "
+      + shell_quote(checkout)
+      + " -c user.name=fixture -c user.email=fixture@example.test -c commit.gpgsign=false commit -q -m seed",
+  )
+  assert(setup.success, setup.combined)
+  const head = trim(
+    harness.process.run({program: "git", args: ["-C", checkout, "rev-parse", "HEAD"]}).stdout,
+  )
+  const wrapper = path_join(bin, "harn")
+  harness.fs.write_text(
+    wrapper,
+    "#!/bin/sh\nprintf 'formatter:%s\\n' \"$*\" >> " + shell_quote(trace) + "\nexec "
+      + shell_quote(runtime)
+      + " \"$@\"\n",
+  )
+  assert(harness.process.run({program: "chmod", args: ["+x", wrapper]}).success)
+  const candidate = {
+    repo: "fixture/consumer",
+    directory: checkout,
+    pr_number: 1,
+    pr_url: "https://github.com/fixture/consumer/pull/1",
+    head_sha: head,
+    validation_command: "printf 'validation\\n' >> " + shell_quote(trace)
+      + "; printf 'source defect\\n' >&2; exit 1",
+    failing_checks: [],
+    allowed_new_files: [],
+    branch: "bump",
+    auto_arm: false,
+    require_signed_head: true,
+  }
+  const policy = {
+    max_repositories: 1,
+    max_rounds: 1,
+    max_attempts_per_repository: 1,
+    max_tokens_per_attempt: 100,
+    max_cost_per_attempt_usd: 0.1,
+    max_cost_per_repository_usd: 0.1,
+    max_cost_per_run_usd: 0.1,
+    deterministic_only: true,
+    runtime_provenance: {
+      harn_version: "fixture",
+      controller_revision: "fixture",
+      repair_contract_revision: "harn-update-repair-v10",
+    },
+  }
+  const script = path_join(root, "probe.harn")
+  harness.fs.write_text(
+    script,
+    "import { repair_fleet_candidate_in_checkout } from "
+      + json_stringify(path_join(repository, "lib/fleet_repair"))
+      + "\n"
+      + "fn main(harness: Harness) {\nconst result = repair_fleet_candidate_in_checkout(harness, "
+      + json_stringify(candidate)
+      + ", \"v0.10.130\", "
+      + json_stringify(policy)
+      + ")\nassert_eq(result.reason, \"agent_repair_required\")\nassert_eq(len(result.attempts), 0)\n}\n",
+  )
+  const result = harness.process.run(
+    {
+      program: runtime,
+      args: ["run", "--no-sandbox", script],
+      cwd: repository,
+      env: {PATH: bin + ":" + (harness.env.get("PATH") ?? "")},
+    },
+  )
+  assert(result.success, result.combined)
+  assert_eq(harness.fs.read_lines(trace), ["validation", "formatter:fmt .", "validation"])
+  assert_eq(
+    harness.fs.read_text(path_join(checkout, "sample.harn")),
+    "fn main() {\n  return 1\n}\n",
+  )
+}
+
+pipeline test_manifest_validator_reaches_source_before_checkout_installer(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const repo = manifest.repositories.find({ row -> row.slug == "burin-labs/harn-bump-fleet" })
+  assert(repo != nil)
+  const command = bump_validation_command(repo)
+  const root = harness.fs.mkdtemp_in_workspace("repair-source-first")
+  const scripts = path_join(root, "scripts")
+  harness.fs.mkdir(scripts)
+  const installer = path_join(scripts, "harn-project.sh")
+  const installer_marker = path_join(root, "installer-called")
+  const source_marker = path_join(root, "source-called")
+  harness.fs.write_text(
+    installer,
+    "#!/bin/sh\nprintf called > " + shell_quote(installer_marker)
+      + "\nprintf 'fixture installer denied\\n' >&2\nexit 9\n",
+  )
+  assert(harness.process.run({program: "chmod", args: ["+x", installer]}).success)
+  const candidate = {
+    repo: repo.slug,
+    directory: root,
+    pr_number: 1,
+    pr_url: "https://github.com/fixture/consumer/pull/1",
+    head_sha: "1111111111111111111111111111111111111111",
+    validation_command: "harn() { printf '%s\\n' \"$*\" >> " + shell_quote(source_marker)
+      + "; printf 'fixture source defect\\n'; return 1; };\n"
+      + command,
+    failing_checks: [],
+    allowed_new_files: [],
+    branch: "bump",
+    auto_arm: false,
+    require_signed_head: true,
+  }
+  const context = {
+    target: "v0.10.130",
+    private_temp_root: harness.fs.mkdtemp_in_workspace("repair-validation"),
+  }
+  const failed = fleet_repair_validate_candidate(
+    {fs: harness.fs, process: harness.process},
+    candidate,
+    context,
+  )
+  assert(!failed.ok)
+  assert(harness.fs.exists(source_marker), failed.output)
+  assert(!harness.fs.exists(installer_marker))
+  assert(contains(failed.output, repo.slug), failed.output)
+  assert(contains(failed.output, "fixture source defect"), failed.output)
+  const both = fleet_repair_validate_candidate(
+    {fs: harness.fs, process: harness.process},
+    candidate
+      + {
+        validation_command:
+          "printf 'stdout diagnostic\\n'; printf 'stderr diagnostic\\n' >&2; exit 1",
+      },
+    context,
+  )
+  assert(!both.ok)
+  assert(contains(both.output, repo.slug))
+  assert(contains(both.output, "stdout diagnostic"), both.output)
+  assert(contains(both.output, "stderr diagnostic"), both.output)
+  assert_eq(harness.fs.read_lines(source_marker), ["package verify . --strict"])
+  const positive = fleet_repair_validate_candidate(
+    {fs: harness.fs, process: harness.process},
+    candidate
+      + {
+        validation_command: "harn() { printf '%s\\n' \"$*\" >> " + shell_quote(source_marker)
+          + "; return 0; };\n"
+          + command,
+      },
+    context,
+  )
+  assert(positive.ok, positive.output)
+  assert_eq(
+    harness.fs.read_lines(source_marker),
+    [
+      "package verify . --strict",
+      "package verify . --strict",
+      "run --no-sandbox check_source_length.harn",
+      "test tests-risky --approve-risky git.push",
+    ],
+  )
+  assert_eq(
+    harness.fs.read_text("../.github/workflows/bump-harn.yml"),
+    render_bump_workflow(manifest, repo),
+  )
+}

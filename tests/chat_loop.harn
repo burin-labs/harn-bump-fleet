@@ -1,0 +1,345 @@
+import {
+  chat_cfg_from_run_dir,
+  chat_enabled,
+  chat_enabled_for,
+  resolve_chat_run_path,
+  summarize_bump_run,
+  summarize_release_run,
+} from "../lib/chat_runs"
+import {
+  InteractiveChatDecision,
+  route_interactive_chat_input,
+  run_interactive_agent_chat,
+} from "../lib/interactive_agent_chat"
+import { failing_step_logs_command, format_failing_logs_section } from "../lib/post_run_chat"
+import { classifier_payload, colorize_changelog } from "../lib/release_gate_chat"
+
+// -------------------------------------------------------------------------------------------------
+
+// chat_enabled_for — deterministic opt-out, environment, and terminal policy.
+
+// -------------------------------------------------------------------------------------------------
+
+pipeline test_chat_enabled_respects_no_chat(harness: Harness, task: any) {
+  assert_eq(chat_enabled({term: harness.term, env: harness.env}, {no_chat: true}), false)
+  assert_eq(chat_enabled_for({no_chat: true}, nil, true), false)
+  assert_eq(chat_enabled_for({}, "0", true), false)
+  assert_eq(chat_enabled_for({}, nil, false), false)
+  assert_eq(chat_enabled_for({}, nil, true), true)
+}
+
+pipeline test_interactive_chat_routing_is_host_owned_and_deterministic(task: any) {
+  const handlers = {
+    "/approve": { req -> return {kind: "exit", reason: "approved", argument: req.args[0] ?? ""} },
+  }
+  assert_eq(route_interactive_chat_input(" hello ", {}, handlers).message, "hello")
+  assert_eq(route_interactive_chat_input("/quit", {}, handlers).reason, "operator_exit")
+  const help = route_interactive_chat_input("/help", {}, handlers)
+  assert_eq(help.kind, "handled")
+  assert(contains(help.message ?? "", "/approve"))
+  const approved = route_interactive_chat_input("/approve now", {}, handlers)
+  assert_eq(approved.reason, "approved")
+  assert_eq(approved.argument, "now")
+  const unknown = route_interactive_chat_input("/missing", {}, handlers)
+  assert_eq(unknown.kind, "handled")
+  assert_eq(unknown.message, "Unknown command: /missing")
+}
+
+pipeline test_interactive_chat_runs_one_agent_loop_per_prompt_without_wall_clock(
+  harness: Harness,
+  task: any,
+) {
+  harness.llm.mock_clear()
+  harness.llm.mock_enqueue({text: "first answer"})
+  harness.llm.mock_enqueue({text: "second answer"})
+  let input_index = 0
+  let rendered = []
+  const decisions: list<InteractiveChatDecision> = [
+    {kind: "handled"},
+    {kind: "send", message: "first"},
+    {kind: "send", message: "second"},
+    {kind: "exit", reason: "done"},
+  ]
+  const result = run_interactive_agent_chat(
+    harness,
+    {
+      session_id: "interactive-chat-test-" + harness.random.uuid_v7(),
+      system_prompt: "Answer briefly.",
+      max_input_events: len(decisions),
+      agent_options: {
+        provider: "mock",
+        tool_format: "native",
+        iteration_budget: {mode: "fixed", initial: 1, max: 1, extend_by: 0},
+      },
+      on_user_input: { _state ->
+        const decision = decisions[input_index]
+        input_index = input_index + 1
+        return decision ?? {kind: "exit", reason: "fixture_exhausted"}
+      },
+      on_model_turn: { turn, _state ->
+        rendered = rendered + [turn.visible_text]
+        return {state: {render_count: len(rendered)}}
+      },
+    },
+  )
+  assert_eq(result.turns, 2)
+  assert_eq(result.input_events, 4)
+  assert_eq(result.stop_reason, "done")
+  assert_eq(rendered, ["first answer", "second answer"])
+  assert_eq(result.state.render_count, 2)
+  assert_eq(result.state.session_id, result.session_id)
+}
+
+// -------------------------------------------------------------------------------------------------
+// classifier_payload — deterministic metrics on a synthetic changelog.
+// -------------------------------------------------------------------------------------------------
+
+pipeline test_classifier_payload_metrics(task: any) {
+  const inputs = {
+    changelog: """### Fixed
+
+- a single fix bullet
+""",
+    pr_body: "Bump version.",
+    findings: [],
+  }
+  const payload = classifier_payload(inputs)
+  assert_eq(payload.metrics.breaking_hits, 0)
+  assert_eq(payload.metrics.section_lines, 1)
+  assert_eq(payload.metrics.bullet_lines, 1)
+  assert_eq(payload.metrics.finding_count, 0)
+}
+
+pipeline test_classifier_payload_detects_breaking(task: any) {
+  const inputs = {
+    changelog: """### Changed
+
+- BREAKING: rename the foo flag to bar (incompatible upgrade)
+- restructure the bazr module
+""",
+    pr_body: "",
+    findings: ["release scripts are missing or not executable"],
+  }
+  const payload = classifier_payload(inputs)
+  assert_eq(payload.metrics.breaking_hits >= 1, true)
+  assert_eq(payload.metrics.finding_count, 1)
+  assert_eq(payload.metrics.bullet_lines, 2)
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// summarize_release_run / summarize_bump_run — fail-soft on missing dirs.
+// We do not assume a specific fixture run exists (the repo is shared CI),
+// so the negative path is the contract.
+
+// -------------------------------------------------------------------------------------------------
+
+pipeline test_summarize_release_run_handles_missing(harness: Harness, task: any) {
+  const summary = summarize_release_run(harness.fs, "/nonexistent/run/path-that-does-not-exist")
+  assert_eq(summary.ok, false)
+  assert_eq(summary.version, "?")
+}
+
+pipeline test_summarize_bump_run_handles_missing(harness: Harness, task: any) {
+  const summary = summarize_bump_run(harness.fs, "/nonexistent/run/path-that-does-not-exist")
+  assert_eq(summary.ok, false)
+  assert_eq(summary.version, "?")
+}
+
+// -------------------------------------------------------------------------------------------------
+// chat_cfg_from_run_dir — path derivation.
+// -------------------------------------------------------------------------------------------------
+
+pipeline test_chat_cfg_from_run_dir_derives_release_paths(harness: Harness, task: any) {
+  const cfg = chat_cfg_from_run_dir(
+    harness.fs,
+    {provider: "ollama", model: "test", timeout_s: 30},
+    "release-harn",
+    "/tmp/harn-runs/release-harn/01999999-0000-0000-0000-000000000000",
+  )
+  assert_eq(cfg.harness_kind, "release-harn")
+  assert_eq(cfg.run_id, "01999999-0000-0000-0000-000000000000")
+  assert_eq(
+    cfg.audit_md_path,
+    "/tmp/harn-runs/release-harn/01999999-0000-0000-0000-000000000000/release-audit.md",
+  )
+  assert_eq(
+    cfg.audit_json_path,
+    "/tmp/harn-runs/release-harn/01999999-0000-0000-0000-000000000000/release-audit.json",
+  )
+  // Base fields flow through.
+  assert_eq(cfg.provider, "ollama")
+  assert_eq(cfg.model, "test")
+  assert_eq(cfg.timeout_s, 30)
+}
+
+pipeline test_chat_cfg_from_run_dir_derives_bump_paths(harness: Harness, task: any) {
+  const cfg = chat_cfg_from_run_dir(
+    harness.fs,
+    {provider: "ollama"},
+    "bump-fleet",
+    "/tmp/harn-runs/bump-fleet/01999999-0000-0000-0000-000000000001",
+  )
+  assert_eq(cfg.harness_kind, "bump-fleet")
+  assert_eq(
+    cfg.audit_md_path,
+    "/tmp/harn-runs/bump-fleet/01999999-0000-0000-0000-000000000001/audit.md",
+  )
+  assert_eq(
+    cfg.audit_json_path,
+    "/tmp/harn-runs/bump-fleet/01999999-0000-0000-0000-000000000001/audit.json",
+  )
+}
+
+pipeline test_resolve_chat_run_path_accepts_dirs_ids_and_json_artifacts(
+  harness: Harness,
+  task: any,
+) {
+  const run_id = "resolve-chat-" + harness.random.uuid_v7()
+  const run_dir = path_join(harness.fs.cwd(), ".harn-runs", "bump-fleet", run_id)
+  const audit_json = path_join(run_dir, "audit.json")
+  harness.fs.mkdir(run_dir, true)
+  harness.fs.write_text(audit_json, "{}\n")
+  assert_eq(resolve_chat_run_path(harness.fs, "bump-fleet", run_id), run_dir)
+  assert_eq(resolve_chat_run_path(harness.fs, "bump-fleet", run_dir), run_dir)
+  assert_eq(resolve_chat_run_path(harness.fs, "bump-fleet", audit_json), run_dir)
+  assert_eq(
+    resolve_chat_run_path(harness.fs, "bump-fleet", ".harn-runs/bump-fleet/${run_id}/audit.json"),
+    run_dir,
+  )
+  assert_eq(resolve_chat_run_path(harness.fs, "bump-fleet", "missing-run"), nil)
+}
+
+pipeline test_chat_cfg_from_run_dir_reopens_legacy_transcript_sidecar(harness: Harness, task: any) {
+  const root = path_join(harness.fs.temp_dir(), "harn-chat-legacy-" + harness.random.uuid_v7())
+  const run_dir = path_join(root, "release-harn", "legacy-run")
+  const transcript = path_join(run_dir, "agent-llm/llm_transcript.jsonl")
+  harness.fs.mkdir(path_join(run_dir, "agent-llm"), true)
+  harness.fs.write_text(transcript, "")
+  const cfg = chat_cfg_from_run_dir(harness.fs, {}, "release-harn", run_dir)
+  assert_eq(cfg.run_id, "legacy-run")
+  assert_eq(cfg.run_dir, run_dir)
+  assert_eq(cfg.llm_transcript_path, transcript)
+}
+
+pipeline test_summarize_release_run_reads_versioned_receipts(harness: Harness, task: any) {
+  const root = path_join(harness.fs.temp_dir(), "harn-release-summary-" + harness.random.uuid_v7())
+  const run_dir = path_join(root, "release-harn", "versioned-summary")
+  harness.fs.mkdir(run_dir, true)
+  harness.fs.write_text(
+    path_join(run_dir, "release-audit.json"),
+    json_stringify(
+      {
+        schema_version: "release_harn.audit.v1",
+        run_id: "versioned-summary",
+        started_iso: "2026-05-22T12:00:00Z",
+        finished_iso: "2026-05-22T12:00:01Z",
+        duration_ms: 1000,
+        operator: "operator",
+        host: "host",
+        config: {mode: "audit"},
+        analysis: {
+          current_version: "0.8.31",
+          next_version: "0.8.32",
+          branch: "main",
+          changelog_top: "0.8.32",
+          deterministic_findings: [],
+        },
+        agent_review: "ok",
+        agent_review_detail: {validation_findings: []},
+        execution: [{name: "check", success: true, status: "completed", cwd: "/tmp/harn"}],
+        cleanup: nil,
+        trace_spans: [],
+        timing_summary: {},
+      },
+    )
+      + "\n",
+  )
+  const summary = summarize_release_run(harness.fs, run_dir)
+  assert_eq(summary.ok, true)
+  assert_eq(summary.version, "v0.8.32")
+  assert_eq(summary.outcome, "audit")
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// colorize_changelog — visual rules. The gate's printed overview leans on
+// ANSI weight to make red/green/bold separation between sections (`##`,
+// `###`) and entries (`-`) at a glance, plus a red flag on BREAKING bullets
+// and dim weight on continuation indents. We assert the escape sequences
+// land in the right slots and that already-coloured input is left alone so
+// the helper stays idempotent if pre-coloured CHANGELOGs flow through.
+
+// -------------------------------------------------------------------------------------------------
+
+pipeline test_colorize_changelog_marks_sections_and_bullets(task: any) {
+  const raw = """## v1.2.3
+
+### Added
+
+- A new feature
+- BREAKING: removed legacy flag
+  continuation detail
+"""
+  const coloured = colorize_changelog(raw)
+  // The raw text content is preserved (we only wrap, never strip).
+  assert_eq(contains(coloured, "## v1.2.3"), true)
+  assert_eq(contains(coloured, "### Added"), true)
+  assert_eq(contains(coloured, "A new feature"), true)
+  // BREAKING entries keep the `- ` marker (red+bold path retains the line
+  // verbatim so the operator can still read it as a bullet).
+  assert_eq(contains(coloured, "- BREAKING: removed legacy flag"), true)
+  // Colour codes land — at least one bold-cyan and one bold-yellow opener
+  // plus a reset for the `## v1.2.3` / `### Added` headers. Use the same
+  // raw ESC-byte strings the lib defines so the test stays in sync with
+  // the renderer.
+  const ansi_reset = "[0m"
+  const ansi_bold_cyan = "[1m[36m"
+  const ansi_bold_yellow = "[1m[33m"
+  const ansi_green = "[32m"
+  const ansi_red = "[31m"
+  const ansi_dim = "[2m"
+  assert_eq(contains(coloured, ansi_bold_cyan + "## v1.2.3" + ansi_reset), true)
+  assert_eq(contains(coloured, ansi_bold_yellow + "### Added" + ansi_reset), true)
+  assert_eq(contains(coloured, ansi_green + "+ " + ansi_reset + "A new feature"), true)
+  assert_eq(contains(coloured, ansi_red + "[1m- BREAKING:"), true)
+  assert_eq(contains(coloured, ansi_dim + "  continuation detail" + ansi_reset), true)
+}
+
+pipeline test_colorize_changelog_is_idempotent_on_coloured_input(task: any) {
+  const ansi_reset = "[0m"
+  const pre_coloured = "[1m[36m## v1.0.0" + ansi_reset + "\nfoo"
+  const result = colorize_changelog(pre_coloured)
+  assert_eq(result, pre_coloured)
+}
+
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Failing-step live-log seed context — the chat agent must see real stderr, not
+ * just step status, so it never again guesses a cause (e.g. "LLM budget
+ * exhausted") when the truth is in prepare.log.
+ */
+pipeline test_failing_step_logs_command_scopes_to_escaped_dir(task: any) {
+  const cmd = failing_step_logs_command("'/runs/abc/live-logs'")
+  assert(contains(cmd, "for f in '/runs/abc/live-logs'/*.log"))
+  // Surfaces error signatures including the sccache EPERM phrasing.
+  assert(contains(cmd, "operation not permitted"))
+  assert(contains(cmd, "--- tail ---"))
+}
+
+pipeline test_format_failing_logs_section_empty_when_no_errors(task: any) {
+  assert_eq(format_failing_logs_section(""), "")
+  assert_eq(format_failing_logs_section("   \n  "), "")
+  assert_eq(format_failing_logs_section(nil), "")
+}
+
+pipeline test_format_failing_logs_section_wraps_real_error(task: any) {
+  const body =
+    "### prepare.log\nsccache: Operation not permitted (os error 1)\n--- tail ---\nerror: warm prebuild failed"
+  const section = format_failing_logs_section(body)
+  assert(contains(section, "Failing-step live logs"))
+  assert(contains(section, "diagnose from"))
+  assert(contains(section, "Operation not permitted"))
+  assert(contains(section, "```text"))
+}

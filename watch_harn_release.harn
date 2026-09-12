@@ -1,0 +1,740 @@
+#!/usr/bin/env harn
+// Resume the post-PR release handoff from a durable typed receipt.
+import { help_requested } from "std/cli/argparse"
+import { env_str } from "std/config"
+import { GithubClientOptions } from "harn-github-connector/default"
+import { cli_options } from "lib/cli_options"
+import { github_connector_options } from "lib/github"
+import { run_release_candidate_tag } from "lib/release_candidate_tag"
+import { execution_failed } from "lib/release_execution"
+import { run_release_unfold } from "lib/release_main_tag"
+import {
+  ReleaseMergeLeaseFinish,
+  ReleaseMergeMethod,
+  finish_release_merge_lease,
+  release_merge_method,
+} from "lib/release_merge_lease"
+import { release_queue_refresh_or_throw, release_queue_restore_step } from "lib/release_queue_gate"
+import {
+  mock_release_ref_cleanup_adapter,
+  release_ref_cleanup_receipt_path,
+  run_release_ref_cleanup,
+} from "lib/release_ref_cleanup"
+import { run_release_ref_sweep } from "lib/release_ref_sweep"
+import { release_run_root } from "lib/release_runtime"
+import {
+  reconstruct_release_stranded_watch_receipt,
+  run_release_stranded_recovery,
+} from "lib/release_stranded_recovery"
+import {
+  ReleaseWatchGuardOptions,
+  release_watch_guard_acquire,
+  release_watch_guard_cleanup_warning,
+  release_watch_guard_finish,
+} from "lib/release_watch_guard"
+import {
+  HostedReleaseWatchAdapter,
+  HostedReleaseWatchImport,
+  import_hosted_release_watch_receipt,
+} from "lib/release_watch_handoff"
+import {
+  RELEASE_WATCH_DEFAULT_LIMIT_MS,
+  release_watch_progress_lines,
+  release_watch_stage_finish,
+  release_watch_stage_start,
+  release_watch_stage_tick,
+} from "lib/release_watch_progress"
+import {
+  ReleaseWatchProgressSink,
+  mock_release_watch_adapter,
+  run_release_watch,
+} from "lib/release_watch_runtime"
+import {
+  release_watch_receipt,
+  release_watch_receipt_path,
+  release_watch_receipt_read,
+  release_watch_receipt_write,
+} from "lib/release_watch_state"
+import { ensure_release_sandbox } from "lib/sandbox_preflight"
+
+pub type ReleaseWatchOptions = {
+  tag: string,
+  receipt: string,
+  hosted_run?: int?,
+  import_hosted_receipt_only: bool,
+  max_polls: int,
+  interval_seconds: int,
+  yes_live_release: bool,
+  observe_only: bool,
+  no_recovery: bool,
+  warm_cache: bool,
+  no_pr_watchdog: bool,
+  no_ref_cleanup: bool,
+  tag_stranded_main: string,
+  unfold_merged_bump: string,
+  github_app_signer: bool,
+  repo: string,
+  mock: bool,
+  json: bool,
+}
+
+const WATCH_ARG_SPEC = {
+  name: "watch-harn-release",
+  args: [
+    {kind: "flag", name: "tag", long: "--tag", default: ""},
+    {kind: "flag", name: "receipt", long: "--receipt", default: ""},
+    {kind: "flag", name: "hosted_run", long: "--hosted-run", parse: "int", default: nil},
+    {kind: "switch", name: "import_hosted_receipt_only", long: "--import-hosted-receipt-only"},
+    {kind: "flag", name: "max_polls", long: "--max-polls", parse: "int", default: 240},
+    {kind: "flag", name: "interval_seconds", long: "--interval-seconds", parse: "int", default: 30},
+    {kind: "switch", name: "yes_live_release", long: "--yes-live-release"},
+    {kind: "switch", name: "observe_only", long: "--observe-only"},
+    {kind: "switch", name: "no_recovery", long: "--no-recovery"},
+    {kind: "switch", name: "warm_cache", long: "--warm-cache"},
+    {kind: "switch", name: "no_pr_watchdog", long: "--no-pr-watchdog"},
+    {kind: "switch", name: "no_ref_cleanup", long: "--no-ref-cleanup"},
+    {kind: "flag", name: "tag_stranded_main", long: "--tag-stranded-main", default: ""},
+    {kind: "flag", name: "unfold_merged_bump", long: "--unfold-merged-bump", default: ""},
+    {kind: "switch", name: "github_app_signer", long: "--github-app-signer"},
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "switch", name: "mock", long: "--mock"},
+    {kind: "switch", name: "json", long: "--json"},
+  ],
+}
+
+pub fn parse_release_watch_args(args: list<string>) -> ReleaseWatchOptions {
+  const options = cli_options<ReleaseWatchOptions>(
+    WATCH_ARG_SPEC,
+    args,
+    schema_of(ReleaseWatchOptions),
+  )
+  if options.max_polls < 1 {
+    throw "--max-polls must be a positive integer"
+  }
+  if options.interval_seconds < 0 {
+    throw "--interval-seconds must be a non-negative integer"
+  }
+  if options.hosted_run != nil && options.hosted_run <= 0 {
+    throw "--hosted-run must be a positive GitHub Actions run ID"
+  }
+  return options
+}
+
+fn usage() {
+  return """
+Usage:
+  scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
+
+Resumes the durable post-PR handoff. The ship command writes the receipt before
+returning; this command may be stopped and rerun without repeating release
+preparation or candidate certification. It signs and pushes the immutable
+certified candidate tag, then monitors publication, recovery, and the independent
+release PR merge. Poll
+exhaustion returns a durable pending receipt that the same command resumes by
+exact run ID.
+
+Flags:
+  --tag vX.Y.Z          Release tag whose receipt should be resumed.
+  --receipt PATH        Override the default receipt path.
+  --hosted-run RUN_ID   Import the receipt uploaded by this hosted release run.
+  --max-polls N         Maximum snapshots before returning pending (default 240).
+  --interval-seconds N  Delay between live snapshots (default 30).
+  --yes-live-release    Required because red binary builds may dispatch recovery.
+  --observe-only        Poll status without recovery or cache warm actions.
+  --no-recovery         Observe only; do not dispatch binary recovery.
+  --warm-cache          Opt into the five-target post-publish main-cache warm.
+  --no-pr-watchdog      Do not re-arm the release pull request while polling.
+  --no-ref-cleanup      Retain transient release refs after terminal proof.
+  --unfold-merged-bump SHA
+                          Open the revert for a bump that merged and must not be
+                          published, returning main to its development version.
+  --tag-stranded-main SHA
+                        Recover a release whose bump merged without a tag. Tags
+                        the named release commit when its tree is the certified
+                        one, or differs from it only in paths certification does
+                        not bear on.
+  --github-app-signer   Verify the hosted App tag through Harn's allowed-signers root.
+  --repo PATH           Local Harn checkout used for exact leased ref cleanup.
+  --mock                Rehearse release readiness; add --warm-cache to rehearse warming.
+  --json                Print one machine-readable result.
+"""
+}
+
+fn harness_root(fs: HarnessFs) {
+  const root = fs.runtime_paths().asset_root
+  const leaf = basename(root)
+  if leaf == "lib" || leaf == "tests" {
+    return dirname(root)
+  }
+  return root
+}
+
+/**
+ * Terminal release proof owns the process verdict; housekeeping stays inspectable but non-fatal.
+ */
+pub fn release_watch_exit_status(release_status: int, queue_restore_failed: bool) -> int {
+  if queue_restore_failed {
+    return 2
+  }
+  return release_status
+}
+
+pub type ReleaseWatchMergeLeaseReceipt = {
+  slug: string,
+  pin_sha: string,
+  pr_url: string,
+  merge_lease_candidate_pr: int,
+  merge_lease_generation: string,
+  merge_lease_method: ReleaseMergeMethod | "",
+  publication: {head_oid: string},
+  tag: string,
+}
+
+pub type ReleaseWatchMergeLeaseResult = {
+  status: int,
+  watchdog: dict,
+  receipt: ReleaseWatchMergeLeaseReceipt,
+}
+
+pub type ReleaseWatchMergeLeaseFinishRequest = {
+  result: ReleaseWatchMergeLeaseResult,
+  queue_restore?: dict?,
+  observe_only: bool,
+  mock: bool,
+  options?: GithubClientOptions?,
+}
+
+/**
+ * Finish only a successful release or a candidate whose merge authority was
+ * explicitly revoked. Other status-2 outcomes remain resumable and retain the
+ * lease that prevents unrelated admissions from crossing their recovery.
+ */
+pub fn finish_terminal_release_merge_lease(
+  harness: Harness,
+  request: ReleaseWatchMergeLeaseFinishRequest,
+) -> ReleaseMergeLeaseFinish? {
+  const result = request.result
+  const terminal = result.status == 0
+    || (result.status == 2
+      && result.watchdog?.action == "blocked"
+      && result.watchdog?.reason == "release_pr_merge_authority_revoked")
+  if !terminal || request.observe_only || request.mock
+    || (request.queue_restore != nil && execution_failed([request.queue_restore])) {
+    return nil
+  }
+  if trim(result.receipt.merge_lease_generation ?? "") == ""
+    || result.receipt.merge_lease_candidate_pr <= 0 {
+    return {released: false, reason: "not_owned", ref: "", oid: ""}
+  }
+  const merge_method = release_merge_method(result.receipt.merge_lease_method)
+  if merge_method == nil {
+    return {released: false, reason: "not_owned", ref: "", oid: ""}
+  }
+  return finish_release_merge_lease(
+    harness,
+    {
+      repo: result.receipt.slug,
+      base_branch: "main",
+      base_oid: result.receipt.pin_sha,
+      candidate_pr: result.receipt.merge_lease_candidate_pr,
+      candidate_head: result.receipt.publication.head_oid,
+      generation: result.receipt.merge_lease_generation,
+      tag: result.receipt.tag,
+      merge_method: merge_method,
+    },
+    request.options ?? github_connector_options(),
+  )
+}
+
+/** Import one hosted receipt while holding the watcher's single-writer lease. */
+pub fn import_hosted_release_watch_receipt_guarded(
+  harness: Harness,
+  input: HostedReleaseWatchImport,
+  mock: bool = false,
+  guard_domain: string? = nil,
+  adapter: HostedReleaseWatchAdapter? = nil,
+) {
+  const guard_options: ReleaseWatchGuardOptions = if guard_domain == nil {
+    {tag: input.tag, receipt_path: input.destination, mock: mock}
+  } else {
+    {tag: input.tag, receipt_path: input.destination, mock: mock, domain: guard_domain ?? ""}
+  }
+  const import_guard = release_watch_guard_acquire(harness.host_lease, guard_options)
+  let import_completed = false
+  return try {
+    const imported = import_hosted_release_watch_receipt(harness, input, adapter)
+    import_completed = true
+    imported
+  } finally {
+    const warning = release_watch_guard_cleanup_warning(
+      release_watch_guard_finish(harness.host_lease, import_guard)?.error,
+      import_completed,
+    )
+    if warning != nil {
+      harness.stdio.eprintln(warning ?? "")
+    }
+  }
+}
+
+pipeline main(harness: Harness) {
+  if help_requested(argv) {
+    harness.stdio.println(usage())
+    return 0
+  }
+  const parsed = parse_release_watch_args(argv)
+  const sandbox_error = ensure_release_sandbox(
+    {stdio: harness.stdio, system: harness.system},
+    "watch_harn_release.harn",
+  )
+  if sandbox_error != nil {
+    return sandbox_error
+  }
+  const tag = trim(parsed.tag)
+  if tag == "" {
+    throw "--tag vX.Y.Z is required"
+  }
+  const max_polls = parsed.max_polls
+  const interval_seconds = parsed.interval_seconds
+  const default_root = path_join(harness_root(harness.fs), ".harn-runs", "release-harn")
+  const receipt_path = if trim(parsed.receipt) != "" {
+    parsed.receipt
+  } else {
+    release_watch_receipt_path(default_root, tag)
+  }
+  const repo = if trim(parsed.repo) != "" {
+    parsed.repo
+  } else {
+    path_join(env_str(harness.env, "HOME") ?? "", "projects/harn")
+  }
+  const stranded_commit = trim(parsed.tag_stranded_main ?? "")
+  if parsed.import_hosted_receipt_only ?? false {
+    if parsed.hosted_run == nil {
+      throw "--import-hosted-receipt-only requires --hosted-run"
+    }
+    if stranded_commit != "" || trim(parsed.unfold_merged_bump ?? "") != "" {
+      throw "--import-hosted-receipt-only cannot run a release recovery mutation"
+    }
+    const imported = import_hosted_release_watch_receipt_guarded(
+      harness,
+      {
+        repo_root: harness_root(harness.fs),
+        tag: tag,
+        run_id: parsed.hosted_run ?? 0,
+        destination: receipt_path,
+      },
+      parsed.mock,
+    )
+    if parsed.json {
+      harness.stdio.println(json_stringify(imported))
+    }
+    return 0
+  }
+  if !parsed.yes_live_release && !parsed.mock {
+    throw "--yes-live-release is required for release monitoring and recovery"
+  }
+  const watch_guard = release_watch_guard_acquire(
+    harness.host_lease,
+    {tag: tag, receipt_path: receipt_path, mock: parsed.mock},
+  )
+  let watch_body_completed = false
+  let watch_body_error: string? = nil
+  let watch_reporter = nil
+  try {
+    let receipt = if stranded_commit != "" {
+      // This mode exists for the case where the original hosted handoff is no
+      // longer usable. GitHub retains the merged PR head, so reconstruct the
+      // typed identity from that exact merge instead of depending on a mutable
+      // run artifact. A valid local receipt retains the immutable candidate on
+      // retry; stranded recovery freshly reobserves merged-parent admission.
+      release_watch_receipt_read(harness.fs, receipt_path)
+        ?? reconstruct_release_stranded_watch_receipt(
+          harness,
+          {repo: repo},
+          tag,
+          stranded_commit,
+          receipt_path,
+        )
+    } else if parsed.hosted_run != nil {
+      import_hosted_release_watch_receipt(
+        harness,
+        {
+          repo_root: harness_root(harness.fs),
+          tag: tag,
+          run_id: parsed.hosted_run ?? 0,
+          destination: receipt_path,
+        },
+      )
+    } else {
+      release_watch_receipt_read(harness.fs, receipt_path)
+    }
+    if receipt == nil && parsed.mock {
+      const mock_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      const mock_version = tag.substring(1)
+      receipt = release_watch_receipt(
+        {
+          tag: tag,
+          slug: "burin-labs/harn",
+          pin_sha: mock_head,
+          publication: {
+            version: mock_version,
+            local_branch: "release/${tag}",
+            remote_ref: "release-attempt/${tag}/${mock_head}",
+            head_oid: mock_head,
+          },
+          pr_url: "https://github.com/burin-labs/harn/pull/1",
+          created_at: "2026-07-13T00:00:00Z",
+        },
+      )
+      release_watch_receipt_write({fs: harness.fs, random: harness.random}, receipt_path, receipt)
+    }
+    if receipt == nil {
+      throw "missing or invalid release watch receipt: " + receipt_path
+    }
+    if receipt.tag != tag {
+      throw "receipt tag ${receipt.tag} does not match requested ${tag}"
+    }
+    const observe_only = parsed.observe_only ?? false
+    const no_recovery = observe_only || (parsed.no_recovery ?? false)
+    // Repeating the five hosted release targets after every publication is
+    // intentionally opt-in. Release cadence can be multiple times per day, so
+    // default warming could duplicate hundreds of hosted build-hours monthly.
+    const warm_cache_requested = !observe_only && (parsed.warm_cache ?? false)
+    const no_pr_watchdog = observe_only || (parsed.no_pr_watchdog ?? false)
+    const no_ref_cleanup = observe_only || (parsed.no_ref_cleanup ?? false)
+    if !parsed.json {
+      harness.stdio.println("== watching ${tag}")
+      harness.stdio.println("   receipt: ${receipt_path}")
+      harness.stdio.println("   resume : rerun this command with the same --tag")
+    }
+    const adapter = if parsed.mock {
+      mock_release_watch_adapter(receipt)
+    } else {
+      nil
+    }
+    const watch_limit_ms = if interval_seconds > 0 {
+      max_polls * interval_seconds * 1000
+    } else {
+      RELEASE_WATCH_DEFAULT_LIMIT_MS
+    }
+    watch_reporter = if parsed.json {
+      nil
+    } else {
+      release_watch_stage_start(harness, tag, watch_limit_ms)
+    }
+    const operator_progress_sink: ReleaseWatchProgressSink? = if parsed.json {
+      nil
+    } else {
+      { progress, _path, poll ->
+        const current = watch_reporter
+        if current != nil {
+          watch_reporter = release_watch_stage_tick(harness, current, progress, poll)
+        }
+        return nil
+      }
+    }
+    const progress_sink: ReleaseWatchProgressSink = { progress, path, poll ->
+      if !observe_only {
+        release_queue_refresh_or_throw(harness, release_run_root(harness.fs))
+      }
+      if operator_progress_sink != nil {
+        operator_progress_sink(progress, path, poll)
+      }
+      return nil
+    }
+    const interval_ms = if parsed.mock {
+      0
+    } else {
+      interval_seconds * 1000
+    }
+    const stranded_recovery = stranded_commit != ""
+    const unfold_commit = trim(parsed.unfold_merged_bump ?? "")
+    const main_tag = if observe_only {
+      {
+        status: 0,
+        reason: "observe-only",
+        receipt: receipt,
+        steps: [],
+        polls: 0,
+        phase: "main_tag_admission",
+      }
+    } else if unfold_commit != "" {
+      // The opposite recovery: this bump merged and must not be published, so
+      // open the revert that makes the branch cuttable again. The release opens
+      // it itself when the post-merge lanes fail; this path is for a watch that
+      // died between the merge and the verdict.
+      const unfolded = run_release_unfold(
+        harness,
+        {
+          repo: repo,
+          mock: parsed.mock,
+          skip_tag: false,
+          github_signed_commit: parsed.github_app_signer ?? false,
+        },
+        receipt,
+        unfold_commit,
+      )
+      {
+        status: unfolded.status,
+        reason: unfolded.reason,
+        receipt: receipt,
+        steps: unfolded.steps,
+        polls: 1,
+        // A watch cannot reach this path before a merge exists; the question is
+        // always whether the merged tree may keep or lose the tag.
+        phase: "tag",
+      }
+    } else if stranded_recovery {
+      // Main already carries the bumped version, so there is no merge left to
+      // wait for and no fresh cut the release preflight would admit.
+      const recovered = run_release_stranded_recovery(
+        harness,
+        {
+          repo: repo,
+          mock: parsed.mock,
+          skip_tag: false,
+          github_signed_commit: parsed.github_app_signer ?? false,
+        },
+        receipt,
+        receipt_path,
+        stranded_commit,
+        nil,
+        {max_polls: max_polls, interval_ms: interval_ms},
+      )
+      {
+        status: recovered.status,
+        reason: recovered.reason,
+        receipt: recovered.receipt,
+        steps: recovered.steps,
+        polls: 1,
+        // Main already carries the bumped version; the only remaining question
+        // is the tag, never whether the candidate is admitted.
+        phase: "tag",
+      }
+    } else {
+      run_release_candidate_tag(
+        harness,
+        {
+          repo: repo,
+          mock: parsed.mock,
+          skip_tag: false,
+          github_signed_commit: parsed.github_app_signer ?? false,
+        },
+        receipt,
+        receipt_path,
+      )
+    }
+    if main_tag.status != 0 {
+      // Name the phase in the reader's own words: whether the candidate was
+      // admitted onto main at all, or whether the already-merged commit may
+      // have the tag minted on it. The two are different questions with
+      // different owners, and a bare "main tag" label let a reader read a
+      // pre-merge admission refusal as a tag-time one.
+      const phase_label = if main_tag.phase == "tag" {
+        "tag"
+      } else {
+        "main tag admission"
+      }
+      if parsed.json {
+        harness.stdio.println(json_stringify(main_tag))
+      } else {
+        harness.stdio.println("== ${phase_label} pending/failed after ${main_tag.polls} poll(s)")
+        harness.stdio.println("   reason : ${main_tag.reason}")
+        harness.stdio.println("   receipt: ${receipt_path}")
+      }
+      const failed_watch = watch_reporter
+      if failed_watch != nil {
+        watch_reporter = release_watch_stage_finish(
+          harness,
+          failed_watch,
+          "failed",
+          main_tag.reason,
+        )
+      }
+      watch_body_completed = true
+      return main_tag.status
+    }
+    receipt = main_tag.receipt
+    const runtime_options = {
+      repo: repo,
+      max_polls: max_polls,
+      interval_ms: interval_ms,
+      dispatch_recovery: !no_recovery,
+      dispatch_warm_cache: warm_cache_requested,
+      keep_pr_armed: !no_pr_watchdog,
+      on_progress: progress_sink,
+    }
+    const result = run_release_watch(harness, receipt, receipt_path, runtime_options, adapter)
+    const queue_restore = if result.status != 3 && !observe_only {
+      release_queue_restore_step(harness, release_run_root(harness.fs))
+    } else {
+      nil
+    }
+    const lease_receipt: ReleaseWatchMergeLeaseReceipt = {
+      slug: result.receipt.slug,
+      pin_sha: result.receipt.pin_sha,
+      pr_url: result.receipt.pr_url,
+      merge_lease_candidate_pr: result.receipt.merge_lease_candidate_pr,
+      merge_lease_generation: result.receipt.merge_lease_generation,
+      merge_lease_method: result.receipt.merge_lease_method,
+      publication: {head_oid: result.receipt.publication.head_oid},
+      tag: result.receipt.tag,
+    }
+    const lease_result: ReleaseWatchMergeLeaseResult = {
+      status: result.status,
+      watchdog: result.watchdog,
+      receipt: lease_receipt,
+    }
+    const lease_finish = finish_terminal_release_merge_lease(
+      harness,
+      {
+        result: lease_result,
+        queue_restore: queue_restore,
+        observe_only: observe_only,
+        mock: parsed.mock,
+      },
+    )
+    const cleanup = if result.status == 0
+      && (result.receipt.warm_cache.state == "completed"
+        || !warm_cache_requested)
+      && !no_ref_cleanup {
+      run_release_ref_cleanup(
+        harness,
+        result.receipt,
+        receipt_path,
+        repo,
+        if parsed.mock {
+          mock_release_ref_cleanup_adapter(result.receipt)
+        } else {
+          nil
+        },
+      )
+    } else {
+      nil
+    }
+    const sweep = if cleanup != nil && cleanup.state != "blocked" && !parsed.mock {
+      run_release_ref_sweep(
+        harness,
+        {
+          repo: repo,
+          slug: result.receipt.slug,
+          mode: "apply",
+          receipt_path: receipt_path + ".ref-sweep.json",
+        },
+      )
+    } else {
+      nil
+    }
+    const watch_status = release_watch_exit_status(
+      result.status,
+      queue_restore != nil && execution_failed([queue_restore]),
+    )
+    const final_status = if watch_status == 0 && lease_finish != nil && !lease_finish.released {
+      2
+    } else {
+      watch_status
+    }
+    if parsed.json {
+      harness.stdio.println(
+        json_stringify(
+          result
+            + {
+              status: final_status,
+              ref_cleanup: cleanup,
+              ref_sweep: sweep,
+              queue_restore: queue_restore,
+              release_merge_lease: lease_finish,
+            },
+        ),
+      )
+    } else {
+      harness.stdio.println("== ${result.state} after ${result.polls} poll(s)")
+      harness.stdio.println("   warm    : ${result.receipt.warm_cache.state}")
+      if result.progress != nil {
+        for line in release_watch_progress_lines(result.progress) {
+          harness.stdio.println("   " + line)
+        }
+      }
+      harness.stdio.println("   receipt: ${receipt_path}")
+      if queue_restore != nil {
+        harness.stdio.println(
+          "   queue   : "
+            + if execution_failed([queue_restore]) {
+              "restore failed"
+            } else {
+              "restored exact held heads"
+            },
+        )
+      }
+      if lease_finish != nil {
+        harness.stdio.println(
+          "   merge lease: "
+            + if lease_finish.released {
+              lease_finish.reason
+            } else {
+              "restore failed (${lease_finish.reason})"
+            },
+        )
+      }
+      if cleanup != nil {
+        harness.stdio.println(
+          "   cleanup : ${cleanup.state} (${len(cleanup.refs)} exact ref(s)); receipt: "
+            + release_ref_cleanup_receipt_path(receipt_path),
+        )
+        if cleanup.state == "blocked" {
+          harness.stdio.eprintln(
+            "warning: terminal release ref cleanup is incomplete; durable release status remains authoritative: "
+              + cleanup.message,
+          )
+        }
+      }
+      if sweep != nil {
+        harness.stdio.println(
+          "   sweep   : ${sweep.state} (${len(sweep.refs)} classified ref(s)); receipt: "
+            + receipt_path
+            + ".ref-sweep.json",
+        )
+        if sweep.state == "blocked" {
+          harness.stdio.eprintln(
+            "warning: terminal release ref sweep is incomplete; durable release status remains authoritative: "
+              + sweep.message,
+          )
+        }
+      }
+      if trim(result.reason ?? "") != "" {
+        harness.stdio.println("   reason : ${result.reason}")
+      }
+    }
+    const finished_watch = watch_reporter
+    if finished_watch != nil {
+      watch_reporter = release_watch_stage_finish(
+        harness,
+        finished_watch,
+        if final_status == 0 {
+          "ok"
+        } else {
+          "failed"
+        },
+        result.state,
+      )
+    }
+    watch_body_completed = true
+    return final_status
+  } catch (error) {
+    watch_body_error = to_string(error)
+    const cancelled = watch_reporter
+    if cancelled != nil {
+      watch_reporter = release_watch_stage_finish(harness, cancelled, "cancelled", nil)
+    }
+  } finally {
+    const warning = release_watch_guard_cleanup_warning(
+      release_watch_guard_finish(harness.host_lease, watch_guard)?.error,
+      watch_body_completed,
+    )
+    if warning != nil {
+      harness.stdio.eprintln(warning)
+    }
+  }
+  if watch_body_error != nil {
+    throw watch_body_error
+  }
+}

@@ -1,0 +1,968 @@
+import { shell_quote } from "std/runtime"
+import { FleetConvergenceSnapshot } from "../lib/fleet_convergence"
+import { FleetRepository } from "../lib/fleet_manifest"
+import {
+  FleetRepairPolicy,
+  REPAIR_EGRESS_ALLOW,
+  fleet_repair_authority_audit,
+  fleet_repair_authorized_new_file_path,
+  fleet_repair_egress_readiness,
+  fleet_repair_new_file_allowed,
+  fleet_repair_plan,
+  fleet_repair_receipt,
+  fleet_repair_repository_limit,
+  fleet_repair_route,
+  fleet_repair_safe_attempt_limit,
+  fleet_repair_session_id,
+  fleet_repair_terminal_outcome,
+  fleet_repair_validate_candidate,
+  fleet_repair_validation_environment_blocked,
+  fleet_repair_validation_findings,
+  repair_fleet_candidate_in_checkout,
+} from "../lib/fleet_repair"
+import { pr_title_for_consumer } from "../lib/pr_title_convention"
+
+const POLICY: FleetRepairPolicy = {
+  max_repositories: 1,
+  max_rounds: 4,
+  max_attempts_per_repository: 2,
+  max_tokens_per_attempt: 4000,
+  max_cost_per_attempt_usd: 0.3,
+  max_cost_per_repository_usd: 0.6,
+  max_cost_per_run_usd: 4.0,
+  runtime_provenance: {
+    harn_version: "v0.10.96",
+    controller_revision: "test",
+    repair_contract_revision: "harn-update-repair-v10",
+  },
+  provider_secret_reference: "CEREBRAS_API_KEY",
+}
+
+fn thrown(callback: any) -> string {
+  return try {
+    callback()
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+}
+
+fn checked_shell(process: HarnessProcess, command: string) {
+  const result = process.shell(command)
+  assert(result.success, result.combined)
+  return result
+}
+
+/**
+ * Replay the harn-cloud validator shape through the real deterministic repair
+ * seam. The consumer command names its exact source checkout from the release
+ * target and runner scratch root; neither value may come from ambient process
+ * state, and scratch owned by the repair must not survive the validation.
+ */
+pipeline test_candidate_validation_receives_exact_target_and_owned_temp_context(
+  harness: Harness,
+  task: any,
+) {
+  const root = harness.fs.mkdtemp_in_workspace("fleet-validator-context-")
+  const checkout = path_join(root, "consumer")
+  const observed = path_join(root, "observed-context")
+  harness.fs.mkdir(checkout)
+  harness.fs.write_text(path_join(checkout, "seed.txt"), "seed\n")
+  checked_shell(
+    harness.process,
+    "git -C "
+      + shell_quote(checkout)
+      + " init -q && git -C "
+      + shell_quote(checkout)
+      + " config user.email test@example.test && git -C "
+      + shell_quote(checkout)
+      + " config user.name test && git -C "
+      + shell_quote(checkout)
+      + " add seed.txt && git -C "
+      + shell_quote(checkout)
+      + " -c commit.gpgsign=false commit -q -m seed",
+  )
+  const head = trim(
+    checked_shell(harness.process, "git -C " + shell_quote(checkout) + " rev-parse HEAD").stdout,
+  )
+  const command = "test \"$HARN_BUMP_TARGET_TAG\" = v0.10.125"
+    + " && test -n \"$RUNNER_TEMP\""
+    + " && test -d \"$RUNNER_TEMP\""
+    + " && printf '%s\\n%s\\n' \"$HARN_BUMP_TARGET_TAG\" \"$RUNNER_TEMP\" > "
+    + shell_quote(observed)
+  const result = repair_fleet_candidate_in_checkout(
+    harness,
+    {
+      repo: "burin-labs/harn-cloud",
+      directory: checkout,
+      pr_number: 42,
+      pr_url: "https://github.com/burin-labs/harn-cloud/pull/42",
+      head_sha: head,
+      validation_command: command,
+      failing_checks: [],
+      allowed_new_files: [],
+      branch: "automation/bump-harn-runtime",
+      auto_arm: true,
+      require_signed_head: true,
+    },
+    "v0.10.125",
+    POLICY + {deterministic_only: true},
+  )
+  assert_eq([result.status, result.reason], ["no_change", "leased_checkout_already_valid"])
+  const context = harness.fs.read_lines(observed)
+  assert_eq(context[0], "v0.10.125")
+  assert(starts_with(context[1], harness.fs.workspace_temp_dir() + "/"))
+  assert_eq(harness.fs.exists(context[1]), false)
+}
+
+/** Invalid context is rejected before the consumer shell can execute. */
+pipeline test_candidate_validation_refuses_malformed_target_and_temp_escape_before_launch(
+  harness: Harness,
+  task: any,
+) {
+  const root = harness.fs.mkdtemp_in_workspace("fleet-validator-refusal-")
+  const checkout = path_join(root, "consumer")
+  const marker = path_join(root, "validator-executed")
+  const private_temp = harness.fs.mkdtemp_in_workspace("fleet-validator-valid-")
+  harness.fs.mkdir(checkout)
+  const candidate = {
+    repo: "burin-labs/harn-cloud",
+    directory: checkout,
+    pr_number: 42,
+    pr_url: "https://github.com/burin-labs/harn-cloud/pull/42",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    validation_command: "printf executed > " + shell_quote(marker),
+    failing_checks: [],
+    allowed_new_files: [],
+    branch: "automation/bump-harn-runtime",
+    auto_arm: true,
+    require_signed_head: true,
+  }
+  const malformed = thrown(
+    { ->
+      fleet_repair_validate_candidate(
+        {fs: harness.fs, process: harness.process},
+        candidate,
+        {target: "v0.10.125; touch escaped", private_temp_root: private_temp},
+      )
+    },
+  )
+  assert(contains(malformed, "exact vX.Y.Z release tag"))
+  assert_eq(harness.fs.exists(marker), false)
+  const prerelease = thrown(
+    { ->
+      fleet_repair_validate_candidate(
+        {fs: harness.fs, process: harness.process},
+        candidate,
+        {target: "v0.10.125-rc.1", private_temp_root: private_temp},
+      )
+    },
+  )
+  assert(contains(prerelease, "exact vX.Y.Z release tag"))
+  assert_eq(harness.fs.exists(marker), false)
+  const escaped = thrown(
+    { ->
+      fleet_repair_validate_candidate(
+        {fs: harness.fs, process: harness.process},
+        candidate,
+        {
+          target: "v0.10.125",
+          private_temp_root: path_join(harness.fs.workspace_temp_dir(), "..", "escaped"),
+        },
+      )
+    },
+  )
+  assert(contains(escaped, "validator temp root"))
+  assert_eq(harness.fs.exists(marker), false)
+  harness.fs.delete(private_temp)
+}
+
+pipeline test_default_repository_limit_covers_the_manifest() {
+  assert_eq(fleet_repair_repository_limit(nil, 4), 4)
+  assert_eq(fleet_repair_repository_limit(2, 4), 2)
+}
+
+pipeline test_repair_egress_requires_the_exact_prepared_allowlist(task: any) {
+  assert_eq(
+    fleet_repair_egress_readiness(REPAIR_EGRESS_ALLOW, "deny", "private"),
+    {ready: true, reason: "exact repair destinations are prepared"},
+  )
+  assert_eq(fleet_repair_egress_readiness("api.github.com:443", "deny", "private").ready, false)
+  assert_eq(fleet_repair_egress_readiness(REPAIR_EGRESS_ALLOW, "allow", "private").ready, false)
+  assert_eq(fleet_repair_egress_readiness(REPAIR_EGRESS_ALLOW, "deny", "off").ready, false)
+}
+
+pipeline test_each_attempt_reserves_all_remaining_retry_budget() {
+  const policy = POLICY + {max_attempts_per_repository: 3, max_cost_per_attempt_usd: 0.6}
+  const first_limit = fleet_repair_safe_attempt_limit(policy, 0.0, 0.0)
+  const late_limit = fleet_repair_safe_attempt_limit(policy, 0.0, 3.7)
+  assert(first_limit > 0.199 && first_limit < 0.201)
+  assert(late_limit > 0.099 && late_limit < 0.101)
+}
+
+pipeline test_new_files_require_one_exact_manifest_authorization(task: any) {
+  const allowed = ["changelog.d/harn-update.fixed.md"]
+  assert_eq(fleet_repair_new_file_allowed("changelog.d/harn-update.fixed.md", allowed), true)
+  assert_eq(fleet_repair_new_file_allowed("changelog.d/other.fixed.md", allowed), false)
+  assert_eq(fleet_repair_new_file_allowed("../secrets", allowed), false)
+  const candidate = {
+    repo: "burin-labs/pkg",
+    directory: "/tmp/isolated-checkout",
+    pr_number: 42,
+    pr_url: "https://example.test/pkg/42",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    validation_command: "harn package verify .",
+    failing_checks: [],
+    allowed_new_files: allowed,
+    branch: "automation/bump-harn-runtime",
+    auto_arm: true,
+    require_signed_head: true,
+  }
+  assert_eq(
+    fleet_repair_authorized_new_file_path(candidate, "changelog.d/harn-update.fixed.md"),
+    "/tmp/isolated-checkout/changelog.d/harn-update.fixed.md",
+  )
+  assert(
+    contains(
+      thrown(
+        { -> fleet_repair_authorized_new_file_path(candidate, "changelog.d/not-authorized.md") },
+      ),
+      "manifest-authorized",
+    ),
+  )
+}
+
+pipeline test_repair_sessions_are_anchored_to_checkout_head_route_and_contract(task: any) {
+  const candidate = {
+    repo: "burin-labs/pkg",
+    directory: "/tmp/one",
+    pr_number: 42,
+    pr_url: "https://example.test/pkg/42",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    validation_command: "harn package verify .",
+    failing_checks: [],
+    allowed_new_files: [],
+    branch: "automation/bump-harn-runtime",
+    auto_arm: true,
+    require_signed_head: true,
+  }
+  const value = fleet_repair_route(POLICY, 1, [])
+  const strong = fleet_repair_route(POLICY + {route_override: "strong"}, 1, [])
+  const key = fleet_repair_session_id(
+    candidate,
+    POLICY.runtime_provenance,
+    value,
+    "openrouter",
+    "qwen/value",
+    1,
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+        candidate + {directory: "/tmp/two"},
+        POLICY.runtime_provenance,
+        value,
+        "openrouter",
+        "qwen/value",
+        1,
+      ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+        candidate + {head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        POLICY.runtime_provenance,
+        value,
+        "openrouter",
+        "qwen/value",
+        1,
+      ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+        candidate,
+        POLICY.runtime_provenance,
+        strong,
+        "openrouter",
+        "qwen/value",
+        1,
+      ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+        candidate,
+        POLICY.runtime_provenance,
+        value,
+        "openrouter",
+        "openai/strong",
+        1,
+      ),
+  )
+  assert(
+    key
+      != fleet_repair_session_id(
+        candidate,
+        POLICY.runtime_provenance + {controller_revision: "other"},
+        value,
+        "openrouter",
+        "qwen/value",
+        1,
+      ),
+  )
+  assert_eq(strong.reason, "explicit_rehearsal_route")
+}
+
+pipeline test_failed_validation_is_carried_to_the_next_repair_attempt(task: any) {
+  const findings = fleet_repair_validation_findings(false, "clippy: exact failure")
+  assert_eq(findings, ["clippy: exact failure"])
+  assert_eq(fleet_repair_route(POLICY, 2, findings).tier, "strong")
+  assert_eq(fleet_repair_validation_findings(true, "ignored"), [])
+}
+
+pipeline test_environment_failure_never_enters_source_repair(task: any) {
+  assert_eq(
+    fleet_repair_validation_environment_blocked(
+      "error: Thrown: {category: environment, error: io_error, message: invalid argument}",
+    ),
+    true,
+  )
+  assert_eq(
+    fleet_repair_validation_environment_blocked(
+      "validator could not start under prepared process authority: outside launchable roots",
+    ),
+    true,
+  )
+  assert_eq(fleet_repair_validation_environment_blocked("error[E0308]: mismatched types"), false)
+}
+
+fn authority_plan() {
+  return {
+    target: "v0.10.78",
+    recoveries: [],
+    refused: [],
+    candidates: [
+      {
+        repo: "burin-labs/pkg",
+        directory: "/tmp/isolated-checkout",
+        pr_number: 42,
+        pr_url: "https://example.test/pkg/42",
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        validation_command: "harn package verify .",
+        failing_checks: [],
+        allowed_new_files: [],
+        branch: "automation/bump-harn-runtime",
+        auto_arm: true,
+        require_signed_head: true,
+      },
+    ],
+  }
+}
+
+fn authority_result(reason: string, diagnostic: string) {
+  return {
+    repo: "burin-labs/pkg",
+    status: "failed",
+    reason: reason,
+    validation_evidence: [
+      {attempt: 0, command: "harn package verify .", ok: false, diagnostic: diagnostic},
+    ],
+    attempts: [],
+    known_cost_usd: 0.0,
+    cost_status: "exact",
+  }
+}
+
+pipeline test_validator_authority_audit_distinguishes_started_denied_missing_and_malformed() {
+  const key = "process:validator=burin-labs/pkg"
+  const started = fleet_repair_authority_audit(
+    authority_plan(),
+    [authority_result("validation_attempts_exhausted", "package validation failed")],
+    POLICY,
+  )
+  assert(started.requested.contains(key))
+  assert(started.granted.contains(key))
+  assert(started.used.contains(key))
+  assert(!started.denied.contains(key))
+  assert(started.granted.contains("filesystem:checkout-root=/tmp/isolated-checkout"))
+  assert(!started.granted.contains("tool:repair_read"))
+  const refused = fleet_repair_authority_audit(
+    authority_plan(),
+    [
+      authority_result(
+        "validator_environment_unavailable",
+        "validator could not start under prepared process authority: outside launchable roots",
+      ),
+    ],
+    POLICY,
+  )
+  assert(refused.requested.contains(key))
+  assert(!refused.granted.contains(key))
+  assert(!refused.used.contains(key))
+  assert(refused.denied.contains(key))
+  assert(refused.requested != refused.granted)
+  const missing = fleet_repair_authority_audit(authority_plan(), [], POLICY)
+  assert(missing.requested.contains(key))
+  assert(!missing.granted.contains(key))
+  assert(!missing.used.contains(key))
+  assert(!missing.denied.contains(key))
+  assert(missing.unused.contains(key))
+  const malformed = fleet_repair_authority_audit(
+    authority_plan(),
+    [
+      authority_result(
+        "validation_attempts_exhausted",
+        "validator could not start under prepared process authority: outside launchable roots",
+      ),
+    ],
+    POLICY,
+  )
+  assert(!malformed.granted.contains(key))
+  assert(!malformed.used.contains(key))
+  assert(malformed.denied.contains("authority:malformed-validator-evidence=burin-labs/pkg"))
+}
+
+fn repo(slug: string, validator: string? = "harn package verify .") -> FleetRepository {
+  if validator == nil {
+    return {
+      slug: slug,
+      directory: replace(slug, "burin-labs/", ""),
+      harn_bump: true,
+      bump_workflow_ownership: "fleet",
+    }
+  }
+  return {
+    slug: slug,
+    directory: replace(slug, "burin-labs/", ""),
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: validator ?? "",
+  }
+}
+
+fn snapshot(rows: any) -> FleetConvergenceSnapshot {
+  return {
+    target: "v0.10.78",
+    complete: false,
+    terminal: true,
+    total_count: len(rows),
+    pending_count: 0,
+    failing_count: len(rows),
+    repositories: rows,
+  }
+}
+
+pipeline test_admits_exact_failed_pr_with_manifest_validator(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "burin-labs/pkg",
+          state: "failed",
+          reason: "checks_failing",
+          pr_number: 42,
+          pr_url: "https://github.com/burin-labs/pkg/pull/42",
+          head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          failing_checks: [{name: "CI", details_url: "https://example.test/run/1"}],
+        },
+      ],
+    ),
+    [repo("burin-labs/pkg")],
+    POLICY,
+  )
+  assert_eq(len(plan.candidates), 1)
+  assert_eq(plan.recoveries, [])
+  assert_eq(plan.candidates[0]?.pr_number, 42)
+  assert_eq(plan.candidates[0]?.validation_command, "harn package verify .")
+  assert_eq(len(plan.refused), 0)
+}
+
+pipeline test_package_repair_uses_the_same_default_validator_as_its_bump_workflow(task: any) {
+  const package_repo = repo("owner/package", nil) + {harn_package: true}
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "owner/package",
+          state: "failed",
+          reason: "checks_failing",
+          pr_number: 43,
+          pr_url: "https://github.com/owner/package/pull/43",
+          head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          failing_checks: [{name: "CI", details_url: "https://example.test/run/2"}],
+        },
+      ],
+    ),
+    [package_repo],
+    POLICY,
+  )
+  assert_eq(len(plan.candidates), 1)
+  assert_eq(plan.candidates[0]?.validation_command, "harn package verify .")
+  assert_eq(len(plan.refused), 0)
+}
+
+pipeline test_recovers_exact_target_branch_without_spending_model_tokens(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "burin-labs/pkg",
+          state: "failed",
+          reason: "target_branch_missing_pull_request",
+          pin: "0.10.94",
+          branch_pin: "0.10.95",
+          head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      ],
+    ),
+    [repo("burin-labs/pkg")],
+    POLICY,
+  )
+  assert_eq(plan.candidates, [])
+  assert_eq(
+    plan.recoveries,
+    [
+      {
+        repo: "burin-labs/pkg",
+        branch_pin: "0.10.95",
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        branch: "automation/bump-harn-runtime",
+        base_branch: "main",
+        auto_arm: true,
+        require_signed_head: true,
+        pr_title_area: "",
+      },
+    ],
+  )
+  assert_eq(plan.refused, [])
+}
+
+pipeline test_a_recovery_carries_the_title_area_its_consumer_declares(task: any) {
+  const gated = repo("burin-labs/pkg") + {pr_title_gate: true, pr_title_area: "Harn"}
+  const rows = snapshot(
+    [
+      {
+        repo: "burin-labs/pkg",
+        state: "failed",
+        reason: "target_branch_missing_pull_request",
+        pin: "0.10.94",
+        branch_pin: "0.10.95",
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+    ],
+  )
+  const plan = fleet_repair_plan(rows, [gated], POLICY)
+  assert_eq(plan.recoveries[0]?.pr_title_area ?? "", "Harn")
+  assert_eq(
+    pr_title_for_consumer(plan.recoveries[0]?.pr_title_area ?? "", "Bump Harn runtime"),
+    "[Harn] Bump Harn runtime",
+  )
+  const ungated = fleet_repair_plan(rows, [repo("burin-labs/pkg")], POLICY)
+  assert_eq(
+    pr_title_for_consumer(ungated.recoveries[0]?.pr_title_area ?? "", "Bump Harn runtime"),
+    "Bump Harn runtime",
+  )
+}
+
+pipeline test_manifest_default_admits_every_failed_repo(task: any) {
+  const slugs = ["burin-labs/one", "burin-labs/two", "burin-labs/three", "burin-labs/four"]
+  const repositories = slugs.map({ slug -> repo(slug) }).to_list()
+  const rows = slugs.map(
+    { slug ->
+      {
+        repo: slug,
+        state: "failed",
+        reason: "checks_failing",
+        pr_number: 42,
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      }
+    },
+  )
+    .to_list()
+  const policy = POLICY
+    + {max_repositories: fleet_repair_repository_limit(nil, len(repositories))}
+  const plan = fleet_repair_plan(snapshot(rows), repositories, policy)
+  assert_eq(len(plan.candidates), 4)
+  assert_eq(plan.refused, [])
+}
+
+pipeline test_refuses_non_code_failure_and_missing_validator(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {repo: "burin-labs/ops", state: "failed", reason: "merge_state_blocked"},
+        {
+          repo: "burin-labs/pkg",
+          state: "failed",
+          reason: "checks_failing",
+          pr_number: 42,
+          head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      ],
+    ),
+    [repo("burin-labs/ops"), repo("burin-labs/pkg", nil)],
+    POLICY,
+  )
+  assert_eq(len(plan.candidates), 0)
+  assert_eq(plan.refused[0]?.reason, "failure_not_code_repairable:merge_state_blocked")
+  assert_eq(plan.refused[1]?.reason, "missing_manifest_validator")
+}
+
+pipeline test_refuses_a_no_op_bump_run_instead_of_guessing_at_a_repair(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "burin-labs/ops",
+          state: "failed",
+          reason: "run_success_no_target_change: the bump workflow completed successfully and "
+            + "wrote no target change",
+          default_branch_pin: "0.10.94",
+        },
+      ],
+    ),
+    [repo("burin-labs/ops")],
+    POLICY,
+  )
+  assert_eq(len(plan.candidates), 0, "a run that produced no code delta gives repair nothing to do")
+  assert_eq(len(plan.recoveries), 0, "there is no branch lease to recover")
+  assert(
+    starts_with(
+      plan.refused[0]?.reason ?? "",
+      "failure_not_code_repairable:run_success_no_target_change",
+    ),
+    "the refusal must name the adapter defect, got '${plan.refused[0]?.reason ?? ""}'",
+  )
+}
+
+pipeline test_repository_contract_can_disable_every_repair_path(task: any) {
+  const blocked = repo("burin-labs/tap")
+    + {bump_repair_enabled: false, bump_branch_template: "automation/harn-formula-{target}"}
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "burin-labs/tap",
+          state: "failed",
+          reason: "target_branch_missing_pull_request",
+          branch_pin: "0.10.78",
+          head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      ],
+    ),
+    [blocked],
+    POLICY,
+  )
+  assert_eq(plan.candidates, [])
+  assert_eq(plan.recoveries, [])
+  assert_eq(plan.refused, [{repo: "burin-labs/tap", reason: "repair_disabled_by_update_contract"}])
+}
+
+pipeline test_repository_budget_refuses_later_candidates(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {
+          repo: "burin-labs/one",
+          state: "failed",
+          reason: "checks_failing",
+          pr_number: 1,
+          head_sha: "1111111111111111111111111111111111111111",
+        },
+        {
+          repo: "burin-labs/two",
+          state: "failed",
+          reason: "checks_failing",
+          pr_number: 2,
+          head_sha: "2222222222222222222222222222222222222222",
+        },
+      ],
+    ),
+    [repo("burin-labs/one"), repo("burin-labs/two")],
+    POLICY,
+  )
+  assert_eq(plan.candidates.map({ row -> row.repo }).to_list(), ["burin-labs/one"])
+  assert_eq(plan.refused[0]?.reason, "repository_budget_exhausted")
+}
+
+pipeline test_waiting_and_proven_rows_are_noops(task: any) {
+  const plan = fleet_repair_plan(
+    snapshot(
+      [
+        {repo: "burin-labs/one", state: "waiting", reason: "checks_pending"},
+        {repo: "burin-labs/two", state: "proven", reason: "exact_green_update_merged"},
+      ],
+    ),
+    [repo("burin-labs/one"), repo("burin-labs/two")],
+    POLICY,
+  )
+  assert_eq(plan.candidates, [])
+  assert_eq(plan.refused, [])
+}
+
+fn terminal_plan() {
+  return {
+    target: "v0.10.121",
+    recoveries: [],
+    candidates: [
+      {
+        repo: "burin-labs/pkg",
+        directory: "/tmp/isolated-checkout",
+        pr_number: 42,
+        pr_url: "https://github.com/burin-labs/pkg/pull/42",
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        validation_command: "harn package verify .",
+        failing_checks: [{name: "CI"}],
+        allowed_new_files: [],
+        branch: "automation/bump-harn-runtime",
+        auto_arm: true,
+        require_signed_head: true,
+      },
+    ],
+    refused: [],
+  }
+}
+
+pipeline test_terminal_outcomes_distinguish_justified_noop_from_failed_noop(task: any) {
+  const common = {
+    repo: "burin-labs/pkg",
+    old_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    attempts: [],
+    known_cost_usd: 0.0,
+    cost_status: "exact",
+  }
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          status: "repaired",
+          reason: "validated_published_and_auto_merge_armed",
+          new_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          source_mutation: {
+            before_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            after_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            commit_created: true,
+            pushed_head_observed: true,
+          },
+        },
+    ),
+    "mutated",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          status: "repaired",
+          reason: "validated_published_and_auto_merge_armed",
+          new_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          status: "repaired",
+          reason: "validated_published_and_auto_merge_armed",
+          new_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          source_mutation: {
+            before_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            after_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            commit_created: true,
+            pushed_head_observed: false,
+          },
+        },
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          status: "no_change",
+          reason: "leased_checkout_already_valid",
+          validation_evidence: [
+            {attempt: 0, command: "harn package verify .", ok: true, diagnostic: "passed"},
+          ],
+        },
+    ),
+    "already_repaired",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common + {status: "no_change", reason: "validator_passed_without_repair_delta"},
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common + {status: "no_change", reason: "leased_checkout_already_valid"},
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          status: "no_change",
+          reason: "leased_checkout_already_valid",
+          new_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          validation_evidence: [
+            {attempt: 0, command: "harn package verify .", ok: true, diagnostic: "passed"},
+          ],
+        },
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(common + {status: "refused", reason: "repair_disabled"}),
+    "declined",
+  )
+}
+
+pipeline test_identical_head_recovery_requires_observed_control_plane_change(task: any) {
+  const common = {
+    repo: "burin-labs/pkg",
+    status: "repaired",
+    old_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    new_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    attempts: [],
+    known_cost_usd: 0.0,
+    cost_status: "exact",
+  }
+  assert_eq(
+    fleet_repair_terminal_outcome(common + {reason: "target_branch_presented_auto_merge_withheld"}),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          reason: "target_branch_presented_and_auto_merge_armed",
+          control_plane_mutation: {
+            pull_request_present_before: true,
+            pull_request_present_after: true,
+            auto_merge_before: true,
+            auto_merge_after: true,
+          },
+        },
+    ),
+    "failed",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          reason: "target_branch_presented_and_auto_merge_armed",
+          control_plane_mutation: {
+            pull_request_present_before: true,
+            pull_request_present_after: true,
+            auto_merge_before: false,
+            auto_merge_after: true,
+          },
+        },
+    ),
+    "mutated",
+  )
+  assert_eq(
+    fleet_repair_terminal_outcome(
+      common
+        + {
+          reason: "target_branch_presented_auto_merge_withheld",
+          control_plane_mutation: {
+            pull_request_present_before: false,
+            pull_request_present_after: true,
+            auto_merge_before: false,
+            auto_merge_after: false,
+          },
+        },
+    ),
+    "mutated",
+  )
+}
+
+pipeline test_receipt_fails_closed_on_unchanged_or_missing_red_repository(task: any) {
+  const plan = terminal_plan()
+  const unchanged = fleet_repair_receipt(
+    plan,
+    [
+      {
+        repo: "burin-labs/pkg",
+        status: "no_change",
+        reason: "validator_passed_without_repair_delta",
+        old_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        attempts: [
+          {
+            attempt: 1,
+            validation_ok: true,
+            validation_output: "validation passed but the checkout did not change",
+            agent_status: "completed",
+            route: "value",
+            route_reason: "initial repair attempt",
+            provider: "test",
+            model: "test",
+            usage: {
+              provider: "test",
+              model: "test",
+              tokens_used: 0,
+              cost_status: "exact",
+              cost_usd: 0.0,
+              known_cost_usd: 0.0,
+              unpriced_calls: 0,
+              usage_unknown_calls: 0,
+            },
+          },
+        ],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      },
+    ],
+    POLICY,
+  )
+  assert_eq(unchanged.ok, false)
+  const unchanged_result = unchanged.results[0]
+  assert(unchanged_result != nil)
+  assert_eq(unchanged_result.terminal_outcome, "failed")
+  assert_eq(unchanged_result.before_head_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  assert_eq(unchanged_result.after_head_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  assert_eq(unchanged_result.mutation.head_changed, false)
+  assert_eq(unchanged_result.attempted_validations[0]?.command, "harn package verify .")
+  assert_eq(unchanged_result.attempted_validations[0]?.ok, true)
+  const missing = fleet_repair_receipt(plan, [], POLICY)
+  assert_eq(missing.ok, false)
+  assert_eq(missing.results[0]?.terminal_outcome, "failed")
+  assert_eq(missing.results[0]?.reason, "missing_terminal_outcome")
+}
+
+pipeline test_receipt_accepts_an_observed_published_head(task: any) {
+  const receipt = fleet_repair_receipt(
+    terminal_plan(),
+    [
+      {
+        repo: "burin-labs/pkg",
+        status: "repaired",
+        reason: "validated_published_and_auto_merge_armed",
+        old_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        new_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        source_mutation: {
+          before_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          after_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          commit_created: true,
+          pushed_head_observed: true,
+        },
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      },
+    ],
+    POLICY,
+  )
+  assert_eq(receipt.ok, true)
+  const result = receipt.results[0]
+  assert(result != nil)
+  assert_eq(result.terminal_outcome, "mutated")
+  assert_eq(result.mutation.commit_created, true)
+  assert_eq(result.mutation.pushed_head_observed, true)
+}

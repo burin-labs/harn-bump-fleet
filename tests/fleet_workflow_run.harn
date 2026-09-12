@@ -1,0 +1,288 @@
+import { fleet_chain_branch } from "../lib/fleet_chain_ref"
+import { FleetDispatchScope } from "../lib/fleet_operation_scope"
+import {
+  FleetWorkflowChainAdapter,
+  FleetWorkflowRunAdapter,
+  fleet_workflow_chain_title,
+  wait_fleet_workflow_chain_with_adapter,
+  wait_fleet_workflow_run_with_adapter,
+} from "../lib/fleet_workflow_run"
+import {
+  GithubConnectorError,
+  GithubWorkflowRun,
+  GithubWorkflowRuns,
+} from "harn-github-connector/default"
+
+const FULL_FLEET: FleetDispatchScope = {kind: "full_fleet"}
+
+const RUN_ID = 9001
+
+const RUN_URL = "https://github.test/burin-labs/harn-bump-fleet/actions/runs/9001"
+
+fn workflow_run(
+  id: int,
+  status: string,
+  conclusion: string? = nil,
+  display_title: string = "",
+) -> GithubWorkflowRun {
+  return {
+    repo: "burin-labs/harn-bump-fleet",
+    id: id,
+    workflow_id: 42,
+    workflow_path: ".github/workflows/bump-fleet.yml",
+    run_number: 101,
+    run_attempt: 1,
+    name: "Bump Harn fleet",
+    display_title: display_title,
+    event: "workflow_dispatch",
+    status: status,
+    conclusion: conclusion,
+    head_branch: "main",
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    url: RUN_URL,
+    created_at: "2026-08-13T00:00:00Z",
+    run_started_at: "2026-08-13T00:00:01Z",
+    updated_at: "2026-08-13T00:00:02Z",
+  }
+}
+
+fn workflow_runs(runs: list<GithubWorkflowRun>) -> GithubWorkflowRuns {
+  return {
+    repo: "burin-labs/harn-bump-fleet",
+    workflow_id: "bump-fleet.yml",
+    total_count: len(runs),
+    runs: runs,
+    page: 1,
+    per_page: 100,
+  }
+}
+
+fn connector_error(code: string, message: string) -> GithubConnectorError {
+  return {code: code, category: "test", message: message}
+}
+
+pipeline test_transient_read_between_valid_observations_recovers_without_redispatch(task: any) {
+  let now_ms = 0
+  let attempts = 0
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return now_ms },
+    run: fn(exact_run_id) {
+      attempts = attempts + 1
+      assert_eq(exact_run_id, RUN_ID)
+      if attempts == 1 {
+        return Ok(workflow_run(RUN_ID, "in_progress"))
+      }
+      if attempts == 2 {
+        return Err(connector_error("network", "temporary transport failure"))
+      }
+      return Ok(workflow_run(RUN_ID, "completed", "success"))
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_fleet_workflow_run_with_adapter(
+    "v0.10.89",
+    FULL_FLEET,
+    RUN_ID,
+    RUN_URL,
+    60,
+    1,
+    adapter,
+  )
+  assert_eq(receipt.status, "completed")
+  assert_eq(receipt.conclusion, "success")
+  assert_eq(receipt.observation_attempts, 3)
+  assert_eq(receipt.transient_retries, 1)
+  assert_eq(receipt.run_id, RUN_ID)
+  assert_eq(receipt.controller_revision, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  assert_eq(attempts, 3)
+}
+
+pipeline test_authorization_failure_is_not_retried(task: any) {
+  let attempts = 0
+  let waits = 0
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return 0 },
+    run: fn(_exact_run_id) {
+      attempts = attempts + 1
+      return Err(connector_error("unauthorized", "credential refused"))
+    },
+    wait: fn(_delay_ms) { waits = waits + 1 },
+  }
+  let message = ""
+  try {
+    wait_fleet_workflow_run_with_adapter("v0.10.89", FULL_FLEET, RUN_ID, RUN_URL, 60, 1, adapter)
+  } catch (error) {
+    message = to_string(error)
+  }
+  assert(contains(message, "unauthorized"))
+  assert_eq(attempts, 1)
+  assert_eq(waits, 0)
+}
+
+pipeline test_consecutive_network_failures_are_bounded(task: any) {
+  let now_ms = 0
+  let attempts = 0
+  let waits = 0
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return now_ms },
+    run: fn(_exact_run_id) {
+      attempts = attempts + 1
+      return Err(connector_error("network", "still unavailable"))
+    },
+    wait: fn(delay_ms) {
+      waits = waits + 1
+      now_ms = now_ms + delay_ms
+    },
+  }
+  let message = ""
+  try {
+    wait_fleet_workflow_run_with_adapter("v0.10.89", FULL_FLEET, RUN_ID, RUN_URL, 60, 1, adapter)
+  } catch (error) {
+    message = to_string(error)
+  }
+  assert(contains(message, "exhausted transient network retries"))
+  assert_eq(attempts, 4)
+  assert_eq(waits, 3)
+}
+
+pipeline test_exact_run_identity_mismatch_fails_closed(task: any) {
+  let attempts = 0
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return 0 },
+    run: fn(_exact_run_id) {
+      attempts = attempts + 1
+      return Ok(workflow_run(RUN_ID + 1, "completed", "success"))
+    },
+    wait: fn(_delay_ms) {
+    },
+  }
+  let message = ""
+  try {
+    wait_fleet_workflow_run_with_adapter("v0.10.89", FULL_FLEET, RUN_ID, RUN_URL, 60, 1, adapter)
+  } catch (error) {
+    message = to_string(error)
+  }
+  assert(contains(message, "another run ID"))
+  assert_eq(attempts, 1)
+}
+
+pipeline test_timeout_returns_last_exact_nonterminal_observation(task: any) {
+  let now_ms = 0
+  let attempts = 0
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return now_ms },
+    run: fn(_exact_run_id) {
+      attempts = attempts + 1
+      if attempts == 1 {
+        return Ok(workflow_run(RUN_ID, "in_progress"))
+      }
+      return Err(connector_error("network", "timeout-edge transport failure"))
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_fleet_workflow_run_with_adapter(
+    "v0.10.89",
+    FULL_FLEET,
+    RUN_ID,
+    RUN_URL,
+    1,
+    1,
+    adapter,
+  )
+  assert_eq(receipt.status, "in_progress")
+  assert_eq(receipt.observation_attempts, 2)
+  assert_eq(receipt.transient_retries, 1)
+  assert_eq(receipt.elapsed_ms, 1000)
+}
+
+pipeline test_failed_round_hands_off_to_one_exact_correlated_successor(task: any) {
+  let now_ms = 0
+  let list_attempts = 0
+  const target = "v0.10.99"
+  const chain_id = "31900000001"
+  const successor_id = RUN_ID + 1
+  const successor_title = fleet_workflow_chain_title(target, chain_id, 2, 4)
+  const adapter: FleetWorkflowChainAdapter = {
+    now_ms: fn() { return now_ms },
+    run: fn(exact_run_id) { return if exact_run_id == RUN_ID {
+      Ok(workflow_run(RUN_ID, "completed", "failure"))
+    } else {
+      Ok(workflow_run(successor_id, "completed", "success", successor_title))
+    } },
+    runs: fn(branch) {
+      assert_eq(branch, fleet_chain_branch(chain_id))
+      list_attempts = list_attempts + 1
+      return if list_attempts == 1 {
+        Ok(workflow_runs([]))
+      } else {
+        Ok(
+          workflow_runs(
+            [
+              workflow_run(successor_id, "queued", nil, successor_title)
+                + {head_branch: fleet_chain_branch(chain_id)},
+            ],
+          ),
+        )
+      }
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  const receipt = wait_fleet_workflow_chain_with_adapter(
+    {
+      target: target,
+      scope: FULL_FLEET,
+      chain_id: chain_id,
+      initial_run_id: RUN_ID,
+      initial_run_url: RUN_URL,
+      max_rounds: 4,
+      timeout_s: 60,
+      successor_timeout_s: 10,
+      interval_s: 1,
+    },
+    adapter,
+  )
+  assert_eq(receipt.conclusion, "success")
+  assert_eq(receipt.runs.map({ run -> run.run_id }).to_list(), [RUN_ID, successor_id])
+  assert_eq(list_attempts, 2)
+  // Each terminal observation already carries the provenance used for the
+  // handoff. There is no fragile second API read after either run completes.
+  assert_eq(receipt.runs[0]?.observation_attempts, 1)
+  assert_eq(receipt.runs[1]?.observation_attempts, 1)
+}
+
+pipeline test_successor_on_a_different_controller_revision_fails_closed(task: any) {
+  const target = "v0.10.99"
+  const chain_id = "31900000001"
+  const title = fleet_workflow_chain_title(target, chain_id, 2, 4)
+  let message = ""
+  let now_ms = 0
+  const adapter: FleetWorkflowChainAdapter = {
+    now_ms: fn() { return now_ms },
+    run: fn(_exact_run_id) { return Ok(workflow_run(RUN_ID, "completed", "failure")) },
+    runs: fn(_branch) {
+      const changed = workflow_run(RUN_ID + 1, "queued", nil, title)
+        + {head_branch: fleet_chain_branch(chain_id), head_sha: "bbbbbbbb"}
+      return Ok(workflow_runs([changed]))
+    },
+    wait: fn(delay_ms) { now_ms = now_ms + delay_ms },
+  }
+  try {
+    wait_fleet_workflow_chain_with_adapter(
+      {
+        target: target,
+        scope: FULL_FLEET,
+        chain_id: chain_id,
+        initial_run_id: RUN_ID,
+        initial_run_url: RUN_URL,
+        max_rounds: 4,
+        timeout_s: 60,
+        successor_timeout_s: 1,
+        interval_s: 1,
+      },
+      adapter,
+    )
+  } catch (error) {
+    message = to_string(error)
+  }
+  assert(contains(message, "timed out waiting for exact successor"))
+}

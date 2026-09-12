@@ -1,0 +1,846 @@
+import { changelog_find_section, changelog_parse_sections } from "std/changelog"
+import {
+  compare_release,
+  next,
+  parse_release,
+  strip_v,
+  version_from_release_branch,
+  version_from_tag,
+} from "std/semver"
+import { truncate_text } from "std/text"
+// Extracted release-harness stage. See AGENTS.md for ownership.
+import { release_log_range_args } from "./git"
+import { ReleasePublication } from "./release_publication"
+import {
+  ReleaseAnalysisSnapshot,
+  ReleaseConfig,
+  ReleaseNotesScope,
+  ReleaseRepoConfig,
+  checked_git,
+  latest_release_tag,
+  probe_ok,
+  prompt_asset,
+  read_repo_file,
+  release_github_pr_files,
+  release_github_pr_list,
+  release_github_pr_view,
+} from "release_runtime"
+import { release_analysis_snapshot } from "release_workspace"
+
+pub type ReleaseAnalysis = {
+  repo: string,
+  mode: string,
+  bump: string,
+  model: string,
+  provider: string,
+  mock: bool,
+  operator_focus: string,
+  branch: string,
+  expected_branch: string,
+  base_branch: string,
+  pin_sha: string,
+  pin_sha_input: string,
+  source_snapshot: ReleaseAnalysisSnapshot,
+  fixup_mode: bool,
+  release_notes_scope: ReleaseNotesScope,
+  fixup_tag: string,
+  fixup_pr_url: string,
+  fixup_publication: ReleasePublication?,
+  pre_tag_resume?: bool,
+  pre_tag_supersede?: bool,
+  fixup_release_exists?: bool,
+  fixup_missing_assets?: list<string>,
+  current_version: string,
+  next_version: string,
+  prepared_release: bool,
+  latest_tag: string,
+  changelog_top: string,
+  dirty_files: int,
+  status: string,
+  diff_stat: string,
+  diff_names: string,
+  commits_since_latest_tag: string,
+  commit_file_changes_since_latest_tag: string,
+  commit_stats_since_latest_tag: string,
+  post_tag_pr_numbers: list<int>,
+  post_tag_pr_details: string,
+  recent_merged_prs: string,
+  changelog_section: string,
+  changelog_unreleased_section: string,
+  release_scripts: {release_ship: bool, release_gate: bool},
+  workflows: {publish_release: bool, build_release_binaries: bool},
+  release_scope_findings: list<string>,
+  deterministic_findings: list<string>,
+  run_session_view?: dict,
+}
+
+pub type ReleaseScope = {expected_prs: list<int>, rejected_prs: list<int>}
+
+pub type CompactReleaseAnalysis = {
+  repo: string,
+  mode: string,
+  bump: string,
+  branch: string,
+  expected_branch: string,
+  base_branch: string,
+  pin_sha: string,
+  release_notes_scope: ReleaseNotesScope,
+  current_version: string,
+  next_version: string,
+  operator_focus: string,
+  latest_tag: string,
+  changelog_top: string,
+  dirty_files: int,
+  diff_names: string,
+  post_tag_commit_count: int,
+  latest_post_tag_commit: string,
+  commits_since_latest_tag: string,
+  commit_stats_since_latest_tag: string,
+  commit_file_changes_since_latest_tag: string,
+  post_tag_pr_numbers: list<int>,
+  post_tag_pr_details: string,
+  changelog_section: string,
+  changelog_unreleased_section: string,
+  release_scripts: {release_ship: bool, release_gate: bool},
+  workflows: {publish_release: bool, build_release_binaries: bool},
+  deterministic_findings: list<string>,
+  recent_merged_prs: string,
+  suggested_read_only_inspections: list<string>,
+}
+
+pub fn workspace_version_from_manifest(text: string) -> string {
+  const matches = regex_captures("(?m)^version\\s*=\\s*\"([^\"]+)\"", text)
+  if len(matches) == 0 {
+    return ""
+  }
+  return matches[0].groups[0]
+}
+
+pub fn current_version(fs: HarnessFs, cfg: ReleaseRepoConfig) -> string {
+  return workspace_version_from_manifest(read_repo_file(fs, cfg, "Cargo.toml"))
+}
+
+/**
+ * The prerelease identifier the target repo cuts main to after each release.
+ *
+ * This module is the only owner of the development-version convention. Every
+ * gate that asks "what did this workspace version publish?", "what will it
+ * release?", or "does it prove the prior fold?" must route through the
+ * resolvers below rather than re-deriving the suffix. Three gates re-derived it
+ * independently and each was discovered by burning a live release cut.
+ */
+const DEVELOPMENT_PRERELEASE = "dev"
+
+pub type DevelopmentCutoverVerdict = {
+  state: "ready" | "blocking_pull_request" | "missing_cutover" | "unreadable",
+  blocked: bool,
+  workspace_version: string,
+  expected_version?: string,
+  pull_request_branches: list<string>,
+  detail: string,
+}
+
+/** Resolve the stable release already named by an exact `X.Y.Z-dev` version. */
+pub fn development_release_target(current: string) -> string? {
+  const matches = regex_captures(
+    "^([0-9]+[.][0-9]+[.][0-9]+)-${DEVELOPMENT_PRERELEASE}$",
+    trim(current),
+  )
+  if len(matches) == 0 {
+    return nil
+  }
+  return matches[0].groups[0]
+}
+
+/** Render the development form that names `stable` as its next release. */
+pub fn development_version_for(stable: string) -> string {
+  return "${trim(stable)}-${DEVELOPMENT_PRERELEASE}"
+}
+
+/** Render the development version main carries once `latest_version` has shipped. */
+pub fn next_development_version(latest_version: string) -> string {
+  return development_version_for(next(trim(latest_version), "patch", ""))
+}
+
+/**
+ * Detect a stable workspace left behind after publication.
+ *
+ * The post-release pull request is useful evidence only while main still has
+ * the stable version. Once the development version lands, an old branch no
+ * longer blocks the next cut and must not keep the alarm red.
+ */
+pub fn development_cutover_verdict(
+  workspace_version: string,
+  open_pull_request_branches: list<string>,
+) -> DevelopmentCutoverVerdict {
+  const workspace = trim(workspace_version)
+  if development_release_target(workspace) != nil {
+    return {
+      state: "ready",
+      blocked: false,
+      workspace_version: workspace,
+      expected_version: workspace,
+      pull_request_branches: [],
+      detail: "default branch carries an exact X.Y.Z-dev workspace version",
+    }
+  }
+  const stable = parse_release(workspace)
+  if stable == nil || trim(stable.prerelease ?? "") != "" {
+    return {
+      state: "unreadable",
+      blocked: true,
+      workspace_version: workspace,
+      pull_request_branches: [],
+      detail: "default-branch workspace version is not an exact X.Y.Z or X.Y.Z-dev value",
+    }
+  }
+  const expected = next_development_version(workspace)
+  const branch = "automation/development-${expected}"
+  const matching = open_pull_request_branches.filter({ value -> value == branch }).to_list()
+  return {
+    state: if len(matching) > 0 {
+      "blocking_pull_request"
+    } else {
+      "missing_cutover"
+    },
+    blocked: true,
+    workspace_version: workspace,
+    expected_version: expected,
+    pull_request_branches: matching,
+    detail: if len(matching) > 0 {
+      "${branch} is open while the default branch still carries ${workspace}"
+    } else {
+      "the default branch still carries ${workspace}, but no ${branch} pull request is open"
+    },
+  }
+}
+
+/**
+ * Report whether a workspace version proves `latest_version` is folded into base.
+ *
+ * Two shapes prove the fold: the released version itself (pre-development-version
+ * repos), or the next patch's development form that post-release automation cuts
+ * main to immediately after each release.
+ */
+pub fn workspace_proves_release_fold(workspace_version: string, latest_version: string) -> bool {
+  const workspace = trim(workspace_version)
+  const latest = trim(latest_version)
+  return workspace == latest || workspace == next_development_version(latest)
+}
+
+/**
+ * Resolve the release already published behind a workspace version.
+ *
+ * Post-release automation cuts main to the next patch's `-dev` form, so the
+ * workspace version no longer names the last published release. Callers that
+ * look up a tag, a published release, or a crates.io version must ask for the
+ * published release rather than reading the workspace version directly.
+ */
+pub fn last_published_release_version(current: string, latest_tag: string) -> string {
+  if development_release_target(current) == nil || trim(latest_tag) == "" {
+    return current
+  }
+  return version_from_tag(latest_tag)
+}
+
+/**
+ * Choose the published release whose body the integrity gate must verify.
+ *
+ * A fixup pass over an already-published release verifies that release, which
+ * the candidate names as `next_version`. Every other run verifies the release
+ * that shipped before this candidate, which the workspace version only names
+ * before the development-version cutover.
+ */
+pub fn release_body_gate_version(
+  current_version: string,
+  next_version: string,
+  latest_tag: string,
+  release_exists: bool,
+) -> string {
+  if release_exists {
+    return next_version
+  }
+  return last_published_release_version(current_version, latest_tag)
+}
+
+/**
+ * Report the one resumable state a released tail leaves behind.
+ *
+ * A hosted release tags `vX.Y.Z` and then opens its own next-development-version
+ * PR. Between those two events the workspace still reads `X.Y.Z-dev` while the
+ * tag for `X.Y.Z` already exists, so the run's own follow-up bump is a
+ * prerequisite of its own rerun and every retry of the tail dies before doing
+ * work. This predicate names exactly that window and nothing else: the
+ * development target must equal the version the latest tag already published.
+ *
+ * It is deliberately not a general loosening. In every other mismatch the
+ * workspace disagrees with the published history for a reason the release must
+ * not paper over.
+ */
+pub fn development_target_awaits_next_dev_bump(current: string, latest_tag: string) -> bool {
+  const development_target = development_release_target(current)
+  if development_target == nil || trim(latest_tag) == "" {
+    return false
+  }
+  return development_target == version_from_tag(latest_tag)
+}
+
+/**
+ * Compute a globally unused version while preserving the source pin's scope.
+ *
+ * `resume_tagged_release` authorizes resuming the tail of an already-published
+ * release whose next-development-version bump has not landed yet. It permits
+ * only the state `development_target_awaits_next_dev_bump` names, and it is
+ * opt-in because that same version pair is also what a doomed fresh cut of an
+ * already-tagged version looks like. Reruns of a released tail pass it; a first
+ * cut never does.
+ */
+pub fn next_release_version(
+  current: string,
+  latest_tag: string,
+  bump: string,
+  preid: string,
+  resume_tagged_release: bool = false,
+) -> string {
+  const development_target = development_release_target(current)
+  if development_target != nil {
+    if bump != "patch" || trim(preid) != "" {
+      throw "workspace version ${current} already names its stable release; use a patch release to strip -dev"
+    }
+    if latest_tag != "" {
+      const expected = next_development_version(version_from_tag(latest_tag))
+      if development_version_for(development_target) != expected {
+        if !(resume_tagged_release
+          && development_target_awaits_next_dev_bump(current, latest_tag)) {
+          throw "workspace development version ${current} does not name the patch after ${latest_tag}; expected ${expected}"
+        }
+      }
+    }
+    return development_target
+  }
+  const version_floor = if latest_tag != "" && compare_release(latest_tag, "v${current}") > 0 {
+    version_from_tag(latest_tag)
+  } else {
+    current
+  }
+  return next(version_floor, bump, preid)
+}
+
+pub fn changelog_top_from_text(text: string) -> string {
+  const sections = changelog_parse_sections(text)
+  if is_err(sections) {
+    throw unwrap_err(sections).message
+  }
+  for section in unwrap(sections) {
+    const version = strip_v(substring(section.heading, 3, len(section.heading)))
+    if starts_with(section.heading, "## v") && parse_release(version) != nil {
+      return version
+    }
+  }
+  return ""
+}
+
+pub fn changelog_top(fs: HarnessFs, cfg: ReleaseRepoConfig) -> string {
+  return changelog_top_from_text(read_repo_file(fs, cfg, "CHANGELOG.md"))
+}
+
+fn changelog_section(fs: HarnessFs, cfg: ReleaseConfig) -> string {
+  const text = read_repo_file(fs, cfg, "CHANGELOG.md")
+  const top = changelog_top(fs, cfg)
+  if top == "" {
+    return ""
+  }
+  const section = changelog_find_section(text, "v${top}")
+  return is_ok(section) ? unwrap(section).body : ""
+}
+
+fn changelog_unreleased_section(fs: HarnessFs, cfg: ReleaseConfig) -> string {
+  const section = changelog_find_section(read_repo_file(fs, cfg, "CHANGELOG.md"), "Unreleased")
+  return is_ok(section) ? unwrap(section).body : ""
+}
+
+fn diff_names(harness: {env: HarnessEnv, process: HarnessProcess}, cfg: ReleaseConfig) -> string {
+  return checked_git(harness, cfg, ["diff", "HEAD", "--name-only"])
+}
+
+fn release_file_changes(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseConfig,
+  latest_tag: string,
+) -> string {
+  return checked_git(
+    harness,
+    cfg,
+    ["log", "--name-status", "--pretty=format:commit %h %s", "--no-merges"]
+      + release_log_range_args(latest_tag, cfg.pin_sha),
+  )
+}
+
+fn release_commit_stats(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseConfig,
+  latest_tag: string,
+) -> string {
+  return checked_git(
+    harness,
+    cfg,
+    ["log", "--stat", "--oneline", "--no-renames", "--no-merges"]
+      + release_log_range_args(latest_tag, cfg.pin_sha),
+  )
+}
+
+fn count_lines(text: string) -> int {
+  const t = trim(text)
+  if t == "" {
+    return 0
+  }
+  return len(t.split("\n"))
+}
+
+fn changelog_section_for_agent(analysis: ReleaseAnalysis) -> string {
+  if analysis.changelog_top == analysis.next_version {
+    return truncate_text(analysis.changelog_section, 8000)
+  }
+  const unreleased = trim(analysis.changelog_unreleased_section ?? "")
+  if unreleased != "" {
+    return "No `v${analysis.next_version}` section exists yet. CHANGELOG.md has this non-empty `## Unreleased` section that will be promoted or replaced during prepare; preserve these existing entries and fold in only the missing post-tag release notes:\n\n"
+      + truncate_text(unreleased, 10000)
+  }
+  return "No `v${analysis.next_version}` section exists yet. CHANGELOG.md currently starts at `v${analysis.changelog_top}`; draft the next section from the post-tag commit/file evidence instead of summarizing the old release."
+}
+
+pub fn first_post_tag_commit(analysis: ReleaseAnalysis) -> string {
+  const commits = trim(analysis.commits_since_latest_tag)
+  if commits == "" {
+    return "(none)"
+  }
+  return trim(commits.split("\n")[0])
+}
+
+fn post_tag_commit_count(analysis: ReleaseAnalysis) -> int {
+  const commits = trim(analysis.commits_since_latest_tag)
+  if commits == "" {
+    return 0
+  }
+  return len(commits.split("\n").filter({ line -> trim(line) != "" }))
+}
+
+pub fn pr_numbers_from_commits(commits: string) -> list<int> {
+  let seen = {}
+  let out = []
+  for line in split(commits, "\n") {
+    for m in regex_captures("\\(#([0-9]+)\\)", line) {
+      const number = to_int(m.groups[0])
+      if number == nil {
+        continue
+      }
+      if seen[number] ?? false {
+        continue
+      }
+      seen[number] = true
+      out = out + [number]
+    }
+  }
+  return out
+}
+
+fn has_number(values: list<int>, number: int) -> bool {
+  for value in values {
+    if value == number {
+      return true
+    }
+  }
+  return false
+}
+
+pub fn release_scope_findings(cfg: ReleaseScope, observed_pr_numbers: list<int>) -> list<string> {
+  let findings = []
+  for number in cfg.expected_prs {
+    if !has_number(observed_pr_numbers, number) {
+      findings = findings
+        + ["release scope expected PR #${number} is absent from the selected range"]
+    }
+  }
+  for number in cfg.rejected_prs {
+    if has_number(observed_pr_numbers, number) {
+      findings = findings
+        + ["release scope rejected PR #${number} is present in the selected range"]
+    }
+  }
+  return findings
+}
+
+fn release_pr_details(harness: Harness, cfg: ReleaseConfig, commits: string) -> string {
+  const numbers = pr_numbers_from_commits(commits)
+  if len(numbers) == 0 {
+    return ""
+  }
+  if cfg.mock {
+    return "PR #998\n{\"number\":998,\"title\":\"release: consolidate harn release PR flow\",\"body\":\"Mock PR body describing the one-PR release handoff, auto-merge enablement, and release workflow consolidation.\",\"files\":[\"CHANGELOG.md\",\"scripts/release_ship.sh\"]}"
+  }
+  let blocks = []
+  for number in numbers {
+    if len(blocks) >= 20 {
+      break
+    }
+    const details = try {
+      const pr = release_github_pr_view(harness, cfg, number)
+      const files = release_github_pr_files(harness, cfg, number)
+      json_stringify(
+        {
+          number: pr.number,
+          title: pr.title,
+          url: pr.url,
+          body: pr.body,
+          files: files.files.map({ file -> file.filename }),
+        },
+      )
+    } catch (e) {
+      nil
+    }
+    if details != nil {
+      blocks = blocks + ["PR #${number}\n" + truncate_text(details, 5000)]
+    } else {
+      blocks = blocks
+        + ["PR #${number}\nmetadata unavailable from the GitHub connector"]
+    }
+  }
+  return truncate_text(blocks.join("\n\n---\n\n"), 24000)
+}
+
+pub fn compact_agent_analysis(analysis: ReleaseAnalysis) -> CompactReleaseAnalysis {
+  return {
+    repo: analysis.repo,
+    mode: analysis.mode,
+    bump: analysis.bump,
+    branch: analysis.branch,
+    expected_branch: analysis.expected_branch,
+    base_branch: analysis.base_branch,
+    pin_sha: analysis.pin_sha,
+    release_notes_scope: analysis.release_notes_scope,
+    current_version: analysis.current_version,
+    next_version: analysis.next_version,
+    operator_focus: analysis.operator_focus,
+    latest_tag: analysis.latest_tag,
+    changelog_top: analysis.changelog_top,
+    dirty_files: analysis.dirty_files,
+    diff_names: truncate_text(analysis.diff_names, 1000),
+    post_tag_commit_count: post_tag_commit_count(analysis),
+    latest_post_tag_commit: first_post_tag_commit(analysis),
+    commits_since_latest_tag: truncate_text(analysis.commits_since_latest_tag, 8000),
+    commit_stats_since_latest_tag: truncate_text(analysis.commit_stats_since_latest_tag, 12000),
+    commit_file_changes_since_latest_tag: truncate_text(
+      analysis.commit_file_changes_since_latest_tag,
+      12000,
+    ),
+    post_tag_pr_numbers: analysis.post_tag_pr_numbers,
+    post_tag_pr_details: truncate_text(analysis.post_tag_pr_details, 12000),
+    changelog_section: changelog_section_for_agent(analysis),
+    changelog_unreleased_section: truncate_text(analysis.changelog_unreleased_section, 10000),
+    release_scripts: analysis.release_scripts,
+    workflows: analysis.workflows,
+    deterministic_findings: analysis.deterministic_findings,
+    recent_merged_prs: truncate_text(analysis.recent_merged_prs, 5000),
+    suggested_read_only_inspections: [
+      "git log --oneline --no-merges --max-count=80 ${analysis.latest_tag}..${analysis.pin_sha}",
+      "git diff --stat --stat-count=80 ${analysis.latest_tag}..${analysis.pin_sha}",
+      "git show --stat --oneline --no-renames --max-count=20 ${analysis.latest_tag}..${analysis.pin_sha}",
+      "sed -n '1,120p' CHANGELOG.md",
+      "sed -n '1,180p' scripts/release_ship.sh",
+      "sed -n '1,180p' .github/workflows/publish-release.yml",
+    ],
+  }
+}
+
+/**
+ * Concrete post-tag PR evidence the audit's `CHANGELOG coverage:` line must
+ * cite — the deterministic validator (`lib/release_audit`) rejects a generic
+ * coverage line that names neither a `#`-prefixed PR nor the PR count.
+ */
+pub fn pr_evidence_count(analysis: ReleaseAnalysis) -> int {
+  return len(analysis.post_tag_pr_numbers)
+}
+
+pub fn pr_evidence_sample(analysis: ReleaseAnalysis) -> string {
+  const prs = analysis.post_tag_pr_numbers
+  if len(prs) > 0 {
+    return "#${prs[0]}"
+  }
+  return ""
+}
+
+pub fn release_finalization_prompt(fs: HarnessFs, analysis: ReleaseAnalysis) -> string {
+  if analysis.fixup_mode ?? false {
+    return fs.render_prompt(
+      prompt_asset(fs, "release_fixup_finalization.harn.prompt"),
+      {
+        target_version: analysis.next_version,
+        fixup_tag: analysis.fixup_tag ?? "",
+        base_branch: analysis.base_branch,
+        candidate_tree_notes: analysis.release_notes_scope == "candidate_tree",
+        release_fact_sheet: release_fact_sheet(analysis),
+      },
+    )
+  }
+  return fs.render_prompt(
+    prompt_asset(fs, "release_finalization.harn.prompt"),
+    {
+      target_version: "v${analysis.next_version}",
+      tag_range: "${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}",
+      first_post_tag_commit: first_post_tag_commit(analysis),
+      post_tag_pr_count: pr_evidence_count(analysis),
+      sample_pr: pr_evidence_sample(analysis),
+      release_fact_sheet: release_fact_sheet(analysis),
+      changelog_draft_instructions: release_changelog_draft_prompt(fs, analysis),
+    },
+  )
+}
+
+pub fn release_changelog_draft_prompt(fs: HarnessFs, analysis: ReleaseAnalysis) -> string {
+  return fs.render_prompt(
+    prompt_asset(fs, "release_changelog_draft.harn.prompt"),
+    {
+      target_version: "v${analysis.next_version}",
+      tag_range: "${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}",
+      first_post_tag_commit: first_post_tag_commit(analysis),
+    },
+  )
+}
+
+pub fn release_fact_sheet(analysis: ReleaseAnalysis) -> string {
+  return """
+- Repo: `${analysis.repo}`.
+- Mode: `${analysis.mode}`.
+- Version: `${analysis.current_version}` -> `${analysis.next_version}` (${analysis.bump}).
+- Pinned base SHA: `${analysis.pin_sha ?? "(unset)"}` — release branch is anchored here; commits that landed on `${analysis.base_branch}` after this run started are excluded from the release.
+- Latest tag/range: `${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}`.
+- Post-tag commit count: ${post_tag_commit_count(analysis)}.
+- First post-tag commit: `${first_post_tag_commit(analysis)}`.
+- Release-note source rule: use only commits in `${analysis.latest_tag}..${analysis.pin_sha ?? "HEAD"}`
+  plus authored `## Unreleased` content. Recent merged PRs are historical
+  context only when they are not in that post-tag range.
+- Operator focus: ${if trim(analysis.operator_focus ?? "") == "" {
+    "none"
+  } else {
+    analysis.operator_focus
+  }}.
+- Current CHANGELOG top: `${analysis.changelog_top}`.
+- Deterministic findings: ${if len(analysis.deterministic_findings ?? []) == 0 {
+    "none"
+  } else {
+    join(analysis.deterministic_findings, "; ")
+  }}.
+
+Authored CHANGELOG content to preserve or update:
+${changelog_section_for_agent(analysis)}
+
+Recent post-tag commits:
+${truncate_text(analysis.commits_since_latest_tag, 8000)}
+
+Post-tag PR descriptions and touched files:
+${if trim(analysis.post_tag_pr_details ?? "") == "" {
+    "(none)"
+  } else {
+    truncate_text(analysis.post_tag_pr_details, 12000)
+  }}
+
+Representative per-commit stats:
+${truncate_text(analysis.commit_stats_since_latest_tag, 12000)}
+
+Representative per-commit file changes:
+${truncate_text(analysis.commit_file_changes_since_latest_tag, 12000)}
+"""
+}
+
+pub fn analyze_release(harness: Harness, cfg: ReleaseConfig) -> ReleaseAnalysis {
+  const source_snapshot = release_analysis_snapshot(
+    {env: harness.env, process: harness.process},
+    cfg,
+  )
+  const branch = checked_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["branch", "--show-current"],
+  )
+  const current = current_version(harness.fs, cfg)
+  const status = checked_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["status", "--porcelain", "--untracked-files=normal"],
+  )
+  const latest_tag = latest_release_tag(harness.process, cfg)
+  const top = changelog_top(harness.fs, cfg)
+  const branch_version = version_from_release_branch(branch)
+  const prepared_release = branch_version != "" && branch_version == current && top == current
+    && version_from_tag(latest_tag)
+      != current
+  // A frozen source pin can precede a release that was published from a
+  // concurrent release branch. Version names are global, not ancestral: never
+  // recreate an already-published tag just because that tag is outside this
+  // candidate's history. The changelog/log baseline stays `latest_tag`; only
+  // the next version's numeric floor changes.
+  const next = if prepared_release {
+    current
+  } else {
+    next_release_version(
+      current,
+      latest_tag,
+      cfg.bump,
+      cfg.preid,
+      cfg.resume_tagged_release ?? false,
+    )
+  }
+  const baseline = if prepared_release {
+    version_from_tag(latest_tag)
+  } else {
+    current
+  }
+  const expected_branch = "release/v${next}"
+  const committed_release_content = prepared_release && trim(status) == ""
+    && branch == expected_branch
+  const diff_stat = if committed_release_content {
+    checked_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["diff", "--stat", "${cfg.pin_sha}..HEAD"],
+    )
+  } else {
+    checked_git({env: harness.env, process: harness.process}, cfg, ["diff", "HEAD", "--stat"])
+  }
+  const diff_name_list = if committed_release_content {
+    checked_git(
+      {env: harness.env, process: harness.process},
+      cfg,
+      ["diff", "--name-only", "${cfg.pin_sha}..HEAD"],
+    )
+  } else {
+    diff_names({env: harness.env, process: harness.process}, cfg)
+  }
+  const commits = checked_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["log", "--oneline", "--no-merges"] + release_log_range_args(latest_tag, cfg.pin_sha),
+  )
+  const post_tag_pr_numbers = pr_numbers_from_commits(commits)
+  const commit_file_changes = release_file_changes(
+    {env: harness.env, process: harness.process},
+    cfg,
+    latest_tag,
+  )
+  const commit_stats = release_commit_stats(
+    {env: harness.env, process: harness.process},
+    cfg,
+    latest_tag,
+  )
+  const post_tag_pr_details = release_pr_details(harness, cfg, commits)
+  const section = changelog_section(harness.fs, cfg)
+  const unreleased_section = changelog_unreleased_section(harness.fs, cfg)
+  const recent_merged_prs = json_stringify(
+    release_github_pr_list(harness, cfg, {state: "merged", base: cfg.base, limit: 30}).map(
+      { pr ->
+        return {
+          number: pr.number,
+          title: pr.title,
+          merged_at: pr.merged_at,
+          url: pr.url,
+          head_ref: pr.head.ref,
+          merge_commit_oid: pr.merge_commit_oid,
+        }
+      },
+    ),
+  )
+  const scripts = {
+    release_ship: probe_ok(
+      {env: harness.env, process: harness.process},
+      cfg,
+      "test -x scripts/release_ship.sh && echo release_ship=ok",
+    ),
+    release_gate: probe_ok(
+      {env: harness.env, process: harness.process},
+      cfg,
+      "test -x scripts/release_gate.sh && echo release_gate=ok",
+    ),
+  }
+  const workflows = {
+    publish_release: probe_ok(
+      {env: harness.env, process: harness.process},
+      cfg,
+      "test -f .github/workflows/publish-release.yml && echo publish_workflow=ok",
+    ),
+    build_release_binaries: probe_ok(
+      {env: harness.env, process: harness.process},
+      cfg,
+      "test -f .github/workflows/build-release-binaries.yml && echo binary_workflow=ok",
+    ),
+  }
+  let findings = []
+  if trim(status) == "" && trim(diff_name_list) == "" {
+    findings = findings + ["working tree has no candidate release content"]
+  }
+  if top != next {
+    findings = findings
+      + ["CHANGELOG.md top entry is v${top}; expected v${next} for --bump ${cfg.bump}"]
+  }
+  if cfg.mode != "audit" && branch == cfg.base {
+    findings = findings
+      + ["release branch setup will move from ${cfg.base} to ${expected_branch} before preparing"]
+  }
+  if cfg.mode != "audit" && branch != expected_branch {
+    findings = findings
+      + ["current branch is ${branch}; branch setup will target ${expected_branch}"]
+  }
+  if !scripts.release_ship || !scripts.release_gate {
+    findings = findings + ["release scripts are missing or not executable"]
+  }
+  if !workflows.publish_release || !workflows.build_release_binaries {
+    findings = findings + ["release cascade workflows are missing"]
+  }
+  const scope_findings = release_scope_findings(cfg, post_tag_pr_numbers)
+  findings = findings + scope_findings
+  return {
+    repo: if cfg.mock {
+      "(mock harn repo)"
+    } else {
+      cfg.repo
+    },
+    mode: cfg.mode,
+    bump: cfg.bump,
+    model: cfg.model,
+    provider: cfg.provider,
+    mock: cfg.mock,
+    operator_focus: cfg.release_focus,
+    branch: branch,
+    expected_branch: expected_branch,
+    base_branch: cfg.base,
+    pin_sha: cfg.pin_sha,
+    pin_sha_input: cfg.pin_sha_input ?? "",
+    source_snapshot: source_snapshot,
+    fixup_mode: cfg.fixup_mode ?? false,
+    release_notes_scope: cfg.release_notes_scope,
+    fixup_tag: cfg.fixup_tag ?? "",
+    fixup_pr_url: cfg.fixup_pr_url ?? "",
+    fixup_publication: cfg.fixup_publication,
+    pre_tag_supersede: cfg.pre_tag_supersede ?? false,
+    current_version: baseline,
+    next_version: next,
+    prepared_release: prepared_release,
+    latest_tag: latest_tag,
+    changelog_top: top,
+    dirty_files: count_lines(status),
+    status: status,
+    diff_stat: diff_stat,
+    diff_names: diff_name_list,
+    commits_since_latest_tag: commits,
+    commit_file_changes_since_latest_tag: commit_file_changes,
+    commit_stats_since_latest_tag: commit_stats,
+    post_tag_pr_numbers: post_tag_pr_numbers,
+    post_tag_pr_details: post_tag_pr_details,
+    recent_merged_prs: recent_merged_prs,
+    changelog_section: section,
+    changelog_unreleased_section: unreleased_section,
+    release_scripts: scripts,
+    workflows: workflows,
+    release_scope_findings: scope_findings,
+    deterministic_findings: findings,
+  }
+}
