@@ -53,6 +53,9 @@ if [ "$installed_version" != "$expected_version" ]; then
   fi
 fi
 
+# Subprocesses launched by checks and tests must use the same verified runtime.
+export PATH="${repo_root}/.harn/bin:${PATH}"
+
 if [ "$action" = "test" ]; then
   cd "$repo_root"
   exec "$harn_bin" test tests/ --parallel --verbose
