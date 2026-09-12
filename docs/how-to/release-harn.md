@@ -94,6 +94,13 @@ The hosted route gives the audit the same runner, checkout, credential, and
 confinement setup as a live release. Use `--local-audit` only to diagnose local
 source lanes; a local result does not certify hosted release readiness.
 
+The dispatcher preserves `--agent` explicitly. Omit it for deterministic
+preparation with model calls disabled, or select `agent: false` in the hosted
+workflow. This choice is retained in dispatch and failure-recovery receipts;
+older receipts without the field retain their original agent-enabled behavior.
+Deterministic preparation requires valid release notes or changelog fragments
+and still runs the normal certification gates.
+
 Useful mock runs:
 
 ```sh
