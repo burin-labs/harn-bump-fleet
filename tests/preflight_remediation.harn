@@ -1,0 +1,914 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { git_worktree_path_for_branch } from "../lib/git_worktrees"
+import {
+  PreflightRemediationInputs,
+  preflight_remediate_base_behind,
+  preflight_remediate_stale_release_branch,
+  preflight_remediation_decision,
+} from "../lib/preflight_remediation"
+import {
+  reconcile_release_worktree_owner,
+  release_checkout_reclaims_immutable_owner,
+} from "../lib/release_checkout"
+import { FailedReleaseWorkspaceAuthorization } from "../lib/release_failed_workspace"
+
+fn scripted_git(entries: any) {
+  return { args ->
+    const key = join(args, " ")
+    for entry in entries {
+      if entry.cmd == key {
+        return entry.result
+      }
+    }
+    throw "unexpected git: " + key
+  }
+}
+
+fn entry(cmd: any, result: any) {
+  return {cmd: cmd, result: result}
+}
+
+/**
+ * A stale, dirty release branch with all three preservation gates satisfied by
+ * default (crashed reclaim, no open PR, no unique commits). Each falsifier flips
+ * exactly one field.
+ */
+fn stale_dirty_decision(overrides: PreflightRemediationInputs) {
+  if overrides.resume_current_dirty ?? false {
+    return preflight_remediation_decision(
+      {
+        kind: "stale_release_branch",
+        label: "v1.2.3",
+        branch_exists: true,
+        dirty_tree: overrides.dirty_tree ?? true,
+        has_open_pr: overrides.has_open_pr ?? false,
+        unique_unpushed: overrides.unique_unpushed ?? false,
+        crashed_reclaim: overrides.crashed_reclaim ?? true,
+        current_branch: overrides.current_branch ?? "",
+        resume_current_dirty: true,
+      },
+    )
+  }
+  return preflight_remediation_decision(
+    {
+      kind: "stale_release_branch",
+      label: "v1.2.3",
+      branch_exists: true,
+      dirty_tree: overrides.dirty_tree ?? true,
+      has_open_pr: overrides.has_open_pr ?? false,
+      unique_unpushed: overrides.unique_unpushed ?? false,
+      crashed_reclaim: overrides.crashed_reclaim ?? true,
+    },
+  )
+}
+
+pipeline test_stale_release_branch_crashed_reclaim_triple_gate(task: any) {
+  // All three gates pass + dirty -> preserve the crashed run's dirty tree.
+  const preserve = stale_dirty_decision({})
+  assert_eq(preserve.action, "remediate")
+  assert_eq(preserve.preserve_dirty_current, true)
+  // Falsifier: no crashed reclaim -> fail loud (dirty tree preserved).
+  const no_reclaim = stale_dirty_decision({crashed_reclaim: false})
+  assert_eq(no_reclaim.action, "fail")
+  assert_eq(no_reclaim.preserve_dirty_current ?? false, false)
+  // Current target branch + dirty tree is not a stale delete/recreate case;
+  // preserve it so prepare can resume transactionally in place.
+  const current_dirty = stale_dirty_decision(
+    {crashed_reclaim: false, current_branch: "release/v1.2.3", resume_current_dirty: true},
+  )
+  assert_eq(current_dirty.action, "noop")
+  assert_eq(current_dirty.resume_dirty_current, true)
+  const current_dirty_stale_remote = stale_dirty_decision(
+    {
+      crashed_reclaim: false,
+      current_branch: "release/v1.2.3",
+      resume_current_dirty: true,
+      unique_unpushed: true,
+    },
+  )
+  assert_eq(current_dirty_stale_remote.action, "noop")
+  assert_eq(current_dirty_stale_remote.resume_dirty_current, true)
+  // A reclaimed dead owner is not an intentional resume. Preservation wins,
+  // and the caller must stop before treating that dirty tree as a fresh run.
+  const reclaimed_current = stale_dirty_decision(
+    {current_branch: "release/v1.2.3", resume_current_dirty: true},
+  )
+  assert_eq(reclaimed_current.action, "remediate")
+  assert_eq(reclaimed_current.preserve_dirty_current, true)
+  // Falsifier: an open PR -> fail, even with the reclaim signal.
+  assert_eq(stale_dirty_decision({has_open_pr: true}).action, "fail")
+  // Falsifier: unique un-pushed commits on a non-resume path -> fail, even with
+  // the reclaim signal.
+  assert_eq(stale_dirty_decision({unique_unpushed: true}).action, "fail")
+  // Reclaim signal but a CLEAN tree -> ordinary delete, never dirty preservation.
+  const clean = stale_dirty_decision({dirty_tree: false})
+  assert_eq(clean.action, "remediate")
+  assert_eq(clean.preserve_dirty_current ?? false, false)
+}
+
+pipeline test_preflight_remediation_decision(task: any) {
+  // Stale release branch: absent -> noop.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: false},
+    ).action,
+    "noop",
+  )
+  // Present + clean + no PR + no unique -> remediate (delete/recreate).
+  const safe = preflight_remediation_decision(
+    {
+      kind: "stale_release_branch",
+      label: "v1.2.3",
+      branch_exists: true,
+      dirty_tree: false,
+      has_open_pr: false,
+      unique_unpushed: false,
+    },
+  )
+  assert_eq(safe.action, "remediate")
+  assert_eq(safe.safe, true)
+  // Dirty tree -> fail.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, dirty_tree: true},
+    ).action,
+    "fail",
+  )
+  assert_eq(
+    preflight_remediation_decision(
+      {
+        kind: "stale_release_branch",
+        label: "v1.2.3",
+        branch_exists: true,
+        dirty_tree: true,
+        current_branch: "release/v1.2.3",
+        resume_current_dirty: true,
+      },
+    ).action,
+    "noop",
+  )
+  assert_eq(
+    preflight_remediation_decision(
+      {
+        kind: "stale_release_branch",
+        label: "v1.2.3",
+        branch_exists: true,
+        dirty_tree: true,
+        current_branch: "release/v1.2.3",
+        resume_current_dirty: true,
+        unique_unpushed: true,
+      },
+    ).action,
+    "noop",
+  )
+  // Open PR -> fail (would clobber).
+  const open_pr = preflight_remediation_decision(
+    {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, has_open_pr: true},
+  )
+  assert_eq(open_pr.action, "fail")
+  assert_eq(contains(open_pr.reason, "open PR"), true)
+  // Unique un-pushed commits -> fail (don't lose work).
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "stale_release_branch", label: "v1.2.3", branch_exists: true, unique_unpushed: true},
+    ).action,
+    "fail",
+  )
+  // Base behind: up to date -> noop.
+  assert_eq(
+    preflight_remediation_decision({kind: "base_behind", label: "main", base_behind: false}).action,
+    "noop",
+  )
+  // Behind + clean -> remediate.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "base_behind", label: "main", base_behind: true, dirty_tree: false},
+    ).action,
+    "remediate",
+  )
+  // Behind + dirty -> fail.
+  assert_eq(
+    preflight_remediation_decision(
+      {kind: "base_behind", label: "main", base_behind: true, dirty_tree: true},
+    ).action,
+    "fail",
+  )
+}
+
+pipeline test_stale_release_branch_wrapper_unsafe(harness: Harness, task: any) {
+  // Unsafe: an open PR blocks deletion (no state transition needed).
+  const open_git = scripted_git(
+    [
+      entry("rev-parse --verify --quiet refs/heads/release/v1.2.3", command_result_ok("abc\n")),
+      entry(
+        "worktree list --porcelain",
+        command_result_ok("worktree /tmp/release-main\nbranch refs/heads/main\n"),
+      ),
+      entry("rev-parse --show-toplevel", command_result_ok("/tmp/release-main\n")),
+      entry("status --porcelain --untracked-files=normal", command_result_ok("")),
+      entry("rev-parse release/v1.2.3", command_result_ok("abc\n")),
+      entry(
+        "rev-parse --verify --quiet refs/remotes/origin/release/v1.2.3",
+        command_result_fail(1, ""),
+      ),
+      entry("rev-list --count origin/main..release/v1.2.3", command_result_ok("0\n")),
+    ],
+  )
+  const blocked = preflight_remediate_stale_release_branch(
+    harness.tools,
+    open_git,
+    { _b -> 1 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(blocked.action, "fail")
+  assert_eq(blocked.remediated, false)
+  // Unsafe: unique un-pushed commits block deletion.
+  const unique_git = scripted_git(
+    [
+      entry("rev-parse --verify --quiet refs/heads/release/v1.2.3", command_result_ok("abc\n")),
+      entry(
+        "worktree list --porcelain",
+        command_result_ok("worktree /tmp/release-main\nbranch refs/heads/main\n"),
+      ),
+      entry("rev-parse --show-toplevel", command_result_ok("/tmp/release-main\n")),
+      entry("status --porcelain --untracked-files=normal", command_result_ok("")),
+      entry("rev-parse release/v1.2.3", command_result_ok("abc\n")),
+      entry(
+        "rev-parse --verify --quiet refs/remotes/origin/release/v1.2.3",
+        command_result_fail(1, ""),
+      ),
+      entry("rev-list --count origin/main..release/v1.2.3", command_result_ok("2\n")),
+      entry("rev-list --count release/v1.2.3 --not --remotes=origin", command_result_ok("2\n")),
+    ],
+  )
+  assert_eq(
+    preflight_remediate_stale_release_branch(
+      harness.tools,
+      unique_git,
+      { _b -> 0 },
+      {version: "v1.2.3", base: "main"},
+    ).action,
+    "fail",
+  )
+  // Absent branch -> noop, no delete attempted.
+  const absent = preflight_remediate_stale_release_branch(
+    harness.tools,
+    scripted_git(
+      [entry("rev-parse --verify --quiet refs/heads/release/v9.9.9", command_result_fail(1, ""))],
+    ),
+    { _b -> 0 },
+    {version: "v9.9.9", base: "main"},
+  )
+  assert_eq(absent.action, "noop")
+}
+
+pipeline test_stale_release_branch_wrapper_refuses_dirty_owner_worktree(
+  harness: Harness,
+  task: any,
+) {
+  const owner = "/tmp/release-owner"
+  const dirty_owner = scripted_git(
+    [
+      entry("rev-parse --verify --quiet refs/heads/release/v1.2.3", command_result_ok("abc\n")),
+      entry("status --porcelain --untracked-files=normal", command_result_ok("")),
+      entry(
+        "rev-parse --verify --quiet refs/remotes/origin/release/v1.2.3",
+        command_result_fail(1, ""),
+      ),
+      entry("rev-list --count origin/main..release/v1.2.3", command_result_ok("0\n")),
+      entry(
+        "worktree list --porcelain",
+        command_result_ok(
+          "worktree /tmp/release-main\nbranch refs/heads/main\n\nworktree ${owner}\nbranch refs/heads/release/v1.2.3\n",
+        ),
+      ),
+      entry("rev-parse --show-toplevel", command_result_ok("/tmp/release-main\n")),
+      entry(
+        "-C ${owner} status --porcelain --untracked-files=normal",
+        command_result_ok(" M CHANGELOG.md\n"),
+      ),
+      entry("rev-parse release/v1.2.3", command_result_ok("abc\n")),
+    ],
+  )
+  // `resume_current_dirty` is what the canonical release path passes. It must
+  // never absorb a dirty tree that belongs to a *different* worktree.
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    dirty_owner,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main", resume_current_dirty: true},
+  )
+  assert_eq(result.action, "fail")
+  assert_eq(result.remediated, false)
+  assert_eq(result.resume_dirty_current ?? false, false)
+  assert_eq(contains(result.reason, "dirty worktree"), true)
+  assert_eq(contains(result.reason, owner), true)
+}
+
+pipeline test_base_behind_wrapper_unsafe(harness: Harness, task: any) {
+  // An explicit release pin is load-bearing: do not fetch, switch, or pull.
+  const pinned = scripted_git([])
+  const pinned_result = preflight_remediate_base_behind(
+    harness.tools,
+    pinned,
+    {base: "main", preserve_checkout: true},
+  )
+  assert_eq(pinned_result.action, "noop")
+  assert_eq(pinned_result.remediated, false)
+  assert_eq(pinned_result.verified, true)
+  assert_eq(contains(pinned_result.reason, "explicit release pin"), true)
+  // Up to date -> noop.
+  const uptodate = scripted_git(
+    [
+      entry("fetch origin --prune --quiet", command_result_ok("")),
+      entry("rev-list --count main..origin/main", command_result_ok("0\n")),
+    ],
+  )
+  assert_eq(preflight_remediate_base_behind(harness.tools, uptodate, {base: "main"}).action, "noop")
+  // Behind but dirty tree -> fail (never destructive).
+  const dirty = scripted_git(
+    [
+      entry("fetch origin --prune --quiet", command_result_ok("")),
+      entry("rev-list --count main..origin/main", command_result_ok("2\n")),
+      entry("rev-list --count origin/main..main", command_result_ok("0\n")),
+      entry("status --porcelain --untracked-files=normal", command_result_ok(" M file.rs\n")),
+    ],
+  )
+  assert_eq(preflight_remediate_base_behind(harness.tools, dirty, {base: "main"}).action, "fail")
+  // Diverged base -> fail before switching/pulling.
+  const diverged = scripted_git(
+    [
+      entry("fetch origin --prune --quiet", command_result_ok("")),
+      entry("rev-list --count main..origin/main", command_result_ok("2\n")),
+      entry("rev-list --count origin/main..main", command_result_ok("1\n")),
+      entry("status --porcelain --untracked-files=normal", command_result_ok("")),
+    ],
+  )
+  const diverged_result = preflight_remediate_base_behind(harness.tools, diverged, {base: "main"})
+  assert_eq(diverged_result.action, "fail")
+  assert_eq(contains(diverged_result.reason, "local commit"), true)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Dogfood: exercise the safe remediation end-to-end against real git fixtures.
+// -------------------------------------------------------------------------------------------------
+
+fn sh(process: HarnessProcess, cmd: any) {
+  const r = process.shell(cmd)
+  if !(r.success ?? false) {
+    throw "fixture command failed: ${cmd}\n${r.stderr ?? ""}"
+  }
+  return r
+}
+
+fn git_runner_for(process: HarnessProcess, repo: any) {
+  return { args ->
+    process.shell("git -C '" + repo + "' " + join(args.map({ a -> "'" + a + "'" }), " "))
+  }
+}
+
+fn configure_test_git_identity(process: HarnessProcess, repo: any) {
+  sh(process, "git -C '" + repo + "' config user.email t@example.com")
+  sh(process, "git -C '" + repo + "' config user.name test")
+  sh(process, "git -C '" + repo + "' config commit.gpgsign false")
+}
+
+fn setup_repo_with_origin(process: HarnessProcess) {
+  const root = trim(sh(process, "mktemp -d").stdout)
+  const origin = root + "/origin.git"
+  const work = root + "/work"
+  sh(process, "git init --bare -q '" + origin + "'")
+  sh(process, "git init -q '" + work + "'")
+  configure_test_git_identity(process, work)
+  sh(process, "git -C '" + work + "' checkout -q -b main")
+  sh(process, "printf 'a\\n' > '" + work + "/f.txt'")
+  sh(process, "git -C '" + work + "' add -A")
+  sh(process, "git -C '" + work + "' commit -q -m init")
+  sh(process, "git -C '" + work + "' remote add origin '" + origin + "'")
+  sh(process, "git -C '" + work + "' push -q -u origin main")
+  sh(process, "git --git-dir='" + origin + "' symbolic-ref HEAD refs/heads/main")
+  return {root: root, origin: origin, work: work}
+}
+
+fn advance_origin(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  repo: dict,
+  changes: list<string>,
+) {
+  const updater = repo.root + "/updater"
+  sh(harness.process, "git clone -q '" + repo.origin + "' '" + updater + "'")
+  configure_test_git_identity(harness.process, updater)
+  let revision = 0
+  for change in changes {
+    revision = revision + 1
+    harness.fs.write_text(
+      path_join(updater, "f.txt"),
+      harness.fs.read_text(path_join(updater, "f.txt")) + change + "\n",
+    )
+    sh(harness.process, "git -C '" + updater + "' commit -q -am remote-" + to_string(revision))
+  }
+  sh(harness.process, "git -C '" + updater + "' push -q origin main")
+}
+
+pipeline test_worktree_owner_parser_is_shared_across_release_paths(task: any) {
+  const output =
+    "worktree /tmp/main\nHEAD aaaaaaaa\nbranch refs/heads/main\n\nworktree /tmp/release owner\nHEAD bbbbbbbb\nbranch refs/heads/release/v1.2.3\n"
+  assert_eq(git_worktree_path_for_branch(output, "release/v1.2.3"), "/tmp/release owner")
+  assert_eq(git_worktree_path_for_branch(output, "missing"), "")
+}
+
+pipeline test_every_immutable_recovery_mode_reclaims_a_clean_branch_owner(task: any) {
+  assert_eq(
+    release_checkout_reclaims_immutable_owner(
+      {fixup_mode: true, pre_tag_resume: false, pre_tag_supersede: false},
+    ),
+    true,
+  )
+  assert_eq(
+    release_checkout_reclaims_immutable_owner(
+      {fixup_mode: false, pre_tag_resume: true, pre_tag_supersede: false},
+    ),
+    true,
+  )
+  assert_eq(
+    release_checkout_reclaims_immutable_owner(
+      {fixup_mode: false, pre_tag_resume: false, pre_tag_supersede: true},
+    ),
+    true,
+  )
+  assert_eq(
+    release_checkout_reclaims_immutable_owner(
+      {fixup_mode: false, pre_tag_resume: false, pre_tag_supersede: false},
+    ),
+    false,
+  )
+}
+
+// These dogfood cases each create repositories, remotes, and linked worktrees.
+// Their state is isolated, but concurrent Git process trees saturate one host's
+// filesystem and can hit the runner's safety timeout. Keep the deterministic
+// unit cases parallel and serialize only this I/O resource class.
+@serial(group: "git-worktree-dogfood")
+pipeline test_immutable_recovery_dogfood_detaches_exact_clean_owner(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/release-owner"
+  sh(
+    harness.process,
+    "git -C '" + repo.work + "' worktree add -q -b release/v1.2.3 '" + owner + "' main",
+  )
+  sh(harness.process, "printf 'candidate\\n' > '" + owner + "/candidate.txt'")
+  sh(harness.process, "git -C '" + owner + "' add -A")
+  sh(harness.process, "git -C '" + owner + "' commit -q -m candidate")
+  const git = git_runner_for(harness.process, repo.work)
+  const candidate = trim(git(["-C", owner, "rev-parse", "HEAD"]).stdout)
+  const result = reconcile_release_worktree_owner(
+    harness.tools,
+    git,
+    "release/v1.2.3",
+    candidate,
+    true,
+  )
+  assert_eq(result.success, true)
+  assert_eq(result.action, "detached")
+  assert_eq(trim(git(["-C", owner, "branch", "--show-current"]).stdout), "")
+  assert_eq(trim(git(["-C", owner, "rev-parse", "HEAD"]).stdout), candidate)
+  const listed = git(["worktree", "list", "--porcelain"])
+  assert_eq(git_worktree_path_for_branch(listed.stdout, "release/v1.2.3"), "")
+  assert_eq(trim(git(["rev-parse", "release/v1.2.3"]).stdout), candidate)
+  sh(harness.process, "git -C '" + repo.work + "' worktree remove '" + owner + "'")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_immutable_recovery_preserves_dirty_moved_and_non_recovery_owners(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/release-owner"
+  sh(
+    harness.process,
+    "git -C '" + repo.work + "' worktree add -q -b release/v1.2.3 '" + owner + "' main",
+  )
+  const git = git_runner_for(harness.process, repo.work)
+  const candidate = trim(git(["-C", owner, "rev-parse", "HEAD"]).stdout)
+  const disabled = reconcile_release_worktree_owner(
+    harness.tools,
+    git,
+    "release/v1.2.3",
+    candidate,
+    false,
+  )
+  assert_eq(disabled.action, "noop")
+  assert_eq(trim(git(["-C", owner, "branch", "--show-current"]).stdout), "release/v1.2.3")
+  const moved = reconcile_release_worktree_owner(
+    harness.tools,
+    git,
+    "release/v1.2.3",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    true,
+  )
+  assert_eq(moved.success, false)
+  assert(contains(moved.reason, "not proven immutable candidate"))
+  sh(harness.process, "printf 'dirty\\n' > '" + owner + "/dirty.txt'")
+  const dirty = reconcile_release_worktree_owner(
+    harness.tools,
+    git,
+    "release/v1.2.3",
+    candidate,
+    true,
+  )
+  assert_eq(dirty.success, false)
+  assert(contains(dirty.reason, "dirty worktree"))
+  assert_eq(trim(git(["-C", owner, "branch", "--show-current"]).stdout), "release/v1.2.3")
+  sh(harness.process, "rm -f '" + owner + "/dirty.txt'")
+  sh(harness.process, "git -C '" + repo.work + "' worktree remove '" + owner + "'")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  // Create a stale release branch at main with no extra commits, not pushed.
+  sh(harness.process, "git -C '" + repo.work + "' branch release/v1.2.3 main")
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q main")
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  // Branch is really gone.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_removes_clean_owner_worktree(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/release-owner"
+  sh(
+    harness.process,
+    "git -C '" + repo.work + "' worktree add -q -b release/v1.2.3 '" + owner + "' main",
+  )
+  // The stale branch is owned by another clean worktree; remediation can remove
+  // that holder and then delete the branch without losing local work.
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  assert_eq(harness.process.shell("test -d '" + owner + "'").success, false)
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_accepts_commit_on_immutable_origin_ref(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/release-owner"
+  sh(
+    harness.process,
+    "git -C '" + repo.work + "' worktree add -q -b release/v1.2.3 '" + owner + "' main",
+  )
+  sh(harness.process, "printf 'candidate\\n' >> '" + owner + "/f.txt'")
+  sh(harness.process, "git -C '" + owner + "' add f.txt")
+  sh(harness.process, "git -C '" + owner + "' commit -q -m candidate")
+  const oid = trim(sh(harness.process, "git -C '" + owner + "' rev-parse HEAD").stdout)
+  sh(
+    harness.process,
+    "git -C '" + owner + "' push -q origin HEAD:refs/heads/release-failed/v1.2.3/"
+      + oid
+      + "-abandoned",
+  )
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  assert_eq(
+    git(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "refs/remotes/origin/release-failed/v1.2.3/${oid}-abandoned",
+      ],
+    ).success,
+    true,
+  )
+  harness.fs.delete(repo.root)
+}
+
+/**
+ * The canonical release call always passes `resume_current_dirty`, which lets a
+ * dirty checkout of the release branch resume in place. A dirty tree owned by a
+ * *different* worktree is not that case and must still reach remediation.
+ */
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_detaches_authorized_dirty_failed_owner(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/release-owner"
+  sh(
+    harness.process,
+    "git -C '" + repo.work + "' worktree add -q -b release/v1.2.3 '" + owner + "' main",
+  )
+  sh(harness.process, "printf 'prepare\\n' >> '" + owner + "/f.txt'")
+  sh(harness.process, "printf 'generated\\n' > '" + owner + "/generated.txt'")
+  const git = git_runner_for(harness.process, repo.work)
+  const head = trim(git(["rev-parse", "release/v1.2.3"]).stdout)
+  const status_before = git(["-C", owner, "status", "--porcelain", "--untracked-files=normal"])
+    .stdout
+  const diff_before = git(["-C", owner, "diff", "--binary", "--no-ext-diff", "HEAD"]).stdout
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main", resume_current_dirty: true},
+    { workspace, branch ->
+      const authorization: FailedReleaseWorkspaceAuthorization = {
+        authorized: branch == "release/v1.2.3",
+        reason: "fixture failed before publication",
+        run_id: "fixture-run",
+        workspace: workspace,
+        branch: branch,
+        pin_sha: head,
+      }
+      return authorization
+    },
+  )
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert(ends_with(result.discarded?.preserved_workspace ?? "", "/release-owner"))
+  assert_eq(result.discarded?.recovery_run_id, "fixture-run")
+  assert_eq(result.discarded?.diff_preserved, true)
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  assert_eq(trim(git(["-C", owner, "branch", "--show-current"]).stdout), "")
+  assert_eq(
+    git(["-C", owner, "status", "--porcelain", "--untracked-files=normal"]).stdout,
+    status_before,
+  )
+  assert_eq(git(["-C", owner, "diff", "--binary", "--no-ext-diff", "HEAD"]).stdout, diff_before)
+  assert_eq(harness.fs.read_text(path_join(owner, "generated.txt")), "generated\n")
+  sh(harness.process, "git -C '" + repo.work + "' worktree remove --force '" + owner + "'")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_unique(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  // Release branch has a unique un-pushed commit -> refuse to delete.
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3 main")
+  sh(harness.process, "printf 'b\\n' > '" + repo.work + "/g.txt'")
+  sh(harness.process, "git -C '" + repo.work + "' add -A")
+  sh(harness.process, "git -C '" + repo.work + "' commit -q -m unique")
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q main")
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(result.action, "fail")
+  // Branch is preserved.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, true)
+  harness.fs.delete(repo.root)
+}
+
+fn setup_crashed_dirty_release_branch(process: HarnessProcess, repo: any) {
+  // A crashed prepare with distinct staged, unstaged, executable, binary, and
+  // symlink state. Detaching at the same commit must preserve every category.
+  sh(process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3 main")
+  sh(process, "printf 'staged\\n' >> '" + repo.work + "/f.txt'")
+  sh(process, "git -C '" + repo.work + "' add f.txt")
+  sh(process, "printf 'unstaged\\n' >> '" + repo.work + "/f.txt'")
+  sh(process, "chmod +x '" + repo.work + "/f.txt'")
+  sh(process, "printf '\\001\\002binary\\000' > '" + repo.work + "/generated.bin'")
+  sh(process, ": > '" + repo.work + "/generated-empty'")
+  sh(process, "chmod +x '" + repo.work + "/generated-empty'")
+  sh(process, "printf '#!/bin/sh\\nexit 0\\n' > '" + repo.work + "/generated-tool'")
+  sh(process, "chmod +x '" + repo.work + "/generated-tool'")
+  sh(process, "ln -s generated-tool '" + repo.work + "/generated-link'")
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_preserves_crashed_dirty(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  sh(harness.process, "printf 'sentinel\\n' > '" + repo.work + "/stash-sentinel.txt'")
+  sh(harness.process, "git -C '" + repo.work + "' stash push -q -u -m sentinel")
+  const stash_before = trim(
+    sh(harness.process, "git -C '" + repo.work + "' rev-parse refs/stash").stdout,
+  )
+  setup_crashed_dirty_release_branch(harness.process, repo)
+  const git = git_runner_for(harness.process, repo.work)
+  const head_before = trim(git(["rev-parse", "release/v1.2.3"]).stdout)
+  const status_before = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout
+  const index_before = git(["diff", "--cached", "--binary", "--no-ext-diff"]).stdout
+  const worktree_before = git(["diff", "--binary", "--no-ext-diff"]).stdout
+  const binary_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated.bin"],
+  ).stdout
+  const executable_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-tool"],
+  ).stdout
+  const symlink_before = git(
+    ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-link"],
+  ).stdout
+  // Triple gate satisfied (crashed_reclaim + no open PR + no unique commits):
+  // the dirty tree belongs to the dead run, so preserve and quarantine it.
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main", crashed_reclaim: true, resume_current_dirty: true},
+  )
+  assert_eq(result.action, "fail")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  assert(contains(result.reason, "rerun"))
+  // Forensic receipt names the branch, its head sha, and the dirty file count.
+  assert(result.discarded != nil)
+  assert_eq(result.discarded.branch, "release/v1.2.3")
+  assert_eq(result.discarded.head_sha, head_before)
+  assert(result.discarded.dirty_file_count >= 4)
+  assert(ends_with(result.discarded.preserved_workspace, "/work"))
+  assert_eq(result.discarded.diff_preserved, true)
+  // Branch is free, while the detached workspace retains every byte and mode.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, false)
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "")
+  assert_eq(git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout, status_before)
+  assert_eq(git(["diff", "--cached", "--binary", "--no-ext-diff"]).stdout, index_before)
+  assert_eq(git(["diff", "--binary", "--no-ext-diff"]).stdout, worktree_before)
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated.bin"])
+      .stdout,
+    binary_before,
+  )
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-tool"])
+      .stdout,
+    executable_before,
+  )
+  assert_eq(
+    git(["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", "generated-link"])
+      .stdout,
+    symlink_before,
+  )
+  assert_eq(trim(git(["rev-parse", "refs/stash"]).stdout), stash_before)
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_current_dirty_resumes_in_place(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  setup_crashed_dirty_release_branch(harness.process, repo)
+  const git = git_runner_for(harness.process, repo.work)
+  // Same dirty branch, but it is the current target checkout. This is not a
+  // stale branch deletion case, so preflight preserves it for prepare resume.
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main", resume_current_dirty: true},
+  )
+  assert_eq(result.action, "noop")
+  assert_eq(result.remediated, false)
+  assert_eq(result.discarded, nil)
+  // Branch preserved and the working tree is untouched.
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, true)
+  assert(trim(git(["status", "--porcelain", "--untracked-files=normal"]).stdout) != "")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_stale_release_branch_dogfood_non_current_dirty_without_reclaim_fails(
+  harness: Harness,
+  task: any,
+) {
+  const repo = setup_repo_with_origin(harness.process)
+  setup_crashed_dirty_release_branch(harness.process, repo)
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q main")
+  sh(harness.process, "printf 'unrelated\\n' >> '" + repo.work + "/f.txt'")
+  const git = git_runner_for(harness.process, repo.work)
+  // Dirty tree on a non-target checkout is still operator work, not a release
+  // resume surface. Preserve it by failing loud.
+  const result = preflight_remediate_stale_release_branch(
+    harness.tools,
+    git,
+    { _b -> 0 },
+    {version: "v1.2.3", base: "main"},
+  )
+  assert_eq(result.action, "fail")
+  assert_eq(result.remediated, false)
+  assert_eq(result.discarded, nil)
+  assert_eq(git(["rev-parse", "--verify", "--quiet", "refs/heads/release/v1.2.3"]).success, true)
+  assert(trim(git(["status", "--porcelain", "--untracked-files=normal"]).stdout) != "")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_base_behind_dogfood(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  // Advance origin independently, leaving local main safely behind without
+  // rewriting fixture history.
+  advance_origin({fs: harness.fs, process: harness.process}, repo, ["b", "c"])
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_base_behind(harness.tools, git, {base: "main"})
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  // Local main really caught up.
+  assert_eq(trim(git(["rev-list", "--count", "main..origin/main"]).stdout), "0")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_base_behind_dogfood_switches_to_base_before_pull(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  // Advance origin independently, then stand on a non-base release branch.
+  // The remediation must switch to main before pull; otherwise it fast-forwards
+  // the release branch and local main stays behind.
+  advance_origin({fs: harness.fs, process: harness.process}, repo, ["b"])
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3")
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_base_behind(harness.tools, git, {base: "main"})
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "main")
+  assert_eq(trim(git(["rev-list", "--count", "main..origin/main"]).stdout), "0")
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_base_behind_dogfood_fast_forwards_other_clean_worktree(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/main-owner"
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3")
+  sh(harness.process, "git -C '" + repo.work + "' worktree add -q '" + owner + "' main")
+  // Advance origin independently, leaving the clean main owner behind while
+  // release/v1.2.3 remains current in the primary checkout.
+  advance_origin({fs: harness.fs, process: harness.process}, repo, ["b"])
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_base_behind(harness.tools, git, {base: "main"})
+  assert_eq(result.action, "remediate")
+  assert_eq(result.remediated, true)
+  assert_eq(result.verified, true)
+  // The release checkout stays on its release branch, and the owning worktree
+  // cleanly receives the base fast-forward.
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "release/v1.2.3")
+  assert_eq(trim(git(["rev-list", "--count", "main..origin/main"]).stdout), "0")
+  assert_eq(
+    trim(
+      harness.process.shell("git -C '" + owner + "' status --porcelain --untracked-files=normal")
+        .stdout,
+    ),
+    "",
+  )
+  harness.fs.delete(repo.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_base_behind_dogfood_refuses_dirty_owner_worktree(harness: Harness, task: any) {
+  const repo = setup_repo_with_origin(harness.process)
+  const owner = repo.root + "/main-owner"
+  sh(harness.process, "git -C '" + repo.work + "' checkout -q -b release/v1.2.3")
+  sh(harness.process, "git -C '" + repo.work + "' worktree add -q '" + owner + "' main")
+  sh(harness.process, "printf 'local\\n' >> '" + owner + "/f.txt'")
+  // Advance origin independently so the owner worktree is both behind and dirty.
+  advance_origin({fs: harness.fs, process: harness.process}, repo, ["remote"])
+  const git = git_runner_for(harness.process, repo.work)
+  const result = preflight_remediate_base_behind(harness.tools, git, {base: "main"})
+  assert_eq(result.action, "fail")
+  assert_eq(contains(result.reason, "dirty worktree"), true)
+  assert_eq(trim(git(["rev-list", "--count", "main..origin/main"]).stdout), "1")
+  harness.fs.delete(repo.root)
+}

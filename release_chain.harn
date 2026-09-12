@@ -1,0 +1,226 @@
+#!/usr/bin/env harn
+// Inspect release-chain journals or resume an explicitly selected published tail.
+import { ParserSpec } from "std/cli/argparse"
+import { cli_options } from "lib/cli_options"
+import { fleet_scope_excluding, read_fleet_manifest } from "lib/fleet_manifest"
+import { fleet_scope_inputs } from "lib/fleet_operation_scope"
+import {
+  ReleaseChainDriverAdapter,
+  release_chain_drive,
+  release_chain_run_summary,
+} from "lib/release_chain_driver"
+import { ReleaseChainPlannedEffect } from "lib/release_chain_effect"
+import { ReleaseChainReceipt } from "lib/release_chain_state"
+import { release_chain_pending_controls, release_chain_replay } from "lib/release_chain_state"
+import { release_chain_reduce } from "lib/release_chain_transition"
+import {
+  PublishedTailAdapter,
+  PublishedTailRequest,
+  run_published_release_tail,
+} from "lib/release_published_tail"
+import {
+  published_tail_exit_code,
+  run_published_tail_entry,
+} from "lib/release_published_tail_entry"
+import { release_tail_recovery_read } from "lib/release_tail_recovery"
+import { release_watch_receipt_read } from "lib/release_watch_state"
+
+pub type ReleaseChainCliOptions = {
+  state_root: string,
+  chain_id: string,
+  resume_published: bool,
+  tag: string,
+  receipt: string,
+  repo: string,
+  yes_live_release: bool,
+  no_wait: bool,
+  reconcile_only: bool,
+  plan: bool,
+  repositories_json?: string,
+  skip_consumers?: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "release-chain",
+  args: [
+    {kind: "flag", name: "state_root", long: "--state-root", required: true},
+    {kind: "flag", name: "chain_id", long: "--chain-id", required: true},
+    {kind: "switch", name: "resume_published", long: "--resume-published"},
+    {kind: "flag", name: "tag", long: "--tag", default: ""},
+    {kind: "flag", name: "receipt", long: "--receipt", default: ""},
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "switch", name: "yes_live_release", long: "--yes-live-release"},
+    {kind: "switch", name: "no_wait", long: "--no-wait"},
+    {kind: "switch", name: "reconcile_only", long: "--reconcile-only"},
+    {kind: "switch", name: "plan", long: "--plan"},
+    {kind: "flag", name: "repositories_json", long: "--repositories-json"},
+    {kind: "flag", name: "skip_consumers", long: "--skip-consumers-json"},
+  ],
+}
+
+pub fn parse_release_chain_args(args: list<string>) -> ReleaseChainCliOptions {
+  const options = cli_options<ReleaseChainCliOptions>(
+    ARG_SPEC,
+    args,
+    schema_of(ReleaseChainCliOptions),
+  )
+  if options.resume_published && (trim(options.tag) == "" || trim(options.receipt) == "") {
+    throw "published release resumption requires --tag and --receipt"
+  }
+  if options.repositories_json != nil && options.skip_consumers != nil {
+    throw "repository selection and skip_consumers are mutually exclusive"
+  }
+  if !options.resume_published
+    && (options.tag != "" || options.receipt != "" || options.yes_live_release || options.no_wait
+      || options.reconcile_only) {
+    throw "published release inputs require --resume-published"
+  }
+  return options
+}
+
+/** Explicit immutable receipt selection shared by the CLI and its canonical regression. */
+pub fn published_request_from_cli(
+  fs: HarnessFs,
+  options: ReleaseChainCliOptions,
+) -> PublishedTailRequest {
+  if !options.resume_published || !options.yes_live_release {
+    throw "published tail writes require --resume-published and --yes-live-release"
+  }
+  const watch = release_watch_receipt_read(fs, options.receipt)
+  if watch == nil {
+    throw "published tail requires a valid v7 release watch receipt"
+  }
+  let request: PublishedTailRequest = {
+    tag: options.tag,
+    watch: watch,
+    chain_id: options.chain_id,
+    state_root: options.state_root,
+  }
+  if options.repositories_json != nil {
+    request.repositories_json = options.repositories_json
+  }
+  if options.skip_consumers != nil {
+    request.repositories_json = to_string(
+      fleet_scope_inputs(fleet_scope_excluding(read_fleet_manifest(fs), options.skip_consumers))
+        .repositories_json,
+    )
+  }
+  return request
+}
+
+pub fn run_published_chain_cli_with_adapter(
+  harness: Harness,
+  options: ReleaseChainCliOptions,
+  adapter: PublishedTailAdapter,
+) -> ReleaseChainReceipt {
+  return run_published_release_tail(
+    harness,
+    published_request_from_cli(harness.fs, options),
+    adapter,
+  )
+}
+
+fn main(harness: Harness) -> int {
+  const options = parse_release_chain_args(argv)
+  if options.resume_published {
+    const request = published_request_from_cli(harness.fs, options)
+    const receipt = run_published_tail_entry(
+      harness,
+      request,
+      {repo: options.repo, no_wait: options.no_wait, reconcile_only: options.reconcile_only},
+    )
+    // The supervisor's own durable receipt, not this process's memory of it.
+    const recovery = release_tail_recovery_read(harness.fs, request.state_root, request.tag)
+    harness.stdio.println(
+      json_stringify_pretty(
+        {
+          mode: if options.no_wait {
+            "handoff"
+          } else {
+            "published_tail"
+          },
+          receipt: receipt,
+          recovery: recovery,
+        },
+      ),
+    )
+    return published_tail_exit_code(
+      receipt,
+      options.no_wait,
+      recovery?.terminal_action == "dispatch_recovery",
+    )
+  }
+  const history = release_chain_replay(harness.fs, options.state_root, options.chain_id)
+  if len(history) == 0 {
+    throw "release chain has no durable receipt history"
+  }
+  const latest = history.find({ receipt -> receipt.revision == len(history) - 1 })
+  if latest == nil {
+    throw "release chain history has no latest revision"
+  }
+  const controls = release_chain_pending_controls(harness.fs, options.state_root, latest)
+  if options.plan {
+    // Read-only by construction. The driver is the only thing that applies an
+    // effect, and this adapter's door to one refuses, so a chain that needs a
+    // repair says so instead of taking it.
+    //
+    // The refusal is recorded before it is raised. A planner that only threw
+    // reported an exception where the useful answer is which effect the chain
+    // wanted, and an operator reading a stack trace cannot tell a plan that
+    // needed one repair from a plan that failed to run.
+    let refused: list<ReleaseChainPlannedEffect> = []
+    const planner: ReleaseChainDriverAdapter = {
+      observe: fn(_stage) { return nil },
+      apply_effect: fn(planned) {
+        refused = refused + [planned]
+        throw "planning is read-only; ${planned.kind} was not applied"
+      },
+      controls: fn(_cursor) { return controls },
+      now: fn() { return harness.clock.date_iso() },
+    }
+    const run = try {
+      release_chain_drive(latest, planner)
+    } catch (_error) {
+      nil
+    }
+    if run == nil {
+      // Never a silent no-op: the plan says exactly which effect it declined
+      // to take, and exits non-zero so nothing reads the refusal as a clean
+      // plan with nothing to do.
+      harness.stdio.eprintln(
+        json_stringify_pretty(
+          {
+            schema_version: "harn.release-chain.plan-refusal.v1",
+            chain_id: options.chain_id,
+            outcome: "refused",
+            reason: "planning is read-only; no effect was applied",
+            refused_effects: refused,
+          },
+        ),
+      )
+      for planned in refused {
+        harness.stdio.println("REFUSED ${planned.kind} on ${planned.target}: planning is read-only")
+      }
+      return 2
+    }
+    harness.stdio.println(release_chain_run_summary(unwrap(run)))
+    return if unwrap(run).outcome == "escalated" {
+      2
+    } else {
+      0
+    }
+  }
+  const decision = release_chain_reduce(latest, nil, controls)
+  harness.stdio.log(
+    json_stringify(
+      {
+        mode: "read_only",
+        dispatch_authority: false,
+        history_count: len(history),
+        receipt: latest,
+        decision: decision,
+      },
+    ),
+  )
+  return 0
+}

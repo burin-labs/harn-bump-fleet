@@ -1,0 +1,201 @@
+import { poll_until } from "std/poll"
+import { strip_v } from "std/semver"
+import { harn_pin_decision } from "./bump_decision"
+import { HarnPinProbe } from "./bump_pins"
+import { remote_pin, remote_pin_probe } from "./fleet_convergence"
+import { HarnUpdateSpec, harn_update_arm_decision } from "./fleet_manifest"
+import { github_connector_options } from "./github"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+import { load_pr_signature_metadata, unsigned_commits } from "./signed_bot_prs"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+pub type HarnUpdatePullRequest = {
+  number: int,
+  auto_merge_armed: bool,
+  head: {sha: string, ...rest},
+  ...rest,
+}
+
+pub type HarnUpdatePrerequisiteStatus = {
+  ready: bool,
+  total: int,
+  pending: list<string>,
+  detail: string,
+}
+
+/** How one dispatch attempt observes prerequisites before it may mutate a repository. */
+pub type UpdatePrerequisiteObservationPolicy = {kind: "snapshot"} \
+  | {kind: "bounded_wait", timeout_ms: int, interval_ms: int}
+
+pub type UpdatePrerequisiteProbe = fn() -> HarnUpdatePrerequisiteStatus
+
+pub fn update_remote_pin_probe(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  ref: string,
+) -> HarnPinProbe {
+  return remote_pin_probe(harness, update, ref)
+}
+
+pub fn update_remote_pin(harness: Harness, update: HarnUpdateSpec) -> string? {
+  return remote_pin(harness, update)
+}
+
+/** Arm only the exact observed, fully signed PR head allowed by the update contract. */
+pub fn ensure_update_auto_merge(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  pr: HarnUpdatePullRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> string {
+  if !update.auto_arm {
+    const withheld = harn_update_arm_decision(update, pr.head.sha, pr.auto_merge_armed)
+    return if withheld.action == "refuse" {
+      "failed: " + withheld.reason
+    } else {
+      withheld.reason
+    }
+  }
+  let signature_head: string? = nil
+  let unsigned_count = 0
+  if update.require_signed_head {
+    const metadata = try {
+      load_pr_signature_metadata(harness, update.repository, pr.number)
+    } catch (error) {
+      return "failed: signed head evidence unavailable: " + to_string(error)
+    }
+    signature_head = metadata.head_oid
+    unsigned_count = len(unsigned_commits(metadata))
+  }
+  const decision = harn_update_arm_decision(
+    update,
+    pr.head.sha,
+    pr.auto_merge_armed,
+    signature_head,
+    unsigned_count,
+  )
+  if decision.action == "refuse" {
+    return "failed: " + decision.reason
+  }
+  if decision.action != "arm" {
+    return decision.reason
+  }
+  const result = github_enable_auto_merge_with_release_lease(
+    harness,
+    update.repository,
+    pr.number,
+    pr.head.sha,
+    "squash",
+    options,
+  )
+  return if is_err(result) {
+    "failed: " + to_string(unwrap_err(result))
+  } else {
+    unwrap(result).state
+  }
+}
+
+pub fn update_prerequisite_status(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+) -> HarnUpdatePrerequisiteStatus {
+  let pending = []
+  for required in update.prerequisites {
+    const required_spec: HarnUpdateSpec = {
+      repository: required.repository,
+      base_branch: required.base_branch,
+      workflow_path: "",
+      workflow_name: "",
+      branch: "",
+      pin: required.pin,
+      repair_enabled: false,
+      auto_arm: false,
+      require_signed_head: true,
+      prerequisites: [],
+      max_releases_behind: 0,
+      adapter: {
+        repository_owned: false,
+        workflow_reference: "",
+        orchestration_sha: "",
+        refresh_command: "",
+        validation_command: "",
+        node_version: "",
+        publish_failure_for_repair: false,
+        apply_behavior_preserving_fixes: false,
+        enable_auto_merge: false,
+      },
+    }
+    const pin = remote_pin(harness, required_spec)
+    const decision = if pin == nil {
+      nil
+    } else {
+      harn_pin_decision(pin, strip_v(target))
+    }
+    if decision == nil || !decision.ok || !decision.satisfies_target {
+      pending = pending
+        + [
+          required.repository + "="
+            + if pin == nil {
+              "unreadable"
+            } else {
+              pin
+            },
+        ]
+    }
+  }
+  return {
+    ready: len(pending) == 0,
+    total: len(update.prerequisites),
+    pending: pending,
+    detail: if len(pending) == 0 {
+      "all ${len(update.prerequisites)} prerequisite update(s) are on ${target}"
+    } else {
+      "${len(pending)}/${len(update.prerequisites)} prerequisite update(s) pending: "
+        + join(pending, ", ")
+    },
+  }
+}
+
+/**
+ * Resolve prerequisite readiness under the caller's execution model.
+ *
+ * A durable controller snapshots once and lets its successor re-observe pending
+ * dependencies. An inline caller may instead wait within its declared bound.
+ */
+pub fn resolve_update_prerequisites(
+  clock: HarnessClock,
+  policy: UpdatePrerequisiteObservationPolicy,
+  probe: UpdatePrerequisiteProbe,
+) -> HarnUpdatePrerequisiteStatus {
+  if policy.kind == "snapshot" {
+    return probe()
+  }
+  const settled = poll_until(
+    clock,
+    fn() {
+      const status = probe()
+      return if status.ready {
+        status
+      } else {
+        nil
+      }
+    },
+    {timeout_ms: policy.timeout_ms, interval_ms: policy.interval_ms},
+  )
+  return settled ?? probe()
+}
+
+/** Observe exact prerequisite pins using one named dispatch policy. */
+pub fn observe_update_prerequisites(
+  harness: Harness,
+  update: HarnUpdateSpec,
+  target: string,
+  policy: UpdatePrerequisiteObservationPolicy,
+) -> HarnUpdatePrerequisiteStatus {
+  return resolve_update_prerequisites(
+    harness.clock,
+    policy,
+    fn() { return update_prerequisite_status(harness, update, target) },
+  )
+}

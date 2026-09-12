@@ -1,0 +1,377 @@
+#!/usr/bin/env harn
+import { help_requested } from "std/cli/argparse"
+import { env_str } from "std/config"
+import { cli_options } from "lib/cli_options"
+import { remote_mutation_slug_check } from "lib/git"
+import {
+  ReleaseAttemptAbandonAdapter,
+  ReleaseAttemptAbandonReceipt,
+  release_attempt_archive_claim,
+  run_release_attempt_abandon,
+  valid_release_version,
+} from "lib/release_attempt_abandon"
+import {
+  ReleaseLaneClaim,
+  claim_release_lane,
+  release_lane_report,
+  release_release_lane,
+} from "lib/release_lane_lock"
+import {
+  ReleaseOwnerConfig,
+  ReleaseOwnerGuard,
+  release_owner_guard_acquire,
+  release_owner_guard_finish,
+} from "lib/release_owner_guard"
+import { delete_remote_ref_with_lease } from "lib/release_ref_cleanup"
+import {
+  release_git_remote_refs,
+  release_github_pr_list,
+  release_github_release,
+  run_git,
+} from "lib/release_runtime"
+import { ensure_unrestricted_sandbox } from "lib/sandbox_preflight"
+
+pub type ReleaseAttemptAbandonCliOptions = {
+  repo: string,
+  slug: string,
+  version: string,
+  attempt_oid: string,
+  apply: bool,
+  yes_live_release: bool,
+  json: bool,
+}
+
+const ARG_SPEC = {
+  name: "abandon-release-attempts",
+  args: [
+    {kind: "flag", name: "repo", long: "--repo", default: ""},
+    {kind: "flag", name: "slug", long: "--slug", default: "burin-labs/harn"},
+    {kind: "flag", name: "version", long: "--version", default: ""},
+    {kind: "flag", name: "attempt_oid", long: "--attempt-oid", default: ""},
+    {kind: "switch", name: "apply", long: "--apply"},
+    {kind: "switch", name: "yes_live_release", long: "--yes-live-release"},
+    {kind: "switch", name: "json", long: "--json"},
+  ],
+}
+
+pub fn parse_release_attempt_abandon_args(args: list<string>) -> ReleaseAttemptAbandonCliOptions {
+  const parsed = cli_options<ReleaseAttemptAbandonCliOptions>(
+    ARG_SPEC,
+    args,
+    schema_of(ReleaseAttemptAbandonCliOptions),
+  )
+  if parsed.apply && !parsed.yes_live_release {
+    throw "--apply requires --yes-live-release"
+  }
+  if !valid_release_version(parsed.version) {
+    throw "--version must be X.Y.Z, got: " + trim(parsed.version)
+  }
+  if len(split(trim(parsed.slug), "/")) != 2 {
+    throw "--slug must be an owner/name repository"
+  }
+  if trim(parsed.attempt_oid) != ""
+    && len(regex_captures("^[0-9a-f]{40}$", lowercase(trim(parsed.attempt_oid)))) != 1 {
+    throw "--attempt-oid must be a full 40-character commit OID"
+  }
+  return parsed
+}
+
+/**
+ * Resolve what a tag actually points at. An annotated tag needs its peeled
+ * `^{}` line: the unpeeled line is the tag object, never the commit a
+ * candidate could match.
+ */
+pub fn tag_target_oid(tag: string, ls_remote_stdout: string) -> string {
+  let fallback = ""
+  for line in split(ls_remote_stdout, "\n") {
+    const captured = regex_captures("^([0-9a-f]{40})[[:space:]]+(.+)$", trim(line))
+    if len(captured) != 1 {
+      continue
+    }
+    const oid = lowercase(captured[0].groups[0])
+    const name = trim(captured[0].groups[1])
+    if name == "refs/tags/${tag}^{}" {
+      return oid
+    }
+    if name == "refs/tags/${tag}" {
+      fallback = oid
+    }
+  }
+  return fallback
+}
+
+fn default_adapter(harness: Harness, slug: string) -> ReleaseAttemptAbandonAdapter {
+  return {
+    now: fn() { return harness.clock.date_iso() },
+    attempt_refs: fn(repo, version) {
+      const observed = release_git_remote_refs(
+        harness.process,
+        {repo: repo, mock: false},
+        ["refs/heads/release-attempt/v${version}/*"],
+      )
+      if !observed.success {
+        throw "could not inventory release attempt refs: " + trim(observed.stderr)
+      }
+      return observed.refs
+    },
+    claim: fn(repo, version, _oid) {
+      const cfg = {repo: repo, mock: false}
+      const tag = "v${version}"
+      const tag_lookup = run_git(
+        {env: harness.env, process: harness.process},
+        cfg,
+        ["ls-remote", "--tags", "origin", "refs/tags/${tag}", "refs/tags/${tag}^{}"],
+      )
+      // A tag lookup that could not run at all must not read as "no tag".
+      if !tag_lookup.success {
+        throw "could not probe tag ${tag}: " + trim(tag_lookup.stderr)
+      }
+      const open = release_github_pr_list(
+        harness,
+        cfg,
+        {head: "release-attempt/v${version}/${_oid}", state: "open", limit: 10},
+      )
+      return {
+        tag_target_oid: tag_target_oid(tag, tag_lookup.stdout ?? ""),
+        release_exists: release_github_release(harness, cfg, tag).found ?? false,
+        open_pr: if len(open) > 0 {
+          open[0]?.url ?? ""
+        } else {
+          ""
+        },
+      }
+    },
+    // GitHub's create-ref endpoint is create-only. It is the expected-absent
+    // lease that `std/git::git_push` cannot currently express: contention is
+    // read back structurally, an exact existing archive is safe to adopt, and
+    // a different object is never overwritten.
+    archive_ref: fn(request) { return release_attempt_archive_claim(harness, slug, request) },
+    delete_ref: fn(repo, ref, oid) { return delete_remote_ref_with_lease(
+      harness.process,
+      repo,
+      ref,
+      oid,
+    ) },
+  }
+}
+
+fn usage() {
+  return """
+Usage:
+  harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53
+  harn run --no-sandbox abandon_release_attempts.harn -- --version 0.10.53 --attempt-oid <sha>
+  harn run --no-sandbox --approve-risky git.push abandon_release_attempts.harn -- --version 0.10.53 --apply --yes-live-release
+
+Frees a version wedged by leftover release attempts. Two or more refs under
+`release-attempt/vX.Y.Z/` make that version unreleasable: every recovery route
+resumes an existing frozen candidate and none mints a fresh one at current
+main, so no fix that landed after the candidate froze can ever reach a gate.
+
+Each unclaimed attempt is renamed into `release-failed/vX.Y.Z/<oid>-abandoned`,
+never deleted, so the commit stays on origin and stays inventoried by
+`sweep_release_refs.harn`. An attempt claimed by a tag, a published release, or
+an open PR is retained. Whole-version mode remains all-or-nothing.
+`--attempt-oid` instead selects one exact content-addressed attempt and
+preserves every sibling, which is safe when a live release PR claims the
+candidate to keep.
+
+The checkout's `origin` fetch URL and sole push URL must both resolve to the
+exact `--slug`. An unreadable, unparseable, multiple, or different origin
+refuses before either release lane or any ref mutation.
+
+Both modes hold the `release-owner` host lease for the whole run and refuse
+outright while a live release owns it. A release that has not tagged yet has
+none of the claims above, so its in-flight candidate would otherwise classify
+as an unclaimed orphan and be archived out from under it.
+
+The default is a dry run.
+
+Flags:
+  --repo PATH           Harn checkout (default ~/projects/harn).
+  --slug OWNER/REPO     Hosted repository (default burin-labs/harn).
+  --version X.Y.Z       Release version to free. Required.
+  --attempt-oid SHA     Retire only this exact attempt; retain every sibling.
+  --apply               Archive the planned attempts; default is dry-run.
+  --yes-live-release    Required with --apply.
+  --json                Print the complete machine-readable receipt.
+"""
+}
+
+pipeline main(harness: Harness) {
+  if help_requested(argv) {
+    harness.stdio.println(usage())
+    return 0
+  }
+  const sandbox_error = ensure_unrestricted_sandbox(
+    {stdio: harness.stdio, system: harness.system},
+    "abandon_release_attempts.harn",
+  )
+  if sandbox_error != nil {
+    return sandbox_error
+  }
+  const parsed = parse_release_attempt_abandon_args(argv)
+  const repo = if trim(parsed.repo) != "" {
+    parsed.repo
+  } else {
+    path_join(env_str(harness.env, "HOME") ?? "", "projects/harn")
+  }
+  // Every local ref observation and leased deletion below targets this checkout's
+  // origin, while the fleet lane, PR claims, and archive creation target `--slug`.
+  // Prove those are one repository before acquiring either lane or making any
+  // cross-machine mutation. Matching OIDs are not repository identity.
+  const fetch_origin = run_git(
+    {env: harness.env, process: harness.process},
+    {repo: repo, mock: false},
+    ["remote", "get-url", "origin"],
+  )
+  const push_origins = run_git(
+    {env: harness.env, process: harness.process},
+    {repo: repo, mock: false},
+    ["remote", "get-url", "--push", "--all", "origin"],
+  )
+  const repository_identity = remote_mutation_slug_check(
+    {
+      expected_slug: parsed.slug,
+      fetch_url: fetch_origin.stdout,
+      fetch_readable: fetch_origin.success,
+      push_urls: (push_origins.stdout ?? "").split("\n"),
+      push_readable: push_origins.success,
+    },
+  )
+  if !repository_identity.ok {
+    harness.stdio.println("== release attempt abandon: refused")
+    harness.stdio.println("   repo : ${repo}")
+    harness.stdio.println("   slug : ${parsed.slug}")
+    harness.stdio.println("   ${repository_identity.detail}")
+    return 2
+  }
+  // Take the same lane a live release takes. `release-attempt/vX.Y.Z/` refs are
+  // shared mutable state: a release in flight for this version is still
+  // pushing candidates, and none of the terminal claims this harness checks —
+  // tag, published release, open PR — exists yet during that window. Without
+  // the lease an in-flight candidate reads as an unclaimed orphan, and
+  // archiving it deletes the attempt ref of a release that is mid-cut.
+  const owner_cfg: ReleaseOwnerConfig = {
+    mode: "abandon",
+    yes_live_release: parsed.yes_live_release,
+    repo: repo,
+    base: "main",
+  }
+  let owner_guard: ReleaseOwnerGuard? = nil
+  let owner_error = ""
+  try {
+    owner_guard = release_owner_guard_acquire(
+      harness.host_lease,
+      owner_cfg,
+      {next_version: parsed.version},
+      harness.random.uuid_v7(),
+    )
+  } catch (e) {
+    owner_error = to_string(e)
+  }
+  if owner_guard == nil {
+    harness.stdio.println("== release attempt abandon: refused")
+    harness.stdio.println("   version : v${parsed.version}")
+    harness.stdio.println("   ${owner_error}")
+    harness.stdio.println(
+      "   that release is still pushing candidates for this version, so no attempt ref"
+        + " can be classified yet; retry once the lane is free",
+    )
+    return 2
+  }
+  const lane = owner_guard
+  harness.stdio.println(
+    "   lane : ${lane.handle.domain} (${lane.decision.action}) held for the whole run",
+  )
+  // The host lease answers for this machine only. A release on another machine
+  // holds no attempt ref, no tag, and no PR until it has already built — which
+  // is the whole window this harness is most likely to run in, and the window
+  // where its plan is most likely to be wrong. Only `--apply` claims: a dry run
+  // that published a ref into the release repository would be a side effect it
+  // promises not to have.
+  let fleet_lane: ReleaseLaneClaim? = nil
+  if parsed.apply {
+    fleet_lane = claim_release_lane(
+      harness,
+      {
+        slug: parsed.slug,
+        base_branch: "main",
+        version: parsed.version,
+        holder: {
+          run_id: lane.record.run_id,
+          host: lane.record.host,
+          mode: "abandon",
+          started_at: harness.clock.date_iso(),
+        },
+        now: harness.clock.date_iso(),
+      },
+    )
+    for line in release_lane_report(fleet_lane) {
+      harness.stdio.println(line)
+    }
+    if fleet_lane.state == "held" {
+      harness.stdio.println("== release attempt abandon: refused")
+      harness.stdio.println(
+        "   another machine is releasing v${parsed.version}; its candidate is in flight and"
+          + " would read here as an unclaimed orphan",
+      )
+      release_owner_guard_finish(harness.host_lease, lane, "fleet_lane_held", false)
+      return 2
+    }
+  }
+  let result: ReleaseAttemptAbandonReceipt? = nil
+  let failure = ""
+  try {
+    result = run_release_attempt_abandon(
+      default_adapter(harness, parsed.slug),
+      {
+        repo: repo,
+        slug: parsed.slug,
+        version: parsed.version,
+        selected_attempt_oid: parsed.attempt_oid,
+        mode: if parsed.apply {
+          "apply"
+        } else {
+          "dry_run"
+        },
+      },
+    )
+  } catch (e) {
+    failure = to_string(e)
+  }
+  // Freeing the version means freeing the lane too, whether this run claimed it
+  // or inherited an abandoned one. Leaving it behind would have the next
+  // release report contention against a run that no longer exists.
+  if fleet_lane != nil && fleet_lane.oid != "" {
+    release_release_lane(harness, parsed.slug, parsed.version, fleet_lane.oid)
+  }
+  release_owner_guard_finish(
+    harness.host_lease,
+    lane,
+    if failure == "" {
+      "ok"
+    } else {
+      "exception"
+    },
+    failure == "",
+  )
+  if result == nil {
+    throw failure
+  }
+  if parsed.json {
+    harness.stdio.println(json_stringify(result))
+  } else {
+    harness.stdio.println("== release attempt abandon: ${result.state}")
+    harness.stdio.println("   version : v${result.version}")
+    harness.stdio.println("   attempts: ${len(result.attempts)}")
+    harness.stdio.println("   ${result.message}")
+    for entry in result.attempts {
+      harness.stdio.println("   ${entry.outcome} ${entry.source_ref}: ${entry.message}")
+    }
+  }
+  return if result.state == "blocked" || result.state == "failed" {
+    2
+  } else {
+    0
+  }
+}

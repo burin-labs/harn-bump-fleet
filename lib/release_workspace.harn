@@ -1,0 +1,886 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { recorded_step } from "./release_execution"
+import {
+  ReleaseAnalysisSnapshot,
+  ReleaseCommandResult,
+  ReleaseConfig,
+  checked_git,
+  release_log_event,
+  run_git,
+} from "./release_runtime"
+
+pub type ReleaseWorkspaceGitRunner = fn(list<string>) -> ReleaseCommandResult
+
+pub type ReleaseWorkspaceFingerprint = {
+  ok: bool,
+  reason: string,
+  head: string,
+  branch: string,
+  status: string,
+  index_diff: string,
+  worktree_diff: string,
+  untracked: list<{path: string, binary_diff: string}>,
+}
+
+pub type PreserveReleaseWorkspaceResult = {
+  success: bool,
+  reason: string,
+  path: string,
+  head: string,
+  fingerprint_preserved: bool,
+}
+
+fn prefixed_git_args(prefix: list<string>, args: list<string>) -> list<string> {
+  return prefix + args
+}
+
+/** Capture every Git-visible byte and mode needed to prove a dirty tree survived. */
+pub fn release_workspace_fingerprint(
+  git_runner: ReleaseWorkspaceGitRunner,
+  prefix: list<string> = [],
+) -> ReleaseWorkspaceFingerprint {
+  const head = git_runner(prefixed_git_args(prefix, ["rev-parse", "HEAD"]))
+  const branch = git_runner(prefixed_git_args(prefix, ["branch", "--show-current"]))
+  const status = git_runner(
+    prefixed_git_args(prefix, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+  )
+  const index_diff = git_runner(
+    prefixed_git_args(prefix, ["diff", "--cached", "--binary", "--no-ext-diff"]),
+  )
+  const worktree_diff = git_runner(prefixed_git_args(prefix, ["diff", "--binary", "--no-ext-diff"]))
+  const untracked_paths = git_runner(
+    prefixed_git_args(prefix, ["ls-files", "--others", "--exclude-standard", "-z"]),
+  )
+  if !(head.success ?? false)
+    || !(branch.success ?? false)
+    || !(status.success ?? false)
+    || !(index_diff.success ?? false)
+    || !(worktree_diff.success ?? false)
+    || !(untracked_paths.success ?? false) {
+    return {
+      ok: false,
+      reason: "could not fingerprint release workspace",
+      head: "",
+      branch: "",
+      status: "",
+      index_diff: "",
+      worktree_diff: "",
+      untracked: [],
+    }
+  }
+  let untracked = []
+  const paths = split(untracked_paths.stdout ?? "", "\0").filter({ path -> path != "" }).to_list()
+  for path in paths {
+    // `--no-index` renders a new-file patch with the blob bytes and Git mode:
+    // 100644, 100755, or 120000 for a symlink. Exit 1 means files differ.
+    const diff = git_runner(
+      prefixed_git_args(
+        prefix,
+        ["diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", path],
+      ),
+    )
+    // Do not let an absent process measurement collapse into the expected
+    // `git diff` mismatch. A measured exit 1 is the only valid result.
+    if diff.exit_code == nil || diff.exit_code != 1 {
+      return {
+        ok: false,
+        reason: "could not fingerprint untracked release file ${path}",
+        head: "",
+        branch: "",
+        status: "",
+        index_diff: "",
+        worktree_diff: "",
+        untracked: [],
+      }
+    }
+    untracked = untracked + [{path: path, binary_diff: diff.stdout ?? ""}]
+  }
+  return {
+    ok: true,
+    reason: "release workspace fingerprint captured",
+    head: trim(head.stdout ?? ""),
+    branch: trim(branch.stdout ?? ""),
+    status: status.stdout ?? "",
+    index_diff: index_diff.stdout ?? "",
+    worktree_diff: worktree_diff.stdout ?? "",
+    untracked: untracked,
+  }
+}
+
+pub fn release_workspace_fingerprint_equal(
+  before: ReleaseWorkspaceFingerprint,
+  after: ReleaseWorkspaceFingerprint,
+) -> bool {
+  return before.ok && after.ok && before.head == after.head
+    && before.status
+      == after.status
+    && before.index_diff
+      == after.index_diff
+    && before.worktree_diff
+      == after.worktree_diff
+    && before.untracked
+      == after.untracked
+}
+
+/** Free a branch while retaining its failed workspace byte-for-byte in place. */
+pub fn preserve_failed_release_workspace(
+  git_runner: ReleaseWorkspaceGitRunner,
+  path: string,
+  expected_head: string,
+) -> PreserveReleaseWorkspaceResult {
+  const prefix = ["-C", path]
+  const before = release_workspace_fingerprint(git_runner, prefix)
+  if !before.ok || lowercase(before.head) != lowercase(trim(expected_head)) {
+    return {
+      success: false,
+      reason: "could not prove failed release workspace ${path} at ${expected_head}",
+      path: path,
+      head: before.head,
+      fingerprint_preserved: false,
+    }
+  }
+  const detached = git_runner(prefixed_git_args(prefix, ["switch", "--detach", before.head]))
+  const after = release_workspace_fingerprint(git_runner, prefix)
+  if !(detached.success ?? false)
+    || after.branch
+      != ""
+    || !release_workspace_fingerprint_equal(before, after) {
+    return {
+      success: false,
+      reason: "failed to detach ${before.head} while preserving failed workspace ${path}",
+      path: path,
+      head: before.head,
+      fingerprint_preserved: false,
+    }
+  }
+  return {
+    success: true,
+    reason: "preserved failed release workspace byte-for-byte at ${path}",
+    path: path,
+    head: before.head,
+    fingerprint_preserved: true,
+  }
+}
+
+pub type ReleaseSourceSnapshot = {
+  branch: string,
+  head: string,
+  status: string,
+  index_diff: string,
+  worktree_diff: string,
+}
+
+pub type ReleaseWorkspaceCleanup = {
+  success: bool,
+  skipped: bool,
+  branch: string,
+  detail: string,
+  warning: string,
+  fatal: bool,
+  steps: list<dict>,
+  path: string,
+  preserved: bool,
+  retained: bool,
+}
+
+/**
+ * Keep post-run repo tools on a checkout that still exists after cleanup.
+ *
+ * The audit receipt retains the execution config and cleanup record. Only the
+ * config passed to post-run tools is projected onto the durable source repo
+ * after this harness has proven that it removed the managed worktree.
+ */
+pub fn release_post_cleanup_config(
+  cfg: ReleaseConfig,
+  cleanup: ReleaseWorkspaceCleanup?,
+) -> ReleaseConfig {
+  if !(cfg.release_workspace_managed ?? false)
+    || cleanup == nil
+    || !cleanup.success
+    || cleanup.preserved {
+    return cfg
+  }
+  if cleanup.path != cfg.release_workspace {
+    throw "successful release cleanup path does not match the managed workspace"
+  }
+  // Removal is one proof the managed worktree holds nothing this run still
+  // owns. A retained shared workspace carries the other: verified clean and
+  // detached at the shipped commit, waiting for the next release to switch it.
+  if trim(cfg.source_repo) == "" {
+    throw "successful managed release cleanup is missing a durable source repo"
+  }
+  let out = cfg
+  out["repo"] = cfg.source_repo
+  return out
+}
+
+pub fn release_workspace_required(cfg: dict) -> bool {
+  return !(cfg.mock ?? false)
+}
+
+/**
+ * Return the closed identity consumed by release analysis.
+ *
+ * Non-mock analysis is invalid until the exact resolved commit has been
+ * materialized in a detached managed worktree. This runtime assertion keeps a
+ * future caller from silently feeding analysis the operator's mutable checkout.
+ */
+pub fn release_analysis_snapshot(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseConfig,
+) -> ReleaseAnalysisSnapshot {
+  let snapshot = cfg.analysis_snapshot
+  if cfg.mock {
+    if snapshot.kind != "mock"
+      || snapshot.resolved_sha
+        != cfg.pin_sha
+      || snapshot.analysis_root
+        != cfg.repo {
+      throw "mock release analysis is missing its resolved snapshot identity"
+    }
+    snapshot["analysis_head"] = cfg.pin_sha
+    return snapshot
+  }
+  if snapshot.kind != "detached_worktree"
+    || !(cfg.release_workspace_managed ?? false)
+    || snapshot.analysis_root
+      != cfg.repo
+    || snapshot.analysis_root
+      != cfg.release_workspace
+    || snapshot.source_repo
+      != cfg.source_repo {
+    throw "release analysis requires one detached worktree at the resolved pin"
+  }
+  const expected_head = if cfg.pre_tag_resume ?? false {
+    trim(cfg.fixup_publication?.head_oid ?? "")
+  } else {
+    cfg.pin_sha
+  }
+  const analysis_head = checked_git(harness, cfg, ["rev-parse", "HEAD"])
+  if expected_head == ""
+    || lowercase(analysis_head)
+      != lowercase(expected_head)
+    || (!(cfg.pre_tag_resume ?? false)
+      && lowercase(snapshot.resolved_sha)
+        != lowercase(cfg.pin_sha)) {
+    throw "release analysis worktree does not match its immutable snapshot identity"
+  }
+  snapshot["analysis_head"] = analysis_head
+  return snapshot
+}
+
+fn source_cfg(cfg: dict, repo: string) -> dict {
+  return cfg + {repo: repo, mock: false}
+}
+
+fn source_snapshot(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  repo: string,
+) -> ReleaseSourceSnapshot {
+  const scoped = source_cfg(cfg, repo)
+  return {
+    branch: checked_git(harness, scoped, ["branch", "--show-current"]),
+    head: checked_git(harness, scoped, ["rev-parse", "HEAD"]),
+    status: checked_git(harness, scoped, ["status", "--porcelain", "--untracked-files=normal"]),
+    index_diff: checked_git(harness, scoped, ["diff", "--cached", "--binary", "--no-ext-diff"]),
+    worktree_diff: checked_git(harness, scoped, ["diff", "--binary", "--no-ext-diff"]),
+  }
+}
+
+fn assert_source_unchanged(
+  before: ReleaseSourceSnapshot,
+  after: ReleaseSourceSnapshot,
+  workspace: string,
+) -> nil {
+  if before.branch != after.branch
+    || before.head
+      != after.head
+    || before.status
+      != after.status
+    || before.index_diff
+      != after.index_diff
+    || before.worktree_diff
+      != after.worktree_diff {
+    throw "release workspace creation observed a concurrent change in the source checkout; refusing to continue\n"
+      + "source: branch ${before.branch} -> ${after.branch}, HEAD ${before.head} -> ${after.head}; local diff content omitted\n"
+      + "isolated workspace preserved at ${workspace}"
+  }
+}
+
+/**
+ * Where one release materializes its checkout.
+ *
+ * A run that owns the release lane gets the shared path, which every such run
+ * reuses. Cargo fingerprints a source file by mtime, so a worktree recreated at
+ * any path — stable or not — presents every file as newer than the artifacts
+ * built from it and recompiles the whole workspace. Only switching a surviving
+ * checkout to the new pin leaves untouched files untouched, which is what makes
+ * the shared release target directory worth anything.
+ *
+ * A run without the lane gets a per-run path. Reuse needs exclusivity, and the
+ * `release-owner` lease is where this repo already proves it; a second locking
+ * scheme beside it would be a parallel system with no additional authority.
+ */
+fn release_workspace_path(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_repo: string,
+  run_id: string,
+  shared: bool,
+) -> string {
+  if len(regex_captures("^[A-Za-z0-9][A-Za-z0-9._-]*$", run_id)) == 0 {
+    throw "invalid release run id for workspace path: " + run_id
+  }
+  const common_dir = checked_git(
+    harness,
+    source_cfg(cfg, source_repo),
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+  )
+  if basename(common_dir) != ".git" {
+    throw "release source does not resolve to a non-bare Git checkout: " + source_repo
+  }
+  const primary_checkout = dirname(common_dir)
+  return path_join(
+    dirname(primary_checkout),
+    basename(primary_checkout) + "-release-workspaces",
+    if shared {
+      "release"
+    } else {
+      "release-" + run_id
+    },
+  )
+}
+
+/**
+ * Take over a surviving shared workspace by switching it to this run's pin.
+ *
+ * Reuse is the only path that preserves Cargo's fingerprints, so it is also the
+ * only path that can carry a previous run's state into this one. Every
+ * condition here is a reason the surviving tree cannot be trusted as a clean
+ * checkout of the pin; failing any of them is not an error, it just means this
+ * run materializes fresh instead.
+ */
+fn reuse_shared_release_workspace(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_repo: string,
+  workspace: string,
+) -> bool {
+  const registered = run_git(
+    harness,
+    source_cfg(cfg, source_repo),
+    ["worktree", "list", "--porcelain"],
+  )
+  if !registered.success || !contains(registered.stdout ?? "", "worktree " + workspace + "\n") {
+    return false
+  }
+  const workspace_cfg = source_cfg(cfg, workspace)
+  const status = run_git(
+    harness,
+    workspace_cfg,
+    ["status", "--porcelain", "--untracked-files=normal"],
+  )
+  if !status.success || trim(status.stdout ?? "") != "" {
+    return false
+  }
+  const switched = run_git(harness, workspace_cfg, ["switch", "--detach", cfg.pin_sha])
+  if !switched.success {
+    return false
+  }
+  const head = checked_git(harness, workspace_cfg, ["rev-parse", "HEAD"])
+  const branch = checked_git(harness, workspace_cfg, ["branch", "--show-current"])
+  return lowercase(head) == lowercase(cfg.pin_sha) && branch == ""
+}
+
+/**
+ * Move a shared workspace this run cannot reuse out of the way.
+ *
+ * Whatever is there was left by a previous release and may be the only copy of
+ * its recovery state, so it is never removed — only renamed, and reported.
+ */
+fn displace_shared_release_workspace(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: dict,
+  source_repo: string,
+  workspace: string,
+  run_id: string,
+) -> string {
+  const displaced = workspace + "-superseded-" + run_id
+  const moved = run_git(
+    harness,
+    source_cfg(cfg, source_repo),
+    ["worktree", "move", workspace, displaced],
+  )
+  if !moved.success {
+    throw "refusing to reuse a shared release workspace that cannot be moved aside: ${workspace}\n"
+      + trim(moved.stderr)
+  }
+  return displaced
+}
+
+/**
+ * Materialize a live release at its frozen pin without changing the checkout
+ * supplied by the operator. Every downstream release adapter receives the
+ * returned config, whose `repo` is the disposable worktree.
+ */
+pub fn materialize_release_workspace(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+  owns_release_lane: bool = false,
+) -> ReleaseConfig {
+  if cfg.mock {
+    let mock_cfg = cfg
+    mock_cfg["analysis_snapshot"] = {
+      kind: "mock",
+      requested_sha: cfg.pin_sha_input,
+      resolved_sha: cfg.pin_sha,
+      analysis_head: cfg.pin_sha,
+      analysis_root: cfg.repo,
+      source_repo: cfg.repo,
+    }
+    return mock_cfg
+  }
+  if cfg.release_workspace_managed ?? false {
+    release_analysis_snapshot({env: harness.env, process: harness.process}, cfg)
+    return cfg
+  }
+  const source_repo = checked_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["rev-parse", "--show-toplevel"],
+  )
+  const before = source_snapshot({env: harness.env, process: harness.process}, cfg, source_repo)
+  const workspace = release_workspace_path(
+    {env: harness.env, process: harness.process},
+    cfg,
+    source_repo,
+    run_id,
+    owns_release_lane,
+  )
+  let reused = false
+  let displaced = ""
+  if harness.fs.exists(workspace) {
+    if !owns_release_lane {
+      throw "release workspace already exists: " + workspace
+    }
+    reused = reuse_shared_release_workspace(
+      {env: harness.env, process: harness.process},
+      cfg,
+      source_repo,
+      workspace,
+    )
+    if !reused {
+      displaced = displace_shared_release_workspace(
+        {env: harness.env, process: harness.process},
+        cfg,
+        source_repo,
+        workspace,
+        run_id,
+      )
+    }
+  }
+  if !reused {
+    const workspace_parent = dirname(workspace)
+    if !harness.fs.exists(workspace_parent) {
+      harness.fs.mkdir(workspace_parent, true)
+    }
+    const added = run_git(
+      {env: harness.env, process: harness.process},
+      source_cfg(cfg, source_repo),
+      ["worktree", "add", "--detach", workspace, cfg.pin_sha],
+    )
+    if !added.success {
+      throw "failed to create isolated release workspace at ${workspace}:\n${trim(added.stderr)}"
+    }
+  }
+  try {
+    const after = source_snapshot({env: harness.env, process: harness.process}, cfg, source_repo)
+    assert_source_unchanged(before, after, workspace)
+    const workspace_cfg = source_cfg(cfg, workspace)
+    const workspace_head = checked_git(
+      {env: harness.env, process: harness.process},
+      workspace_cfg,
+      ["rev-parse", "HEAD"],
+    )
+    const workspace_branch = checked_git(
+      {env: harness.env, process: harness.process},
+      workspace_cfg,
+      ["branch", "--show-current"],
+    )
+    if lowercase(workspace_head) != lowercase(cfg.pin_sha) || workspace_branch != "" {
+      throw "isolated release workspace did not materialize detached at frozen pin ${cfg.pin_sha}: ${workspace}"
+    }
+    let out = cfg
+    out["source_repo"] = source_repo
+    out["repo"] = workspace
+    out["release_workspace"] = workspace
+    out["release_workspace_managed"] = true
+    out["release_workspace_shared"] = owns_release_lane
+    out["analysis_snapshot"] = {
+      kind: "detached_worktree",
+      requested_sha: cfg.pin_sha_input,
+      resolved_sha: cfg.pin_sha,
+      analysis_head: cfg.pin_sha,
+      analysis_root: workspace,
+      source_repo: source_repo,
+    }
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_workspace_created",
+      {
+        source_repo: source_repo,
+        workspace: workspace,
+        pin_sha: cfg.pin_sha,
+        source_branch: before.branch,
+        source_head: before.head,
+        source_dirty: trim(before.status) != "",
+        cargo_target_dir: cfg.release_cargo_target_dir,
+        shared: owns_release_lane,
+        reused: reused,
+        superseded_workspace: displaced,
+      },
+    )
+    return out
+  } catch (e) {
+    // A reused workspace was already clean and detached before this run touched
+    // it, so there is nothing partial to unwind and removing it would discard
+    // the compiled state that reuse exists to keep.
+    if reused {
+      throw e
+    }
+    const removed = run_git(
+      {env: harness.env, process: harness.process},
+      source_cfg(cfg, source_repo),
+      ["worktree", "remove", "--force", workspace],
+    )
+    if !removed.success || harness.fs.exists(workspace) {
+      throw to_string(e)
+        + "\nfailed to remove partially materialized release workspace ${workspace}: "
+        + trim(removed.stderr)
+    }
+    throw e
+  }
+}
+
+/** Candidate certification warms and audits the immutable attempt at HEAD. */
+pub fn align_pre_tag_release_workspace(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+) -> nil {
+  if !(cfg.pre_tag_resume ?? false) || !(cfg.release_workspace_managed ?? false) {
+    return
+  }
+  const candidate = trim(cfg.fixup_publication?.head_oid ?? "")
+  if len(regex_captures("^[0-9a-fA-F]{40}$", candidate)) == 0 {
+    throw "pre-tag resume is missing a concrete immutable candidate OID"
+  }
+  const status = checked_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["status", "--porcelain", "--untracked-files=normal"],
+  )
+  if trim(status) != "" {
+    throw "refusing to align a dirty release workspace to immutable candidate ${candidate}: ${cfg.repo}"
+  }
+  const switched = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["switch", "--detach", candidate],
+  )
+  if !switched.success {
+    throw "failed to align pre-tag release workspace to ${candidate}:\n${trim(switched.stderr)}"
+  }
+  const head = checked_git({env: harness.env, process: harness.process}, cfg, ["rev-parse", "HEAD"])
+  if lowercase(head) != lowercase(candidate) {
+    throw "pre-tag release workspace resolved to ${head}, expected ${candidate}"
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_workspace_aligned_to_candidate",
+    {workspace: cfg.repo, candidate_oid: candidate, pin_sha: cfg.pin_sha},
+  )
+}
+
+fn preservation_cleanup(
+  cfg: ReleaseConfig,
+  branch: string,
+  detail: string,
+  step: dict,
+) -> ReleaseWorkspaceCleanup {
+  return {
+    success: true,
+    skipped: true,
+    branch: branch,
+    detail: detail,
+    warning: "",
+    fatal: false,
+    steps: [step],
+    path: cfg.release_workspace,
+    preserved: true,
+    retained: false,
+  }
+}
+
+fn assert_release_workspace_target(
+  harness: {env: HarnessEnv, process: HarnessProcess},
+  cfg: ReleaseConfig,
+  run_id: string,
+) -> nil {
+  const workspace = cfg.release_workspace
+  if trim(cfg.source_repo) == "" || cfg.repo != workspace {
+    throw "managed release workspace identity is incomplete"
+  }
+  const shared = cfg.release_workspace_shared ?? false
+  const expected = release_workspace_path(harness, cfg, cfg.source_repo, run_id, shared)
+  if workspace != expected {
+    throw "refusing to remove a release workspace not owned by run ${run_id}: ${workspace}"
+  }
+  return nil
+}
+
+fn removal_cleanup(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+  branch: string,
+  force: bool,
+) -> ReleaseWorkspaceCleanup {
+  assert_release_workspace_target({env: harness.env, process: harness.process}, cfg, run_id)
+  const workspace = cfg.release_workspace
+  if !harness.fs.exists(workspace) {
+    const detail = "isolated release workspace already removed: ${workspace}"
+    const cleanup: ReleaseWorkspaceCleanup = {
+      success: true,
+      skipped: true,
+      branch: branch,
+      detail: detail,
+      warning: "",
+      fatal: false,
+      steps: [
+        recorded_step(
+          "release-workspace-already-removed",
+          "verify absent " + workspace,
+          command_result_ok(detail),
+        ),
+      ],
+      path: workspace,
+      preserved: false,
+      retained: false,
+    }
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_workspace_already_removed",
+      cleanup,
+    )
+    return cleanup
+  }
+  const remove_args = ["worktree", "remove"]
+    + if force {
+      ["--force"]
+    } else {
+      []
+    }
+    + [workspace]
+  const removed = run_git(
+    {env: harness.env, process: harness.process},
+    source_cfg(cfg, cfg.source_repo),
+    remove_args,
+  )
+  const removed_cleanly = removed.success && !harness.fs.exists(workspace)
+  const detail = if removed_cleanly {
+    "removed isolated release workspace ${workspace}"
+  } else {
+    "failed to remove isolated release workspace; preserved for recovery: ${workspace}"
+  }
+  const cleanup: ReleaseWorkspaceCleanup = {
+    success: removed_cleanly,
+    skipped: !removed_cleanly,
+    branch: branch,
+    detail: detail,
+    warning: if removed_cleanly {
+      ""
+    } else {
+      "non-fatal release workspace cleanup warning: " + detail
+    },
+    fatal: false,
+    steps: [
+      recorded_step(
+        "remove-release-workspace",
+        "git worktree remove " + workspace,
+        if removed_cleanly {
+          command_result_ok(detail)
+        } else {
+          command_result_fail(removed.exit_code ?? 1, removed.stderr)
+        },
+      ),
+    ],
+    path: workspace,
+    preserved: !removed_cleanly,
+    retained: false,
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    if removed_cleanly {
+      "release_workspace_removed"
+    } else {
+      "release_workspace_preserved"
+    },
+    cleanup,
+  )
+  return cleanup
+}
+
+/**
+ * Remove isolated audit snapshots on every terminal path. A leased audit uses
+ * the shared checkout and retains it only after proving it clean, so the next
+ * audit or release can inherit its Cargo fingerprints. Preserve live
+ * workspaces when they contain recovery state; retain only a clean,
+ * successfully shipped shared one.
+ */
+pub fn finish_release_workspace(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  ship_succeeded: bool,
+  run_id: string,
+) -> ReleaseWorkspaceCleanup? {
+  if !(cfg.release_workspace_managed ?? false) {
+    return nil
+  }
+  const workspace = cfg.release_workspace
+  assert_release_workspace_target({env: harness.env, process: harness.process}, cfg, run_id)
+  const branch = if harness.fs.exists(workspace) {
+    trim(
+      run_git({env: harness.env, process: harness.process}, cfg, ["branch", "--show-current"])
+        .stdout
+        ?? "",
+    )
+  } else {
+    ""
+  }
+  if cfg.mode == "audit" && !(cfg.release_workspace_shared ?? false) {
+    return removal_cleanup(harness, cfg, run_id, branch, true)
+  }
+  if cfg.mode != "audit" && (!ship_succeeded || cfg.mode != "ship-pr") {
+    const reason = if cfg.mode == "prepare" && ship_succeeded {
+      "prepared release workspace preserved for inspection and continuation: ${workspace}"
+    } else {
+      "release did not ship successfully; workspace preserved for recovery: ${workspace}"
+    }
+    const cleanup = preservation_cleanup(
+      cfg,
+      branch,
+      reason,
+      recorded_step(
+        "preserve-release-workspace",
+        "preserve " + workspace,
+        command_result_ok(reason),
+      ),
+    )
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_workspace_preserved",
+      cleanup,
+    )
+    return cleanup
+  }
+  const status = run_git(
+    {env: harness.env, process: harness.process},
+    cfg,
+    ["status", "--porcelain", "--untracked-files=normal"],
+  )
+  if !status.success || trim(status.stdout ?? "") != "" {
+    const detail = if status.success {
+      "shipped release workspace is dirty; preserved for recovery: ${workspace}"
+    } else {
+      "could not verify shipped release workspace cleanliness; preserved for recovery: ${workspace}"
+    }
+    const cleanup: ReleaseWorkspaceCleanup = {
+      success: false,
+      skipped: true,
+      branch: branch,
+      detail: detail,
+      warning: "non-fatal release workspace cleanup warning: " + detail,
+      fatal: false,
+      steps: [
+        recorded_step(
+          "verify-release-workspace-clean",
+          "git status --porcelain --untracked-files=normal",
+          if status.success {
+            command_result_fail(1, status.stdout)
+          } else {
+            command_result_fail(status.exit_code ?? 1, status.stderr)
+          },
+        ),
+      ],
+      path: workspace,
+      preserved: true,
+      retained: false,
+    }
+    release_log_event(
+      {clock: harness.clock, fs: harness.fs},
+      run_id,
+      "release_workspace_preserved",
+      cleanup,
+    )
+    return cleanup
+  }
+  if cfg.release_workspace_shared ?? false {
+    return retention_cleanup(harness, cfg, run_id, branch)
+  }
+  return removal_cleanup(harness, cfg, run_id, branch, false)
+}
+
+/**
+ * Keep a shipped shared workspace so the next release can switch it to a new
+ * pin instead of checking out every file again.
+ *
+ * The caller has already proven the tree clean, which is what makes retaining
+ * it equivalent to removing it as far as this run's state is concerned. The
+ * detached HEAD is recorded so a later run's reuse decision, and an operator
+ * reading the receipt, can both see what is sitting there.
+ */
+fn retention_cleanup(
+  harness: Harness,
+  cfg: ReleaseConfig,
+  run_id: string,
+  branch: string,
+) -> ReleaseWorkspaceCleanup {
+  const workspace = cfg.release_workspace
+  const head = trim(
+    run_git({env: harness.env, process: harness.process}, cfg, ["rev-parse", "HEAD"]).stdout ?? "",
+  )
+  const detail = if cfg.mode == "audit" {
+    "audit workspace retained for reuse at ${head}: ${workspace}"
+  } else {
+    "shipped release workspace retained for reuse at ${head}: ${workspace}"
+  }
+  const cleanup: ReleaseWorkspaceCleanup = {
+    success: true,
+    skipped: true,
+    branch: branch,
+    detail: detail,
+    warning: "",
+    fatal: false,
+    steps: [
+      recorded_step("retain-release-workspace", "retain " + workspace, command_result_ok(detail)),
+    ],
+    path: workspace,
+    preserved: false,
+    retained: true,
+  }
+  release_log_event(
+    {clock: harness.clock, fs: harness.fs},
+    run_id,
+    "release_workspace_retained",
+    cleanup,
+  )
+  return cleanup
+}

@@ -1,0 +1,913 @@
+import { fleet_convergence_snapshot } from "../lib/fleet_convergence"
+import { FleetManifest } from "../lib/fleet_manifest"
+import {
+  fleet_operation_scope,
+  fleet_scope_digest,
+  fleet_scope_title_suffix,
+} from "../lib/fleet_operation_scope"
+import { fleet_workflow_chain_title } from "../lib/fleet_workflow_run"
+import {
+  release_chain_control_write,
+  release_chain_latest_stage,
+  release_chain_receipt_write,
+  release_chain_replay,
+} from "../lib/release_chain_state"
+import {
+  PublishedTailAdapter,
+  PublishedTailRead,
+  PublishedTailRequest,
+  published_tail_identity,
+  run_published_release_tail,
+} from "../lib/release_published_tail"
+import {
+  published_tail_dispatch_matches,
+  published_tail_find_dispatch_with_adapter,
+  published_tail_live_adapter,
+} from "../lib/release_published_tail_live"
+import {
+  release_watch_receipt,
+  release_watch_receipt_bind_main_commit,
+  release_watch_receipt_write,
+} from "../lib/release_watch_state"
+import { parse_release_chain_args, run_published_chain_cli_with_adapter } from "../release_chain"
+import { GithubWorkflowRun, GithubWorkflowRuns } from "harn-github-connector/default"
+
+const SHA = "1111111111111111111111111111111111111111"
+
+const NOW = "2026-09-05T00:00:00Z"
+
+pipeline test_read_only_tail_observes_exact_main_without_waiting_for_legacy_title(
+  harness: Harness,
+) {
+  const input = request(harness.fs) + {repositories_json: "[\"fixture/consumer\"]"}
+  const manifest: FleetManifest = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow: "owner/policy/.github/workflows/package.yml@${SHA}",
+      bump_workflow: "owner/policy/.github/workflows/bump.yml@${SHA}",
+    },
+    repositories: [{slug: "fixture/consumer", directory: "consumer", harn_bump: true}],
+  }
+  const api = "https://tail-observation.test"
+  const check = {
+    id: 1,
+    name: "CI status",
+    head_sha: SHA,
+    status: "completed",
+    conclusion: "success",
+  }
+  harness.testing.http_mock_clear()
+  for row in [
+    {path: "/branches/main", body: {commit: {sha: SHA}}},
+    {
+      path: "/contents/.harn-version?ref=${SHA}",
+      body: {
+        type: "file",
+        encoding: "base64",
+        content: base64_encode("0.10.125\n"),
+        sha: SHA,
+        size: 9,
+        name: ".harn-version",
+        path: ".harn-version",
+      },
+    },
+    // The update proof reads the pin file's own history and asks which pull
+    // request carries the commit that set the pin, so the fixture describes
+    // that call shape rather than a page of recently closed pull requests.
+    {path: "/commits?sha=main&path=.harn-version&per_page=100", body: [{sha: SHA}]},
+    {
+      path: "/commits/${SHA}/pulls?per_page=100",
+      body: [
+        {
+          number: 125,
+          title: "Bump Harn runtime",
+          state: "closed",
+          merged_at: NOW,
+          merge_commit_sha: SHA,
+          html_url: "https://github.com/fixture/consumer/pull/125",
+          head: {sha: SHA, ref: "bump"},
+          base: {ref: "main", repo: {full_name: "fixture/consumer"}},
+        },
+      ],
+    },
+    {path: "/commits/${SHA}/check-runs", body: {total_count: 1, check_runs: [check]}},
+    {
+      path: "/commits/${SHA}/check-runs?filter=latest&per_page=100",
+      body: {total_count: 1, check_runs: [check]},
+    },
+    {path: "/compare/${SHA}...${SHA}", body: {status: "identical"}},
+    {
+      path: "/rules/branches/main",
+      body: [
+        {
+          type: "required_status_checks",
+          parameters: {required_status_checks: [{context: "CI status"}]},
+        },
+      ],
+    },
+  ] {
+    harness.testing.http_mock(
+      "GET",
+      api + "/repos/fixture/consumer" + row.path,
+      {status: 200, body: json_stringify(row.body)},
+    )
+  }
+  const live = published_tail_live_adapter(
+    harness,
+    input,
+    input.state_root,
+    fn(_request, apply) {
+      assert(!apply)
+      return proven("baseline")
+    },
+    fn(_request, apply) {
+      assert(!apply)
+      return proven("promotion")
+    },
+    {no_wait: false, reconcile_only: true},
+    manifest,
+    {api_base_url: api, installation_token: "fixture-only-token", allow_gh_auth_fallback: false},
+  )
+  // No workflow endpoint is mocked: consulting the rejected legacy title cannot pass.
+  live.baseline(input, true)
+  live.promote(input, true)
+  const observed = live.converge(input, {run_id: 125, run_url: accepted_run().url})
+  assert_eq(observed.state, "proven")
+  assert_eq(observed.evidence[0].subject, "fixture/consumer")
+  assert_eq(observed.evidence[0].observed, "0.10.125")
+  assert_eq(observed.evidence[0].identity, SHA)
+  const no_dispatch = try {
+    live.dispatch(input)
+    false
+  } catch (_) {
+    true
+  }
+  assert(no_dispatch)
+  const no_acceptance = try {
+    live.converge(input, {run_id: 0, run_url: ""})
+    false
+  } catch (_) {
+    true
+  }
+  assert(no_acceptance)
+  const seed = successful_adapter()
+    + {
+      current_targets: fn() { return [{subject: "fixture/consumer", version: "v0.10.125"}] },
+      converge: fn(_request, _run) { return proven("fixture/consumer") + {state: "pending"} },
+    }
+  run_published_release_tail(harness, input, seed)
+  const resumed = run_published_release_tail(
+    harness,
+    input,
+    seed
+      + {
+        find_dispatch: fn(_request) {
+          throw "accepted dispatch must not be rediscovered by title"
+        },
+        dispatch: live.dispatch,
+        converge: live.converge,
+      },
+  )
+  assert_eq(release_chain_latest_stage(resumed, "converge")?.status, "proven")
+  const missing_input = request(harness.fs) + {repositories_json: input.repositories_json}
+  const missing_dispatch = try {
+    run_published_release_tail(
+      harness,
+      missing_input,
+      seed
+        + {
+          dispatch: live.dispatch,
+          converge: fn(_request, _run) {
+            throw "must not observe convergence without acceptance"
+          },
+        },
+    )
+    "unexpected completion"
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(missing_dispatch, "read-only reconciliation cannot dispatch"))
+  for observation in [
+    {total_count: 1, check_runs: [check + {conclusion: "skipped"}]},
+    {total_count: 1, check_runs: [check + {status: "in_progress", conclusion: ""}]},
+    {total_count: 0, check_runs: []},
+    {total_count: 2, check_runs: [check]},
+  ] {
+    harness.testing.http_mock(
+      "GET",
+      api + "/repos/fixture/consumer/commits/${SHA}/check-runs?filter=latest&per_page=100",
+      {status: 200, body: json_stringify(observation)},
+    )
+    assert_eq(live.converge(input, {run_id: 125, run_url: accepted_run().url}).state, "pending")
+    const snapshot = fleet_convergence_snapshot(
+      harness,
+      manifest,
+      manifest.repositories,
+      input.tag,
+      {api_base_url: api, installation_token: "fixture-only-token", allow_gh_auth_fallback: false},
+    )
+    assert_eq(len(snapshot.repositories), 1)
+    assert_eq(snapshot.repositories[0]?.state, "waiting")
+    assert_eq(snapshot.pending_count, 1)
+    assert_eq(snapshot.failing_count, 0)
+  }
+  harness.testing.http_mock_clear()
+}
+
+pipeline test_large_scope_title_stays_compact_and_never_adopts_truncated_or_other_scope(
+  harness: Harness,
+) {
+  let names: list<string> = []
+  for index in range(0, 29) {
+    names = names + ["fixture/long-consumer-" + to_string(index)]
+  }
+  const wire = json_stringify(names.sort())
+  const scope = fleet_operation_scope(nil, wire)
+  const input = request(harness.fs) + {repositories_json: wire}
+  const title = fleet_workflow_chain_title(input.tag, input.chain_id, 1, 4, scope)
+  assert(len(title) < 200)
+  assert_eq(len(fleet_scope_digest(scope)), 64)
+  assert(published_tail_dispatch_matches(accepted_run() + {display_title: title}, input))
+  const legacy = accepted_run().display_title + " / repositories " + wire
+  assert(len(legacy) > 256)
+  assert(
+    !published_tail_dispatch_matches(
+      accepted_run() + {display_title: substring(legacy, 0, 253) + "..."},
+      input,
+    ),
+  )
+  const changed = fleet_operation_scope(nil, json_stringify(names + ["fixture/another"]))
+  assert(fleet_scope_digest(changed) != fleet_scope_digest(scope))
+  assert(
+    !published_tail_dispatch_matches(
+      accepted_run()
+        + {display_title: fleet_workflow_chain_title(input.tag, input.chain_id, 1, 4, changed)},
+      input,
+    ),
+  )
+}
+
+pipeline test_published_cli_hydrates_only_selected_contracts_before_reading_pins(harness: Harness) {
+  const input = request(harness.fs)
+    + {repositories_json: "[\"burin-labs/harn-bump-fleet\",\"fixture/selected\"]"}
+  const manifest: FleetManifest = {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow: "owner/policy/.github/workflows/package.yml@${SHA}",
+      bump_workflow: "owner/policy/.github/workflows/bump.yml@${SHA}",
+    },
+    repositories: [
+      {slug: "burin-labs/harn-bump-fleet", directory: "controller", harn_bump: true},
+      {
+        slug: "fixture/selected",
+        directory: "selected",
+        harn_bump: true,
+        consumer_owned_contract: true,
+      },
+      {
+        slug: "fixture/excluded",
+        directory: "excluded",
+        harn_bump: true,
+        consumer_owned_contract: true,
+      },
+    ],
+  }
+  const api = "https://tail-contract.test"
+  const contract =
+    "schema_version = 1\nfile_projections = []\n[harn_pin]\nkind = \"version_file\"\npath = \"runtime-version.txt\"\n[bump]\nrefresh_command = \"./refresh\"\nvalidate_command = \"./validate\"\n"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/fixture/selected/branches/main",
+    {status: 200, body: json_stringify({name: "main", commit: {sha: SHA}})},
+  )
+  const contract_url = api + "/repos/fixture/selected/contents/.harn/fleet-projections.toml?ref="
+    + SHA
+  for row in [
+    {url: contract_url, text: contract},
+    {
+      url: api + "/repos/fixture/selected/contents/runtime-version.txt?ref=main",
+      text: "0.10.124\n",
+    },
+    {
+      url: api + "/repos/burin-labs/harn-bump-fleet/contents/.harn-version?ref=main",
+      text: "0.10.124\n",
+    },
+  ] {
+    harness.testing.http_mock(
+      "GET",
+      row.url,
+      {
+        status: 200,
+        body: json_stringify(
+          {
+            type: "file",
+            encoding: "base64",
+            content: base64_encode(row.text),
+            sha: SHA,
+            size: len(row.text),
+            name: "fixture",
+            path: "fixture",
+          },
+        ),
+      },
+    )
+  }
+  const options = {
+    api_base_url: api,
+    installation_token: "tail-contract-test-token",
+    allow_gh_auth_fallback: false,
+  }
+  const live = published_tail_live_adapter(
+    harness,
+    input,
+    input.state_root,
+    fn(_request, _apply) { return proven("baseline") },
+    fn(_request, _apply) { return proven("promotion") },
+    {no_wait: false, reconcile_only: false},
+    manifest,
+    options,
+  )
+  const watch_path = path_join(input.state_root, "watch.json")
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, watch_path, input.watch)
+  const cli = parse_release_chain_args(
+    [
+      "--resume-published",
+      "--tag",
+      input.tag,
+      "--receipt",
+      watch_path,
+      "--state-root",
+      input.state_root,
+      "--chain-id",
+      input.chain_id,
+      "--repositories-json",
+      input.repositories_json ?? "",
+      "--yes-live-release",
+    ],
+  )
+  const outcome = try {
+    const receipt = run_published_chain_cli_with_adapter(
+      harness,
+      cli,
+      successful_adapter()
+        + {
+          current_targets: live.current_targets,
+          baseline: fn(_request, _apply) {
+            throw "reached hydrated current pins before effects"
+          },
+        },
+    )
+    json_stringify(receipt)
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(outcome, "reached hydrated current pins before effects"), outcome)
+  const calls = harness.testing.http_mock_calls()
+  assert_eq(len(calls), 4)
+  assert(calls.all({ call -> !contains(call.url, "fixture/excluded") }))
+  assert(calls.any({ call -> contains(call.url, "runtime-version.txt?ref=main") }))
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/fixture/selected/branches/main",
+    {status: 200, body: json_stringify({name: "main", commit: {sha: SHA}})},
+  )
+  harness.testing.http_mock("GET", contract_url, {status: 404, body: "{\"message\":\"Not Found\"}"})
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/fixture/selected",
+    {status: 200, body: "{\"full_name\":\"fixture/selected\",\"default_branch\":\"main\"}"},
+  )
+  const missing = try {
+    published_tail_live_adapter(
+      harness,
+      input,
+      input.state_root,
+      fn(_request, _apply) {
+        throw "unexpected baseline"
+      },
+      fn(_request, _apply) {
+        throw "unexpected promotion"
+      },
+      {no_wait: false, reconcile_only: false},
+      manifest,
+      options,
+    )
+    "unexpected adapter"
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(missing, "manifest is missing"), missing)
+  assert_eq(len(harness.testing.http_mock_calls()), 3)
+  harness.testing.http_mock_clear()
+}
+
+pipeline test_scoped_tail_cannot_adopt_full_dispatch_or_retarget_existing_journal(
+  harness: Harness,
+) {
+  const input = request(harness.fs)
+  const scoped = input + {repositories_json: "[\"consumer\"]"}
+  assert(published_tail_identity(input) != published_tail_identity(scoped))
+  assert(!published_tail_dispatch_matches(accepted_run(), scoped))
+  assert(
+    published_tail_dispatch_matches(
+      accepted_run()
+        + {
+          display_title: accepted_run().display_title
+            + fleet_scope_title_suffix({kind: "repositories", repositories: ["consumer"]}),
+        },
+      scoped,
+    ),
+  )
+  run_published_release_tail(harness, input, successful_adapter())
+  const effects = harness.runtime.atomic(0)
+  const blocked = try {
+    run_published_release_tail(
+      harness,
+      scoped,
+      successful_adapter()
+        + {
+          publication: fn(_request) {
+            harness.runtime.atomic_add(effects, 1)
+            return proven("publication")
+          },
+        },
+    )
+    false
+  } catch (_) {
+    true
+  }
+  assert(blocked)
+  assert_eq(harness.runtime.atomic_get(effects), 0)
+}
+
+pipeline test_scoped_tail_rejects_equal_count_wrong_consumer_before_effects(harness: Harness) {
+  const input = request(harness.fs) + {repositories_json: "[\"selected\"]"}
+  const effects = harness.runtime.atomic(0)
+  const rejected = try {
+    run_published_release_tail(
+      harness,
+      input,
+      successful_adapter()
+        + {
+          baseline: fn(_request, _apply) {
+            harness.runtime.atomic_add(effects, 1)
+            return proven("baseline")
+          },
+        },
+    )
+    false
+  } catch (_) {
+    true
+  }
+  assert(rejected)
+  assert_eq(harness.runtime.atomic_get(effects), 0)
+}
+
+fn accepted_run() -> GithubWorkflowRun {
+  return {
+    repo: "burin-labs/harn-bump-fleet",
+    id: 125,
+    workflow_id: 42,
+    workflow_path: ".github/workflows/bump-fleet.yml",
+    run_number: 1,
+    run_attempt: 1,
+    name: "Update Harn fleet",
+    display_title: "Update Harn fleet / v0.10.125 / chain 125 / round 1 of 4",
+    event: "workflow_dispatch",
+    status: "completed",
+    conclusion: "failure",
+    head_branch: "main",
+    head_sha: SHA,
+    url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/125",
+    created_at: NOW,
+    run_started_at: NOW,
+    updated_at: NOW,
+  }
+}
+
+pipeline test_dispatch_census_adopts_red_identity_but_never_calls_it_success(harness: Harness) {
+  const input = request(harness.fs)
+  const run = accepted_run()
+  assert(published_tail_dispatch_matches(run, input))
+  assert(
+    !published_tail_dispatch_matches(
+      run + {display_title: "Update Harn fleet / v0.10.126 / chain 125 / round 1 of 4"},
+      input,
+    ),
+  )
+  assert(
+    !published_tail_dispatch_matches(
+      run + {workflow_path: ".github/workflows/unrelated.yml"},
+      input,
+    ),
+  )
+  assert(!published_tail_dispatch_matches(run + {head_sha: ""}, input))
+  const page: GithubWorkflowRuns = {
+    repo: run.repo,
+    workflow_id: "bump-fleet.yml",
+    total_count: 1,
+    runs: [run],
+    page: 1,
+    per_page: 100,
+  }
+  const adopted = published_tail_find_dispatch_with_adapter(input, fn(_page) { return page })
+  assert_eq(adopted, [{run_id: 125, run_url: run.url}])
+  const incomplete = try {
+    published_tail_find_dispatch_with_adapter(input, fn(_page) { return page + {total_count: 2} })
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(incomplete, "incomplete"))
+  const empty = published_tail_find_dispatch_with_adapter(
+    input,
+    fn(_page) { return page + {total_count: 0, runs: []} },
+  )
+  assert_eq(empty, [])
+}
+
+fn request(fs: HarnessFs) -> PublishedTailRequest {
+  const root = fs.mkdtemp_in_workspace("published-tail")
+  fs.write_text(path_join(root, "Cargo.toml"), "[workspace.package]\nversion = \"0.10.126-dev\"\n")
+  const watch = release_watch_receipt(
+    {
+      tag: "v0.10.125",
+      slug: "burin-labs/harn",
+      pin_sha: SHA,
+      publication: {
+        version: "0.10.125",
+        local_branch: "release/v0.10.125",
+        remote_ref: "release-attempt/v0.10.125/${SHA}",
+        head_oid: SHA,
+      },
+      pr_url: "https://github.com/burin-labs/harn/pull/125",
+      created_at: NOW,
+    },
+  )
+  return {
+    tag: watch.tag,
+    watch: release_watch_receipt_bind_main_commit(watch, SHA, NOW),
+    chain_id: "125",
+    state_root: root,
+  }
+}
+
+fn proven(subject: string) -> PublishedTailRead {
+  return {
+    state: "proven",
+    detail: "",
+    evidence: [
+      {
+        subject: subject,
+        kind: "fixture",
+        status: "observed",
+        expected: "v0.10.125",
+        observed: "v0.10.125",
+        source: "fixture",
+        ref: "v0.10.125",
+        identity: SHA,
+        observed_at: NOW,
+      },
+    ],
+  }
+}
+
+fn successful_adapter() -> PublishedTailAdapter {
+  return {
+    publication: fn(_request) { return proven("publication") },
+    current_targets: fn() { return [{subject: "consumer", version: "v0.10.124"}] },
+    baseline: fn(_request, _apply) { return proven("baseline") },
+    promote: fn(_request, _apply) { return proven("promotion") },
+    find_dispatch: fn(_request) { return [] },
+    dispatch: fn(_request) { return {
+      run_id: 125,
+      run_url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/125",
+    } },
+    converge: fn(_request, _run) { return proven("consumer") },
+  }
+}
+
+pipeline test_uncertain_dispatch_is_adopted_without_repeating_the_effect(harness: Harness) {
+  const input = request(harness.fs)
+  const dispatched = harness.runtime.atomic(0)
+  const visible = harness.runtime.atomic(0)
+  const base = successful_adapter()
+  const adapter: PublishedTailAdapter = base
+    + {
+      dispatch: fn(actual) {
+        harness.runtime.atomic_add(dispatched, 1)
+        throw "simulated process loss after GitHub accepted the dispatch"
+      },
+      find_dispatch: fn(actual) { return if harness.runtime.atomic_get(visible) == 1 {
+        [base.dispatch(actual)]
+      } else {
+        []
+      } },
+    }
+  const failed = try {
+    run_published_release_tail(harness, input, adapter)
+    false
+  } catch (_error) {
+    true
+  }
+  assert(failed)
+  const pending = run_published_release_tail(harness, input, adapter)
+  assert_eq(pending.status, "active")
+  assert_eq(release_chain_latest_stage(pending, "repin")?.status, "pending")
+  assert_eq(harness.runtime.atomic_get(dispatched), 1)
+  harness.runtime.atomic_add(visible, 1)
+  const adopted = run_published_release_tail(harness, input, adapter)
+  assert_eq(adopted.status, "complete")
+  assert_eq(release_chain_latest_stage(adopted, "repin")?.evidence?.[0]?.observed, "125")
+  assert_eq(harness.runtime.atomic_get(dispatched), 1)
+}
+
+pipeline test_baseline_exception_is_failed_evidence_but_does_not_skip_convergence(
+  harness: Harness,
+) {
+  const input = request(harness.fs)
+  const writes = harness.runtime.atomic(0)
+  const reads = harness.runtime.atomic(0)
+  const base = successful_adapter()
+  const adapter: PublishedTailAdapter = base
+    + {
+      baseline: fn(_request, apply) {
+        if apply {
+          harness.runtime.atomic_add(writes, 1)
+          throw "baseline proposal rejected"
+        }
+        harness.runtime.atomic_add(reads, 1)
+        const proof = proven("baseline")
+        return proof
+          + {
+            state: "failed",
+            detail: "the prior proposal remains rejected",
+            evidence: proof.evidence.map({ item -> item + {status: "broken"} }).to_list(),
+          }
+      },
+    }
+  const first = run_published_release_tail(harness, input, adapter)
+  assert_eq(first.status, "active")
+  assert_eq(release_chain_latest_stage(first, "baseline")?.status, "failed")
+  assert_eq(release_chain_latest_stage(first, "converge")?.status, "proven")
+  const second = run_published_release_tail(harness, input, adapter)
+  assert_eq(second.status, "active")
+  assert_eq(release_chain_latest_stage(second, "baseline")?.status, "failed")
+  assert_eq(harness.runtime.atomic_get(writes), 1)
+  assert_eq(harness.runtime.atomic_get(reads), 1)
+  const changed_observation: PublishedTailAdapter = adapter
+    + {
+      baseline: fn(_request, apply) {
+        assert(!apply, "later absence cannot erase the recorded failed write")
+        const proof = proven("baseline")
+        return proof
+          + {
+            state: "pending",
+            effect_absent: true,
+            detail: "the exact proposal is absent but a prior failure remains recorded",
+            evidence: proof.evidence.map({ item -> item + {status: "missing", observed: ""} })
+              .to_list(),
+          }
+      },
+    }
+  run_published_release_tail(harness, input, changed_observation)
+  run_published_release_tail(harness, input, changed_observation)
+  assert_eq(harness.runtime.atomic_get(writes), 1)
+}
+
+pipeline test_historical_release_cannot_downgrade_any_observed_target(harness: Harness) {
+  const input = request(harness.fs)
+  const base = successful_adapter()
+  const calls = harness.runtime.atomic(0)
+  const adapter: PublishedTailAdapter = base
+    + {
+      current_targets: fn() { return [
+        {subject: "baseline", version: "v0.10.125"},
+        {subject: "consumer", version: "v0.10.126"},
+      ] },
+      publication: fn(_actual) {
+        harness.runtime.atomic_add(calls, 1)
+        return proven("publication")
+      },
+    }
+  const refused = run_published_release_tail(harness, input, adapter)
+  assert_eq(refused.status, "escalated")
+  assert_eq(release_chain_latest_stage(refused, "prove")?.cause, "target_superseded")
+  assert_eq(run_published_release_tail(harness, input, adapter), refused)
+  assert_eq(harness.runtime.atomic_get(calls), 0)
+  const journal = release_chain_replay(harness.fs, input.state_root, input.chain_id)
+  assert_eq(len(journal), 2)
+  const initial = journal[0]
+  assert(initial != nil)
+  if initial == nil {
+    throw "missing initial journal"
+  }
+  assert_eq(len(initial.stages), 0)
+}
+
+pipeline test_empty_publication_scope_is_not_proven(harness: Harness) {
+  const base = successful_adapter()
+  const input = request(harness.fs)
+  const adapter: PublishedTailAdapter = base
+    + {publication: fn(_request) { return {state: "proven", detail: "", evidence: []} }}
+  const receipt = run_published_release_tail(harness, input, adapter)
+  assert_eq(receipt.status, "active")
+  assert_eq(release_chain_latest_stage(receipt, "prove")?.status, "failed")
+  assert_eq(release_chain_latest_stage(receipt, "promote"), nil)
+}
+
+pipeline test_partial_convergence_keeps_measured_success_and_pending_names(harness: Harness) {
+  const input = request(harness.fs)
+  const base = successful_adapter()
+  const good = proven("consumer-one")
+  const pending = proven("consumer-two")
+  const adapter: PublishedTailAdapter = base
+    + {
+      converge: fn(_request, _accepted) { return {
+        state: "pending",
+        detail: "one consumer remains pending",
+        evidence: good.evidence
+          + pending.evidence.map({ item -> item + {status: "missing", observed: ""} }).to_list(),
+      } },
+    }
+  const receipt = run_published_release_tail(harness, input, adapter)
+  const stage = release_chain_latest_stage(receipt, "converge")
+  assert_eq(stage?.subject_count, 2)
+  assert_eq(stage?.proven_count, 1)
+  assert_eq(stage?.unproven_count, 1)
+  assert_eq(stage?.unproven?.[0]?.subject, "consumer-two")
+  assert_eq(stage?.unproven?.[0]?.retryable, true)
+  assert_eq(receipt.status, "active")
+}
+
+pipeline test_crash_before_proposal_recovers_only_with_affirmative_owner_absence(harness: Harness) {
+  const input = request(harness.fs)
+  const recovered = input + {state_root: harness.fs.mkdtemp_in_workspace("tail-crash-recovery")}
+  const base = successful_adapter()
+  const baseline = proven("baseline")
+  const absent: PublishedTailRead = {
+    state: "pending",
+    effect_absent: true,
+    detail: "exact owner proved no proposal",
+    evidence: baseline.evidence.map({ item -> item + {status: "missing", observed: ""} }).to_list(),
+  }
+  const interrupted: PublishedTailAdapter = base
+    + {
+      baseline: fn(_request, apply) {
+        assert(apply)
+        // Snapshot exactly the durable boundary immediately before the effect.
+        for receipt in release_chain_replay(harness.fs, input.state_root, input.chain_id) {
+          release_chain_receipt_write(
+            {fs: harness.fs, random: harness.random},
+            recovered.state_root,
+            receipt,
+          )
+        }
+        return absent
+      },
+      promote: fn(_request, _apply) { return absent },
+    }
+  run_published_release_tail(harness, input, interrupted)
+  const writes = harness.runtime.atomic(0)
+  const resume: PublishedTailAdapter = base
+    + {
+      baseline: fn(_request, apply) {
+        if !apply {
+          return absent
+        }
+        harness.runtime.atomic_add(writes, 1)
+        return baseline
+      },
+    }
+  const result = run_published_release_tail(harness, recovered, resume)
+  assert_eq(result.status, "complete")
+  assert_eq(harness.runtime.atomic_get(writes), 1)
+  assert_eq(run_published_release_tail(harness, recovered, resume), result)
+  assert_eq(harness.runtime.atomic_get(writes), 1)
+}
+
+pipeline test_control_after_publication_stops_before_proposals_and_survives_replay(
+  harness: Harness,
+) {
+  const input = request(harness.fs)
+  const writes = harness.runtime.atomic(0)
+  const base = successful_adapter()
+  const adapter: PublishedTailAdapter = base
+    + {
+      publication: fn(_actual) {
+        release_chain_control_write(
+          {fs: harness.fs, random: harness.random},
+          input.state_root,
+          {
+            schema_version: "harn.release-chain.control.v1",
+            chain_id: input.chain_id,
+            revision: 0,
+            sequence: 1,
+            kind: "stop",
+            actor: "release operator",
+            reason: "stop before proposals",
+            field: "",
+            value: "",
+            identity_bearing: false,
+            created_at: NOW,
+          },
+        )
+        return proven("publication")
+      },
+      baseline: fn(_actual, _apply) {
+        harness.runtime.atomic_add(writes, 1)
+        return proven("baseline")
+      },
+    }
+  const stopped = run_published_release_tail(harness, input, adapter)
+  assert_eq(stopped.status, "stopped")
+  assert_eq(stopped.control_cursor, 1)
+  assert_eq(harness.runtime.atomic_get(writes), 0)
+  assert_eq(run_published_release_tail(harness, input, adapter), stopped)
+}
+
+pipeline test_explicit_published_tail_never_prepares_the_next_development_version(
+  harness: Harness,
+) {
+  const input = request(harness.fs)
+  const effects = harness.runtime.atomic(0)
+  const adapter: PublishedTailAdapter = {
+    publication: fn(actual) {
+      assert_eq(actual.tag, "v0.10.125")
+      return proven("published tag")
+    },
+    current_targets: fn() { return [{subject: "consumer pin", version: "v0.10.124"}] },
+    baseline: fn(actual, apply) {
+      assert(apply)
+      assert_eq(actual.tag, "v0.10.125")
+      harness.runtime.atomic_add(effects, 1)
+      return proven("baseline")
+    },
+    promote: fn(actual, apply) {
+      assert(apply)
+      assert_eq(actual.watch.release_commit_oid, SHA)
+      harness.runtime.atomic_add(effects, 1)
+      return proven("anchor")
+    },
+    find_dispatch: fn(_actual) { return [] },
+    dispatch: fn(actual) {
+      assert_eq(actual.tag, "v0.10.125")
+      harness.runtime.atomic_add(effects, 1)
+      return {
+        run_id: 125,
+        run_url: "https://github.com/burin-labs/harn-bump-fleet/actions/runs/125",
+      }
+    },
+    converge: fn(actual, run) {
+      assert_eq(actual.tag, "v0.10.125")
+      assert_eq(run.run_id, 125)
+      return proven("consumer pin")
+    },
+  }
+  const watch_path = path_join(input.state_root, "watch.json")
+  release_watch_receipt_write({fs: harness.fs, random: harness.random}, watch_path, input.watch)
+  const options = parse_release_chain_args(
+    [
+      "--state-root",
+      input.state_root,
+      "--chain-id",
+      input.chain_id,
+      "--resume-published",
+      "--tag",
+      input.tag,
+      "--receipt",
+      watch_path,
+      "--yes-live-release",
+    ],
+  )
+  const done = run_published_chain_cli_with_adapter(harness, options, adapter)
+  assert_eq(done.status, "complete")
+  assert_eq(done.target.tag, "v0.10.125")
+  assert_eq(harness.runtime.atomic_get(effects), 3)
+  assert(!done.stages.any({ stage -> contains(["prepare", "cut", "tag"], stage.stage) }))
+  const resumed = run_published_chain_cli_with_adapter(harness, options, adapter)
+  assert_eq(resumed, done)
+  assert_eq(harness.runtime.atomic_get(effects), 3)
+}
+
+pipeline test_published_tail_requires_an_explicit_receipt_bound_tag() {
+  const options = parse_release_chain_args(
+    [
+      "--state-root",
+      ".harn-runs",
+      "--chain-id",
+      "125",
+      "--resume-published",
+      "--tag",
+      "v0.10.125",
+      "--receipt",
+      ".harn-runs/release-harn/watches/v0.10.125.json",
+    ],
+  )
+  assert_eq(options.tag, "v0.10.125")
+  assert_eq(options.resume_published, true)
+}
