@@ -1,0 +1,161 @@
+import { bump_workflow_dispatch_probe } from "../lib/bump_fleet_pre_dispatch"
+import { render_bump_workflow } from "../lib/bump_workflow_projection"
+import { read_fleet_manifest } from "../lib/fleet_manifest"
+import { decode_github_workflow } from "../lib/github_workflow"
+
+const SETUP_ACTION =
+  "burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0"
+
+fn workflows_dir(fs: HarnessFs) -> string {
+  return path_join(dirname(fs.cwd()), ".github", "workflows")
+}
+
+fn workflow_source(fs: HarnessFs, name: string) -> string {
+  return fs.read_text(path_join(workflows_dir(fs), name))
+}
+
+/** Every workflow this repository defines, in a stable order. */
+fn workflow_names(fs: HarnessFs) -> list<string> {
+  return fs.list_dir(workflows_dir(fs)).sort().filter({ item -> ends_with(item, ".yml") }).to_list()
+}
+
+/** The bump adapter pins Harn's reusable workflow and contains no local engine. */
+pipeline test_bump_workflow_delegates_to_pinned_reusable_workflow(harness: Harness, task: any) {
+  const source = workflow_source(harness.fs, "bump-harn.yml")
+  const manifest = read_fleet_manifest(
+    harness.fs,
+    path_join(dirname(harness.fs.cwd()), "fleet.toml"),
+  )
+  const repo = manifest.repositories.filter({ item -> item.slug == "burin-labs/harn-bump-fleet" })
+    .to_list()[0]
+  assert_eq(source, render_bump_workflow(manifest, repo))
+  const workflow = decode_github_workflow(source)
+  assert_eq(workflow.jobs.keys(), ["bump"])
+  const bump = workflow.jobs.get("bump") ?? {}
+  assert_eq(bump.uses, manifest.policy.bump_workflow)
+  assert_eq(
+    bump.secrets,
+    {
+      "app-client-id": "$" + "{{ secrets.RELEASE_APP_CLIENT_ID }}",
+      "app-private-key": "$" + "{{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+    },
+  )
+  assert_eq(bump.steps, nil)
+}
+
+/**
+ * The fleet decides a repo is bumpable by looking for a manual trigger at
+ * exactly two-space indentation (`lib/bump_fleet_pre_dispatch.harn`). This repo
+ * dispatches itself, so losing or re-indenting that key would silently drop
+ * harn-bump-fleet out of its own fleet.
+ */
+pipeline test_bump_workflow_stays_fleet_dispatchable(harness: Harness, task: any) {
+  assert_eq(
+    bump_workflow_dispatch_probe(workflow_source(harness.fs, "bump-harn.yml")),
+    {ok: true, reason: ""},
+  )
+}
+
+/** The remaining first-party CI workflows still pin setup-harn by SHA. */
+pipeline test_ci_workflows_use_immutable_first_party_harn_setup(harness: Harness, task: any) {
+  const workflows = ["ci.yml", "bump-fleet.yml"]
+  for name in workflows {
+    const workflow = decode_github_workflow(workflow_source(harness.fs, name))
+    let setup_steps = []
+    for job in workflow.jobs {
+      for step in job.value.steps ?? [] {
+        const uses = step.uses ?? ""
+        if starts_with(uses, "burin-labs/harn/.github/actions/setup-harn@") {
+          assert_eq(uses, SETUP_ACTION, name)
+          setup_steps = setup_steps + [step.uses]
+        }
+        for legacy in ["scripts/install_harn.sh", "rust-toolchain"] {
+          assert_eq(contains(step.run ?? "", legacy), false, name)
+          assert_eq(contains(uses, legacy), false, name)
+        }
+      }
+    }
+    assert(setup_steps.count >= 1, name)
+  }
+}
+
+/**
+ * Every first-party action, in every workflow, at one commit.
+ *
+ * The check above reads three workflows and only the `setup-harn` step, so a
+ * repin that updated `setup-harn` and left `rust-cache` behind passed — and
+ * `hosted-release.yml`, where a stale pin costs a whole release, was not read
+ * at all. A partial repin is the realistic mistake; pinning nothing is not.
+ *
+ * The workflow list is read from disk rather than written here. A named list is
+ * the same partial-coverage failure one level up: it passes while a workflow it
+ * does not name carries a stale pin, and nothing about adding a workflow
+ * prompts anyone to extend it. `fleet-projection-convergence.yml` was already
+ * in that position.
+ */
+pipeline test_every_first_party_action_shares_one_pin(harness: Harness, task: any) {
+  const prefix = "burin-labs/harn/.github/actions/"
+  const expected_pin = SETUP_ACTION.split("@")[1]
+  let checked = 0
+  let workflows = 0
+  for name in workflow_names(harness.fs) {
+    const workflow = decode_github_workflow(workflow_source(harness.fs, name))
+    workflows = workflows + 1
+    for job in workflow.jobs {
+      for step in job.value.steps ?? [] {
+        const uses = trim(step.uses ?? "")
+        if !starts_with(uses, prefix) {
+          continue
+        }
+        const parts = uses.split("@")
+        assert_eq(len(parts), 2, "${name}: ${uses}")
+        assert_eq(parts[1], expected_pin, "${name}: ${uses}")
+        checked = checked + 1
+      }
+    }
+  }
+  // Floors, not counts: a discovered list should not have to be edited every
+  // time a workflow gains a step. They exist so that a listing that silently
+  // returned nothing reads as the failure it is, rather than as a clean sweep.
+  assert(workflows >= 5, "only ${to_string(workflows)} workflow(s) were read")
+  assert(checked >= 8, "only ${to_string(checked)} first-party action pins were read")
+}
+
+/**
+ * A projection alarm must not decide whether the fleet may converge.
+ *
+ * `check_fleet_policy.harn` ran before the controller under `set -euo
+ * pipefail`, so drift in a projection aborted the job and not one repository
+ * bumped. `[policy] bump_workflow` pins a SHA of a file that moved six times in
+ * two weeks, and every move puts all 26 fleet-owned adapters out of conformance
+ * at once — so the check was red by construction and took the fleet down with
+ * it for three days (2026-08-01..03).
+ *
+ * Ordering is the whole fix, so ordering is what this pins. The check still
+ * runs and still fails the run; it just no longer runs first.
+ */
+pipeline test_projection_check_cannot_gate_updates(harness: Harness, task: any) {
+  const workflow = decode_github_workflow(workflow_source(harness.fs, "bump-fleet.yml"))
+  let convergence_at = -1
+  let check_at = -1
+  for job in workflow.jobs {
+    let index = 0
+    for step in job.value.steps ?? [] {
+      const name = step.name ?? ""
+      if name == "Start Harn updates" {
+        convergence_at = index
+      }
+      if name == "Verify remote fleet projections" {
+        check_at = index
+      }
+      index = index + 1
+    }
+  }
+  assert_eq(convergence_at >= 0, true, "Harn update step is missing")
+  assert_eq(check_at >= 0, true, "projection check step is missing")
+  assert_eq(
+    convergence_at < check_at,
+    true,
+    "the projection check must run after Harn updates, not gate them",
+  )
+}
