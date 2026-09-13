@@ -10,8 +10,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 refresh_script="${HARN_EXT_HOSTED_RELEASE_REFRESH_SCRIPT:-${script_dir}/refresh_hosted_release_credentials.sh}"
 watch_script="${HARN_EXT_HOSTED_RELEASE_WATCH_SCRIPT:-${script_dir}/watch_harn_release.sh}"
-segment_polls="${HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS:-60}"
-interval_seconds="${HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS:-30}"
+segment_polls="${HARN_EXT_HOSTED_RELEASE_SEGMENT_POLLS:-15}"
+interval_seconds="${HARN_EXT_HOSTED_RELEASE_INTERVAL_SECONDS:-180}"
 max_segment_seconds=2700
 
 # Keep the refreshed gh login under the runner's secret scratch root. The
