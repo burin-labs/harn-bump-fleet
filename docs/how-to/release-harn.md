@@ -213,9 +213,11 @@ scripts/dispatch_hosted_release.sh \
 `mode: audit` is read-only. `mode: prepare` builds and certifies the candidate.
 `mode: ship-pr` opens the release PR and hands its receipt to the watcher. The
 watcher tags the immutable certified candidate, arms the release PR, and monitors
-publication, so a release needs no local step.
+publication, even when `converge_fleet` is false. The watcher checks every three
+minutes and refreshes its credentials between segments of at most 45 minutes.
+A release needs no local step.
 
-With `update_fleet: true`, the hosted run also follows the complete bounded
+With `converge_fleet: true`, the hosted run also follows the complete bounded
 repository-update chain, not just its first Actions run. Each continuation has
 the same release run ID in its display name. The first incomplete round leases
 an exact-OID `harn-update-chain/<release-run-id>` branch; later rounds dispatch
