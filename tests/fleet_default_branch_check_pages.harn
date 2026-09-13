@@ -1,0 +1,177 @@
+import { fleet_default_branch_proof } from "../lib/fleet_default_branch_proof"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const SHA = "1111111111111111111111111111111111111111"
+
+const API = "https://fleet-check-pages.test"
+
+const ROOT = API + "/repos/owner/project"
+
+const CHECKS = ROOT + "/commits/" + SHA + "/check-runs?filter=latest&per_page=100"
+
+fn options() -> GithubClientOptions {
+  return {api_base_url: API, installation_token: "check-pages-fixture", retry: {max_attempts: 1}}
+}
+
+fn check(id: int, name: string) -> dict {
+  return {id: id, name: name, head_sha: SHA, status: "completed", conclusion: "success"}
+}
+
+fn setup(testing: HarnessTesting, total: int = 101) {
+  testing.http_mock_clear()
+  testing.http_mock(
+    "GET",
+    ROOT + "/rules/branches/main",
+    {
+      status: 200,
+      body: json_stringify(
+        [
+          {
+            type: "required_status_checks",
+            parameters: {required_status_checks: [{context: "CI status"}]},
+          },
+        ],
+      ),
+    },
+  )
+  testing.http_mock(
+    "GET",
+    ROOT + "/branches/main",
+    {status: 200, body: json_stringify({name: "main", commit: {sha: SHA}})},
+  )
+  let rows = []
+  for index in range(0, 100) {
+    rows = rows + [check(index + 1, "check-" + to_string(index))]
+  }
+  const first = {status: 200, body: json_stringify({total_count: total, check_runs: rows})}
+  // Keep the original one-page request reachable so the regression measures
+  // its incomplete verdict rather than failing on an unmatched mock.
+  testing.http_mock("GET", CHECKS, first)
+  testing.http_mock("GET", CHECKS + "&page=1", first)
+  testing.http_mock(
+    "GET",
+    ROOT + "/commits/" + SHA + "/status?per_page=100&page=1",
+    {status: 200, body: json_stringify({sha: SHA, total_count: 0, statuses: []})},
+  )
+}
+
+pipeline test_required_check_after_first_page_is_proven(harness: Harness) {
+  setup(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    CHECKS + "&page=2",
+    {status: 200, body: json_stringify({total_count: 101, check_runs: [check(101, "CI status")]})},
+  )
+  const proof = fleet_default_branch_proof(harness, "owner/project", "main", SHA, options())
+  assert(proof.ok, json_stringify(proof))
+  assert_eq(proof.state, "proven")
+  assert_eq(proof.total_checks, 101)
+  assert_eq(proof.unproven, [])
+  assert_eq(
+    len(
+      harness.testing.http_mock_calls().filter({ call -> call.url == CHECKS + "&page=2" }).to_list(),
+    ),
+    1,
+  )
+}
+
+pipeline test_failed_later_page_cannot_prove_default_branch(harness: Harness) {
+  setup(harness.testing)
+  harness.testing.http_mock("GET", CHECKS + "&page=2", {status: 403, body: "{}"})
+  const proof = fleet_default_branch_proof(harness, "owner/project", "main", SHA, options())
+  assert(!proof.ok)
+  assert(contains(join(proof.unproven, " "), "exact-head check census read failed"))
+}
+
+pipeline test_partial_later_page_cannot_prove_default_branch(harness: Harness) {
+  setup(harness.testing, 102)
+  harness.testing.http_mock(
+    "GET",
+    CHECKS + "&page=2",
+    {status: 200, body: json_stringify({total_count: 102, check_runs: [check(101, "CI status")]})},
+  )
+  const proof = fleet_default_branch_proof(harness, "owner/project", "main", SHA, options())
+  assert(!proof.ok)
+  assert(contains(join(proof.unproven, " "), "exact-head check census read failed"))
+}
+
+pipeline test_empty_check_inventory_is_not_success(harness: Harness) {
+  setup(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    CHECKS + "&page=1",
+    {status: 200, body: json_stringify({total_count: 0, check_runs: []})},
+  )
+  const proof = fleet_default_branch_proof(harness, "owner/project", "main", SHA, options())
+  assert(!proof.ok)
+  assert_eq(proof.total_checks, 0)
+  assert_eq(proof.state, "pending")
+  assert(contains(join(proof.unproven, " "), "incomplete_check_evidence"))
+}
+
+pipeline test_replacement_workflow_must_finish_before_default_branch_is_proven(harness: Harness) {
+  for finished in [false, true] {
+    setup(harness.testing)
+    let rows = []
+    let runs = []
+    for id in [10, 11] {
+      const complete = id == 10 || finished
+      const status = if complete {
+        "completed"
+      } else {
+        "queued"
+      }
+      const conclusion = if id == 10 {
+        "cancelled"
+      } else if finished {
+        "success"
+      } else {
+        nil
+      }
+      const url = "https://github.com/owner/project/actions/runs/" + to_string(id)
+      rows = rows
+        + [
+          check(id, "CI status")
+            + {status: status, conclusion: conclusion, details_url: url + "/job/1"},
+        ]
+      runs = runs
+        + [
+          {
+            id: id,
+            workflow_id: 5,
+            path: ".github/workflows/ci.yml",
+            event: "push",
+            status: status,
+            conclusion: conclusion,
+            head_sha: SHA,
+            run_attempt: 1,
+            html_url: url,
+          },
+        ]
+    }
+    harness.testing.http_mock(
+      "GET",
+      CHECKS + "&page=1",
+      {status: 200, body: json_stringify({total_count: 2, check_runs: rows})},
+    )
+    harness.testing.http_mock(
+      "GET",
+      ROOT + "/actions/runs?head_sha=" + SHA + "&per_page=100&page=1",
+      {status: 200, body: json_stringify({total_count: 2, workflow_runs: runs})},
+    )
+    const proof = fleet_default_branch_proof(harness, "owner/project", "main", SHA, options())
+    assert_eq(proof.ok, finished, json_stringify(proof))
+    assert_eq(
+      proof.state,
+      if finished {
+        "proven"
+      } else {
+        "pending"
+      },
+    )
+    if finished {
+      assert_eq(proof.total_checks, 1)
+      assert_eq(proof.unproven, [])
+    }
+  }
+}
