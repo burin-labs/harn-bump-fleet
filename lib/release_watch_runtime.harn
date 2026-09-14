@@ -14,6 +14,7 @@ import { newest_run_for_workflow } from "./release_health"
 import {
   ReleaseLandingReceipt,
   ReleaseMergeLease,
+  github_enable_auto_merge_with_release_lease,
   observe_release_landing,
   record_release_landing,
   release_landing_admission,
@@ -170,6 +171,9 @@ fn default_watch_adapter(harness: Harness, repo: string) -> ReleaseWatchRuntimeA
     ) },
     pr_probe:
       fn(slug, pr_url) { return github_adapter_result(github_pr_view(harness, slug, pr_url)) },
+    enable_auto_merge: fn(slug, pr) { return github_adapter_result(
+      github_enable_auto_merge_with_release_lease(harness, slug, pr.number, pr.head.sha, "squash"),
+    ) },
     replacement_prs: fn(slug, _tag, _poll) {
       // Superseding a frozen release creates a new immutable attempt ref, so
       // it necessarily has a different head from the receipt. GitHub also
@@ -354,12 +358,77 @@ fn persist_release_pr_authority(
   } else {
     {watchdog: {action: "skip", reason: "pull_request_watchdog_disabled"}, landing: receipt.landing}
   }
-  if authority.landing == nil || authority.landing == receipt.landing {
-    return {receipt: receipt, watchdog: authority.watchdog}
+  let persisted = receipt
+  if receipt.initial_merge_request == "attempted"
+    && (authority.watchdog.action == "ok" || authority.watchdog.action == "done") {
+    persisted = persisted + {initial_merge_request: "observed", updated_at: observed_at}
   }
-  const persisted = record_release_landing(receipt, authority.landing, observed_at)
-  release_watch_receipt_write(harness, receipt_path, persisted)
+  if authority.landing != nil && authority.landing != receipt.landing {
+    persisted = record_release_landing(persisted, authority.landing, observed_at)
+  }
+  if persisted != receipt {
+    release_watch_receipt_write(harness, receipt_path, persisted)
+  }
   return {receipt: persisted, watchdog: authority.watchdog}
+}
+
+/** Consume the certified handoff once; an uncertain request is never sent again. */
+fn request_initial_release_merge(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  if receipt.initial_merge_request != "authorized" {
+    return receipt
+  }
+  if receipt.release_commit_oid != receipt.publication.head_oid
+    || receipt.merge_lease_generation == ""
+    || receipt.merge_lease_method != "squash" {
+    throw "initial merge request requires the tagged candidate and its squash merge lease"
+  }
+  const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if is_err(probe) {
+    throw "initial release merge identity could not be read"
+  }
+  if probe?.head?.sha != receipt.publication.head_oid
+    || probe?.number != receipt.merge_lease_candidate_pr
+    || probe?.base?.ref != "main" {
+    throw "initial release merge identity does not match the certified handoff"
+  }
+  const already_armed = (probe?.auto_merge_armed ?? false)
+    || (probe?.in_merge_queue ?? false)
+    || (probe?.merged ?? false)
+  if already_armed {
+    const adopted = receipt + {initial_merge_request: "observed", updated_at: observed_at}
+    release_watch_receipt_write(harness, receipt_path, adopted)
+    return adopted
+  }
+  if probe?.github_state != "open" || probe?.mergeable_state == "dirty" {
+    return receipt
+  }
+  const arm = adapter.enable_auto_merge
+  if arm == nil {
+    throw "initial release merge adapter is unavailable"
+  }
+  const attempted = receipt + {initial_merge_request: "attempted", updated_at: observed_at}
+  release_watch_receipt_write(harness, receipt_path, attempted)
+  // Persist before the network effect. A lost response leaves attempted state,
+  // and the observer below may adopt success but can never repeat the request.
+  const sent = arm(receipt.slug, probe)
+  if is_err(sent) {
+    return attempted
+  }
+  const observed = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if !is_err(observed) && observed?.head?.sha == receipt.publication.head_oid
+    && ((observed?.auto_merge_armed ?? false) || (observed?.in_merge_queue ?? false)
+      || (observed?.merged ?? false)) {
+    const confirmed = attempted + {initial_merge_request: "observed"}
+    release_watch_receipt_write(harness, receipt_path, confirmed)
+    return confirmed
+  }
+  return attempted
 }
 
 /** Select one exact-version immutable replacement without trusting connector-side filtering. */
@@ -694,6 +763,8 @@ fn emit_progress(
 fn release_watch_blocked_message(reason: string) -> string {
   return if reason == "release_pr_conflicted" {
     "release PR conflicts with main; resume the canonical release command for post-publish fixup while preserving the published tag and immutable candidate"
+  } else if reason == "release_pr_merge_authority_revoked" {
+    "release PR has no observed merge request or queue membership; the watcher will not re-enable it"
   } else {
     "replacement release PR signature, release notes, or identity verification failed; the published tag and certified candidate remain unchanged"
   }
@@ -731,6 +802,15 @@ pub fn run_release_watch(
   )
   while poll < max_polls {
     const observed_at = adapter.now(poll)
+    if keep_pr_armed {
+      receipt = request_initial_release_merge(
+        pick(harness, ["fs", "random"]),
+        adapter,
+        receipt,
+        receipt_path,
+        observed_at,
+      )
+    }
     const authority = persist_release_pr_authority(
       pick(harness, ["fs", "random"]),
       adapter,
