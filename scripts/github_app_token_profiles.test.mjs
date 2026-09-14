@@ -19,8 +19,10 @@ test("fleet profile is organization-wide but permission-minimal", () => {
   assert.deepEqual(installationTokenRequest("fleet-orchestration"), {
     permissions: {
       actions: "write",
+      checks: "read",
       contents: "write",
       pull_requests: "write",
+      statuses: "read",
       workflows: "write",
     },
   });
