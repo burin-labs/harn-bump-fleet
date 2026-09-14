@@ -66,5 +66,11 @@ The hosted release uses `--no-wait` to hand off a pending journal to its cheaper
 fleet job. That job uses `--reconcile-only` with read-only credentials to record
 terminal proof through the same owner. A successful handoff isn't completion.
 
+After external repairs complete, use the same command with `--reconcile-only`
+to observe their result. This reads the original journal once even when automatic
+recovery has exhausted its retry budget. It preserves that recovery history and
+cannot create proposals or dispatch workflows. Missing or failed proof remains
+incomplete; observation does not renew permission to retry a write.
+
 For repository-update receipts and failure diagnosis, see
 [Run or resume an update](../harn-update-operations.md).
