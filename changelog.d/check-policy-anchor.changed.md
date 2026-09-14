@@ -1,0 +1,1 @@
+- Verify each manifest-owned reusable-workflow pin still publishes the owner's current workflow bytes before dispatching fleet bumps.
