@@ -1,0 +1,487 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { shell_quote } from "std/runtime"
+import {
+  RELEASE_PIN_CLI_WARM_TIMEOUT_MS,
+  append_std_command_step,
+  coerce_flag_choice,
+  default_release_cargo_target_dir,
+  release_audit_tmp_dir,
+  release_cargo_build_dir,
+  release_cargo_build_script_refresh_command,
+  release_cargo_cache_prune_command,
+  release_cargo_target_dir_guard_error,
+  release_command_in_context,
+  release_flag_passed,
+  release_pin_cli_warm_command,
+  release_prepare_env,
+  release_prepared_cli_aot_check_command,
+  release_shield_harn_binary_command,
+  release_shielded_harn_bin,
+  resolve_release_cargo_target_dir,
+} from "../lib/release_commands"
+import { user_timing_spans } from "../lib/timing_report"
+
+pipeline test_interactive_flag_helpers(task: any) {
+  // release_flag_passed: bare flag, `=` form, and absence.
+  assert_eq(release_flag_passed(["--mode", "ship-pr", "--bump", "patch"], "--mode"), true)
+  assert_eq(release_flag_passed(["--bump=minor"], "--bump"), true)
+  assert_eq(release_flag_passed(["--agent", "--yes-live-release"], "--mode"), false)
+  assert_eq(release_flag_passed([], "--mode"), false)
+  // coerce_flag_choice: verbatim accept, case-insensitive, blank/invalid/timeout fallbacks.
+  const good = coerce_flag_choice("ship-pr", true, ["audit", "prepare", "ship-pr"], "audit")
+  assert_eq(good.value, "ship-pr")
+  assert_eq(good.note, "")
+  assert_eq(
+    coerce_flag_choice("  SHIP-PR ", true, ["audit", "prepare", "ship-pr"], "audit").value,
+    "ship-pr",
+  )
+  const blank = coerce_flag_choice("", true, ["patch", "minor", "major"], "patch")
+  assert_eq(blank.value, "patch")
+  assert_eq(contains(blank.note, "patch"), true)
+  const bad = coerce_flag_choice("yolo", true, ["patch", "minor", "major"], "patch")
+  assert_eq(bad.value, "patch")
+  assert_eq(contains(bad.note, "not"), true)
+  const timed_out = coerce_flag_choice("", false, ["audit", "prepare", "ship-pr"], "audit")
+  assert_eq(timed_out.value, "audit")
+  assert_eq(contains(timed_out.note, "timeout"), true)
+}
+
+pipeline test_release_prepare_env_defaults_to_stable_cargo_target(task: any) {
+  const repo = "/tmp/harn-release-fixture"
+  const tmp = release_audit_tmp_dir(repo)
+  const env = release_prepare_env(repo)
+  assert_eq(
+    env,
+    "env -u HARN_BIN -u HARN_EGRESS_ALLOW -u HARN_EGRESS_DENY -u HARN_EGRESS_DEFAULT -u HARN_EGRESS_BLOCK_PRIVATE -u HARN_EGRESS_ALLOW_LOOPBACK RUSTC_WRAPPER= SCCACHE_DISABLE=1 CARGO_TARGET_DIR='/tmp/harn-bump-fleet-release-harn-target' CARGO_BUILD_BUILD_DIR='/tmp/harn-bump-fleet-release-harn-target/build' TMPDIR='${tmp}' TMP='${tmp}' TEMP='${tmp}' HARN_RELEASE_HARNESS=1",
+  )
+  const bootstrap = release_prepare_env(repo, true)
+  assert_eq(contains(bootstrap, "HARN_BOOTSTRAP_NEW_CRATES=1"), true)
+  const override_env = release_prepare_env(repo, false, "/tmp/shared-release-target")
+  assert_eq(
+    override_env,
+    "env -u HARN_BIN -u HARN_EGRESS_ALLOW -u HARN_EGRESS_DENY -u HARN_EGRESS_DEFAULT -u HARN_EGRESS_BLOCK_PRIVATE -u HARN_EGRESS_ALLOW_LOOPBACK RUSTC_WRAPPER= SCCACHE_DISABLE=1 CARGO_TARGET_DIR='/tmp/shared-release-target' CARGO_BUILD_BUILD_DIR='/tmp/shared-release-target/build' TMPDIR='${tmp}' TMP='${tmp}' TEMP='${tmp}' HARN_RELEASE_HARNESS=1",
+  )
+}
+
+pipeline test_release_command_context_keeps_plain_checks_plain_and_builds_canonical(
+  harness: Harness,
+  task: any,
+) {
+  const repo = "/tmp/harn release fixture"
+  const target = "/tmp/shared release target"
+  assert_eq(
+    release_command_in_context("make -s lint-md", "plain", repo, false, target),
+    "make -s lint-md",
+  )
+  const build = release_command_in_context(
+    "make check-cli-aot",
+    "release_build",
+    repo,
+    true,
+    target,
+  )
+  assert_eq(contains(build, "CARGO_TARGET_DIR='/tmp/shared release target'"), true)
+  assert_eq(contains(build, "CARGO_BUILD_BUILD_DIR='/tmp/shared release target/build'"), true)
+  assert_eq(contains(build, "RUSTC_WRAPPER= SCCACHE_DISABLE=1"), true)
+  assert_eq(contains(build, "HARN_BOOTSTRAP_NEW_CRATES=1"), true)
+  assert_eq(ends_with(build, " make check-cli-aot"), true)
+  assert_eq(contains(build, repo + "/target"), false)
+  const probe = release_command_in_context(
+    "sh -c "
+      + shell_quote(
+        "printf '%s|%s|%s|%s' \"$CARGO_TARGET_DIR\" \"$CARGO_BUILD_BUILD_DIR\" \"$HARN_RELEASE_HARNESS\" \"$HARN_BOOTSTRAP_NEW_CRATES\"",
+      ),
+    "release_build",
+    repo,
+    true,
+    target,
+  )
+  const result = harness.process.shell(probe)
+  assert_eq(result.status, "completed")
+  assert_eq(result.exit_code, 0)
+  assert_eq(result.stdout, target + "|" + target + "/build|1|1")
+}
+
+pipeline test_prepared_cli_aot_check_reuses_generator_from_release_target(task: any) {
+  const command = release_prepared_cli_aot_check_command("/tmp/shared release target", "1.2.4")
+  assert(contains(command, "/tmp/shared release target/debug/harn-cli-aot-gen"))
+  assert(contains(command, "[ -x \"$generator.exe\" ]"))
+  assert(contains(command, "HARN_CLI_AOT_GEN_BIN=\"$generator\""))
+  assert(contains(command, "HARN_CLI_AOT_ARTIFACT_VERSION="))
+  assert(contains(command, "1.2.4"))
+  assert(contains(command, "make check-cli-aot"))
+  assert_eq(contains(command, "cargo "), false)
+  const missing = try {
+    release_prepared_cli_aot_check_command("", "1.2.4")
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(missing, "requires the canonical release target"))
+  const missing_version = try {
+    release_prepared_cli_aot_check_command("/tmp/shared-release-target", "")
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(contains(missing_version, "requires the reconciled release version"))
+}
+
+pipeline test_release_pin_cli_warm_uses_exact_checkout_and_release_target(task: any) {
+  assert_eq(RELEASE_PIN_CLI_WARM_TIMEOUT_MS, 1800000)
+  const pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const command = release_pin_cli_warm_command(
+    "/tmp/harn-release-fixture",
+    pin,
+    false,
+    "/tmp/shared-release-target",
+  )
+  assert_eq(contains(command, "env -u HARN_BIN"), true)
+  assert_eq(contains(command, "CARGO_TARGET_DIR='/tmp/shared-release-target'"), true)
+  assert_eq(contains(command, "CARGO_BUILD_BUILD_DIR='/tmp/shared-release-target/build'"), true)
+  assert_eq(contains(command, "git rev-parse HEAD"), true)
+  assert_eq(contains(command, pin), true)
+  assert_eq(contains(command, "cargo build -p harn-cli --bin harn --locked"), true)
+  const bad_pin = try {
+    release_pin_cli_warm_command("/tmp/harn-release-fixture", "abc", false, "/tmp/target")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(bad_pin, "40-character"))
+}
+
+pipeline test_release_cargo_target_dir_defaults_to_stable_user_cache(task: any) {
+  assert_eq(
+    default_release_cargo_target_dir("/Users/example"),
+    "/Users/example/.cache/harn-bump-fleet/release-harn-target",
+  )
+  assert_eq(
+    default_release_cargo_target_dir("/Users/example", "/var/tmp/xdg-cache"),
+    "/var/tmp/xdg-cache/harn-bump-fleet/release-harn-target",
+  )
+  assert_eq(default_release_cargo_target_dir(""), "/tmp/harn-bump-fleet-release-harn-target")
+  assert_eq(
+    release_cargo_build_dir("/tmp/harn-bump-fleet-release-harn-target"),
+    "/tmp/harn-bump-fleet-release-harn-target/build",
+  )
+  assert_eq(
+    release_audit_tmp_dir(),
+    "/tmp/harn-workspace/harn-bump-fleet/release-harn-target/tmp/shared",
+  )
+  assert_eq(
+    resolve_release_cargo_target_dir("", "/Users/example"),
+    "/Users/example/.cache/harn-bump-fleet/release-harn-target",
+  )
+  assert_eq(resolve_release_cargo_target_dir("/tmp/explicit", "/Users/example"), "/tmp/explicit")
+}
+
+pipeline test_release_cargo_cache_prune_command_caps_the_full_target(task: any) {
+  const cmd = release_cargo_cache_prune_command("/tmp/shared-release-target", 32, 48)
+  assert_eq(contains(cmd, "target_dir='/tmp/shared-release-target'"), true)
+  assert_eq(contains(cmd, "build_dir='/tmp/shared-release-target/build'"), true)
+  assert_eq(
+    contains(cmd, "tmp_dir='/tmp/harn-workspace/harn-bump-fleet/release-harn-target/tmp/shared'"),
+    true,
+  )
+  assert_eq(contains(cmd, "max_gib=32"), true)
+  assert_eq(contains(cmd, "min_free_gib=48"), true)
+  assert_eq(
+    contains(cmd, "rm -rf \"$tmp_dir\"; mkdir -p \"$target_dir\" \"$build_dir\" \"$tmp_dir\""),
+    true,
+  )
+  assert_eq(
+    contains(
+      cmd,
+      "rm -rf \"$target_dir/debug/build\" \"$target_dir/release/build\" \"$build_dir/debug/build\" \"$build_dir/release/build\"",
+    ),
+    true,
+  )
+  assert_eq(contains(cmd, "du -sk \"$target_dir\""), true)
+  assert_eq(contains(cmd, "df -Pk \"$target_dir\""), true)
+  assert_eq(contains(cmd, "rm -rf \"$target_dir/debug\" \"$target_dir/release\""), true)
+  assert_eq(contains(cmd, "rm -rf \"$target_dir/package-check-target\""), true)
+  assert_eq(contains(cmd, "rm -rf \"$build_dir\""), true)
+  assert_eq(contains(cmd, "disk free space is below floor"), true)
+  assert_eq(contains(cmd, "preserving canonical build cache"), true)
+  assert_eq(contains(cmd, "release cargo cache above cap"), true)
+  const fallback = release_cargo_cache_prune_command("/tmp/shared-release-target", -1)
+  assert_eq(contains(fallback, "max_gib=64"), true)
+  assert_eq(contains(fallback, "min_free_gib=96"), true)
+}
+
+pipeline test_release_cargo_tmp_is_isolated_by_workspace_owner(task: any) {
+  const first = release_cargo_cache_prune_command(
+    "/tmp/shared-release-target",
+    32,
+    48,
+    "/tmp/release-first-run",
+  )
+  const second = release_cargo_cache_prune_command(
+    "/tmp/shared-release-target",
+    32,
+    48,
+    "/tmp/release-second-run",
+  )
+  assert(contains(first, "release-harn-target/tmp/release-first-run-"))
+  assert(contains(second, "release-harn-target/tmp/release-second-run-"))
+  assert_eq(contains(first, "release-second-run"), false)
+  assert_eq(contains(second, "release-first-run"), false)
+  // Only the owner's own directory is ever removed, and the selected path is
+  // recorded so a linker failure can be traced to the exact temp owner.
+  assert(contains(first, "rm -rf \"$tmp_dir\""))
+  assert(contains(first, "printf 'release cargo temp: owner_dir=%s\\n' \"$tmp_dir\""))
+}
+
+pipeline test_release_cargo_build_script_refresh_preserves_compiled_cache(
+  harness: Harness,
+  task: any,
+) {
+  const target = path_join(
+    harness.fs.temp_dir(),
+    "release-build-script-refresh-" + harness.random.uuid_v7(),
+  )
+  for dir in [
+    "debug/build/stale",
+    "release/build/stale",
+    "build/debug/build/stale",
+    "build/release/build/stale",
+    "debug/deps",
+  ] {
+    harness.fs.mkdir(path_join(target, dir), true)
+  }
+  harness.fs.write_text(path_join(target, "debug/deps/compiled.rlib"), "keep")
+  const result = harness.process.shell(release_cargo_build_script_refresh_command(target))
+  assert_eq(result.status, "completed")
+  assert_eq(result.exit_code, 0)
+  for dir in ["debug/build", "release/build", "build/debug/build", "build/release/build"] {
+    assert_eq(harness.fs.exists(path_join(target, dir)), false)
+  }
+  assert_eq(harness.fs.read_text(path_join(target, "debug/deps/compiled.rlib")), "keep")
+}
+
+pipeline test_release_cargo_target_dir_guard_rejects_repo_local_targets(task: any) {
+  assert_eq(
+    release_cargo_target_dir_guard_error("/tmp/harn-release-fixture", "/tmp/shared-release-target"),
+    nil,
+  )
+  assert(
+    contains(
+      release_cargo_target_dir_guard_error("/tmp/harn-release-fixture", "target-release") ?? "",
+      "absolute",
+    ),
+  )
+  assert(
+    contains(
+      release_cargo_target_dir_guard_error(
+        "/tmp/harn-release-fixture",
+        "/tmp/harn-release-fixture/target-release",
+      )
+        ?? "",
+      "outside the release repo",
+    ),
+  )
+  assert(
+    contains(
+      release_cargo_target_dir_guard_error(
+        "/tmp/harn-release-fixture/",
+        "/tmp/harn-release-fixture",
+      )
+        ?? "",
+      "outside the release repo",
+    ),
+  )
+  const relative_env = try {
+    release_prepare_env("/tmp/harn-release-fixture", false, "target-release")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(relative_env, "must be absolute"))
+  const in_repo_env = try {
+    release_prepare_env(
+      "/tmp/harn-release-fixture",
+      false,
+      "/tmp/harn-release-fixture/target-release",
+    )
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(in_repo_env, "outside the release repo"))
+}
+
+pipeline test_release_commands(harness: Harness, task: any) {
+  const cfg = {repo: harness.fs.cwd()}
+  const ok_step = append_std_command_step(
+    harness,
+    cfg,
+    [],
+    "sample",
+    "printf sample",
+    { _spec, _options -> command_result_ok("sample\n") },
+  )
+  assert_eq(ok_step.success, true)
+  assert_eq(ok_step.step.classification, "ok")
+  assert_eq(ok_step.step.stdout, "sample\n")
+  const failed = append_std_command_step(
+    harness,
+    cfg,
+    [],
+    "lint",
+    "make -s lint-md",
+    { _spec, _options -> command_result_fail(2, "MD013 line too long") },
+  )
+  assert_eq(failed.success, false)
+  assert_eq(failed.step.command, "make -s lint-md")
+  assert_eq(failed.step.classification, "generated_markdown_lint_failed")
+  assert(contains(failed.step.recovery_hint, "markdown lint"))
+  // Argv-mode spec: list inputs build an argv command with the
+  // shell-equivalent label lifted onto step.command so downstream classifiers
+  // and audit logs still see a sensible string.
+  const argv_step = append_std_command_step(
+    harness,
+    cfg,
+    [],
+    "argv-sample",
+    ["git", "status", "--porcelain"],
+    { spec, _options -> command_result_ok(spec.command ?? "") },
+  )
+  assert_eq(argv_step.success, true)
+  assert_eq(argv_step.step.command, "git status --porcelain")
+  assert_eq(argv_step.step.argv, ["git", "status", "--porcelain"])
+  const live_logged = append_std_command_step(
+    harness,
+    cfg,
+    [],
+    "live-sample",
+    "printf sample",
+    { spec, _options -> command_result_ok(spec.command ?? "") },
+    {live_log_path: "/tmp/release-prepare.log"},
+  )
+  assert_eq(live_logged.success, true)
+  assert(contains(live_logged.step.stdout, "{ printf sample; }"))
+  assert(contains(live_logged.step.stdout, "> '/tmp/release-prepare.log' 2>&1"))
+  assert_eq(live_logged.step.command, "printf sample")
+  assert_eq(live_logged.step.live_log, "/tmp/release-prepare.log")
+  const command_spans = user_timing_spans(harness.obs).filter(
+    { span -> span.name == "release.command" },
+  )
+  const argv_spans = command_spans.filter({ span -> span.attributes.step == "argv-sample" })
+  assert_eq(len(argv_spans), 1)
+  assert_eq(argv_spans[0]?.attributes.category, "git")
+  assert_eq(argv_spans[0]?.status, "ok")
+  const failed_spans = command_spans.filter({ span -> span.attributes.step == "lint" })
+  assert_eq(len(failed_spans), 1)
+  assert_eq(failed_spans[0]?.status, "error")
+}
+
+/**
+ * Cargo publishes `<target>/debug/harn` by overwriting it in place, so a
+ * concurrent build rewrites a binary another release has mapped and macOS kills
+ * that process with `SIGKILL (Code Signature Invalid)`. The release must
+ * execute a copy it installed itself, through a rename that leaves any running
+ * process on its own inode.
+ */
+pipeline test_release_cli_is_shielded_from_in_place_cargo_rewrites(task: any) {
+  const pin = "2b98fd0b45ea7e26921ba1637bb2d570832319bb"
+  const staged = release_shielded_harn_bin("/tmp/release-target", pin)
+  assert_eq(staged, "/tmp/release-target/shielded-cli/${pin}/harn")
+  // The prune prologue clears `debug/` and `release/`; the shielded copy must
+  // not live inside either.
+  assert_eq(contains(staged, "/debug/"), false)
+  assert_eq(contains(staged, "/release/"), false)
+  assert_eq(release_shielded_harn_bin("/tmp/release-target", uppercase(pin)), staged)
+  const command = release_shield_harn_binary_command("/tmp/release-target/debug/harn", staged)
+  // Install by rename, never by writing the destination directly.
+  assert(contains(command, "cp '/tmp/release-target/debug/harn' '${staged}.staging'"))
+  assert(contains(command, "mv -f '${staged}.staging' '${staged}'"))
+  assert_eq(contains(command, "cp '/tmp/release-target/debug/harn' '${staged}'"), false)
+  assert(contains(command, "mkdir -p '/tmp/release-target/shielded-cli/${pin}'"))
+}
+
+pipeline test_release_cli_shielding_rejects_unusable_inputs(task: any) {
+  const short_pin = try {
+    release_shielded_harn_bin("/tmp/release-target", "abc")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(short_pin, "40-character commit SHA"))
+  const empty_pin = try {
+    release_shielded_harn_bin("/tmp/release-target", "")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(empty_pin, "40-character commit SHA"))
+  const no_source = try {
+    release_shield_harn_binary_command("", "/tmp/staged/harn")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(no_source, "source and a staged path"))
+  const no_target = try {
+    release_shield_harn_binary_command("/tmp/debug/harn", "")
+    ""
+  } catch (e) {
+    to_string(e)
+  }
+  assert(contains(no_target, "source and a staged path"))
+}
+
+/**
+ * The exact-pin warm runs more than once per release, and the build-script
+ * OUT_DIR wipe used to run with it every time. Cargo re-runs every build script
+ * whose output directory disappeared and recompiles everything downstream, so
+ * the second warm was cold by construction: 342.7s then 345.6s on v0.10.92, for
+ * the same pin on the same target. The wipe protects a long-lived target across
+ * runs, which one run touching it twice does not need.
+ */
+pipeline test_build_script_refresh_runs_once_per_run_not_once_per_warm(task: any) {
+  const untokened = release_cargo_build_script_refresh_command("/tmp/shared-release-target")
+  // No run identity means no stamp to compare against, so the old
+  // unconditional behavior is what a caller still gets.
+  assert(contains(untokened, "rm -rf \"$target_dir/debug/build\""))
+  assert_eq(contains(untokened, "stamp="), false)
+  const first = release_cargo_build_script_refresh_command(
+    "/tmp/shared-release-target",
+    "run-alpha",
+  )
+  assert(contains(first, "stamp='/tmp/shared-release-target/.release-build-script-refresh'"))
+  assert(contains(first, "token='run-alpha'"))
+  // The wipe is still present; it is now guarded, not removed.
+  assert(contains(first, "rm -rf \"$target_dir/debug/build\""))
+  assert(contains(first, "if [ \"$(cat \"$stamp\" 2>/dev/null)\" = \"$token\" ]"))
+  assert(contains(first, "already refreshed for this run"))
+  // The stamp is only written after a wipe, so a crashed warm cannot leave a
+  // stamp claiming a refresh that never happened.
+  assert(contains(first, "printf '%s' \"$token\" > \"$stamp\""))
+  // A different release must still refresh: the cross-run stale-fingerprint
+  // hazard is the reason the wipe exists at all.
+  const next_run = release_cargo_build_script_refresh_command(
+    "/tmp/shared-release-target",
+    "run-beta",
+  )
+  assert(contains(next_run, "token='run-beta'"))
+  assert_eq(contains(next_run, "run-alpha"), false)
+  // The token reaches the warm through the prune wrapper, which is the only
+  // path that actually runs it.
+  const warmed = release_pin_cli_warm_command(
+    "/tmp/harn-release-fixture",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    false,
+    "/tmp/shared-release-target",
+    "run-alpha",
+  )
+  assert(contains(warmed, "token='run-alpha'"))
+  assert(contains(warmed, "cargo build -p harn-cli --bin harn --locked"))
+  const unwarmed = release_pin_cli_warm_command(
+    "/tmp/harn-release-fixture",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    false,
+    "/tmp/shared-release-target",
+  )
+  assert_eq(contains(unwarmed, "stamp="), false)
+}
