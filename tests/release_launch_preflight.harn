@@ -1,0 +1,724 @@
+import {
+  github_commit_id_is_exact,
+  github_commit_prefix_is_well_formed,
+  github_large_file_text_at_ref,
+} from "../lib/github_commits"
+import {
+  RELEASE_LAUNCH_PRECONDITION_NAMES,
+  RELEASE_STATE_PRECONDITIONS,
+  ReleaseLaunchInputs,
+  at_sha_preconditions,
+  consumer_contract_precondition,
+  credential_refresh_precondition,
+  hosted_release_refresh_interval_s,
+  preflight_fail,
+  preflight_pass,
+  preflight_reported_causes,
+  preflight_scope_decision,
+  preflight_unavailable,
+  release_input_preconditions,
+  release_launch_preflight_lines,
+  release_launch_preflight_receipt,
+  token_description_preconditions,
+  token_lifetime_precondition,
+  token_permission_precondition,
+  workflow_mint_precondition,
+  workflow_mint_preconditions,
+} from "../lib/release_launch_preflight"
+import { is_release_changelog_fragment_name } from "../lib/release_note_fold"
+import { release_harness_root } from "../lib/release_paths"
+import {
+  RELEASE_CREDENTIAL_LIFETIME_S,
+  RELEASE_CREDENTIAL_REFRESH_INTERVAL_S,
+  release_phase_budget_drift,
+  release_phases_outliving_credential,
+} from "../lib/release_phase_budgets"
+
+/** Just the part of a receipt this comparison reads. */
+type ReceiptNames = {preconditions: list<{name: string}>}
+
+fn launch_inputs(
+  overrides: {mode?: string, bump?: string, at_sha?: string, preid?: string} = {},
+) -> ReleaseLaunchInputs {
+  return {
+    mode: overrides.mode ?? "ship-pr",
+    bump: overrides.bump ?? "patch",
+    prerelease_identifier: overrides.preid ?? "",
+    at_sha: overrides.at_sha ?? "",
+    repositories_json: "",
+    skip_consumers: "",
+    consumer_proof_runs_json: "",
+  }
+}
+
+fn status_of(checks: list<any>, name: string) -> string {
+  const check = checks.find({ entry -> return entry.name == name })
+  return if check == nil {
+    "absent"
+  } else {
+    to_string(check?.status ?? "absent")
+  }
+}
+
+fn detail_of(checks: list<any>, name: string) -> string {
+  return to_string(checks.find({ entry -> return entry.name == name })?.detail ?? "")
+}
+
+pipeline test_a_full_release_input_tuple_passes_every_shape_check(task: any) {
+  const checks = release_input_preconditions(
+    launch_inputs({at_sha: "0123456789abcdef0123456789abcdef01234567"}),
+  )
+  assert_eq(status_of(checks, "inputs.mode"), "pass")
+  assert_eq(status_of(checks, "inputs.bump"), "pass")
+  assert_eq(status_of(checks, "inputs.shape"), "pass")
+}
+
+pipeline test_an_unresolved_pin_is_withheld_from_the_delegated_validator(task: any) {
+  // A short pin is answered by its own two preconditions and widened before
+  // anything downstream sees it, so the delegated validator -- whose rule is
+  // that the release receives forty characters -- is handed nothing rather
+  // than the same shortfall under a second name.
+  const short = release_input_preconditions(launch_inputs({at_sha: "548d304"}))
+  assert_eq(status_of(short, "inputs.shape"), "pass")
+  // The resolved commit is what it does validate, and it validates cleanly.
+  const resolved = release_input_preconditions(
+    launch_inputs({at_sha: "548d304c21c5ce0ebab4186fc826914258815339"}),
+  )
+  assert_eq(status_of(resolved, "inputs.shape"), "pass")
+}
+
+pipeline test_an_unknown_mode_leaves_the_delegated_shape_check_unasked_not_passed(task: any) {
+  const checks = release_input_preconditions(launch_inputs({mode: "shipit"}))
+  assert_eq(status_of(checks, "inputs.mode"), "fail")
+  // The delegated validator cannot represent this mode, so it was not asked.
+  // Reporting that as a pass is the failure this whole preflight exists to
+  // remove.
+  assert_eq(status_of(checks, "inputs.shape"), "unavailable")
+}
+
+pipeline test_a_prerelease_bump_without_an_identifier_fails_the_shape_check(task: any) {
+  const checks = release_input_preconditions(launch_inputs({bump: "prerelease"}))
+  assert_eq(status_of(checks, "inputs.shape"), "fail")
+  assert(contains(detail_of(checks, "inputs.shape"), "prerelease identifier"))
+}
+
+pipeline test_a_mint_missing_a_permission_fails_and_names_it(task: any) {
+  // burin-labs/harn-bump-fleet#1234: the installation held `workflows: write`
+  // and the mint did not, so the certify push was refused 30 seconds in.
+  const check = token_permission_precondition(
+    "harn-release",
+    {actions: "write", contents: "write", pull_requests: "write", workflows: "write"},
+    {actions: "write", contents: "write", pull_requests: "write"},
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "workflows (want write, not granted)"), check.detail)
+  assert(contains(check.remedy, "spec/github-app-token-profiles.json"))
+}
+
+pipeline test_a_mint_granting_a_weaker_level_than_requested_fails(task: any) {
+  const check = token_permission_precondition(
+    "harn-release",
+    {contents: "write"},
+    {contents: "read"},
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "granted read"), check.detail)
+}
+
+pipeline test_a_complete_mint_passes(task: any) {
+  const grants = {actions: "write", contents: "write", workflows: "write"}
+  assert_eq(token_permission_precondition("harn-release", grants, grants).status, "pass")
+}
+
+pipeline test_a_refresher_armed_for_ship_pr_only_fails_a_prepare_launch(task: any) {
+  // burin-labs/harn-bump-fleet#1235: `prepare` spent 51 minutes in the linked
+  // suite and died on a 401 at 65 minutes, because the refresher was armed for
+  // ship-pr on the theory that prepare was short.
+  const check = credential_refresh_precondition(
+    "prepare",
+    RELEASE_CREDENTIAL_LIFETIME_S,
+    RELEASE_CREDENTIAL_REFRESH_INTERVAL_S,
+    ["ship-pr"],
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "release_job"), check.detail)
+  assert(contains(check.detail, "not armed for this mode"), check.detail)
+}
+
+pipeline test_a_refresher_armed_in_every_mode_passes_a_prepare_launch(task: any) {
+  const check = credential_refresh_precondition(
+    "prepare",
+    RELEASE_CREDENTIAL_LIFETIME_S,
+    RELEASE_CREDENTIAL_REFRESH_INTERVAL_S,
+    ["audit", "prepare", "ship-pr"],
+  )
+  assert_eq(check.status, "pass")
+}
+
+pipeline test_a_refresh_interval_without_headroom_fails_however_it_is_armed(task: any) {
+  const check = credential_refresh_precondition(
+    "ship-pr",
+    RELEASE_CREDENTIAL_LIFETIME_S,
+    3500,
+    ["audit", "prepare", "ship-pr"],
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "headroom"), check.detail)
+}
+
+pipeline test_a_mint_shorter_than_the_refresh_interval_fails_however_it_is_armed(task: any) {
+  // The structural half reasons from a declared one-hour ceiling. This is what
+  // keeps that constant honest against what GitHub actually hands back.
+  const short = token_lifetime_precondition(900, RELEASE_CREDENTIAL_LIFETIME_S, 2400)
+  assert_eq(short.status, "fail")
+  assert(contains(short.detail, "under the 3000s"), short.detail)
+  const ample = token_lifetime_precondition(
+    RELEASE_CREDENTIAL_LIFETIME_S,
+    RELEASE_CREDENTIAL_LIFETIME_S,
+    2400,
+  )
+  assert_eq(ample.status, "pass")
+}
+
+pipeline test_every_release_mode_reaches_a_phase_that_outlives_one_mint(task: any) {
+  // The registry's whole point: no mode is short enough to skip the refresher.
+  for mode in ["audit", "prepare", "ship-pr"] {
+    assert(
+      len(release_phases_outliving_credential(mode, RELEASE_CREDENTIAL_LIFETIME_S)) > 0,
+      "${mode} was treated as short enough to outrun a mint",
+    )
+  }
+}
+
+pipeline test_a_phase_budget_that_no_longer_matches_its_workflow_ceiling_is_reported(task: any) {
+  const drift = release_phase_budget_drift(
+    {
+      ".github/workflows/hosted-release.yml#release": 200,
+      ".github/workflows/hosted-release.yml#fleet": 210,
+      ".github/workflows/fleet-projection-convergence.yml#converge": 30,
+    },
+  )
+  assert_eq(len(drift), 1)
+  assert(contains(drift[0] ?? "", "release_job"), drift[0] ?? "")
+}
+
+pipeline test_a_phase_whose_job_declares_no_ceiling_is_reported_not_skipped(task: any) {
+  // An unmeasured row and a matching row must not read the same.
+  const drift = release_phase_budget_drift({})
+  assert_eq(len(drift), 3)
+  assert(contains(drift[0] ?? "", "declares no timeout-minutes"), drift[0] ?? "")
+}
+
+pipeline test_a_workflow_mint_missing_a_permission_input_fails(task: any) {
+  const check = workflow_mint_precondition(
+    ".github/workflows/hosted-release.yml",
+    "Mint scoped release token",
+    "harn-release",
+    {contents: "write", pull_requests: "write", workflows: "write"},
+    {"permission-contents": "write", "permission-pull-requests": "write"},
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "permission-workflows is absent"), check.detail)
+}
+
+pipeline test_a_workflow_mint_matching_the_registry_passes(task: any) {
+  const check = workflow_mint_precondition(
+    ".github/workflows/hosted-release.yml",
+    "Mint scoped release token",
+    "harn-release",
+    {contents: "write", pull_requests: "write", workflows: "write"},
+    {
+      "permission-contents": "write",
+      "permission-pull-requests": "write",
+      "permission-workflows": "write",
+    },
+  )
+  assert_eq(check.status, "pass")
+}
+
+pipeline test_a_missing_workflow_mint_step_fails_rather_than_passing_vacuously(task: any) {
+  const check = workflow_mint_precondition(
+    ".github/workflows/hosted-release.yml",
+    "Mint scoped release token",
+    "harn-release",
+    {contents: "write"},
+    nil,
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "no step named"), check.detail)
+}
+
+pipeline test_a_drifted_consumer_digest_names_the_convergence_workflow_to_dispatch(task: any) {
+  // A renderer change lands here, and until the convergence run re-renders the
+  // consumers their contract digests do not match. That drift refused a live
+  // ship-pr at the publication gate. The answer an operator needs is not the
+  // digest; it is which workflow repairs it.
+  const check = consumer_contract_precondition(
+    false,
+    [
+      "consumer contract projection drift: .github/workflows/harn-update.yml digest "
+        + "aaaa does not match generated adapter digest bbbb",
+    ],
+  )
+  assert_eq(check.status, "fail")
+  assert(contains(check.detail, "does not match generated adapter digest"), check.detail)
+  assert(contains(check.remedy, "fleet-projection-convergence.yml"), check.remedy)
+  assert(contains(check.remedy, "apply=true"), check.remedy)
+}
+
+pipeline test_matching_consumer_contracts_pass(task: any) {
+  assert_eq(consumer_contract_precondition(true, []).status, "pass")
+}
+
+pipeline test_a_receipt_separates_a_clean_read_from_a_partial_one(task: any) {
+  const inputs = launch_inputs()
+  const complete = release_launch_preflight_receipt(
+    inputs,
+    "harn-release",
+    [consumer_contract_precondition(true, [])],
+  )
+  assert_eq(complete.ok, true)
+  assert_eq(complete.complete, true)
+  const partial = release_launch_preflight_receipt(
+    inputs,
+    "harn-release",
+    release_input_preconditions(launch_inputs({mode: "shipit"})),
+  )
+  // A context that could not ask every question is never reported as a clean
+  // read, even when nothing it did ask came back bad.
+  assert_eq(partial.ok, false)
+  assert_eq(partial.complete, false)
+  assert(contains(partial.unavailable, "inputs.shape"))
+  assert(contains(join(release_launch_preflight_lines(partial), "\n"), "NOT ASKED"))
+}
+
+pipeline test_the_checked_in_workflow_mint_matches_the_checked_in_profile(harness: Harness) {
+  // The live pairing, not a fixture. A workflow step or a profile edited alone
+  // fails here, which is the drift that cost the certify push.
+  const root = release_harness_root(harness.fs)
+  const registry = json_parse(
+    harness.fs.read_text(path_join(root, "spec", "github-app-token-profiles.json")),
+  )
+  const bindings = registry?.get("workflow_mints") ?? []
+  assert(len(bindings) > 0, "the registry binds no workflow mint step")
+  for binding in bindings {
+    const workflows = yaml_parse(harness.fs.read_text(path_join(root, binding.workflow)))
+    const steps = workflows?.get("jobs")?.get(binding.job)?.get("steps") ?? []
+    const step = steps.find({ entry -> return entry?.get("name") == binding.step })
+    const permissions = registry?.get("profiles")?.get(binding.profile)?.get("permissions") ?? {}
+    const check = workflow_mint_precondition(
+      binding.workflow,
+      binding.step,
+      binding.profile,
+      permissions,
+      if step == nil {
+        nil
+      } else {
+        step?.get("with") ?? {}
+      },
+    )
+    assert_eq(check.status, "pass", check.detail)
+  }
+}
+
+pipeline test_the_registry_and_the_node_minter_agree_on_every_profile(harness: Harness) {
+  const root = release_harness_root(harness.fs)
+  const result = harness.process.run(
+    {
+      program: "node",
+      args: [
+        "-e",
+        "import(\"./scripts/github_app_token_profiles.mjs\").then((m) => console.log("
+          + "JSON.stringify(m.tokenProfileNames().map((n) => [n, m.tokenProfilePermissions(n)]))))",
+      ],
+      cwd: root,
+    },
+  )
+  assert((result.exit_code ?? 1) == 0, to_string(result.stderr ?? ""))
+  const registry = json_parse(
+    harness.fs.read_text(path_join(root, "spec", "github-app-token-profiles.json")),
+  )
+  const profiles = registry?.get("profiles") ?? {}
+  for entry in json_parse(trim(result.stdout ?? "")) {
+    assert_eq(entry[1], profiles.get(entry[0])?.get("permissions"))
+  }
+}
+
+/**
+ * One recorded `--describe` response, of the shape GitHub's installation token
+ * endpoint returns and `scripts/mint_github_app_installation_token.mjs` prints.
+ */
+fn recorded_mint(permissions: string, lifetime_s: string) -> any {
+  return json_parse(
+    "{\"schema_version\": \"harn_bump_fleet.installation_token_description.v1\","
+      + " \"profile\": \"harn-release\", \"granted_permissions\": ${permissions},"
+      + " \"repository_selection\": \"selected\", \"repositories\": [\"harn\"],"
+      + " \"expires_at\": \"2026-09-07T21:00:00Z\", \"lifetime_s\": ${lifetime_s}}",
+  )
+}
+
+pipeline test_a_recorded_mint_response_reads_into_its_two_preconditions(task: any) {
+  // The decode seam runs against a recorded response here rather than being
+  // exercised for the first time on a live cut.
+  const requested = {contents: "write", workflows: "write"}
+  const good = token_description_preconditions(
+    "harn-release",
+    requested,
+    recorded_mint("{\"contents\": \"write\", \"workflows\": \"write\"}", "3600"),
+    3600,
+    2400,
+  )
+  assert_eq(len(good), 2)
+  assert_eq(status_of(good, "token.permissions"), "pass")
+  assert_eq(status_of(good, "token.lifetime"), "pass")
+  // The narrowed mint that refused the certification push.
+  const narrowed = token_description_preconditions(
+    "harn-release",
+    requested,
+    recorded_mint("{\"contents\": \"write\"}", "3600"),
+    3600,
+    2400,
+  )
+  assert_eq(status_of(narrowed, "token.permissions"), "fail")
+  assert(contains(detail_of(narrowed, "token.permissions"), "workflows"))
+}
+
+pipeline test_a_mint_response_without_an_expiry_fails_rather_than_defaulting(task: any) {
+  const checks = token_description_preconditions(
+    "harn-release",
+    {contents: "write"},
+    json_parse("{\"granted_permissions\": {\"contents\": \"write\"}}"),
+    3600,
+    2400,
+  )
+  assert_eq(status_of(checks, "token.lifetime"), "fail")
+  assert(contains(detail_of(checks, "token.lifetime"), "no expiry"))
+}
+
+pipeline test_a_short_at_sha_passes_syntax_and_is_widened_before_anything_downstream(task: any) {
+  // The live refusal was a ten-character pin. It is a legitimate thing to
+  // type; what was missing was the widening, not the validation.
+  const checks = at_sha_preconditions(
+    {
+      requested: "548d304c21",
+      resolved: "548d304c21c5ce0ebab4186fc826914258815339",
+      asked: true,
+      reason: "",
+    },
+  )
+  assert_eq(status_of(checks, "inputs.at_sha"), "pass")
+  assert_eq(status_of(checks, "inputs.at_sha_resolved"), "pass")
+  assert(
+    contains(
+      detail_of(checks, "inputs.at_sha_resolved"),
+      "548d304c21c5ce0ebab4186fc826914258815339",
+    ),
+  )
+}
+
+pipeline test_a_commit_that_does_not_exist_stops_in_the_preflight(task: any) {
+  const checks = at_sha_preconditions(
+    {
+      requested: "deadbeefcafe",
+      resolved: "",
+      asked: true,
+      reason: "burin-labs/harn has no commit deadbeefcafe",
+    },
+  )
+  assert_eq(status_of(checks, "inputs.at_sha"), "pass")
+  assert_eq(status_of(checks, "inputs.at_sha_resolved"), "fail")
+  assert(contains(detail_of(checks, "inputs.at_sha_resolved"), "no commit"))
+}
+
+pipeline test_a_branch_name_is_not_a_commit_prefix(task: any) {
+  // `--at-sha main` would otherwise become whatever main was at that instant,
+  // which is the unpinned cut the input exists to remove.
+  assert_eq(github_commit_prefix_is_well_formed("main"), false)
+  assert_eq(github_commit_prefix_is_well_formed("548d30"), false)
+  assert_eq(github_commit_prefix_is_well_formed("548d304"), true)
+  // Case is normalized rather than refused; what is handed on is lowercase.
+  assert_eq(github_commit_prefix_is_well_formed("548D304C21"), true)
+  const checks = at_sha_preconditions(
+    {requested: "main", resolved: "", asked: false, reason: "nothing to resolve"},
+  )
+  assert_eq(status_of(checks, "inputs.at_sha"), "fail")
+  // Not asked, not passed: the resolver was never given this string.
+  assert_eq(status_of(checks, "inputs.at_sha_resolved"), "unavailable")
+}
+
+pipeline test_an_unresolvable_context_reports_a_short_pin_unasked_not_resolved(task: any) {
+  const checks = at_sha_preconditions(
+    {requested: "548d304c21", resolved: "", asked: false, reason: "--offline"},
+  )
+  assert_eq(status_of(checks, "inputs.at_sha"), "pass")
+  assert_eq(status_of(checks, "inputs.at_sha_resolved"), "unavailable")
+  assert(contains(detail_of(checks, "inputs.at_sha_resolved"), "forty characters"))
+}
+
+pipeline test_a_full_at_sha_needs_no_resolution_and_a_blank_one_has_nothing_to_resolve(task: any) {
+  const full = at_sha_preconditions(
+    {
+      requested: "548d304c21c5ce0ebab4186fc826914258815339",
+      resolved: "",
+      asked: false,
+      reason: "nothing to resolve",
+    },
+  )
+  assert_eq(status_of(full, "inputs.at_sha_resolved"), "pass")
+  assert(contains(detail_of(full, "inputs.at_sha_resolved"), "already the full commit"))
+  const blank = at_sha_preconditions(
+    {requested: "", resolved: "", asked: false, reason: "nothing to resolve"},
+  )
+  assert_eq(status_of(blank, "inputs.at_sha"), "pass")
+  assert_eq(status_of(blank, "inputs.at_sha_resolved"), "pass")
+}
+
+pipeline test_an_ambiguous_prefix_is_refused_rather_than_widened_to_the_wrong_commit(task: any) {
+  // GitHub answering a prefix with a commit that does not extend it is the
+  // shape of an ambiguous abbreviation; adopting it would pin the wrong tree.
+  const checks = at_sha_preconditions(
+    {
+      requested: "548d304c21",
+      resolved: "",
+      asked: true,
+      reason: "burin-labs/harn resolved 548d304c21 to ffffffff..., which does not extend it",
+    },
+  )
+  assert_eq(status_of(checks, "inputs.at_sha_resolved"), "fail")
+  assert(contains(detail_of(checks, "inputs.at_sha_resolved"), "does not extend it"))
+}
+
+pipeline test_only_a_full_commit_id_is_exact(task: any) {
+  // What a provider answers with has to be one whole commit before this fleet
+  // adopts it as a pin. A prefix is what an operator may type; it is not what
+  // any step after the dispatch accepts.
+  assert_eq(github_commit_id_is_exact("548d304c21e4dbf5a4d0b2f4c9e0a17c3b8d6e91"), true)
+  assert_eq(github_commit_id_is_exact("  548D304C21E4DBF5A4D0B2F4C9E0A17C3B8D6E91  "), true)
+  assert_eq(github_commit_id_is_exact("548d304c21"), false)
+  assert_eq(github_commit_id_is_exact("548d304c21e4dbf5a4d0b2f4c9e0a17c3b8d6e912"), false)
+  assert_eq(github_commit_id_is_exact("main"), false)
+  assert_eq(github_commit_id_is_exact(""), false)
+}
+
+pipeline test_the_refresh_interval_is_read_from_the_step_the_workflow_runs(task: any) {
+  // The declared interval and the one the workflow sleeps are two facts, and
+  // comparing them is the whole point of the lifetime precondition. A step
+  // naming no interval must not report a plausible default.
+  assert_eq(
+    hosted_release_refresh_interval_s(
+      "set -euo pipefail\n(\n  while true; do\n    sleep 2400\n    ./refresh.sh\n  done\n) &\n",
+    ),
+    2400,
+  )
+  assert_eq(hosted_release_refresh_interval_s("./refresh.sh\n"), nil)
+  assert_eq(hosted_release_refresh_interval_s("echo \"sleep 2400 is what we do\"\n"), nil)
+}
+
+pipeline test_a_changelog_fragment_is_decided_by_its_name(task: any) {
+  // The `changelog.d/` directory legitimately holds infrastructure files. The
+  // naming convention is the one owner of which entries are release notes
+  // waiting to be folded, so a count that classified by anything else would
+  // refuse a tag over a lint config.
+  assert_eq(is_release_changelog_fragment_name("8060.fixed.md"), true)
+  assert_eq(is_release_changelog_fragment_name("7766-runner.fixed.md"), true)
+  assert_eq(is_release_changelog_fragment_name(".gitkeep"), false)
+  assert_eq(is_release_changelog_fragment_name(".markdownlint-cli2.jsonc"), false)
+  assert_eq(is_release_changelog_fragment_name("README.md"), false)
+  assert_eq(is_release_changelog_fragment_name("8060.invented.md"), false)
+  assert_eq(is_release_changelog_fragment_name("8060.fixed.txt"), false)
+}
+
+pipeline test_a_raw_file_read_refuses_an_incomplete_request(harness: Harness) {
+  // The raw route exists for files the typed connector cannot return. It still
+  // has to refuse a request that names no ref rather than shell out and let
+  // the adapter pick a default branch nobody asked for.
+  const missing_ref = github_large_file_text_at_ref(harness.process, "burin-labs/harn", "F.md", "")
+  assert_eq(is_err(missing_ref), true)
+  assert_eq(unwrap_err(missing_ref).code, "invalid_file_lookup")
+}
+
+pipeline test_a_pull_request_is_not_refused_for_another_repositorys_state(task: any) {
+  // An unfolded release and a drifted consumer adapter are real, and no commit
+  // in this repository repairs either. Refusing a change here on one tells its
+  // author to fix something they cannot reach and did not break.
+  const decision = preflight_scope_decision(
+    ["consumers.contracts", "checkpoint.development_version"],
+    "repository",
+  )
+  assert_eq(decision.refuses, false)
+  assert_eq(decision.blocking, [])
+  assert_eq(decision.deferred, ["consumers.contracts", "checkpoint.development_version"])
+}
+
+pipeline test_a_pull_request_is_still_refused_for_what_it_can_break(task: any) {
+  // The narrowing must not become "this check cannot fail". A precondition
+  // this repository owns still refuses, and the release-state one alongside it
+  // is still reported rather than dropped.
+  const decision = preflight_scope_decision(
+    ["inputs.bump", "checkpoint.development_version"],
+    "repository",
+  )
+  assert_eq(decision.refuses, true)
+  assert_eq(decision.blocking, ["inputs.bump"])
+  assert_eq(decision.deferred, ["checkpoint.development_version"])
+}
+
+pipeline test_a_release_scope_refuses_on_everything(task: any) {
+  const decision = preflight_scope_decision(
+    ["consumers.contracts", "checkpoint.release_contract"],
+    "release",
+  )
+  assert_eq(decision.refuses, true)
+  assert_eq(decision.blocking, ["consumers.contracts", "checkpoint.release_contract"])
+  assert_eq(decision.deferred, [])
+}
+
+pipeline test_a_clean_receipt_refuses_in_neither_scope(task: any) {
+  assert_eq(preflight_scope_decision([], "repository").refuses, false)
+  assert_eq(preflight_scope_decision([], "release").refuses, false)
+}
+
+pipeline test_every_deferred_name_is_one_the_receipt_can_report(task: any) {
+  // A name in the deferred list that the preflight never emits would be dead
+  // weight; a name missing from it fails safe, since that precondition simply
+  // keeps refusing. This asserts the harmless direction is also correct.
+  for name in RELEASE_STATE_PRECONDITIONS {
+    assert_eq(preflight_scope_decision([name], "repository").deferred, [name])
+    assert_eq(preflight_scope_decision([name], "release").blocking, [name])
+  }
+}
+
+pipeline test_every_deferred_name_is_a_precondition_the_preflight_emits(task: any) {
+  // The gap the scope change left open. A deferred name the preflight never
+  // reports is dead weight that looks like coverage, and nothing would have
+  // said so: the scope check reads it, finds no match, and refuses as usual.
+  let unknown: list<string> = []
+  for name in RELEASE_STATE_PRECONDITIONS {
+    if !RELEASE_LAUNCH_PRECONDITION_NAMES.contains(name) {
+      unknown = unknown + [name]
+    }
+  }
+  assert_eq(unknown, [])
+}
+
+pipeline test_a_receipt_hands_its_failed_preconditions_on_as_causes(task: any) {
+  // The repair a reader is owed depends on which question refused, and this is
+  // the only place that answer crosses from the preflight to the escalation.
+  const receipt = release_launch_preflight_receipt(
+    launch_inputs(),
+    "harn-release",
+    [
+      preflight_pass("inputs.mode", "mode ship-pr"),
+      preflight_fail("consumers.contracts", "drift", "dispatch convergence"),
+      preflight_fail("checkpoint.consumer_pins", "two unread", "make them readable"),
+      preflight_unavailable("token.lifetime", "not asked: no credentials"),
+    ],
+  )
+  assert_eq(preflight_reported_causes(receipt), ["consumers.contracts", "checkpoint.consumer_pins"])
+}
+
+pipeline test_a_missing_or_foreign_document_names_no_cause_rather_than_none_failing(task: any) {
+  // Reading nothing and reading a clean preflight are different answers. Both
+  // return an empty list here, and the caller's fallback is what keeps them
+  // apart: with no cause it points at the receipt instead of naming a repair.
+  assert_eq(preflight_reported_causes(nil), [])
+  assert_eq(preflight_reported_causes({}), [])
+  assert_eq(preflight_reported_causes({failed: "consumers.contracts"}), [])
+  assert_eq(preflight_reported_causes({failed: []}), [])
+  assert_eq(preflight_reported_causes({failed: ["  ", "a", "a", "b"]}), ["a", "b"])
+}
+
+pipeline test_the_declared_precondition_names_match_a_real_receipt(harness: Harness) {
+  /**
+   * The declared set is what every keyed caller is checked against, so it has
+   * to be what the preflight actually emits rather than what someone believed
+   * it emits. This asks the preflight itself, in the one mode that needs no
+   * credentials and no network.
+   */
+  const result = harness.process.run(
+    {
+      program: "sh",
+      args: [
+        "-c",
+        "./scripts/preflight_release_launch.sh --mode ship-pr --bump patch --offline "
+          + "2>&1 >/dev/null | grep -v '^warning:'",
+      ],
+      cwd: release_harness_root(harness.fs),
+    },
+  )
+  const text = result.stdout ?? ""
+  const start = index_of(text, "{")
+  assert(start >= 0)
+  const receipt = schema_expect(json_parse(text[start:len(text)]), schema_of(ReceiptNames))
+  let names: list<string> = []
+  for check in receipt.preconditions {
+    names = names + [check.name]
+  }
+  assert_eq(names, RELEASE_LAUNCH_PRECONDITION_NAMES)
+}
+
+pipeline test_each_mint_binding_is_read_from_the_workflow_it_names(task: any) {
+  /**
+   * The defect this pins compared every binding against one fixed workflow.
+   * With a single registered mint the two were the same file, so nothing was
+   * visibly wrong; the moment a second profile is bound to another workflow,
+   * its step reads as absent. That is a fail, so the receipt is red, but it
+   * names the wrong situation and sends the reader to the wrong file.
+   *
+   * The reader is a callback so the test can prove which path was consulted,
+   * rather than proving only that some comparison happened.
+   */
+  fn mint_step(name: string) {
+    return {name: name, with: {"permission-contents": "write"}}
+  }
+  const hosted = {jobs: {release: {steps: [mint_step("Mint scoped release token")]}}}
+  const repair = {jobs: {repair: {steps: [mint_step("Mint cutover token")]}}}
+  let consulted: list<string> = []
+  fn reader(path: string) {
+    consulted = consulted + [path]
+    if path == ".github/workflows/hosted-release.yml" {
+      return hosted
+    }
+    if path == ".github/workflows/repair.yml" {
+      return repair
+    }
+    return nil
+  }
+  const bindings = [
+    {
+      workflow: ".github/workflows/hosted-release.yml",
+      job: "release",
+      step: "Mint scoped release token",
+      profile: "p",
+    },
+    {
+      workflow: ".github/workflows/repair.yml",
+      job: "repair",
+      step: "Mint cutover token",
+      profile: "p",
+    },
+  ]
+  const checks = workflow_mint_preconditions(bindings, "p", {contents: "write"}, reader)
+  // Each binding was read from its own workflow, and both pass.
+  assert_eq(consulted, [".github/workflows/hosted-release.yml", ".github/workflows/repair.yml"])
+  assert_eq(len(checks), 2)
+  for check in checks {
+    assert_eq(check.status, "pass")
+  }
+  // A binding for another profile is not read at all, so an unrelated
+  // workflow's absence cannot refuse this profile's release.
+  consulted = []
+  assert_eq(len(workflow_mint_preconditions(bindings, "other", {contents: "write"}, reader)), 0)
+  assert_eq(consulted, [])
+  // A binding naming a workflow the tree does not have fails, rather than
+  // throwing out of the preflight as if the preflight itself were broken.
+  const missing = workflow_mint_preconditions(
+    [{workflow: ".github/workflows/gone.yml", job: "j", step: "s", profile: "p"}],
+    "p",
+    {contents: "write"},
+    reader,
+  )
+  assert_eq(len(missing), 1)
+  assert_eq(missing[0]?.status, "fail")
+  assert(contains(missing[0]?.detail ?? "", "gone.yml"))
+}
