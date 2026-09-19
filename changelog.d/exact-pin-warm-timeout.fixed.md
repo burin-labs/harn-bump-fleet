@@ -1,0 +1,1 @@
+- Run the exact-pin release CLI warmup through the typed command boundary with an explicit long-build timeout, preventing cold Cargo builds from being terminated by the short discovery-process deadline.
