@@ -1,0 +1,521 @@
+import { shell_quote } from "std/runtime"
+import { with_temp_dir } from "std/testing"
+import { render_bump_workflow, sync_bump_workflow_repo } from "../lib/bump_workflow_projection"
+import { FleetManifest, FleetRepository, read_fleet_manifest } from "../lib/fleet_manifest"
+import { decode_github_workflow, github_projection_has_trigger } from "../lib/github_workflow"
+
+fn package_repo() -> FleetRepository {
+  return {
+    slug: "owner/harn-example-connector",
+    directory: "harn-example-connector",
+    harn_package: true,
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+  }
+}
+
+fn manifest(repo: FleetRepository) -> FleetManifest {
+  return {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/policy/.github/workflows/harn-package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/harn/.github/workflows/bump-harn.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [repo],
+  }
+}
+
+pipeline test_render_bump_workflow_is_exact_for_package_defaults() {
+  const repo = package_repo()
+  assert_eq(
+    render_bump_workflow(manifest(repo), repo),
+    """name: Bump Harn Runtime
+
+# fleet.toml in harn-bump-fleet owns this generated dispatch adapter.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional exact Harn tag (vX.Y.Z). Defaults to latest."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    uses: owner/harn/.github/workflows/bump-harn.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    with:
+      orchestration-sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      version: \${{ inputs.version }}
+      validate-command: harn package verify .
+      apply-behavior-preserving-fixes: false
+    secrets:
+      app-client-id: \${{ secrets.RELEASE_APP_CLIENT_ID }}
+      app-private-key: \${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+"""
+      + "\n",
+  )
+}
+
+pipeline test_render_bump_workflow_projects_named_custom_commands() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_refresh_command: "./scripts/refresh\n./scripts/generate",
+    bump_validate_command: "./scripts/verify",
+    bump_node_version: "22",
+  }
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  const workflow = decode_github_workflow(rendered)
+  assert_eq(
+    workflow.jobs.get("bump")?.with,
+    {
+      "orchestration-sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      version: "$" + "{{ inputs.version }}",
+      "refresh-command": "./scripts/refresh\n./scripts/generate",
+      "validate-command": "./scripts/verify",
+      "apply-behavior-preserving-fixes": false,
+      "node-version": "22",
+    },
+  )
+}
+
+pipeline test_orchestration_sha_is_derived_from_the_same_policy_pin_as_uses() {
+  const repo = package_repo()
+  const declared = manifest(repo)
+  const workflow = decode_github_workflow(render_bump_workflow(declared, repo))
+  const bump = workflow.jobs.get("bump")
+  assert_eq(bump?.uses, declared.policy.bump_workflow)
+  assert_eq(bump?.with?.get("orchestration-sha"), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+}
+
+pipeline test_render_bump_workflow_projects_repairable_failure_policy() {
+  const repo = package_repo()
+  const declared = manifest(repo)
+  const rendered = render_bump_workflow(
+    declared + {policy: declared.policy + {publish_failures_for_repair: true}},
+    repo,
+  )
+  const workflow = decode_github_workflow(rendered)
+  assert_eq(workflow.jobs.get("bump")?.with?.get("publish-failure-for-repair"), true)
+}
+
+pipeline test_render_bump_workflow_rejects_unowned_repository() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_validate_command: "./scripts/verify",
+  }
+  const result = try {
+    render_bump_workflow(manifest(repo), repo)
+  }
+  assert(is_err(result))
+  assert(contains(to_string(unwrap_err(result)), "does not delegate bump workflow ownership"))
+}
+
+pipeline test_sync_bump_workflow_is_idempotent(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("bump-workflow-")
+  const repo = package_repo()
+  const checkout = path_join(root, repo.directory)
+  harness.fs.mkdir(path_join(checkout, ".github/workflows"), true)
+  harness.fs.write_text(path_join(checkout, ".git"), "gitdir: fixture\n")
+  harness.fs.write_text(path_join(checkout, ".github/workflows/bump-harn.yml"), "old\n")
+  const declared = manifest(repo)
+  assert_eq(sync_bump_workflow_repo(harness.fs, declared, repo, root, false).status, "drift")
+  assert_eq(sync_bump_workflow_repo(harness.fs, declared, repo, root, true).status, "applied")
+  assert_eq(sync_bump_workflow_repo(harness.fs, declared, repo, root, false).status, "clean")
+  assert_eq(
+    harness.fs.read_text(path_join(checkout, ".github/workflows/bump-harn.yml")),
+    render_bump_workflow(declared, repo),
+  )
+}
+
+pipeline test_refresh_notes_render_as_comments_without_changing_inputs() {
+  // Rationale for a generated adapter has to live in the manifest that owns it.
+  // Hand-editing it into the projected file puts it exactly where the next
+  // `--apply` deletes it, which is how harn-cloud's --no-sandbox explanation
+  // ended up as untracked drift.
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_refresh_notes: "why the flag is here\n\n  indented detail stays indented",
+    bump_refresh_command: "./scripts/refresh",
+    bump_validate_command: "./scripts/verify",
+  }
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  assert(contains(rendered, "      # why the flag is here\n"))
+  // A blank note line becomes a bare `#`, never `# ` with a trailing space.
+  assert(contains(rendered, "\n      #\n"))
+  assert(contains(rendered, "      #   indented detail stays indented\n"))
+  // The comment sits directly above the command it explains.
+  assert(contains(rendered, "      #   indented detail stays indented\n      refresh-command:"))
+  // Comments are not inputs: the decoded `with:` mapping is untouched.
+  const workflow = decode_github_workflow(rendered)
+  assert_eq(
+    workflow.jobs.get("bump")?.with,
+    {
+      "orchestration-sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      version: "$" + "{{ inputs.version }}",
+      "refresh-command": "./scripts/refresh",
+      "validate-command": "./scripts/verify",
+      "apply-behavior-preserving-fixes": false,
+    },
+  )
+}
+
+fn projected_behavior_preserving_fixes(declared: FleetManifest, repo: FleetRepository) -> any {
+  return decode_github_workflow(render_bump_workflow(declared, repo)).jobs.get("bump")?.with?.get(
+    "apply-behavior-preserving-fixes",
+  )
+}
+
+pipeline test_behavior_preserving_fix_pass_is_off_by_fleet_default() {
+  // harn#6837: the pass ships behavior-changing edits under a
+  // behavior-preserving safety tier, so a repository that declares nothing
+  // must not inherit the reusable workflow's own `default: true`.
+  const repo = package_repo()
+  assert_eq(projected_behavior_preserving_fixes(manifest(repo), repo), false)
+}
+
+pipeline test_repository_opts_back_into_the_behavior_preserving_fix_pass() {
+  const repo = package_repo() + {bump_apply_behavior_preserving_fixes: true}
+  assert_eq(projected_behavior_preserving_fixes(manifest(repo), repo), true)
+}
+
+pipeline test_consumer_bump_combines_public_policy_with_private_runtime_contract(harness: Harness) {
+  const declared = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const consumer = schema_expect(
+    declared.repositories.find({ repo -> repo.slug == "burin-labs/burin-code" }),
+    FleetRepository,
+  )
+    + {
+      harn_pin_kind: "version_file",
+      harn_pin_path: "runtime-version.txt",
+      bump_refresh_command: "./scripts/refresh-runtime",
+      bump_validate_command: "./scripts/validate-runtime",
+      bump_node_version: "22",
+      consumer_contract_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    }
+  const inputs = decode_github_workflow(render_bump_workflow(declared, consumer)).jobs.get("bump")
+    ?.with
+  assert_eq(inputs?.get("apply-behavior-preserving-fixes"), true)
+  assert_eq(inputs?.get("refresh-command"), "./scripts/refresh-runtime")
+  assert_eq(inputs?.get("validate-command"), "./scripts/validate-runtime")
+  assert_eq(inputs?.get("node-version"), "22")
+  assert(
+    contains(
+      render_bump_workflow(declared, consumer),
+      "# Consumer contract SHA-256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    ),
+  )
+}
+
+pipeline test_consumer_manifest_identity_rejects_a_stale_adapter() {
+  const repo = package_repo()
+    + {consumer_contract_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  const stale = render_bump_workflow(manifest(repo), repo)
+  const changed = render_bump_workflow(
+    manifest(repo),
+    repo
+      + {
+        consumer_contract_sha256:
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+  )
+  // A note-only or command-only manifest edit changes this identity even when
+  // the workflow inputs happen to remain otherwise byte-identical.
+  assert(stale != changed)
+  assert(
+    contains(
+      changed,
+      "# Consumer contract SHA-256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ),
+  )
+  // Regenerating from the same manifest is the positive control.
+  assert_eq(
+    changed,
+    render_bump_workflow(
+      manifest(repo),
+      repo
+        + {
+          consumer_contract_sha256:
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    ),
+  )
+}
+
+pipeline test_consumer_contract_gate_covers_both_owned_paths() {
+  const repo = package_repo()
+    + {consumer_contract_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  const workflow = decode_github_workflow(rendered)
+  assert(github_projection_has_trigger(workflow, "pull_request"))
+  assert(github_projection_has_trigger(workflow, "push"))
+  const triggers = yaml_parse(rendered).get("on")
+  const owned_paths = [".harn/fleet-projections.toml", ".github/workflows/bump-harn.yml"]
+  assert_eq(triggers.get("pull_request")?.get("paths"), owned_paths)
+  assert_eq(triggers.get("push")?.get("paths"), owned_paths)
+  assert_eq(workflow.jobs.get("bump")?.if, "github.event_name == 'workflow_dispatch'")
+  assert_eq(workflow.jobs.get("bump")?.needs, "consumer-contract-projection")
+  const gate = workflow.jobs.get("consumer-contract-projection")
+  assert(gate != nil, "consumer adapter did not project its contract gate")
+  const check = (gate?.steps ?? []).find({ step -> step.name == "Compare contract and adapter" })
+  assert(check != nil, "consumer contract gate has no comparison step")
+  assert(contains(check?.run ?? "", ".harn/fleet-projections.toml"))
+  assert_eq(
+    check?.env?.get("FLEET_ADAPTER_CONTRACT_SHA256"),
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  )
+}
+
+/**
+ * The runtime rejects an unknown `HARN_*` variable with `HARN-ENV-001`, so a
+ * name this renderer parks under that prefix aborts every `harn` invocation
+ * that inherits it and is refused by consumer namespace guards before the
+ * projection can land. Assert over every rendered environment key rather than
+ * the one name this file happens to set today.
+ */
+pipeline test_rendered_adapter_reserves_no_harn_environment_names() {
+  const repo = package_repo()
+    + {consumer_contract_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  const workflow = decode_github_workflow(render_bump_workflow(manifest(repo), repo))
+  let checked = 0
+  for job_name in keys(workflow.jobs) {
+    for step in workflow.jobs[job_name]?.steps ?? [] {
+      for env_name in keys(step.env ?? {}) {
+        checked = checked + 1
+        assert(
+          !env_name.starts_with("HARN_"),
+          "rendered adapter parks ${env_name} in the runtime's reserved HARN_ namespace",
+        )
+      }
+    }
+  }
+  assert(checked > 0, "no rendered environment name was inspected")
+}
+
+pipeline test_consumer_contract_gate_refuses_manifest_only_drift(harness: Harness) {
+  const first_manifest = "schema_version = 1\n# first note\n"
+  const first = package_repo() + {consumer_contract_sha256: sha256(first_manifest)}
+  const first_workflow = render_bump_workflow(manifest(first), first)
+  const gate = decode_github_workflow(first_workflow).jobs.get("consumer-contract-projection")
+  const check = (gate?.steps ?? []).find({ step -> step.name == "Compare contract and adapter" })
+  const script = check?.run ?? ""
+  const first_digest = to_string(check?.env?.get("FLEET_ADAPTER_CONTRACT_SHA256") ?? "")
+  assert(trim(script) != "", "consumer contract gate has no executable comparison")
+  with_temp_dir(
+    harness.fs,
+    { root ->
+      harness.fs.mkdir(path_join(root, ".harn"), true)
+      harness.fs.mkdir(path_join(root, ".github", "workflows"), true)
+      harness.fs.write_text(path_join(root, ".harn", "fleet-projections.toml"), first_manifest)
+      harness.fs.write_text(
+        path_join(root, ".github", "workflows", "bump-harn.yml"),
+        first_workflow,
+      )
+      const paired = harness.process.shell(
+        "cd "
+          + shell_quote(root)
+          + " && FLEET_ADAPTER_CONTRACT_SHA256="
+          + shell_quote(first_digest)
+          + " bash -c "
+          + shell_quote(script),
+      )
+      assert(paired.success, paired.combined)
+      const changed_manifest = "schema_version = 1\n# changed note\n"
+      harness.fs.write_text(path_join(root, ".harn", "fleet-projections.toml"), changed_manifest)
+      const stale = harness.process.shell(
+        "cd "
+          + shell_quote(root)
+          + " && FLEET_ADAPTER_CONTRACT_SHA256="
+          + shell_quote(first_digest)
+          + " bash -c "
+          + shell_quote(script),
+      )
+      assert_eq(stale.success, false)
+      assert(contains(stale.combined, "consumer contract projection drift"), stale.combined)
+      const changed = first + {consumer_contract_sha256: sha256(changed_manifest)}
+      const changed_workflow = render_bump_workflow(manifest(changed), changed)
+      harness.fs.write_text(
+        path_join(root, ".github", "workflows", "bump-harn.yml"),
+        changed_workflow,
+      )
+      const changed_gate = decode_github_workflow(changed_workflow).jobs.get(
+        "consumer-contract-projection",
+      )
+      const changed_check = (changed_gate?.steps ?? []).find(
+        { step -> step.name == "Compare contract and adapter" },
+      )
+      const changed_digest = to_string(
+        changed_check?.env?.get("FLEET_ADAPTER_CONTRACT_SHA256") ?? "",
+      )
+      const repaired = harness.process.shell(
+        "cd "
+          + shell_quote(root)
+          + " && FLEET_ADAPTER_CONTRACT_SHA256="
+          + shell_quote(changed_digest)
+          + " bash -c "
+          + shell_quote(changed_check?.run ?? ""),
+      )
+      assert(repaired.success, repaired.combined)
+    },
+  )
+}
+
+pipeline test_policy_restores_the_behavior_preserving_fix_pass_fleet_wide() {
+  // The documented revert once harn#6837 is fixed: one manifest line, not 28
+  // repository edits.
+  const repo = package_repo()
+  const declared = manifest(repo)
+  assert_eq(
+    projected_behavior_preserving_fixes(
+      declared + {policy: declared.policy + {apply_behavior_preserving_fixes: true}},
+      repo,
+    ),
+    true,
+  )
+}
+
+pipeline test_repository_opt_out_survives_a_restored_fleet_default() {
+  // A present-but-false override must win over an enabled fleet default. If
+  // the resolution treated a declared `false` as absent, this repository would
+  // silently take the pass again the moment the fleet default returns.
+  const repo = package_repo() + {bump_apply_behavior_preserving_fixes: false}
+  const declared = manifest(repo)
+  assert_eq(
+    projected_behavior_preserving_fixes(
+      declared + {policy: declared.policy + {apply_behavior_preserving_fixes: true}},
+      repo,
+    ),
+    false,
+  )
+}
+
+pipeline test_bump_arms_auto_merge_by_fleet_default() {
+  // Armed stays the default: a routine bump should land on its own checks, and
+  // the input is left absent rather than restated.
+  const repo = package_repo()
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  assert(!contains(rendered, "enable-auto-merge"))
+  assert_eq(decode_github_workflow(rendered).jobs.get("bump")?.with?.get("enable-auto-merge"), nil)
+}
+
+pipeline test_repository_withholds_bump_auto_merge_arming() {
+  // A repository whose bump decides something reserved for a person opens the
+  // pull request but does not arm it.
+  const repo = package_repo() + {bump_enable_auto_merge: false}
+  assert_eq(
+    decode_github_workflow(render_bump_workflow(manifest(repo), repo)).jobs.get("bump")?.with?.get(
+      "enable-auto-merge",
+    ),
+    false,
+  )
+}
+
+pipeline test_withholding_arming_leaves_the_fix_pass_projection_alone() {
+  // The two bump overrides are independent; neither may quietly imply the other.
+  const repo = package_repo() + {bump_enable_auto_merge: false}
+  assert_eq(projected_behavior_preserving_fixes(manifest(repo), repo), false)
+  const armed = package_repo() + {bump_apply_behavior_preserving_fixes: true}
+  assert(!contains(render_bump_workflow(manifest(armed), armed), "enable-auto-merge"))
+}
+
+pipeline test_absent_refresh_notes_render_nothing() {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_refresh_command: "./scripts/refresh",
+  }
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  assert(!contains(rendered, "      #"))
+  assert(contains(rendered, "      version: $" + "{{ inputs.version }}\n      refresh-command:"))
+}
+
+/**
+ * Every shape claim consumers used to make about this render, asserted here.
+ *
+ * A consumer that asserts on the render's jobs, steps, inputs or pins turns
+ * each owner-side edit into a downstream break, and it did three times: a job
+ * count, then a job name list, then a checkout step index that threw once this
+ * renderer stopped emitting a `with:` block. Consumers now verify only the
+ * ownership marker and the contract digest, so the delegation invariants have
+ * to hold here, where the render is produced.
+ */
+pipeline test_rendered_adapter_delegates_and_keeps_no_local_credential() {
+  const repo = package_repo()
+    + {consumer_contract_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  const rendered = render_bump_workflow(manifest(repo), repo)
+  assert(contains(rendered, "# fleet.toml in harn-bump-fleet owns"))
+  assert(
+    contains(
+      rendered,
+      "# Consumer contract SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ),
+  )
+  const workflow = decode_github_workflow(rendered)
+  // The bump job is a delegation and nothing else. A local step here would be
+  // orchestration living in the consumer, which is the whole point of the
+  // adapter being generated.
+  const bump = workflow.jobs.get("bump")
+  assert(bump != nil, "the adapter must project a bump job")
+  assert_eq(bump?.steps, nil, "the bump job must delegate, not run local steps")
+  const reference = to_string(bump?.uses ?? "")
+  const pin = split(reference, "@")[-1]
+  assert_eq(len(pin), 40, "the delegated workflow must pin a full commit: ${reference}")
+  assert(
+    regex_match(r"^[0-9a-f]{40}$", pin) != nil,
+    "the delegated workflow pin must be a commit SHA: ${pin}",
+  )
+  // Every checkout the adapter does render is credential-free and pinned. The
+  // gate job only hashes a file, and a persisted credential breaks later git
+  // reads under a different temp root.
+  let checkouts = 0
+  for job_name in keys(workflow.jobs) {
+    for step in workflow.jobs[job_name]?.steps ?? [] {
+      const uses = to_string(step.uses ?? "")
+      if !uses.starts_with("actions/checkout@") {
+        continue
+      }
+      checkouts = checkouts + 1
+      assert_eq(
+        (step.with ?? {}).get("persist-credentials"),
+        false,
+        "${job_name} checkout must not persist credentials",
+      )
+      const checkout_pin = split(split(uses, "@")[-1], " ")[0]
+      assert(
+        regex_match(r"^[0-9a-f]{40}$", checkout_pin) != nil,
+        "${job_name} checkout must pin a commit: ${uses}",
+      )
+    }
+  }
+  assert_eq(checkouts, 1, "the contract gate is the only job that checks out")
+}
+
+/**
+ * The gate job exists only where a consumer declares a contract half.
+ *
+ * Without a declared contract there is nothing to compare, so rendering the
+ * job anyway would put a checkout and a shell script into a repository that
+ * asked for neither.
+ */
+pipeline test_adapter_without_a_consumer_contract_renders_no_local_job() {
+  const workflow = decode_github_workflow(
+    render_bump_workflow(manifest(package_repo()), package_repo()),
+  )
+  assert_eq(keys(workflow.jobs), ["bump"])
+  assert_eq(workflow.jobs.get("bump")?.steps, nil)
+}

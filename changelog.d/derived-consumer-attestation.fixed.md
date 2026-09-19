@@ -1,0 +1,1 @@
+Attribute a consumer pre-tag red against the consumer's own default-branch history before it fails the release, so a job already failing there no longer needs an operator-typed attestation to be excluded.

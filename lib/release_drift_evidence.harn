@@ -1,0 +1,470 @@
+/**
+ * What landed on the default branch while a release was certifying, and whether
+ * each of those commits passed the branch's own required checks.
+ *
+ * The release certifies one exact tree, and main moves at a median of one merge
+ * every twenty-one minutes, so a two-hour certification almost never sees a
+ * still branch. Demanding that the merged tree equal the certified tree exactly
+ * therefore means demanding a freeze. The contract instead is that the shipped
+ * tree is the certified tree plus commits that passed main's own required
+ * checks, and this module is what makes that claim checkable rather than
+ * assumed: every drifted commit is named, every required context is resolved to
+ * a conclusion, and the whole record goes in the release receipt.
+ *
+ * Three observed shapes drive the rules here, all measured on burin-labs/harn:
+ *
+ * - A required context can be absent from a main commit. `drift` appears on 2
+ *   of the 20 most recent main commits and on 20 of 20 pull-request heads, so
+ *   reading only the main commit would report a green branch as unproved.
+ *   Evidence therefore falls back to the commit's own pull request head.
+ * - A main commit carries stale failures beside fresh successes. Two of those
+ *   20 show a failed workspace test next to a passing aggregate, because a
+ *   rerun does not replace its predecessor's row. Rows reduce to the latest per
+ *   name before anything is judged.
+ * - A required context that never reported is absent, not passing. It resolves
+ *   to `MISSING`, which is not green.
+ */
+import {
+  admission_state_is_unfinished,
+  admission_verdict,
+  latest_check_per_name,
+  required_check_state,
+} from "./pr_admission"
+import {
+  ReleaseContextReadiness,
+  ReleaseContextSet,
+  release_context_readiness,
+  release_context_set,
+} from "./release_context_declaration"
+
+pub type ReleaseDriftCheckSource = "main_commit" | "pull_request_head" | "missing"
+
+pub type ReleaseDriftCheck = {
+  name: string,
+  state: string,
+  source: ReleaseDriftCheckSource,
+  /**
+   * True for a lane only a release runs. Such a lane is not required by the
+   * branch, so a commit can reach main before it reports. That makes an absent
+   * result "not yet" rather than "never", which waits instead of refusing.
+   */
+  release_only: bool,
+}
+
+pub type ReleaseDriftCommit = {
+  sha: string,
+  /** 0 when no pull request could be associated with the commit. */
+  pull_number: int,
+  checks: list<ReleaseDriftCheck>,
+  green: bool,
+  blocking_check: string,
+  /**
+   * Release-only lanes this commit failed. Recorded, never refused: the branch
+   * does not require them, so they are evidence about the commit rather than a
+   * verdict on it.
+   */
+  failed_lanes: list<string>,
+  /**
+   * Release-only lanes that had not reported when the commit was read. Also
+   * recorded rather than waited on, because nothing they go on to report can
+   * change whether the branch admits the commit.
+   */
+  unfinished_lanes: list<string>,
+}
+
+pub type ReleaseDriftEvidence = {
+  certified_base: string,
+  observed_main: string,
+  required_contexts: list<string>,
+  /**
+   * Where the required set came from, kept beside the verdict rather than
+   * folded into it. A reader has to be able to tell a context the branch
+   * requires from one the release declared, and a declaration that was read
+   * from one that could not be.
+   */
+  context_set: ReleaseContextSet,
+  /**
+   * The candidate's shape: which contexts are pending, how many, and which
+   * failed. A boolean answer to "is it green" hides exactly the difference
+   * between a release that is waiting and one that is refused.
+   */
+  readiness: ReleaseContextReadiness,
+  commits: list<ReleaseDriftCommit>,
+  /**
+   * The commit the verdict is about: the tip that would carry the tag. Empty
+   * only when it could not be found among the reported commits, which is a
+   * refusal rather than a pass.
+   */
+  candidate_sha: string,
+  green: bool,
+  blocking_sha: string,
+  blocking_check: string,
+  reason: string,
+  observed_at: string,
+}
+
+fn oid(value: any) -> string {
+  return lowercase(trim(to_string(value ?? "")))
+}
+
+/**
+ * Resolve one required context against a commit, then against its pull request.
+ *
+ * `required_check_state` already reduces to the latest row per name and returns
+ * `MISSING` for a context that never reported, which is the difference between
+ * "this check passed" and "nobody ran this check".
+ */
+fn resolve_context(
+  context: string,
+  commit_rows: list?,
+  head_rows: list?,
+  release_only: bool = false,
+) -> ReleaseDriftCheck {
+  const on_commit = required_check_state(latest_check_per_name(commit_rows), context)
+  if on_commit != "MISSING" {
+    return {name: context, state: on_commit, source: "main_commit", release_only: release_only}
+  }
+  const on_head = required_check_state(latest_check_per_name(head_rows), context)
+  if on_head != "MISSING" {
+    return {name: context, state: on_head, source: "pull_request_head", release_only: release_only}
+  }
+  return {name: context, state: "MISSING", source: "missing", release_only: release_only}
+}
+
+/**
+ * The release-only lanes this commit owes an answer for.
+ *
+ * A lane only a release runs is required of a drifted commit exactly when that
+ * commit touched a path the lane bears on. Without this condition a
+ * documentation commit would owe a workspace test run that its own pull request
+ * never triggered, and the release would wait forever for a result nobody is
+ * going to produce.
+ */
+pub fn release_drift_lane_contexts(
+  release_only_checks: list<string>,
+  changed_paths: list<string>,
+  bearing_paths: list<string>,
+) -> list<string> {
+  if len(release_only_checks) == 0 || len(changed_paths) == 0 || len(bearing_paths) == 0 {
+    return []
+  }
+  return release_only_checks
+}
+
+/** Resolve every required context for one drifted commit. */
+pub fn release_drift_commit_evidence(
+  sha: string,
+  pull_number: int,
+  required_contexts: list<string>,
+  commit_rows: list?,
+  head_rows: list?,
+  lane_contexts: list<string> = [],
+) -> ReleaseDriftCommit {
+  let checks: list<ReleaseDriftCheck> = []
+  let blocking = ""
+  let failed: list<string> = []
+  let unfinished: list<string> = []
+  // Both arms ask the same question of the same owner, so a required context
+  // and a release-only lane can never drift apart on what admission means. The
+  // only difference between them is which one the branch requires.
+  for context in required_contexts {
+    const resolved = resolve_context(context, commit_rows, head_rows)
+    checks = checks + [resolved]
+    const verdict = admission_verdict(true, resolved.state)
+    if verdict == "refuse" && blocking == "" {
+      blocking = resolved.name
+    }
+  }
+  for lane in lane_contexts {
+    if required_contexts.contains(lane) {
+      continue
+    }
+    const resolved = resolve_context(lane, commit_rows, head_rows, true)
+    checks = checks + [resolved]
+    if admission_verdict(false, resolved.state) == "pass" {
+      continue
+    }
+    // A lane that has not finished and a lane that failed are both recorded,
+    // and neither decides anything. They are kept apart because a reader needs
+    // to tell "this went red" from "nobody had an answer yet".
+    if admission_state_is_unfinished(resolved.state) {
+      unfinished = unfinished + [resolved.name]
+    } else {
+      failed = failed + [resolved.name]
+    }
+  }
+  return {
+    sha: oid(sha),
+    pull_number: pull_number,
+    checks: checks,
+    green: len(required_contexts) > 0 && blocking == "",
+    blocking_check: blocking,
+    failed_lanes: failed,
+    unfinished_lanes: unfinished,
+  }
+}
+
+/**
+ * The states a candidate resolved for the contexts the release requires.
+ *
+ * Release-only lanes are excluded on purpose. They are recorded evidence about
+ * a commit rather than a bar it must clear, and folding them in here would turn
+ * a note into a refusal.
+ */
+fn candidate_context_states(candidate: ReleaseDriftCommit) -> dict<string, string> {
+  let states = {}
+  for check in candidate.checks {
+    if check.release_only {
+      continue
+    }
+    states[check.name] = check.state
+  }
+  return states
+}
+
+/**
+ * Judge the release candidate tree: the commit that would carry the tag.
+ *
+ * What ships is a tree, not a sequence. The tag names one commit, consumers pin
+ * that commit, and its required checks are the branch's own verdict on the
+ * exact content being published. Every earlier commit in the range is already
+ * contained in it.
+ *
+ * This used to refuse on any commit in the range that had a failing or
+ * unsettled required check. Under fix-forward, where a red is corrected by a
+ * later commit rather than by reverting the red one, such a commit is always
+ * present on the branch. The old rule therefore refused every cut forever,
+ * while the very tree it was refusing had a green aggregate. It also held the
+ * branch to a stricter bar than the branch holds itself: main accepts a
+ * fix-forward series, and a release that will not tag the fixed tip is
+ * disagreeing with the repository's own merge policy.
+ *
+ * Earlier commits stay in the receipt as history, and any of them that did not
+ * pass is named there. Recording them is the point: a receipt that dropped them
+ * would read the same whether the range was clean or was repaired on the way,
+ * and a reader could not tell those apart. They are history, never a refusal.
+ *
+ * An empty required set is refused rather than treated as satisfied. A branch
+ * whose protection could not be read is indistinguishable from one with nothing
+ * to satisfy, and the second reading would let the candidate through on the
+ * strength of a failed API call. For the same reason, a candidate that is not
+ * among the reported commits is refused: its checks were never read, and an
+ * unread check must not be indistinguishable from a passing one.
+ */
+pub fn release_drift_evidence(
+  certified_base: string,
+  observed_main: string,
+  required_contexts: list<string>,
+  commits: list<ReleaseDriftCommit>,
+  observed_at: string,
+  context_set: ReleaseContextSet? = nil,
+) -> ReleaseDriftEvidence {
+  // A caller that passes no set is a repository with no declaration, and the
+  // required list it did pass is the ruleset set. That is today's behavior
+  // exactly, expressed as the degenerate union rather than as a second path.
+  const resolved_set = context_set ?? release_context_set(required_contexts, [], nil, "none")
+  const base = {
+    certified_base: oid(certified_base),
+    observed_main: oid(observed_main),
+    required_contexts: required_contexts,
+    context_set: resolved_set,
+    readiness: release_context_readiness(resolved_set, {}),
+    commits: commits,
+    candidate_sha: "",
+    observed_at: observed_at,
+  }
+  const unproved = {green: false, blocking_sha: "", blocking_check: ""}
+  // A declared context nothing at this revision can produce is checked before
+  // any commit is judged. The list itself is broken, so no verdict computed
+  // from it means anything, and repairing whatever else is red would not
+  // change that.
+  if len(resolved_set.refused) > 0 {
+    return base
+      + unproved
+      + {
+        reason: "the release declares required context(s) no workflow at"
+          + " ${oid(observed_main)} produces: ${resolved_set.refused.join(", ")}",
+      }
+  }
+  if len(required_contexts) == 0 {
+    return base
+      + unproved
+      + {
+        reason:
+          "the branch's required checks could not be read, so no drifted commit can be proved green",
+      }
+  }
+  if len(commits) == 0 {
+    return base
+      + unproved
+      + {
+        reason:
+          "main moved but no drifted commit was reported; refusing to act on an unproved comparison",
+      }
+  }
+  const candidates = commits.filter({ commit -> commit.sha == oid(observed_main) }).to_list()
+  if len(candidates) == 0 {
+    return base
+      + unproved
+      + {
+        reason: "the commit being tagged (${oid(observed_main)}) was not among the"
+          + " ${to_string(len(commits))} commits reported, so its required checks were never read",
+      }
+  }
+  const candidate = candidates[0]
+  const readiness = release_context_readiness(resolved_set, candidate_context_states(candidate))
+  const identified = base + {candidate_sha: candidate.sha, readiness: readiness}
+  if candidate.blocking_check != "" {
+    return identified
+      + {
+        green: false,
+        blocking_sha: candidate.sha,
+        blocking_check: candidate.blocking_check,
+        reason: "the commit being tagged, ${candidate.sha}, did not pass"
+          + " ${candidate.blocking_check} (${readiness.reason})",
+      }
+  }
+  if !candidate.green {
+    return identified
+      + {
+        green: false,
+        blocking_sha: candidate.sha,
+        blocking_check: "",
+        reason: "the commit being tagged, ${candidate.sha}, has an unresolved required check"
+          + " (${readiness.reason})",
+      }
+  }
+  // The two owners must agree. `candidate.green` comes from resolving each
+  // required context one at a time; readiness resolves the same set as a whole.
+  // A disagreement means one of them dropped a context, which is the failure
+  // this whole module is here to make impossible, so it holds rather than
+  // picking the friendlier answer.
+  if !readiness.ok {
+    return identified
+      + {
+        green: false,
+        blocking_sha: candidate.sha,
+        blocking_check: "",
+        reason: "the commit being tagged, ${candidate.sha}, is not ready:"
+          + " ${readiness.reason}",
+      }
+  }
+  return identified
+    + {
+      green: true,
+      blocking_sha: "",
+      blocking_check: "",
+      reason: "the commit being tagged, ${candidate.sha}, passed"
+        + " ${resolved_set.contexts.join(", ")} (${readiness.reason})"
+        + "${carried_history(commits, candidate.sha)}${noted_lanes(commits)}",
+    }
+}
+
+/**
+ * The rest of the range, named in the receipt as history.
+ *
+ * The verdict is about the candidate alone, so these commits cannot refuse a
+ * release. They still have to appear: a fix-forward range and a clean one
+ * produce the same tree and would otherwise produce the same receipt, and the
+ * difference is exactly what a reader of a release is trying to see. Any
+ * earlier commit that did not pass the branch's required checks is named with
+ * what it failed, so "repaired on the way" is legible rather than inferred.
+ */
+fn carried_history(commits: list<ReleaseDriftCommit>, candidate_sha: string) -> string {
+  const earlier = commits.filter({ commit -> commit.sha != candidate_sha }).to_list()
+  if len(earlier) == 0 {
+    return ""
+  }
+  let unpassed: list<string> = []
+  for commit in earlier {
+    if commit.blocking_check != "" {
+      unpassed = unpassed + ["${commit.sha} (${commit.blocking_check})"]
+    } else if !commit.green {
+      unpassed = unpassed + ["${commit.sha} (unresolved required check)"]
+    }
+  }
+  const carried = ", carrying ${to_string(len(earlier))} earlier commit(s) contained in that tree"
+  if len(unpassed) == 0 {
+    return carried
+  }
+  return carried
+    + " of which these did not themselves pass the branch's required checks"
+    + " (${unpassed.join(", ")})"
+}
+
+/**
+ * Release-only lanes the release proceeded over, named in the green reason.
+ *
+ * The release does not wait for these and does not refuse them, so the receipt
+ * is the only place they appear. A verdict that swallowed them would read the
+ * same whether every lane was green, red, or never reported, and the reader
+ * could not tell those apart. Failed and unfinished are named separately for
+ * the same reason.
+ */
+fn noted_lanes(commits: list<ReleaseDriftCommit>) -> string {
+  let failed: list<string> = []
+  let unfinished: list<string> = []
+  for commit in commits {
+    for lane in commit.failed_lanes {
+      if !failed.contains(lane) {
+        failed = failed + [lane]
+      }
+    }
+    for lane in commit.unfinished_lanes {
+      if !unfinished.contains(lane) {
+        unfinished = unfinished + [lane]
+      }
+    }
+  }
+  let noted = ""
+  if len(failed) > 0 {
+    noted = noted + ", over failing lanes the branch does not require (${failed.join(", ")})"
+  }
+  if len(unfinished) > 0 {
+    noted = noted
+      + ", without waiting for unfinished lanes the branch does not require"
+      + " (${unfinished.join(", ")})"
+  }
+  return noted
+}
+
+/**
+ * Every drifted commit named, so a refusal points at commits rather than a count.
+ *
+ * A terminal reason that says "three commits" sends a reader back to the API to
+ * find out which. The shas cost nothing to carry and are what a person needs.
+ */
+pub fn release_drift_commit_shas(evidence: ReleaseDriftEvidence) -> string {
+  if len(evidence.commits) == 0 {
+    return "none reported"
+  }
+  return evidence.commits.map({ commit -> commit.sha }).join(", ")
+}
+
+/**
+ * The contexts a branch requires, read from its rulesets.
+ *
+ * Classic branch protection answers 404 on this repository's default branch, so
+ * the rulesets endpoint is the authority. Only active rulesets count: a
+ * disabled one describes a rule nobody is enforcing.
+ */
+pub fn release_required_contexts_from_rulesets(rulesets: list?) -> list<string> {
+  let contexts: list<string> = []
+  for ruleset in rulesets ?? [] {
+    if lowercase(trim(to_string(ruleset?.enforcement ?? ""))) != "active" {
+      continue
+    }
+    for rule in ruleset?.rules ?? [] {
+      if to_string(rule?.type ?? "") != "required_status_checks" {
+        continue
+      }
+      for check in rule?.parameters?.required_status_checks ?? [] {
+        const context = trim(to_string(check?.context ?? ""))
+        if context != "" && !contexts.contains(context) {
+          contexts = contexts + [context]
+        }
+      }
+    }
+  }
+  return contexts.sort()
+}

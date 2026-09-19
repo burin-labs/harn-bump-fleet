@@ -1,0 +1,1 @@
+Give the release token's grants one owner. The reviewed profile and the workflow step that mints the token were two independent declarations of the same permissions, and they drifted: the profile gained `workflows` and the workflow step did not, so the token armed for the certification push could not push a branch carrying a workflow change.

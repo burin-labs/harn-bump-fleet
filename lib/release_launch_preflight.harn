@@ -1,0 +1,749 @@
+import { github_commit_prefix_is_well_formed } from "./github_commits"
+import {
+  HostedReleaseBump,
+  HostedReleaseInputs,
+  HostedReleaseMode,
+  hosted_release_inputs_validate,
+} from "./hosted_release_dispatch"
+import {
+  RELEASE_CREDENTIAL_REFRESH_MARGIN_S,
+  release_credential_survival_decision,
+} from "./release_phase_budgets"
+
+/**
+ * Everything a release needs to be true before it takes a lease, asked before
+ * it takes one.
+ *
+ * Five hosted releases were lost in one day, each at a different gate, each
+ * reached between thirty seconds and sixty-five minutes into an attempt that
+ * could not be undone: a token minted without `workflows`, a mint that expired
+ * mid-certification, a consumer contract the daily convergence had not
+ * re-rendered, a consumer whose own guard could not pass on that render, and a
+ * short `at_sha`. Every one of them was knowable in under two minutes and none
+ * of them was asked until the release was already spending.
+ *
+ * The failures have nothing in common except when they were asked. So this
+ * module is not a new gate: it is the existing gates, asked first, through the
+ * same code paths the cut uses, with one receipt that names each answer.
+ *
+ * A precondition has three answers, not two. `unavailable` is for a question
+ * this context genuinely cannot ask -- a fork pull request holds no release
+ * credentials -- and it is deliberately not `pass`. An absent answer that read
+ * as a satisfied one is the shape of every failure above.
+ */
+pub type GrantedPermissions = dict<string, string>
+
+pub type PreflightStatus = "pass" | "fail" | "unavailable"
+
+pub type PreflightPrecondition = {
+  name: string,
+  status: PreflightStatus,
+  detail: string,
+  remedy: string,
+}
+
+pub type ReleaseLaunchPreflightReceipt = {
+  schema_version: "release_harn.launch_preflight.v1",
+  mode: string,
+  bump: string,
+  at_sha: string,
+  /** The exact forty-character commit every later step is handed. */
+  resolved_at_sha: string,
+  token_profile: string,
+  preconditions: list<PreflightPrecondition>,
+  passed: list<string>,
+  failed: list<string>,
+  unavailable: list<string>,
+  /** No precondition failed. A release may proceed. */
+  ok: bool,
+  /** Every precondition was actually asked. `ok` without this is a partial read. */
+  complete: bool,
+}
+
+pub fn preflight_pass(name: string, detail: string) -> PreflightPrecondition {
+  return {name: name, status: "pass", detail: detail, remedy: ""}
+}
+
+pub fn preflight_fail(name: string, detail: string, remedy: string) -> PreflightPrecondition {
+  return {name: name, status: "fail", detail: detail, remedy: remedy}
+}
+
+pub fn preflight_unavailable(name: string, detail: string) -> PreflightPrecondition {
+  return {name: name, status: "unavailable", detail: detail, remedy: ""}
+}
+
+const RELEASE_MODES = ["audit", "prepare", "ship-pr"]
+
+const RELEASE_BUMPS = ["patch", "minor", "major", "premajor", "preminor", "prepatch", "prerelease"]
+
+/** Raw dispatch inputs, before anything has proved they are of the right shape. */
+pub type ReleaseLaunchInputs = {
+  mode: string,
+  bump: string,
+  prerelease_identifier: string,
+  at_sha: string,
+  repositories_json: string,
+  skip_consumers: string,
+  consumer_proof_runs_json: string,
+}
+
+/**
+ * Validate the dispatch inputs through the hosted dispatcher's own validator.
+ *
+ * `hosted_release_inputs_validate` is the single owner of release input shape,
+ * including the full-40-character `at_sha` rule that a live cut was refused on.
+ * Its argument type is closed, so the two enumerated fields are checked here
+ * first; everything else is delegated rather than restated. A second copy of
+ * the SHA rule in a preflight would be a second thing to keep true.
+ */
+pub fn release_input_preconditions(inputs: ReleaseLaunchInputs) -> list<PreflightPrecondition> {
+  let checks: list<PreflightPrecondition> = []
+  if !contains(RELEASE_MODES, inputs.mode) {
+    checks = checks
+      + [
+        preflight_fail(
+          "inputs.mode",
+          "mode '${inputs.mode}' is not a release mode",
+          "use one of " + join(RELEASE_MODES, ", "),
+        ),
+      ]
+  } else {
+    checks = checks + [preflight_pass("inputs.mode", "mode ${inputs.mode}")]
+  }
+  if !contains(RELEASE_BUMPS, inputs.bump) {
+    checks = checks
+      + [
+        preflight_fail(
+          "inputs.bump",
+          "bump '${inputs.bump}' is not a semantic version bump",
+          "use one of " + join(RELEASE_BUMPS, ", "),
+        ),
+      ]
+  } else {
+    checks = checks + [preflight_pass("inputs.bump", "bump ${inputs.bump}")]
+  }
+  if trim(inputs.repositories_json) != "" && trim(inputs.skip_consumers) != "" {
+    checks = checks
+      + [
+        preflight_fail(
+          "inputs.consumer_scope",
+          "repositories_json and skip_consumers are mutually exclusive",
+          "name the consumers to update, or the consumers to leave alone, never both",
+        ),
+      ]
+  } else {
+    checks = checks + [preflight_pass("inputs.consumer_scope", "consumer scope is unambiguous")]
+  }
+  if len(checks.filter({ check -> return check.status == "fail" }).to_list()) > 0 {
+    // The delegated validator's argument type cannot represent a bad mode or
+    // bump, so asking it now would throw on the wrong question.
+    return checks
+      + [
+        preflight_unavailable(
+          "inputs.shape",
+          "not asked: the release input validator cannot be reached with an invalid mode or bump",
+        ),
+      ]
+  }
+  const mode: HostedReleaseMode = inputs.mode
+  const bump: HostedReleaseBump = inputs.bump
+  // The commit pin has its own two preconditions, and only the resolved forty
+  // characters are ever handed on. Anything shorter is withheld from the
+  // delegated validator rather than failed twice: the validator's rule is that
+  // the release receives a full commit, which is exactly what resolution makes
+  // true, and reporting the same shortfall under two names would inflate the
+  // failure count without adding an answer.
+  const pinned = lowercase(trim(inputs.at_sha))
+  let candidate: HostedReleaseInputs = {
+    mode: mode,
+    bump: bump,
+    prerelease_identifier: inputs.prerelease_identifier,
+    at_sha: if len(regex_captures("^[0-9a-f]{40}$", pinned)) == 1 {
+      pinned
+    } else {
+      ""
+    },
+    converge_fleet: true,
+  }
+  if trim(inputs.repositories_json) != "" {
+    candidate.repositories_json = trim(inputs.repositories_json)
+  }
+  if trim(inputs.consumer_proof_runs_json) != "" {
+    candidate.consumer_proof_runs_json = trim(inputs.consumer_proof_runs_json)
+  }
+  const validated = try {
+    hosted_release_inputs_validate(candidate)
+  } catch (error) {
+    Err({code: "invalid_inputs", message: to_string(error)})
+  }
+  if is_err(validated) {
+    return checks
+      + [
+        preflight_fail(
+          "inputs.shape",
+          to_string(unwrap_err(validated).message ?? unwrap_err(validated)),
+          "correct the dispatch inputs; nothing has been leased",
+        ),
+      ]
+  }
+  return checks
+    + [preflight_pass("inputs.shape", "every release input is of the shape the cut accepts")]
+}
+
+/**
+ * What a commit prefix resolved to, and whether the question was asked at all.
+ *
+ * `asked` is separate from `resolved` on purpose. A context with no network
+ * cannot turn seven characters into forty, and reporting that as a resolution
+ * that simply found nothing would be the same absent-reads-as-present failure
+ * the rest of this module exists to refuse.
+ */
+pub type AtShaResolution = {requested: string, resolved: string, asked: bool, reason: string}
+
+/**
+ * The commit pin, as its two separable questions.
+ *
+ * Operators type short SHAs, and a live cut was refused thirty seconds in for
+ * exactly that. The syntax half is answerable anywhere; the resolution half
+ * needs GitHub. Splitting them is what lets a short pin pass the structural
+ * check in a context that cannot reach the network, while the release itself
+ * still only ever receives forty characters.
+ */
+pub fn at_sha_preconditions(resolution: AtShaResolution) -> list<PreflightPrecondition> {
+  const requested = lowercase(trim(resolution.requested))
+  if requested == "" {
+    return [
+      preflight_pass("inputs.at_sha", "unpinned; the release pins origin/main when it starts"),
+      preflight_pass("inputs.at_sha_resolved", "no commit prefix to resolve"),
+    ]
+  }
+  if !github_commit_prefix_is_well_formed(requested) {
+    return [
+      preflight_fail(
+        "inputs.at_sha",
+        "at_sha '${requested}' is not a commit prefix",
+        "give 7 to 40 lowercase hex digits, or leave it blank to pin origin/main",
+      ),
+      preflight_unavailable(
+        "inputs.at_sha_resolved",
+        "not asked: '${requested}' cannot be sent to GitHub as a commit",
+      ),
+    ]
+  }
+  const syntax = preflight_pass(
+    "inputs.at_sha",
+    "at_sha ${requested} is a ${to_string(len(requested))}-character commit prefix",
+  )
+  if len(requested) == 40 {
+    return [
+      syntax,
+      preflight_pass("inputs.at_sha_resolved", "${requested} is already the full commit"),
+    ]
+  }
+  if !resolution.asked {
+    return [
+      syntax,
+      preflight_unavailable(
+        "inputs.at_sha_resolved",
+        "not asked: ${resolution.reason}; the release requires the full forty characters",
+      ),
+    ]
+  }
+  if trim(resolution.resolved) == "" {
+    return [
+      syntax,
+      preflight_fail(
+        "inputs.at_sha_resolved",
+        resolution.reason,
+        "name a commit that exists on the release repository, with enough characters to be "
+          + "unambiguous",
+      ),
+    ]
+  }
+  return [
+    syntax,
+    preflight_pass(
+      "inputs.at_sha_resolved",
+      "${requested} resolves to ${trim(resolution.resolved)}",
+    ),
+  ]
+}
+
+/**
+ * Did the mint actually grant every permission the cut will exercise?
+ *
+ * `requested` is the reviewed profile, which the certify push and the tag push
+ * are armed from. `granted` is what GitHub answered. They can differ: an
+ * installation grant is a ceiling, and a narrowed mint sits below it, which is
+ * how a token that looked correct in the App settings refused a workflow push.
+ */
+pub fn token_permission_precondition(
+  profile: string,
+  requested: dict<string, string>,
+  granted: dict<string, string>,
+) -> PreflightPrecondition {
+  let missing: list<string> = []
+  for permission in requested.keys().sort() {
+    const want = requested.get(permission) ?? ""
+    const have = granted.get(permission)
+    if have == nil {
+      missing = missing + ["${permission} (want ${want}, not granted)"]
+      continue
+    }
+    if have != want {
+      missing = missing + ["${permission} (want ${want}, granted ${to_string(have)})"]
+    }
+  }
+  if len(missing) > 0 {
+    return preflight_fail(
+      "token.permissions",
+      "profile ${profile} minted a token missing " + join(missing, "; "),
+      "add the permission to spec/github-app-token-profiles.json, and grant it on the App "
+        + "installation if the installation itself does not hold it",
+    )
+  }
+  return preflight_pass(
+    "token.permissions",
+    "profile ${profile} granted " + join(requested.keys().sort(), ", "),
+  )
+}
+
+/**
+ * Will the credential outlive the phases this mode reaches, or be refreshed?
+ *
+ * This half is structural: it reads the arming and the interval out of the
+ * workflow and compares them to the declared mint ceiling, so it is answerable
+ * without any credential at all. That matters, because the regression it
+ * catches -- a refresher armed for one mode on the theory that the others were
+ * short -- is exactly the kind of change a pull request makes.
+ */
+pub fn credential_refresh_precondition(
+  mode: string,
+  declared_lifetime_s: int,
+  refresh_interval_s: int,
+  refresher_modes: list<string>,
+) -> PreflightPrecondition {
+  const decision = release_credential_survival_decision(
+    mode,
+    declared_lifetime_s,
+    refresh_interval_s,
+    refresher_modes,
+  )
+  return if decision.ok {
+    preflight_pass("credentials.refresh", decision.detail)
+  } else {
+    preflight_fail("credentials.refresh", decision.detail, decision.remedy)
+  }
+}
+
+/**
+ * Is the mint we actually got as long as the arming above assumed?
+ *
+ * The structural check reasons from a declared one-hour ceiling. This is the
+ * observation that keeps that constant honest: a mint shorter than the refresh
+ * interval plus its headroom would make the refresher a race, however correctly
+ * it is armed.
+ */
+pub fn token_lifetime_precondition(
+  observed_lifetime_s: int,
+  declared_lifetime_s: int,
+  refresh_interval_s: int,
+) -> PreflightPrecondition {
+  const floor = refresh_interval_s + RELEASE_CREDENTIAL_REFRESH_MARGIN_S
+  if observed_lifetime_s < floor {
+    return preflight_fail(
+      "token.lifetime",
+      "the mint lives ${to_string(observed_lifetime_s)}s, under the "
+        + "${to_string(floor)}s a ${to_string(refresh_interval_s)}s refresh interval needs",
+      "shorten the refresh interval, or find out why the mint is shorter than the "
+        + "${to_string(declared_lifetime_s)}s this fleet assumes",
+    )
+  }
+  return preflight_pass(
+    "token.lifetime",
+    "the mint lives ${to_string(observed_lifetime_s)}s against a ${to_string(floor)}s floor",
+  )
+}
+
+/**
+ * Does the workflow's own mint step declare the same grants as the registry?
+ *
+ * `create-github-app-token` takes one `permission-<name>` input per grant, so a
+ * workflow that mints inline is a second declaration of the profile. That is
+ * exactly what drifted: the profile gained `workflows: write` and the workflow
+ * step did not. `declared` is that step's `with:` block.
+ */
+pub fn workflow_mint_precondition(
+  workflow: string,
+  step: string,
+  profile: string,
+  requested: dict<string, string>,
+  declared: dict<string, string>?,
+) -> PreflightPrecondition {
+  if declared == nil {
+    return preflight_fail(
+      "workflow.mint",
+      "${workflow} has no step named '${step}' to compare against profile ${profile}",
+      "restore the step, or update the binding in spec/github-app-token-profiles.json",
+    )
+  }
+  let drift: list<string> = []
+  for permission in requested.keys().sort() {
+    const want = requested.get(permission) ?? ""
+    // `create-github-app-token` spells `pull_requests` as `permission-pull-requests`.
+    const key = "permission-" + replace(permission, "_", "-")
+    const have = (declared ?? {}).get(key)
+    if have == nil {
+      drift = drift + ["${key} is absent (profile wants ${want})"]
+      continue
+    }
+    if to_string(have) != want {
+      drift = drift + ["${key} is ${to_string(have)} (profile wants ${want})"]
+    }
+  }
+  if len(drift) > 0 {
+    return preflight_fail(
+      "workflow.mint",
+      "${workflow} step '${step}' has drifted from profile ${profile}: " + join(drift, "; "),
+      "make the step declare exactly what spec/github-app-token-profiles.json says",
+    )
+  }
+  return preflight_pass("workflow.mint", "${workflow} step '${step}' matches profile ${profile}")
+}
+
+/**
+ * Read one `--describe` mint response into its two preconditions.
+ *
+ * The mint is the only thing that can answer what it granted and how long it
+ * lives, so this is the one seam where a live response is decoded. Keeping the
+ * decode here rather than in the entrypoint is what lets a recorded response
+ * prove the reader, instead of the reader being exercised for the first time
+ * against a live release.
+ */
+pub fn token_description_preconditions(
+  profile: string,
+  requested: dict<string, string>,
+  description: any,
+  declared_lifetime_s: int,
+  refresh_interval_s: int,
+) -> list<PreflightPrecondition> {
+  const granted: dict<string, string> = schema_expect(
+    description?.get("granted_permissions") ?? {},
+    schema_of(GrantedPermissions),
+  )
+  const lifetime = to_int(description?.get("lifetime_s") ?? "")
+  return [
+    token_permission_precondition(profile, requested, granted),
+    if lifetime == nil {
+      preflight_fail(
+        "token.lifetime",
+        "the mint reported no expiry, so its lifetime cannot be compared to anything",
+        "check that the installation token response still carries expires_at",
+      )
+    } else {
+      token_lifetime_precondition(lifetime ?? 0, declared_lifetime_s, refresh_interval_s)
+    },
+  ]
+}
+
+/** The convergence workflow that re-renders a drifted consumer projection. */
+pub const FLEET_CONVERGENCE_WORKFLOW: string = "fleet-projection-convergence.yml"
+
+/**
+ * Do the live consumer mains still match the adapters this fleet renders?
+ *
+ * On drift the answer has to name the repair, not only the symptom. The
+ * convergence workflow that re-renders a consumer runs daily; a release cut in
+ * the hours between a renderer change and that run is the case this precondition
+ * exists for, and the operator's next move is to dispatch it rather than to
+ * wait.
+ */
+pub fn consumer_contract_precondition(
+  policy_ok: bool,
+  failures: list<string>,
+) -> PreflightPrecondition {
+  if policy_ok {
+    return preflight_pass(
+      "consumers.contracts",
+      "every live consumer main matches the adapters this fleet renders",
+    )
+  }
+  return preflight_fail(
+    "consumers.contracts",
+    "consumer projection drift: " + join(failures, "; "),
+    "dispatch ${FLEET_CONVERGENCE_WORKFLOW} with apply=true in burin-labs/harn-bump-fleet, "
+      + "merge the repairs it opens, then re-run this preflight",
+  )
+}
+
+fn names_with_status(
+  preconditions: list<PreflightPrecondition>,
+  status: PreflightStatus,
+) -> list<string> {
+  return preconditions.filter({ check -> return check.status == status }).map(
+    { check -> return check.name },
+  )
+    .to_list()
+}
+
+/** One typed receipt naming every precondition and its answer. */
+pub fn release_launch_preflight_receipt(
+  inputs: ReleaseLaunchInputs,
+  token_profile: string,
+  preconditions: list<PreflightPrecondition>,
+  resolved_at_sha: string = "",
+) -> ReleaseLaunchPreflightReceipt {
+  const failed = names_with_status(preconditions, "fail")
+  const unavailable = names_with_status(preconditions, "unavailable")
+  return {
+    schema_version: "release_harn.launch_preflight.v1",
+    mode: inputs.mode,
+    bump: inputs.bump,
+    at_sha: inputs.at_sha,
+    resolved_at_sha: resolved_at_sha,
+    token_profile: token_profile,
+    preconditions: preconditions,
+    passed: names_with_status(preconditions, "pass"),
+    failed: failed,
+    unavailable: unavailable,
+    ok: len(failed) == 0,
+    complete: len(unavailable) == 0,
+  }
+}
+
+/**
+ * Operator lines: every precondition, then the counts.
+ *
+ * The unavailable count is printed even when nothing failed, because a receipt
+ * that reported only `ok` would let a context which could not ask half the
+ * questions read exactly like one that asked them all and liked the answers.
+ */
+pub fn release_launch_preflight_lines(receipt: ReleaseLaunchPreflightReceipt) -> list<string> {
+  let lines: list<string> = []
+  for check in receipt.preconditions {
+    const mark = if check.status == "pass" {
+      "PASS"
+    } else if check.status == "fail" {
+      "FAIL"
+    } else {
+      "NOT ASKED"
+    }
+    lines = lines + ["${mark} ${check.name}: ${check.detail}"]
+    if check.remedy != "" {
+      lines = lines + ["     remedy: ${check.remedy}"]
+    }
+  }
+  lines = lines
+    + [
+      "${to_string(len(receipt.passed))} passed, ${to_string(len(receipt.failed))} failed, "
+        + "${to_string(len(receipt.unavailable))} not asked",
+    ]
+  if !receipt.complete {
+    lines = lines
+      + ["not asked here: " + join(receipt.unavailable, ", ")]
+  }
+  return lines
+}
+
+/**
+ * The remint interval a release step actually sleeps between refreshes.
+ *
+ * Read from the step's own body rather than from a constant, because the
+ * declared interval and the one the workflow sleeps are two different facts
+ * and the whole point of the lifetime precondition is to compare them. A step
+ * that names no interval returns `nil`, which the precondition reports as a
+ * refresher that cannot be proven rather than as one that is fine.
+ */
+pub fn hosted_release_refresh_interval_s(step_run: string) -> int? {
+  const matched = regex_captures("(?m)^\\s*sleep\\s+([0-9]+)\\s*$", step_run)
+  if len(matched) == 0 {
+    return nil
+  }
+  return to_int(matched[0].groups[0] ?? "")
+}
+
+/**
+ * The preconditions that are facts about another repository.
+ *
+ * Every one of these can be false while this repository is entirely correct:
+ * an unfolded release on the Harn default branch, a consumer whose adapter
+ * drifted, a consumer whose pin cannot be read. No commit here fixes them, so
+ * refusing a pull request on one tells its author to repair something they
+ * cannot reach and did not break.
+ *
+ * They stay in the receipt and stay loud. What changes is only whose failure
+ * blocks whose change.
+ */
+pub const RELEASE_STATE_PRECONDITIONS: list<string> = [
+  "consumers.contracts",
+  "consumers.rehearsal",
+  "checkpoint.development_version",
+  "checkpoint.release_contract",
+  "checkpoint.changelog_fragments",
+  "checkpoint.consumer_pins",
+]
+
+/** What a scope refuses on, and what it defers to whoever owns it. */
+pub type PreflightScopeDecision = {
+  scope: PreflightScope,
+  blocking: list<string>,
+  deferred: list<string>,
+  refuses: bool,
+}
+
+/**
+ * Who is being asked: a change to this repository, or a release.
+ *
+ * `release` is every context that is about to act -- a launch, a push to the
+ * default branch, the hourly tick -- and refuses on everything. `repository`
+ * is a pull request against this repository, and refuses only on what a commit
+ * here could fix.
+ */
+pub type PreflightScope = "release" | "repository"
+
+/**
+ * Split a receipt's failures into the ones this scope refuses on and the rest.
+ *
+ * Deferred is never silent. A caller that drops these has built the thing this
+ * receipt exists to refuse: a check that goes green while something it asked
+ * about is false. The names come back so the caller can say them.
+ */
+pub fn preflight_scope_decision(
+  failed: list<string>,
+  scope: PreflightScope,
+) -> PreflightScopeDecision {
+  let blocking: list<string> = []
+  let deferred: list<string> = []
+  for name in failed {
+    if scope == "repository" && RELEASE_STATE_PRECONDITIONS.contains(name) {
+      deferred = deferred + [name]
+    } else {
+      blocking = blocking + [name]
+    }
+  }
+  return {scope: scope, blocking: blocking, deferred: deferred, refuses: len(blocking) > 0}
+}
+
+/**
+ * The preconditions a launch preflight receipt reported as failed.
+ *
+ * The preflight asks many questions in one step, so which repair a reader is
+ * owed depends on which of them refused. This reads that from the receipt the
+ * preflight already writes.
+ *
+ * A document that is absent, unparsed, or shaped differently yields nothing.
+ * Nothing is not the same as a preflight that passed and must not be read as
+ * one: a caller with no cause named falls back to a repair that points at the
+ * receipt, rather than asserting which precondition broke.
+ */
+pub fn preflight_reported_causes(document: any) -> list<string> {
+  if type_of(document?.failed) != "list" {
+    return []
+  }
+  let causes: list<string> = []
+  for entry in document?.failed ?? [] {
+    const name = trim(to_string(entry))
+    if name != "" && !causes.contains(name) {
+      causes = causes + [name]
+    }
+  }
+  return causes
+}
+
+/**
+ * Every precondition the launch preflight can name, in receipt order.
+ *
+ * Anything keyed on these names -- a repair map, a scope's deferral list, a
+ * dashboard -- is keyed on a string, and a string that never matches fails
+ * silently: the map looks populated, the fallback quietly applies, and nobody
+ * learns the key was wrong. Declaring the set here gives those callers
+ * something to be checked against.
+ */
+/**
+ * Where the preflight writes its receipt, and where every reader looks for it.
+ *
+ * One owner because the cause chain is silent when it breaks. The preflight
+ * writes this file, the release run uploads it, the finalizer downloads it and
+ * reads the refused precondition names out of it, and those names select the
+ * repair a release owner is handed. A rename in any one of those places makes
+ * the read miss, the cause list empty, and the finalizer fall back to the
+ * generic line -- with nothing anywhere reporting that it happened. Anyone
+ * holding a half-published version is then told to go read a file.
+ */
+pub const RELEASE_LAUNCH_RECEIPT_PATH: string = ".harn-runs/release-launch-preflight.json"
+
+pub const RELEASE_LAUNCH_PRECONDITION_NAMES: list<string> = [
+  "inputs.at_sha",
+  "inputs.at_sha_resolved",
+  "inputs.mode",
+  "inputs.bump",
+  "inputs.consumer_scope",
+  "inputs.shape",
+  "workflow.mint",
+  "phases.budgets",
+  "credentials.refresh",
+  "token.permissions",
+  "token.lifetime",
+  "consumers.contracts",
+  "consumers.rehearsal",
+  "checkpoint.development_version",
+  "checkpoint.release_contract",
+  "checkpoint.changelog_fragments",
+  "checkpoint.consumer_pins",
+]
+
+/** One registry binding of a workflow step to the token profile it must mint. */
+pub type WorkflowMintBinding = {workflow: string, job: string, step: string, profile: string}
+
+/**
+ * Compare every binding for one profile against the workflow each binding names.
+ *
+ * `read_workflow` returns the parsed workflow at a repository-relative path, or
+ * nil when the tree does not have it. It is a callback so the reading is part of
+ * what a test can drive: the defect this replaced compared every binding against
+ * one fixed workflow, which reported a step in another workflow as absent. That
+ * is a fail, so the receipt was red, but it named the wrong situation and could
+ * only appear once a second mint was registered somewhere else.
+ *
+ * A binding naming a workflow the tree does not have becomes the same absent-
+ * step fail as one whose step was deleted, provided `read_workflow` answers nil
+ * rather than throwing. That is the reader's half of the contract, and it is
+ * where the entrypoint catches an unreadable file: a binding pointing at a file
+ * nobody kept is exactly the drift this exists to report, and a throw would
+ * report it as the preflight itself being broken.
+ */
+pub fn workflow_mint_preconditions(
+  bindings: list<WorkflowMintBinding>,
+  profile: string,
+  permissions: dict<string, string>,
+  read_workflow: fn(string) -> any,
+) -> list<PreflightPrecondition> {
+  let checks: list<PreflightPrecondition> = []
+  for binding in bindings {
+    if binding.profile != profile {
+      continue
+    }
+    // Nil flows through the chain, so a workflow the reader could not produce
+    // lands on the same absent-step fail as a workflow that lost the step. The
+    // reader owns turning an unreadable file into nil; a reader that throws
+    // instead makes the preflight itself look broken.
+    const step = read_workflow(binding.workflow)?.get("jobs")?.get(binding.job)?.get("steps")?.find(
+      { candidate -> return candidate?.get("name") == binding.step },
+    )
+    checks = checks
+      + [
+        workflow_mint_precondition(
+          binding.workflow,
+          binding.step,
+          binding.profile,
+          permissions,
+          if step == nil {
+            nil
+          } else {
+            step?.get("with") ?? {}
+          },
+        ),
+      ]
+  }
+  return checks
+}
