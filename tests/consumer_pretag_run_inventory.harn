@@ -7,24 +7,48 @@
  */
 import { ConsumerPretagRunRow, run_consumer_pretag_gates } from "../lib/consumer_pretag_dispatch"
 import { GITHUB_ACTIONS_RUNS_PAGE } from "../lib/github"
-import { FAST, REVISION, adapter, row, target } from "../testdata/consumer_pretag_fixtures"
+import {
+  FAST,
+  REVISION,
+  adapter,
+  dated_row,
+  row,
+  target,
+} from "../testdata/consumer_pretag_fixtures"
 
 /**
- * A full inventory page is refused, not treated as "no run yet".
- *
- * The inventory is one bounded page, so a candidate whose run is older than
- * the page looks exactly like a candidate with no run at all. Acting on the
- * second reading dispatches a duplicate of a gate that already ran. A page
- * that came back full is therefore not evidence of absence.
+ * A page of other candidates' runs, newest first, the way GitHub lists them.
+ * Both keys descend together because the live listing's do: run numbers are
+ * issued in creation order.
  */
-pipeline test_a_full_inventory_page_refuses_instead_of_redispatching() {
-  let dispatches = 0
-  // A full page of runs, none of which names this candidate.
-  let crowd: list<ConsumerPretagRunRow> = []
-  for index in range(0, GITHUB_ACTIONS_RUNS_PAGE) {
-    crowd = crowd + [row(100 + index, "completed", "success", "Some other candidate")]
+fn other_runs(size: int) -> list<ConsumerPretagRunRow> {
+  let rows: list<ConsumerPretagRunRow> = []
+  for index in range(0, size) {
+    rows = rows
+      + [
+        dated_row(
+          row(900 - index, "completed", "success", "Some other candidate"),
+          "2026-09-20T12:00:${to_string(59 - index)}Z",
+        ),
+      ]
   }
-  assert_eq(len(crowd), GITHUB_ACTIONS_RUNS_PAGE)
+  return rows
+}
+
+/**
+ * A full page on the RECOVERY read is refused, not treated as "no run yet".
+ *
+ * The recovery read polls for a run an interrupted earlier attempt may have
+ * started. Its answers are wait longer or give up, and a full page supports
+ * neither: a run pushed off the end and a run that never existed arrive
+ * identically. The bound is reported instead of being silently resolved.
+ */
+pipeline test_a_full_page_on_the_recovery_read_refuses_instead_of_redispatching() {
+  let dispatches = 0
+  let reads = 0
+  const partial = other_runs(GITHUB_ACTIONS_RUNS_PAGE - 1)
+  const full = other_runs(GITHUB_ACTIONS_RUNS_PAGE)
+  assert_eq(len(full), GITHUB_ACTIONS_RUNS_PAGE)
   const receipts = run_consumer_pretag_gates(
     [target()],
     adapter(
@@ -34,14 +58,27 @@ pipeline test_a_full_inventory_page_refuses_instead_of_redispatching() {
           dispatches = dispatches + 1
           return Ok({run_id: 11, head_sha: REVISION})
         },
-        runs: fn(_target) { return Ok(crowd) },
+        runs: fn(_target) {
+          reads = reads + 1
+          // The first read is the pre-dispatch one; the page fills underneath
+          // the gate before the recovery poll reads it again.
+          return Ok(
+            if reads == 1 {
+              partial
+            } else {
+              full
+            },
+          )
+        },
       },
     ),
-    FAST,
+    FAST + {recovery_visibility_ms: 10},
   )
+  assert(reads > 1, "the recovery read never ran, so this proves nothing about it")
   assert_eq(dispatches, 0)
   assert_eq(receipts[0]?.status, "unreadable")
   assert(contains(receipts[0]?.detail ?? "", "filled its page"))
+  assert(contains(receipts[0]?.detail ?? "", "recovery-visible"))
 }
 
 /**
@@ -51,10 +88,7 @@ pipeline test_a_full_inventory_page_refuses_instead_of_redispatching() {
  */
 pipeline test_a_partial_inventory_page_still_dispatches_an_unseen_candidate() {
   let dispatches = 0
-  let crowd: list<ConsumerPretagRunRow> = []
-  for index in range(0, GITHUB_ACTIONS_RUNS_PAGE - 1) {
-    crowd = crowd + [row(100 + index, "completed", "success", "Some other candidate")]
-  }
+  const crowd = other_runs(GITHUB_ACTIONS_RUNS_PAGE - 1)
   assert_eq(len(crowd), GITHUB_ACTIONS_RUNS_PAGE - 1)
   let listed = crowd
   const receipts = run_consumer_pretag_gates(
@@ -64,7 +98,7 @@ pipeline test_a_partial_inventory_page_still_dispatches_an_unseen_candidate() {
       {
         dispatch: fn(_target) {
           dispatches = dispatches + 1
-          listed = crowd + [row(11, "completed", "success")]
+          listed = [row(11, "completed", "success")] + crowd
           return Ok({run_id: 11, head_sha: REVISION})
         },
         runs: fn(_target) { return Ok(listed) },
@@ -74,6 +108,106 @@ pipeline test_a_partial_inventory_page_still_dispatches_an_unseen_candidate() {
   )
   assert_eq(dispatches, 1)
   assert_eq(receipts[0]?.status, "passed")
+}
+
+/**
+ * A FULL page before dispatch still dispatches, and that is the point of
+ * splitting the rule by read.
+ *
+ * This candidate's run, if it existed, would have been created after every
+ * run the page displaced, so a newest-first page answers "has it been
+ * dispatched" whether or not it filled. Refusing here instead would stop the
+ * gate permanently on any consumer with a long dispatch history, which is
+ * exactly what a blanket full-page refusal did on 2026-09-20: a consumer with
+ * 67 prior runs could never be gated again.
+ */
+pipeline test_a_full_page_before_dispatch_still_dispatches_an_unseen_candidate() {
+  let dispatches = 0
+  const crowd = other_runs(GITHUB_ACTIONS_RUNS_PAGE)
+  assert_eq(len(crowd), GITHUB_ACTIONS_RUNS_PAGE)
+  let listed = crowd
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          listed = [row(11, "completed", "success")] + crowd
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok(listed) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 1)
+  assert_eq(receipts[0]?.status, "passed")
+}
+
+/**
+ * Control for the premise the case above rests on: an inventory that is not
+ * newest first is refused by name rather than read as absence.
+ *
+ * Nothing in the API contract we can check guarantees the ordering, so the
+ * gate checks it on every read. The day it changes, this refuses instead of
+ * dispatching duplicates silently.
+ */
+pipeline test_an_unsorted_inventory_page_refuses_before_dispatch() {
+  let dispatches = 0
+  const ordered = other_runs(4)
+  // One run out of place by creation time: an older run listed above a newer.
+  const jumbled = [ordered[1] ?? row(0, "completed", "success")]
+    + [ordered[0] ?? row(0, "completed", "success")]
+    + [ordered[2] ?? row(0, "completed", "success")]
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok(jumbled) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "descending creation order"))
+}
+
+/**
+ * The same premise where the listing carries no creation times: the run
+ * number is issued in creation order, so it carries the ordering instead.
+ * Without this arm a listing with the timestamps omitted would be admitted
+ * unchecked, and absence would quietly stop meaning anything.
+ */
+pipeline test_an_unsorted_page_without_timestamps_refuses_before_dispatch() {
+  let dispatches = 0
+  const jumbled = [
+    row(100, "completed", "success", "Some other candidate"),
+    row(200, "completed", "success", "Some other candidate"),
+  ]
+  const receipts = run_consumer_pretag_gates(
+    [target()],
+    adapter(
+      [row(11, "completed", "success")],
+      {
+        dispatch: fn(_target) {
+          dispatches = dispatches + 1
+          return Ok({run_id: 11, head_sha: REVISION})
+        },
+        runs: fn(_target) { return Ok(jumbled) },
+      },
+    ),
+    FAST,
+  )
+  assert_eq(dispatches, 0)
+  assert_eq(receipts[0]?.status, "unreadable")
+  assert(contains(receipts[0]?.detail ?? "", "lower-numbered run"))
 }
 
 /**
