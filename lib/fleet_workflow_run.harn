@@ -1,0 +1,407 @@
+import { fleet_chain_branch } from "./fleet_chain_ref"
+import { FleetDispatchScope, fleet_scope_title_suffix } from "./fleet_operation_scope"
+import { github_actions_run, github_actions_runs, github_is_transient_read_error } from "./github"
+import {
+  GithubConnectorResult,
+  GithubWorkflowRun,
+  GithubWorkflowRuns,
+} from "harn-github-connector/default"
+
+const FLEET_REPO = "burin-labs/harn-bump-fleet"
+
+const MAX_CONSECUTIVE_TRANSIENT_RETRIES = 3
+
+const FLEET_WORKFLOW = "bump-fleet.yml"
+
+const FLEET_WORKFLOW_PATH = ".github/workflows/bump-fleet.yml"
+
+pub type FleetWorkflowReceipt = {
+  schema_version: "harn_bump_fleet.hosted_dispatch.v1",
+  target: string,
+  scope: FleetDispatchScope,
+  run_id: int,
+  run_url: string,
+  status: string,
+  conclusion: string,
+  controller_revision: string?,
+  display_title: string?,
+  elapsed_ms: int,
+  observation_attempts: int,
+  transient_retries: int,
+}
+
+/** Exact-run read and monotonic time primitives for deterministic observation policy tests. */
+pub type FleetWorkflowRunAdapter = {
+  now_ms: fn() -> int,
+  run: fn(int) -> GithubConnectorResult<GithubWorkflowRun>,
+  wait: fn(int) -> nil,
+}
+
+/** Exact-run and run-list primitives for following one correlated update chain. */
+pub type FleetWorkflowChainAdapter = FleetWorkflowRunAdapter \
+  & {runs: fn(string) -> GithubConnectorResult<GithubWorkflowRuns>}
+
+/** Terminal proof for all bounded rounds started by one release. */
+pub type FleetWorkflowChainReceipt = {
+  schema_version: "harn_bump_fleet.hosted_update_chain.v1",
+  target: string,
+  scope: FleetDispatchScope,
+  chain_id: string,
+  status: string,
+  conclusion: string,
+  runs: list<FleetWorkflowReceipt>,
+  elapsed_ms: int,
+}
+
+/** Named limits and identities for observing one hosted update chain. */
+pub type FleetWorkflowChainRequest = {
+  target: string,
+  scope: FleetDispatchScope,
+  chain_id: string,
+  initial_run_id: int,
+  initial_run_url: string,
+  max_rounds: int,
+  timeout_s: int,
+  successor_timeout_s: int,
+  interval_s: int,
+}
+
+/** Stable GitHub run title used as the persisted continuation correlation key. */
+pub fn fleet_workflow_chain_run_name() -> string {
+  const expression = "$" + "{{ "
+  return "Update Harn fleet / " + expression + "inputs.version || 'latest' }} / chain "
+    + expression
+    + "inputs.chain_id || github.run_id }} / round "
+    + expression
+    + "inputs.update_round || '1' }} of "
+    + expression
+    + "inputs.max_rounds || '4' }}"
+    + expression
+    + "inputs.scope_digest && format(' / scope {0}', inputs.scope_digest) || '' }}"
+}
+
+/** Stable GitHub run title used as the persisted continuation correlation key. */
+pub fn fleet_workflow_chain_title(
+  target: string,
+  chain_id: string,
+  round: int,
+  max_rounds: int,
+  scope: FleetDispatchScope = {kind: "full_fleet"},
+) -> string {
+  if trim(target) == "" || len(regex_captures("^[1-9][0-9]*$", trim(chain_id))) == 0
+    || round
+      < 1
+    || max_rounds < round {
+    throw "fleet workflow chain title requires a target, positive chain ID, and bounded round"
+  }
+  return "Update Harn fleet / ${target} / chain ${trim(chain_id)} / round ${round} of ${max_rounds}"
+    + fleet_scope_title_suffix(scope)
+}
+
+fn exact_successor(
+  page: GithubWorkflowRuns,
+  title: string,
+  controller_branch: string,
+  controller_revision: string,
+) -> GithubWorkflowRun? {
+  const matches = page.runs.filter(
+    { run ->
+      return run.workflow_path == FLEET_WORKFLOW_PATH && run.event == "workflow_dispatch"
+        && run.head_branch
+          == controller_branch
+        && run.head_sha == controller_revision
+        && run.display_title == title
+    },
+  )
+    .to_list()
+  if len(matches) > 1 {
+    throw "fleet workflow chain found duplicate exact successor runs"
+  }
+  return if len(matches) == 1 {
+    matches[0]
+  } else {
+    nil
+  }
+}
+
+fn wait_for_successor(
+  adapter: FleetWorkflowChainAdapter,
+  title: string,
+  controller_branch: string,
+  controller_revision: string,
+  timeout_s: int,
+  interval_s: int,
+) -> GithubWorkflowRun {
+  const stop_at = adapter.now_ms() + timeout_s * 1000
+  while true {
+    const listed = adapter.runs(controller_branch)
+    if is_err(listed) {
+      throw "fleet workflow successor lookup failed: " + to_string(unwrap_err(listed))
+    }
+    const successor = exact_successor(unwrap(listed), title, controller_branch, controller_revision)
+    if successor != nil {
+      return successor
+    }
+    if adapter.now_ms() >= stop_at {
+      throw "fleet workflow chain timed out waiting for exact successor '${title}'"
+    }
+    adapter.wait(interval_s * 1000)
+  }
+}
+
+/**
+ * Follow one release's exact bounded update chain until a round proves success.
+ * A failed non-final round is a handoff only when the next correlated run
+ * appears on the immutable branch leased to the same controller revision.
+ */
+pub fn wait_fleet_workflow_chain_with_adapter(
+  request: FleetWorkflowChainRequest,
+  adapter: FleetWorkflowChainAdapter,
+) -> FleetWorkflowChainReceipt {
+  if request.max_rounds < 1 || request.successor_timeout_s < 1 {
+    throw "fleet workflow chain limits must be positive"
+  }
+  const started = adapter.now_ms()
+  let current_run_id = request.initial_run_id
+  let current_run_url = request.initial_run_url
+  let controller_revision = ""
+  let receipts: list<FleetWorkflowReceipt> = []
+  for round in range(1, request.max_rounds + 1) {
+    const elapsed_ms = adapter.now_ms() - started
+    const remaining_s = (request.timeout_s * 1000 - elapsed_ms) / 1000
+    if remaining_s < 1 {
+      throw "fleet workflow chain exceeded its overall timeout"
+    }
+    const receipt = wait_fleet_workflow_run_with_adapter(
+      request.target,
+      request.scope,
+      current_run_id,
+      current_run_url,
+      remaining_s,
+      request.interval_s,
+      adapter,
+    )
+    receipts = receipts + [receipt]
+    if (request.scope.kind == "repositories" || request.scope.kind == "repository")
+      && receipt.display_title
+        != fleet_workflow_chain_title(
+          request.target,
+          request.chain_id,
+          round,
+          request.max_rounds,
+          request.scope,
+        ) {
+      throw "fleet workflow accepted run has a different operation scope"
+    }
+    const run_controller_revision = receipt.controller_revision ?? ""
+    if run_controller_revision == "" {
+      throw "fleet workflow terminal receipt omitted controller revision"
+    }
+    if controller_revision == "" {
+      controller_revision = run_controller_revision
+    } else if run_controller_revision != controller_revision {
+      throw "fleet workflow continuation changed controller revision"
+    }
+    if receipt.status == "completed" && receipt.conclusion == "success" {
+      return {
+        schema_version: "harn_bump_fleet.hosted_update_chain.v1",
+        target: request.target,
+        scope: request.scope,
+        chain_id: trim(request.chain_id),
+        status: "completed",
+        conclusion: "success",
+        runs: receipts,
+        elapsed_ms: adapter.now_ms() - started,
+      }
+    }
+    if receipt.status != "completed" || round == request.max_rounds {
+      return {
+        schema_version: "harn_bump_fleet.hosted_update_chain.v1",
+        target: request.target,
+        scope: request.scope,
+        chain_id: trim(request.chain_id),
+        status: receipt.status,
+        conclusion: receipt.conclusion,
+        runs: receipts,
+        elapsed_ms: adapter.now_ms() - started,
+      }
+    }
+    const title = fleet_workflow_chain_title(
+      request.target,
+      request.chain_id,
+      round + 1,
+      request.max_rounds,
+      request.scope,
+    )
+    const successor = wait_for_successor(
+      adapter,
+      title,
+      fleet_chain_branch(request.chain_id),
+      controller_revision,
+      request.successor_timeout_s,
+      request.interval_s,
+    )
+    current_run_id = successor.id
+    current_run_url = successor.url
+  }
+  throw "fleet workflow chain exhausted without a terminal receipt"
+}
+
+fn fleet_workflow_receipt(
+  target: string,
+  scope: FleetDispatchScope,
+  run_id: int,
+  run_url: string,
+  status: string,
+  conclusion: string,
+  controller_revision: string?,
+  display_title: string?,
+  elapsed_ms: int,
+  observation_attempts: int,
+  transient_retries: int,
+) -> FleetWorkflowReceipt {
+  return {
+    schema_version: "harn_bump_fleet.hosted_dispatch.v1",
+    target: target,
+    scope: scope,
+    run_id: run_id,
+    run_url: run_url,
+    status: status,
+    conclusion: conclusion,
+    controller_revision: controller_revision,
+    display_title: display_title,
+    elapsed_ms: elapsed_ms,
+    observation_attempts: observation_attempts,
+    transient_retries: transient_retries,
+  }
+}
+
+/**
+ * Observe one exact fleet run through a bounded transport-retry policy.
+ * Authorization, schema, semantic, and run-identity failures remain fail-closed.
+ */
+pub fn wait_fleet_workflow_run_with_adapter(
+  target: string,
+  scope: FleetDispatchScope,
+  run_id: int,
+  run_url: string,
+  timeout_s: int,
+  interval_s: int,
+  adapter: FleetWorkflowRunAdapter,
+) -> FleetWorkflowReceipt {
+  if trim(target) == "" || run_id < 1 || trim(run_url) == "" {
+    throw "fleet workflow observation requires a target, exact run ID, and run URL"
+  }
+  if timeout_s < 1 || interval_s < 1 {
+    throw "fleet workflow timeout and interval must be positive"
+  }
+  const started = adapter.now_ms()
+  const stop_at = started + timeout_s * 1000
+  let observation_attempts = 0
+  let transient_retries = 0
+  let consecutive_transient_retries = 0
+  let last_status = ""
+  let last_conclusion = ""
+  let last_controller_revision: string? = nil
+  let last_display_title: string? = nil
+  while true {
+    const observed = adapter.run(run_id)
+    observation_attempts = observation_attempts + 1
+    if is_err(observed) {
+      const error = unwrap_err(observed)
+      if !github_is_transient_read_error(error) {
+        throw "fleet workflow observation failed: " + to_string(error)
+      }
+      transient_retries = transient_retries + 1
+      consecutive_transient_retries = consecutive_transient_retries + 1
+      if consecutive_transient_retries > MAX_CONSECUTIVE_TRANSIENT_RETRIES {
+        throw "fleet workflow observation exhausted transient network retries"
+      }
+      if adapter.now_ms() >= stop_at {
+        if last_status == "" {
+          throw "fleet workflow observation timed out before the first valid response"
+        }
+        return fleet_workflow_receipt(
+          target,
+          scope,
+          run_id,
+          run_url,
+          last_status,
+          last_conclusion,
+          last_controller_revision,
+          last_display_title,
+          adapter.now_ms() - started,
+          observation_attempts,
+          transient_retries,
+        )
+      }
+      adapter.wait(interval_s * 1000)
+      continue
+    }
+    const run = unwrap(observed)
+    if run.id != run_id {
+      throw "fleet workflow exact-run lookup returned another run ID"
+    }
+    consecutive_transient_retries = 0
+    last_status = run.status
+    last_conclusion = to_string(run.conclusion ?? "")
+    last_controller_revision = run.head_sha
+    last_display_title = run.display_title
+    if run.status == "completed" || adapter.now_ms() >= stop_at {
+      return fleet_workflow_receipt(
+        target,
+        scope,
+        run_id,
+        run_url,
+        last_status,
+        last_conclusion,
+        last_controller_revision,
+        last_display_title,
+        adapter.now_ms() - started,
+        observation_attempts,
+        transient_retries,
+      )
+    }
+    adapter.wait(interval_s * 1000)
+  }
+}
+
+/** Wait for one exact fleet run; never substitute or redispatch another run. */
+pub fn wait_fleet_workflow_run(
+  harness: Harness,
+  target: string,
+  scope: FleetDispatchScope,
+  run_id: int,
+  run_url: string,
+  timeout_s: int,
+  interval_s: int,
+) -> FleetWorkflowReceipt {
+  const adapter: FleetWorkflowRunAdapter = {
+    now_ms: fn() { return harness.clock.monotonic_ms() },
+    run: fn(exact_run_id) { return github_actions_run(harness, FLEET_REPO, exact_run_id) },
+    wait: fn(delay_ms) { harness.clock.sleep_ms(delay_ms) },
+  }
+  return wait_fleet_workflow_run_with_adapter(
+    target,
+    scope,
+    run_id,
+    run_url,
+    timeout_s,
+    interval_s,
+    adapter,
+  )
+}
+
+/** Follow a hosted release's exact correlated fleet-update chain. */
+pub fn wait_fleet_workflow_chain(
+  harness: Harness,
+  request: FleetWorkflowChainRequest,
+) -> FleetWorkflowChainReceipt {
+  const adapter: FleetWorkflowChainAdapter = {
+    now_ms: fn() { return harness.clock.monotonic_ms() },
+    run: fn(exact_run_id) { return github_actions_run(harness, FLEET_REPO, exact_run_id) },
+    runs: fn(branch) { return github_actions_runs(harness, FLEET_REPO, FLEET_WORKFLOW, branch) },
+    wait: fn(delay_ms) { harness.clock.sleep_ms(delay_ms) },
+  }
+  return wait_fleet_workflow_chain_with_adapter(request, adapter)
+}
