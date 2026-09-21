@@ -38,9 +38,26 @@ pub type ReleaseLandingReceipt = {
   merge_commit_oid: string,
   merged_tree_oid: string,
   candidate_tree_oid: string,
+  // What the squash landing actually has to preserve. The two trees are equal
+  // only when the base has not moved since the pin, so a cut that is behind
+  // main at merge time can never satisfy tree equality even though it landed
+  // exactly the certified change. These three say that directly: the commit
+  // the candidate was built on, and the same patch computed on both sides.
+  // They are optional keys so a receipt written before this rule still
+  // decodes, and the admission refuses an absent one rather than passing it.
+  tag_parent_oid?: string,
+  candidate_patch_id?: string,
+  merged_patch_id?: string,
 }
 
 pub type ReleaseLandingAdmission = {valid: bool, reason: string}
+
+/** What a squash landing must carry to be provable against a moved base. */
+pub type ReleaseLandingEquivalence = {
+  tag_parent_oid: string,
+  candidate_patch_id: string,
+  merged_patch_id: string,
+}
 
 pub type ReleaseMergeLeaseState = "clear" | "active" | "invalid" | "unreadable"
 
@@ -89,6 +106,7 @@ pub fn release_landing_receipt(
   pull_request: dict,
   candidate_tree_oid: string,
   merged_tree_oid: string,
+  equivalence: ReleaseLandingEquivalence = {tag_parent_oid: "", candidate_patch_id: "", merged_patch_id: ""},
 ) -> ReleaseLandingReceipt? {
   const merged_oid = lowercase(
     trim(to_string(pull_request?.merge_commit_oid ?? pull_request?.merge_commit_sha ?? "")),
@@ -119,6 +137,9 @@ pub fn release_landing_receipt(
     merge_commit_oid: merged_oid,
     merged_tree_oid: merged_tree,
     candidate_tree_oid: candidate_tree,
+    tag_parent_oid: lowercase(trim(equivalence.tag_parent_oid)),
+    candidate_patch_id: lowercase(trim(equivalence.candidate_patch_id)),
+    merged_patch_id: lowercase(trim(equivalence.merged_patch_id)),
   }
 }
 
@@ -148,8 +169,22 @@ pub fn release_landing_admission(
   if !on_main(landing.merge_commit_oid) {
     return {valid: false, reason: "release merge commit is not on main"}
   }
-  if landing.merged_tree_oid != landing.candidate_tree_oid {
-    return {valid: false, reason: "release merge commit tree differs from certified candidate"}
+  if landing.merge_method == "squash" {
+    const parent = lowercase(trim(landing.tag_parent_oid ?? ""))
+    const candidate_patch = lowercase(trim(landing.candidate_patch_id ?? ""))
+    const merged_patch = lowercase(trim(landing.merged_patch_id ?? ""))
+    if !exact_oid(parent) || candidate_patch == "" || merged_patch == "" {
+      return {
+        valid: false,
+        reason: "squash landing equivalence is unmeasured in the release landing receipt",
+      }
+    }
+    if candidate_patch != merged_patch {
+      return {
+        valid: false,
+        reason: "squash landing carried a change the certified candidate does not contain",
+      }
+    }
   }
   if landing.merge_method != "squash" && !on_main(landing.tag_oid) {
     return {
@@ -160,7 +195,7 @@ pub fn release_landing_admission(
   return {
     valid: true,
     reason: if landing.merge_method == "squash" {
-      "squash landing preserves the certified candidate tree"
+      "squash landing carries exactly the certified candidate patch"
     } else {
       "${landing.merge_method} landing preserves the certified candidate tree and ancestry"
     },
@@ -174,6 +209,14 @@ pub fn record_release_landing(receipt: any, landing: ReleaseLandingReceipt, obse
     || landing.merge_method != receipt.merge_lease_method {
     throw "release landing does not match the watch receipt's merge lease"
   }
+  // The pin lives on the watch receipt, so this is the one place that can say
+  // the candidate was built on the commit the cut was asked to tag. The
+  // admission cannot: it reads the landing alone.
+  const pin = lowercase(trim(to_string(receipt.pin_sha ?? "")))
+  const parent = lowercase(trim(landing.tag_parent_oid ?? ""))
+  if pin != "" && parent != "" && pin != parent {
+    throw "release landing candidate was not built on the certified pin"
+  }
   if receipt.landing != nil && receipt.landing != landing {
     throw "release watch receipt is already bound to another landing"
   }
@@ -182,6 +225,57 @@ pub fn record_release_landing(receipt: any, landing: ReleaseLandingReceipt, obse
 
 fn commit_tree(process: HarnessProcess, repo: string, oid: string) -> string {
   const result = git_run(process, ["rev-parse", "--verify", "${oid}^{tree}"], {repo: repo})
+  return if result.success {
+    lowercase(trim(result.stdout))
+  } else {
+    ""
+  }
+}
+
+/**
+ * The patch a commit introduces over its first parent, base-independent.
+ *
+ * `git patch-id` is what makes the two sides comparable: it ignores blob ids
+ * and line numbers, which is exactly what differs when the same change lands
+ * on a base that moved. Reading it needs a pipe, so this is the one shell in
+ * the module, and an unreadable read returns empty rather than a value the
+ * admission would treat as proof.
+ */
+fn commit_patch_id(process: HarnessProcess, repo: string, base: string, head: string) -> string {
+  if !exact_oid(lowercase(trim(base))) || !exact_oid(lowercase(trim(head))) {
+    return ""
+  }
+  const result = process.run(
+    {
+      program: "bash",
+      args: [
+        "-c",
+        "set -o pipefail; git -C \"$1\" diff-tree -p --no-color \"$2\" \"$3\" "
+          + "| git patch-id --stable",
+        "bash",
+        repo,
+        lowercase(trim(base)),
+        lowercase(trim(head)),
+      ],
+      timeout_ms: 120000,
+    },
+  )
+  if is_err(result) {
+    return ""
+  }
+  const done = unwrap(result)
+  if !(done.success ?? false) {
+    return ""
+  }
+  const first = split(trim(to_string(done.stdout ?? "")), " ")
+  return lowercase(trim(to_string(first[0] ?? "")))
+}
+
+fn commit_first_parent(process: HarnessProcess, repo: string, oid: string) -> string {
+  if !exact_oid(lowercase(trim(oid))) {
+    return ""
+  }
+  const result = git_run(process, ["rev-parse", "--verify", "${oid}^1"], {repo: repo})
   return if result.success {
     lowercase(trim(result.stdout))
   } else {
@@ -221,11 +315,18 @@ pub fn observe_release_landing(
   const merged_oid = lowercase(
     trim(to_string(pull_request?.merge_commit_oid ?? pull_request?.merge_commit_sha ?? "")),
   )
+  const tag_parent = commit_first_parent(process, repo, lease.candidate_head)
+  const merge_parent = commit_first_parent(process, repo, merged_oid)
   return release_landing_receipt(
     lease,
     pull_request,
     commit_tree(process, repo, lease.candidate_head),
     commit_tree(process, repo, merged_oid),
+    {
+      tag_parent_oid: tag_parent,
+      candidate_patch_id: commit_patch_id(process, repo, tag_parent, lease.candidate_head),
+      merged_patch_id: commit_patch_id(process, repo, merge_parent, merged_oid),
+    },
   )
 }
 
