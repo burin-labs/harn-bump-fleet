@@ -1,0 +1,1 @@
+Treat a signed source tag without a GitHub Release as unpublished when checking whether the prior release is folded into main, and accept the certified-candidate tag anchor projected by the current release workflow.
