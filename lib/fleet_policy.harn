@@ -1,0 +1,425 @@
+import { FLEET_OWNED_ADAPTER_JOBS, render_bump_workflow } from "./bump_workflow_projection"
+import {
+  BumpAdapterContract,
+  FleetFileProjection,
+  FleetManifest,
+  FleetRepository,
+  bump_adapter_contract,
+  harn_update_workflow_path,
+  package_status_action_reference,
+} from "./fleet_manifest"
+import {
+  GithubWorkflowJob,
+  GithubWorkflowProjection,
+  decode_github_workflow,
+  github_projection_has_trigger,
+  github_reusable_jobs,
+  github_workflow_dispatch_input,
+  github_workflow_dispatch_input_is_string,
+} from "./github_workflow"
+import { render_package_ci } from "./package_ci_projection"
+
+pub type FleetPolicyResult = {slug: string, ok: bool, violations: list<string>}
+
+pub type FleetFileProjectionResult = {
+  source: string,
+  target: string,
+  ok: bool,
+  violations: list<string>,
+}
+
+pub type FleetWorkflowPolicyResult = {
+  name: string,
+  reference: string,
+  ok: bool,
+  behind: bool,
+  violations: list<string>,
+  notes: list<string>,
+}
+
+pub type BumpAdapterAdmission = {ok: bool, status: string, detail: string}
+
+fn evaluate_managed_bump_dispatch(workflow: GithubWorkflowProjection) -> list<string> {
+  let violations = []
+  const manual_dispatch = github_projection_has_trigger(workflow, "workflow_dispatch")
+  if !manual_dispatch {
+    violations = violations + ["bump workflow is not manually dispatchable"]
+  } else {
+    const version_input = github_workflow_dispatch_input(workflow, "version")
+    if version_input == nil {
+      violations = violations + ["bump workflow workflow_dispatch omits the version input"]
+    } else if !github_workflow_dispatch_input_is_string(workflow, "version") {
+      violations = violations
+        + ["bump workflow workflow_dispatch version input must have type string"]
+    }
+  }
+  return violations
+}
+
+/** Evaluate the shared dispatch boundary of a repository-owned Harn update workflow. */
+fn evaluate_repository_bump_workflow_semantics(source: string) -> list<string> {
+  return evaluate_managed_bump_dispatch(decode_github_workflow(source))
+}
+
+fn job_needs(needs: string | list<string> | nil, expected: string) -> bool {
+  if type_of(needs) == "string" {
+    return needs == expected
+  }
+  if type_of(needs) == "list" {
+    return contains(needs, expected)
+  }
+  return false
+}
+
+fn status_job_covers_all_verification_jobs(
+  jobs: dict<GithubWorkflowJob>,
+  status_key: string,
+  status_needs: string | list<string> | nil,
+) -> bool {
+  for job in jobs {
+    if job.key != status_key && !job_needs(status_needs, job.key) {
+      return false
+    }
+  }
+  return true
+}
+
+fn status_job_uses_typed_contract(job: GithubWorkflowJob, expected_action: string) -> bool {
+  const always_expression = "$" + "{{ always() }}"
+  const results_expression = "$" + "{{ toJSON(needs.*.result) }}"
+  if job.if != "always()" && job.if != always_expression {
+    return false
+  }
+  const matching = (job.steps ?? []).filter({ step -> step.uses == expected_action }).to_list()
+  return len(matching) == 1
+    && matching[0]?.with
+      == {"results-json": results_expression}
+}
+
+fn evaluate_bump_adapter_semantics(contract: BumpAdapterContract, source: string) -> list<string> {
+  const workflow = decode_github_workflow(source)
+  let violations = evaluate_managed_bump_dispatch(workflow)
+  if github_projection_has_trigger(workflow, "schedule") {
+    violations = violations + ["bump adapter retains a repository-local schedule"]
+  }
+  const bump_jobs = github_reusable_jobs(workflow, contract.workflow_reference)
+  if len(bump_jobs) != 1 {
+    return violations + ["bump adapter does not pin the canonical reusable workflow"]
+  }
+  const bump_job_key = (bump_jobs[0] ?? {key: "", value: {}}).key
+  const bump_job = (bump_jobs[0] ?? {key: "", value: {}}).value
+  const fleet_owned_jobs = [bump_job_key] + FLEET_OWNED_ADAPTER_JOBS
+  for job_key in keys(workflow.jobs) {
+    if !fleet_owned_jobs.contains(job_key) {
+      violations = violations + ["bump adapter must contain only the canonical reusable job"]
+    }
+  }
+  const orchestration_sha = trim(to_string(bump_job.with?.get("orchestration-sha") ?? ""))
+  if orchestration_sha != contract.orchestration_sha {
+    violations = violations
+      + ["bump adapter orchestration-sha must match the reusable workflow policy pin"]
+  }
+  const refresh_command = trim(to_string(bump_job.with?.get("refresh-command") ?? ""))
+  if refresh_command != contract.refresh_command {
+    violations = violations + ["bump adapter refresh-command projection disagrees with fleet.toml"]
+  }
+  const node_version = trim(to_string(bump_job.with?.get("node-version") ?? ""))
+  if node_version != contract.node_version {
+    violations = violations + ["bump adapter Node.js projection disagrees with fleet.toml"]
+  }
+  const validation_command = trim(to_string(bump_job.with?.get("validate-command") ?? ""))
+  if validation_command != contract.validation_command {
+    violations = violations + ["bump adapter validate-command projection disagrees with fleet.toml"]
+  }
+  const expected_publish_failure = if contract.publish_failure_for_repair {
+    true
+  } else {
+    nil
+  }
+  if bump_job.with?.get("publish-failure-for-repair") != expected_publish_failure {
+    violations = violations
+      + ["bump adapter repair-publication projection disagrees with fleet.toml"]
+  }
+  if bump_job.with?.get("apply-behavior-preserving-fixes")
+    != contract.apply_behavior_preserving_fixes {
+    violations = violations
+      + ["bump adapter behavior-preserving fix projection disagrees with fleet.toml"]
+  }
+  const expected_auto_merge = if contract.enable_auto_merge {
+    nil
+  } else {
+    false
+  }
+  if bump_job.with?.get("enable-auto-merge") != expected_auto_merge {
+    violations = violations + ["bump adapter auto-merge projection disagrees with fleet.toml"]
+  }
+  return violations
+}
+
+/**
+ * Judge one repository's Harn update workflow by the contract its ownership
+ * declares. A repository-owned workflow keeps its own triggers and jobs and
+ * only has to expose the managed dispatch boundary; a fleet or delegated
+ * adapter must project the whole fleet contract. The fleet audit and live
+ * dispatch admission both decide here, so the two paths cannot judge the same
+ * repository differently.
+ */
+pub fn evaluate_bump_workflow_semantics(
+  contract: BumpAdapterContract,
+  source: string,
+) -> list<string> {
+  return if contract.repository_owned {
+    evaluate_repository_bump_workflow_semantics(source)
+  } else {
+    evaluate_bump_adapter_semantics(contract, source)
+  }
+}
+
+/** Decide one live repository adapter admission without erasing lookup failures. */
+pub fn bump_adapter_admission(
+  contract: BumpAdapterContract,
+  source: Result<string?, unknown>,
+) -> BumpAdapterAdmission {
+  if is_err(source) {
+    return {
+      ok: false,
+      status: "preflight_error",
+      detail: "bump adapter lookup failed: " + to_string(unwrap_err(source)),
+    }
+  }
+  const text = unwrap(source)
+  if text == nil {
+    return {
+      ok: false,
+      status: "stale_bump_adapter",
+      detail: "declared bump adapter is missing on the base branch",
+    }
+  }
+  const violations = try {
+    evaluate_bump_workflow_semantics(contract, text ?? "")
+  } catch (error) {
+    return {
+      ok: false,
+      status: "stale_bump_adapter",
+      detail: "bump adapter cannot be decoded: " + to_string(error),
+    }
+  }
+  return if len(violations) == 0 {
+    {ok: true, status: "ready", detail: "bump adapter matches the repository contract"}
+  } else {
+    {ok: false, status: "stale_bump_adapter", detail: violations.join("; ")}
+  }
+}
+
+/** Evaluate one repository projection without performing provider I/O. */
+pub fn evaluate_fleet_policy(
+  manifest: FleetManifest,
+  repo: FleetRepository,
+  package_workflow: string?,
+  bump_workflow: string?,
+) -> FleetPolicyResult {
+  let violations = []
+  if repo.harn_package ?? false {
+    if package_workflow == nil {
+      violations = violations + ["missing .github/workflows/ci.yml"]
+    } else {
+      try {
+        const workflow = decode_github_workflow(package_workflow ?? "")
+        const package_jobs = github_reusable_jobs(workflow, manifest.policy.package_workflow)
+        if len(package_jobs) != 1 {
+          violations = violations + ["package CI does not pin the canonical reusable workflow"]
+        } else {
+          const package_job = package_jobs[0] ?? {key: "", value: {}}
+          const poll_tick = package_job.value.with?.get("run-poll-tick") == true
+          if poll_tick != (repo.run_poll_tick ?? false) {
+            violations = violations + ["package CI poll-tick projection disagrees with fleet.toml"]
+          }
+          const test_jobs = to_int(package_job.value.with?.get("test-jobs")) ?? 0
+          if test_jobs != (repo.test_jobs ?? 0) {
+            violations = violations + ["package CI test-job projection disagrees with fleet.toml"]
+          }
+          const validate_command = trim(
+            to_string(package_job.value.with?.get("validate-command") ?? ""),
+          )
+          if validate_command != trim(repo.package_validate_command ?? "") {
+            violations = violations
+              + ["package CI validate-command projection disagrees with fleet.toml"]
+          }
+          let status_job_count = 0
+          const expected_status_action = package_status_action_reference(
+            manifest.policy.package_workflow,
+          )
+          for job in workflow.jobs {
+            if job.value?.name == "CI status" {
+              if status_job_covers_all_verification_jobs(workflow.jobs, job.key, job.value?.needs)
+                && status_job_uses_typed_contract(job.value ?? {}, expected_status_action) {
+                status_job_count = status_job_count + 1
+              }
+            }
+          }
+          if status_job_count != 1 {
+            violations = violations
+              + [
+                "package CI must have one always-running CI status job that depends on every "
+                  + "verification job and uses the co-versioned successful-needs action",
+              ]
+          }
+          if repo.package_ci_ownership == "fleet"
+            && package_workflow
+              != render_package_ci(manifest, repo) {
+            violations = violations + ["package CI bytes drift from the fleet-owned projection"]
+          }
+        }
+      } catch (_error) {
+        violations = violations + ["package CI is not a valid workflow projection"]
+      }
+    }
+  }
+  if repo.harn_bump ?? false {
+    if bump_workflow == nil {
+      violations = violations + ["missing ${harn_update_workflow_path(repo)}"]
+    } else {
+      try {
+        violations = violations
+          + evaluate_bump_workflow_semantics(
+            bump_adapter_contract(manifest, repo),
+            bump_workflow ?? "",
+          )
+        if repo.bump_workflow_ownership == "fleet"
+          && bump_workflow
+            != render_bump_workflow(manifest, repo) {
+          violations = violations + ["bump workflow bytes drift from the fleet-owned projection"]
+        }
+      } catch (_error) {
+        violations = violations + ["bump workflow is not a valid workflow projection"]
+      }
+    }
+  }
+  return {slug: repo.slug, ok: len(violations) == 0, violations: violations}
+}
+
+/** Evaluate one byte-exact generated projection without provider I/O. */
+pub fn evaluate_file_projection(
+  projection: FleetFileProjection,
+  source: string?,
+  target: string?,
+) -> FleetFileProjectionResult {
+  let violations = []
+  if source == nil {
+    violations = violations + ["source file is missing"]
+  }
+  if target == nil {
+    violations = violations + ["target projection is missing"]
+  }
+  if source != nil && target != nil && source != target {
+    violations = violations + ["target bytes drift from the canonical source"]
+  }
+  return {
+    source: projection.source_slug + ":" + projection.source_path,
+    target: projection.target_slug + ":" + projection.target_path,
+    ok: len(violations) == 0,
+    violations: violations,
+  }
+}
+
+/**
+ * Verify that a manifest policy pin still resolves to a usable workflow, and
+ * report separately whether the owner has moved on since it was pinned.
+ *
+ * These are two different questions and only one of them is a defect.
+ *
+ * A pin that does not resolve, or an owner workflow that has disappeared, is
+ * broken now: consumers cannot run, and the fleet must go red. A pin that
+ * merely trails the owner's newest bytes is the ordinary state of a reviewed
+ * pin between releases — the whole reason the manifest names a SHA instead of
+ * a branch is so upstream commits do NOT take effect until someone promotes
+ * them.
+ *
+ * Conflating the two made this check permanently red between releases, because
+ * its reader runs daily while its only writer, `promote_bump_workflow.harn`,
+ * runs once per release. A gate that cannot return to green without a release
+ * is not a gate; it is a light nobody reads, and it hid a consumer sitting four
+ * releases behind. See harn-bump-fleet#976, and #792 and #823 for the two
+ * earlier rounds of the same class.
+ *
+ * `behind` therefore stays visible in the receipt without failing the run. It
+ * needs no alarm of its own: promotion is automatic at the next release, so a
+ * trailing pin heals without anyone acting on it.
+ */
+pub fn evaluate_workflow_policy_anchor(
+  name: string,
+  reference: string,
+  pinned: string?,
+  current: string?,
+) -> FleetWorkflowPolicyResult {
+  let violations = []
+  if pinned == nil {
+    violations = violations + ["workflow is missing at the policy pin"]
+  }
+  if current == nil {
+    violations = violations + ["workflow is missing on the owner's default branch"]
+  }
+  const behind = pinned != nil && current != nil && pinned != current
+  const notes = if behind {
+    ["policy pin trails the owner's current workflow content; the next release promotes it"]
+  } else {
+    []
+  }
+  return {
+    name: name,
+    reference: reference,
+    ok: len(violations) == 0,
+    behind: behind,
+    violations: violations,
+    notes: notes,
+  }
+}
+
+/**
+ * Every violation the run found, one line per failing row.
+ *
+ * The receipt is one JSON document on stdout and the step tees it to a file,
+ * so the last forty lines of a red job are whichever rows happened to sort
+ * last, all of them `ok: true`. The single `ok: false` that decided the exit
+ * status sits wherever the document put it. A reader then has the exit code
+ * and no cause. These lines go to stderr so the tail of the job names what
+ * failed.
+ *
+ * Passing rows produce nothing. A failing row with no recorded violation still
+ * produces a line, because a row that failed for a reason nobody wrote down is
+ * worse than a noisy log and must not be silent.
+ */
+pub fn fleet_policy_failure_lines(
+  workflow_policies: list<FleetWorkflowPolicyResult>,
+  repositories: list<FleetPolicyResult>,
+  file_projections: list<FleetFileProjectionResult>,
+) -> list<string> {
+  let lines = []
+  for policy in workflow_policies {
+    if policy.ok {
+      continue
+    }
+    lines = lines + violation_lines("workflow policy ${policy.name}", policy.violations)
+  }
+  for repo in repositories {
+    if repo.ok {
+      continue
+    }
+    lines = lines + violation_lines(repo.slug, repo.violations)
+  }
+  for projection in file_projections {
+    if projection.ok {
+      continue
+    }
+    lines = lines
+      + violation_lines("${projection.source} -> ${projection.target}", projection.violations)
+  }
+  return lines
+}
+
+fn violation_lines(subject: string, violations: list<string>) -> list<string> {
+  if len(violations) == 0 {
+    return ["FAILED ${subject}: failed with no recorded violation"]
+  }
+  return violations.map({ violation -> "FAILED ${subject}: ${violation}" }).to_list()
+}
