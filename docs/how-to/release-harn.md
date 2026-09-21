@@ -30,7 +30,10 @@ Each precondition reports `pass`, `fail`, or `not asked`. A context without
 release App credentials -- an operator laptop, a fork pull request -- reports
 the credentialed half as not asked rather than as passing, so a partial read
 never looks like a clean one. On consumer drift the receipt names
-`fleet-projection-convergence.yml` as the repair to dispatch.
+`fleet-projection-convergence.yml` as the repair to dispatch, and names the
+drifted repositories as its `only` targets, so the remedy can be run as
+written. A drift whose failure lines name no repository asks for the
+whole-fleet dispatch instead of a narrower one.
 
 `at_sha` takes seven to forty hex digits. A short one is resolved against the
 release repository and widened before the dispatch, so what reaches the receipt,
