@@ -2,13 +2,16 @@ import { FleetFileProjection } from "../lib/fleet_manifest"
 import { source_head_from_commits } from "../lib/github_source_head"
 import {
   ProjectionSourceObservation,
+  clean_source_record_writes,
   consumers_of_source,
   converged_source_commits,
   declared_projection_sources,
   plan_projection_source_drift,
-  projection_source_record_writes,
+  projection_source_index,
   projection_source_ref,
   projection_source_ref_index,
+  projection_source_ref_rows,
+  sources_proved_clean,
 } from "../lib/projection_source_drift"
 
 const GUARD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -108,7 +111,6 @@ pipeline test_an_unmoved_fleet_dispatches_nothing() {
   assert_eq(plan.dispatch, false)
   assert_eq(plan.consumers, [])
   assert_eq(plan.converged_count, 2)
-  assert_eq(len(projection_source_record_writes(plan)), 0)
 }
 
 pipeline test_an_unresolvable_head_converges_rather_than_reading_as_unmoved() {
@@ -195,59 +197,6 @@ pipeline test_a_source_recorded_twice_is_unknown_not_whichever_ref_sorted_first(
   assert_eq(plan.consumers, ["burin-labs/burin-code", "burin-labs/harn-cloud"])
 }
 
-pipeline test_records_are_written_only_for_sources_that_converged_this_run() {
-  const plan = plan_projection_source_drift(
-    projections(),
-    [
-      observed("scripts/agent_shell_guard.harn", GUARD_MOVED),
-      observed("docs/shared-contract.md", CONTRACT_SHA),
-    ],
-    all_converged(),
-  )
-  const writes = projection_source_record_writes(plan)
-  assert_eq(len(writes), 1)
-  assert_eq(
-    writes[0]?.ref ?? "",
-    projection_source_ref(
-      {slug: "burin-labs/harn", path: "scripts/agent_shell_guard.harn"},
-      GUARD_MOVED,
-    ),
-  )
-  assert_eq(
-    writes[0]?.replaces ?? "",
-    projection_source_ref(
-      {slug: "burin-labs/harn", path: "scripts/agent_shell_guard.harn"},
-      GUARD_SHA,
-    ),
-    "the superseded record is named so a run leaves exactly one per source",
-  )
-}
-
-pipeline test_a_source_with_no_readable_head_records_nothing() {
-  // It converges, but there is no head to record it at. Recording the empty
-  // string would poison the comparison for every later run.
-  const plan = plan_projection_source_drift(
-    projections(),
-    [
-      unreadable("scripts/agent_shell_guard.harn", "timeout"),
-      observed("docs/shared-contract.md", CONTRACT_SHA),
-    ],
-    all_converged(),
-  )
-  assert_eq(len(projection_source_record_writes(plan)), 0)
-}
-
-pipeline test_a_first_record_replaces_nothing() {
-  const plan = plan_projection_source_drift(
-    [projection("scripts/agent_shell_guard.harn", "burin-labs/burin-code")],
-    [observed("scripts/agent_shell_guard.harn", GUARD_SHA)],
-    {},
-  )
-  const writes = projection_source_record_writes(plan)
-  assert_eq(len(writes), 1)
-  assert_eq(writes[0]?.replaces ?? "nope", "")
-}
-
 pipeline test_a_ref_outside_the_namespace_is_not_read_as_a_record() {
   // The listing is a whole-namespace read, and a foreign ref that parsed would
   // silently mark a source converged.
@@ -312,4 +261,138 @@ pipeline test_an_empty_commit_listing_is_an_absent_path_not_an_unchanged_one() {
   )
   assert_eq(is_err(unusable), true)
   assert_eq(to_string(unwrap_err(unusable)?.code ?? ""), "invalid_response")
+}
+
+/** One source's observed head, keyed the way a record is. */
+fn head_of(source: {slug: string, path: string}, head: string) -> dict {
+  let heads = {}
+  heads[projection_source_index(source)] = head
+  return heads
+}
+
+fn result(slug: string, status: string) -> {slug: string, status: string} {
+  return {slug: slug, status: status}
+}
+
+fn all_consumers() -> list<string> {
+  return ["burin-labs/burin-code", "burin-labs/harn-cloud"]
+}
+
+pipeline test_only_a_clean_consumer_proves_its_sources() {
+  // The falsifier for who owns the record. A dispatch being accepted says a
+  // run started. `applied` and `pending` say a repair was PROPOSED, and a
+  // proposal that never merges leaves the consumer exactly as stale as it was.
+  // Recording on either would report a convergence a pull request still owes.
+  const clean = sources_proved_clean(
+    projections(),
+    all_consumers(),
+    [result("burin-labs/burin-code", "clean"), result("burin-labs/harn-cloud", "clean")],
+  )
+  assert_eq(len(clean), 2)
+  for status in ["applied", "pending", "drift", "error"] {
+    assert_eq(
+      sources_proved_clean(
+        projections(),
+        all_consumers(),
+        [result("burin-labs/burin-code", status), result("burin-labs/harn-cloud", "clean")],
+      ),
+      [{slug: "burin-labs/harn", path: "docs/shared-contract.md"}],
+      "only the source whose every consumer is clean may be recorded: ${status}",
+    )
+  }
+}
+
+pipeline test_a_run_that_did_not_look_at_every_consumer_records_nothing_for_that_source() {
+  // A run narrowed by `--only` cannot vouch for a consumer it never read. The
+  // shared source has two consumers and only one was in scope.
+  const proved = sources_proved_clean(
+    projections(),
+    ["burin-labs/harn-cloud"],
+    [result("burin-labs/harn-cloud", "clean")],
+  )
+  assert_eq(proved, [{slug: "burin-labs/harn", path: "docs/shared-contract.md"}])
+}
+
+pipeline test_a_failed_convergence_leaves_the_next_comparison_dispatching_again() {
+  // Control's falsifier, end to end through both halves. The source moved, a
+  // dispatch went out, and the run did not reach clean. Nothing is recorded,
+  // so the next hour reads the OLD record against the NEW head and dispatches
+  // again rather than reporting the fleet converged.
+  const source = {slug: "burin-labs/harn", path: "scripts/agent_shell_guard.harn"}
+  const before = converged_source_commits([projection_source_ref(source, GUARD_SHA)])
+  const proved = sources_proved_clean(
+    projections(),
+    all_consumers(),
+    [result("burin-labs/burin-code", "applied"), result("burin-labs/harn-cloud", "clean")],
+  )
+  const writes = clean_source_record_writes(proved, head_of(source, GUARD_MOVED), before)
+  assert_eq(writes, [], "a convergence that only proposed a repair records nothing")
+  const again = plan_projection_source_drift(
+    projections(),
+    [
+      observed("scripts/agent_shell_guard.harn", GUARD_MOVED),
+      observed("docs/shared-contract.md", CONTRACT_SHA),
+    ],
+    before,
+  )
+  assert_eq(again.dispatch, true)
+  assert_eq(again.moved_count, 1)
+  assert_eq(again.consumers, all_consumers())
+}
+
+pipeline test_a_clean_run_records_the_head_and_names_what_it_replaces() {
+  const source = {slug: "burin-labs/harn", path: "scripts/agent_shell_guard.harn"}
+  const writes = clean_source_record_writes(
+    [source],
+    head_of(source, GUARD_MOVED),
+    converged_source_commits([projection_source_ref(source, GUARD_SHA)]),
+  )
+  assert_eq(len(writes), 1)
+  assert_eq(writes[0]?.ref ?? "", projection_source_ref(source, GUARD_MOVED))
+  assert_eq(
+    writes[0]?.replaces ?? "",
+    projection_source_ref(source, GUARD_SHA),
+    "the superseded record is named so a run leaves exactly one per source",
+  )
+  // A head that could not be read records nothing. The empty string would
+  // compare unequal to every later observation and re-converge for ever.
+  assert_eq(clean_source_record_writes([source], {}, {}), [])
+  // A first record replaces nothing, and an unchanged head writes nothing.
+  const first = clean_source_record_writes([source], head_of(source, GUARD_SHA), {})
+  assert_eq(first[0]?.replaces ?? "nope", "")
+  assert_eq(
+    clean_source_record_writes(
+      [source],
+      head_of(source, GUARD_SHA),
+      converged_source_commits([projection_source_ref(source, GUARD_SHA)]),
+    ),
+    [],
+  )
+}
+
+pipeline test_the_record_listing_drops_a_line_it_cannot_read_whole() {
+  // The listing is how every record is read, so a half-read line is the
+  // quietest way to lose one: a truncated ref compares unequal to its source
+  // and re-converges those consumers, and a missing object id leaves the
+  // superseded record unreleasable. Both are dropped rather than guessed at.
+  const source = {slug: "burin-labs/harn", path: "scripts/agent_shell_guard.harn"}
+  const ref = projection_source_ref(source, GUARD_MOVED)
+  const oid = "1111111111111111111111111111111111111111"
+  const rows = projection_source_ref_rows(
+    join(
+      [
+        "${oid}\t${ref}",
+        "${oid}\trefs/heads/main",
+        "not-an-object-id\t${ref}",
+        ref,
+        "",
+        "${oid}\trefs/heads/projection-source-converged/burin-labs__harn/nothex.${GUARD_SHA}",
+      ],
+      "\n",
+    ),
+  )
+  assert_eq(len(rows), 1, "only the one whole line in our own namespace is a record")
+  assert_eq(rows[0]?.ref ?? "", ref)
+  assert_eq(rows[0]?.oid ?? "", oid, "the object id is read so the record can be released later")
+  assert_eq(projection_source_ref_rows(""), [])
 }

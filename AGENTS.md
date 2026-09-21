@@ -87,7 +87,11 @@ The entry points are:
   cannot resolve, a source with no record, and a source recorded twice all read
   as unknown and converge; none of them may read as unchanged. Records live in
   `refs/heads/projection-source-converged/`, one per source, read in a single
-  `git ls-remote`, and are written only once a dispatch is accepted.
+  `git ls-remote`. This harness writes none of them:
+  `converge_fleet_projections.harn` records a source once every consumer that
+  projects it reports `clean`, because only that run knows whether the bytes
+  are in place. A proposed repair is not a converged one, so a run that opened
+  a pull request records nothing and the comparison asks again.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.

@@ -26,7 +26,21 @@ import {
   projection_source_key,
   resolve_pin_package_ci_targets,
 } from "lib/fleet_projection_targets"
-import { github_connector_options, github_file_text_at_ref } from "lib/github"
+import {
+  github_claim_ref,
+  github_connector_options,
+  github_file_text_at_ref,
+  github_release_ref,
+} from "lib/github"
+import { github_path_head } from "lib/github_source_head"
+import {
+  PROJECTION_SOURCE_PREFIX,
+  clean_source_record_writes,
+  converged_source_commits,
+  projection_source_index,
+  projection_source_ref_rows,
+  sources_proved_clean,
+} from "lib/projection_source_drift"
 import {
   DEFAULT_PROJECTION_PR_AGE_BUDGET_DAYS,
   converge_remote_repository,
@@ -39,6 +53,8 @@ import {
   parse_convergence_options,
   sync_target_matches,
 } from "lib/sync_options"
+
+const FLEET_SLUG = "burin-labs/harn-bump-fleet"
 
 pipeline main(harness: Harness) -> int {
   const converge_options = parse_convergence_options(argv)
@@ -169,6 +185,86 @@ pipeline main(harness: Harness) -> int {
     { result -> result.slug },
   )
     .to_list()
+  // Record which canonical source bytes each consumer is now in step with.
+  //
+  // `refs/heads/projection-source-converged/` is what the hourly source
+  // comparison reads to decide whether a source has moved since anyone last
+  // converged it. The record belongs here, to the run that did the work,
+  // because only this run knows whether the consumer's bytes actually match.
+  //
+  // Only `clean` counts. `applied` and `pending` mean a repair was proposed,
+  // and a proposal that never merges leaves the consumer exactly as stale as
+  // it was; recording on those would report a convergence that a pull request
+  // still owes. A source whose consumers were not all in this run's scope
+  // records nothing either, so a narrowed run cannot vouch for what it did not
+  // look at.
+  let recorded = []
+  if options.apply {
+    const statuses = results.map({ result -> {slug: result.slug, status: result.status} }).to_list()
+    const proved = sources_proved_clean(consumer_resolution.projections, selected, statuses)
+    let heads = {}
+    for source in proved {
+      const head = github_path_head(harness, source.slug, source.path, default_branch)
+      if is_err(head) {
+        harness.stdio.eprintln(
+          "note: ${source.slug}:${source.path} converged but its head could not be read, "
+            + "so the source comparison will ask again",
+        )
+        continue
+      }
+      heads[projection_source_index(source)] = unwrap(head)
+    }
+    const listing = harness.process.run(
+      {
+        program: "git",
+        args: ["ls-remote", "origin", "${PROJECTION_SOURCE_PREFIX}/*"],
+        timeout_ms: 60000,
+      },
+    )
+    // An unreadable listing leaves the records as they are. Claiming without
+    // it would strand the superseded record, and two records for one source
+    // read as unknown, which converges every hour until someone clears it.
+    if is_err(listing) || (unwrap_or(listing, {exit_code: 1}).exit_code ?? 1) != 0 {
+      harness.stdio.eprintln(
+        "note: the projection source records could not be listed, so none were updated",
+      )
+    } else {
+      const rows = projection_source_ref_rows(to_string(unwrap(listing).stdout ?? ""))
+      let held = {}
+      for row in rows {
+        held[row.ref] = row.oid
+      }
+      for write in clean_source_record_writes(
+        proved,
+        heads,
+        converged_source_commits(rows.map({ row -> row.ref }).to_list()),
+      ) {
+        const claim = github_claim_ref(
+          harness,
+          FLEET_SLUG,
+          write.ref,
+          {
+            payload: {
+              message: "Projection source converged\n\nsource: ${write.key}\n",
+              base_ref: "refs/heads/main",
+            },
+          },
+        )
+        if is_err(claim) {
+          harness.stdio.eprintln("note: could not record ${write.ref}")
+          continue
+        }
+        recorded = recorded + [write.ref]
+        const superseded = to_string(held[write.replaces] ?? "")
+        if write.replaces != "" && superseded != "" {
+          const released = github_release_ref(harness, FLEET_SLUG, write.replaces, superseded)
+          if is_err(released) {
+            harness.stdio.eprintln("note: could not clear ${write.replaces}")
+          }
+        }
+      }
+    }
+  }
   harness.stdio.println(
     json_stringify_pretty(
       {
@@ -189,6 +285,7 @@ pipeline main(harness: Harness) -> int {
         consumer_manifest_errors: consumer_resolution.errors,
         consumer_manifest_refs: consumer_resolution.contract_refs,
         consumer_manifest_sha256: consumer_resolution.contract_sha256,
+        recorded_source_refs: recorded,
         repositories: results,
       },
     ),
