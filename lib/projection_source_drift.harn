@@ -1,0 +1,375 @@
+// Decide which consumers must converge because a canonical source moved.
+//
+// A projection has two inputs, not one: the renderer that lives here, and the
+// canonical source bytes that live in somebody else's repository. A renderer
+// change already dispatches convergence on the merge that makes it. A source
+// change matched no trigger at all, so every consumer projecting that file was
+// stale from the merge until the next daily cron. That gap is what left a
+// release refusing at its publication gate on contracts nobody had re-rendered.
+//
+// This module is the comparison half of the missing trigger: given what each
+// declared source's head is now, and the head each source last converged from,
+// it names the consumers whose projections can no longer be trusted.
+//
+// The comparison is deliberately fleet-side. A source repository cannot filter
+// on consumers it does not know about, and raising a dispatch from each source
+// would mean a credential in every source repository that can fire a workflow
+// here: a source that never received the secret would then silently never
+// dispatch, which is the exact shape being removed.
+//
+// ABSENCE MUST NOT READ AS SUCCESS. Three different silences look like "this
+// source is fine" if they are allowed to: a head that could not be resolved, a
+// source with no recorded convergence at all, and a source recorded more than
+// once. All three are reported as unknown and all three converge. Converging a
+// source that did not move costs one pull request that closes as a no-op.
+// Skipping one that did move is the twelve-hour stale window this exists to
+// close.
+import { FleetFileProjection } from "./fleet_manifest"
+import { projection_source_key } from "./fleet_projection_targets"
+
+/** The ref namespace recording the source commit each projection converged from. */
+pub const PROJECTION_SOURCE_PREFIX = "refs/heads/projection-source-converged"
+
+/** One canonical source, addressed the way a projection declares it. */
+pub type ProjectionSource = {slug: string, path: string}
+
+/** What the current head of one source path was observed to be. */
+pub type ProjectionSourceObservation = {
+  slug: string,
+  path: string,
+  head: string,
+  resolved: bool,
+  detail: string,
+}
+
+/**
+ * What the comparison concluded about one source.
+ *
+ * `moved` and `unknown` both converge. They are kept apart anyway so a receipt
+ * can say whether the fleet is reacting to a real change or to a gap in its own
+ * records; a run that is permanently `unknown` for the same source is a broken
+ * recorder, and it would be invisible if both collapsed to "converging".
+ */
+pub type ProjectionSourceDecision = {
+  key: string,
+  slug: string,
+  path: string,
+  state: string,
+  head: string,
+  converged_from: string,
+  detail: string,
+}
+
+/** The consumers to converge, and why each source decided the way it did. */
+pub type ProjectionSourcePlan = {
+  decisions: list<ProjectionSourceDecision>,
+  consumers: list<string>,
+  moved_count: int,
+  unknown_count: int,
+  converged_count: int,
+  dispatch: bool,
+}
+
+/** A source slug reduced to something a ref path can carry. */
+pub fn projection_source_ref_slug(slug: string) -> string {
+  const clean = lowercase(trim(slug))
+  if len(regex_captures("^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$", clean)) == 0 {
+    throw "a projection source slug must be owner/name, got: " + slug
+  }
+  return replace(clean, "/", "__")
+}
+
+/**
+ * A source path reduced to a fixed-width digest.
+ *
+ * The path is hashed rather than escaped because a projection source path may
+ * contain any character a repository path may, and a ref name may not. A digest
+ * is opaque to a reader, which is why the decision receipt carries the path in
+ * full: the ref is an index, not the record.
+ */
+pub fn projection_source_path_digest(path: string) -> string {
+  const clean = trim(path)
+  if clean == "" {
+    throw "a projection source path digest requires a path"
+  }
+  return substring(sha256(clean), 0, 12)
+}
+
+/**
+ * The ref recording that one source path converged at one commit.
+ *
+ * The commit is part of the name rather than a payload the reader would have to
+ * fetch, following the rehearsal proof refs: one `git ls-remote` against this
+ * public repository then answers the whole question for every source at once,
+ * with no API budget spent and no credential required.
+ */
+pub fn projection_source_ref(source: ProjectionSource, commit: string) -> string {
+  const oid = lowercase(trim(commit))
+  if len(regex_captures("^[0-9a-f]{40}$", oid)) == 0 {
+    throw "a projection source record requires a full 40-hex commit, got: " + commit
+  }
+  const slug = projection_source_ref_slug(source.slug)
+  const digest = projection_source_path_digest(source.path)
+  return "${PROJECTION_SOURCE_PREFIX}/${slug}/${digest}.${oid}"
+}
+
+/** The `slug/digest` a recorded ref belongs to, or nil when it is not one of ours. */
+pub fn projection_source_ref_index(ref: string) -> {index: string, commit: string}? {
+  const clean = trim(ref)
+  const captures = regex_captures(
+    "^${PROJECTION_SOURCE_PREFIX}/([a-z0-9][a-z0-9._-]*__[a-z0-9][a-z0-9._-]*)/([0-9a-f]{12})\\.([0-9a-f]{40})$",
+    clean,
+  )
+  // `regex_captures` returns one match object per match, each carrying its own
+  // `groups`. Reading the list itself as the group list finds three fewer
+  // entries than there are groups and silently parses nothing.
+  if len(captures) != 1 {
+    return nil
+  }
+  const groups = captures[0].groups ?? []
+  if len(groups) != 3 {
+    return nil
+  }
+  return {index: to_string(groups[0]) + "/" + to_string(groups[1]), commit: to_string(groups[2])}
+}
+
+/** The index a source observation or declaration is recorded under. */
+pub fn projection_source_index(source: ProjectionSource) -> string {
+  return projection_source_ref_slug(source.slug) + "/" + projection_source_path_digest(source.path)
+}
+
+/**
+ * The commit each source last converged from, read out of a ref listing.
+ *
+ * A source recorded twice maps to the empty string rather than to either
+ * commit. Two records mean a previous run claimed a new one and failed to
+ * release the old, so neither can be trusted to be the last converged state;
+ * the caller reads that as unknown and converges, which also clears it.
+ */
+pub fn converged_source_commits(refs: list<string>) -> dict {
+  let commits = {}
+  let seen = {}
+  for ref in refs {
+    const parsed = projection_source_ref_index(ref)
+    if parsed == nil {
+      continue
+    }
+    const index = (parsed ?? {index: "", commit: ""}).index
+    const commit = (parsed ?? {index: "", commit: ""}).commit
+    if seen[index] ?? false {
+      commits[index] = ""
+      continue
+    }
+    seen[index] = true
+    commits[index] = commit
+  }
+  return commits
+}
+
+/** One recorded ref and the object it points at, as `git ls-remote` prints them. */
+pub type ProjectionSourceRefRow = {ref: string, oid: string}
+
+/**
+ * The records in `git ls-remote` output.
+ *
+ * Each line is an object id, a tab, and a ref name. A line missing either is
+ * dropped rather than half-read: a truncated ref would compare unequal to
+ * every source and quietly re-converge one that was already settled, and a
+ * missing object id would leave the superseded record unreleasable.
+ */
+pub fn projection_source_ref_rows(output: string) -> list<ProjectionSourceRefRow> {
+  let rows = []
+  for line in split(output, "\n") {
+    const parts = split(trim(line), "\t")
+    if len(parts) < 2 {
+      continue
+    }
+    const oid = lowercase(trim(to_string(parts[0] ?? "")))
+    const ref = trim(to_string(parts[1] ?? ""))
+    if len(regex_captures("^[0-9a-f]{40}$", oid)) == 0 {
+      continue
+    }
+    if projection_source_ref_index(ref) == nil {
+      continue
+    }
+    rows = rows + [{ref: ref, oid: oid}]
+  }
+  return rows
+}
+
+/** Every distinct canonical source the declared projections read. */
+pub fn declared_projection_sources(
+  projections: list<FleetFileProjection>,
+) -> list<ProjectionSource> {
+  let sources = []
+  let seen = {}
+  for projection in projections {
+    const key = projection_source_key(projection.source_slug, projection.source_path)
+    if seen[key] ?? false {
+      continue
+    }
+    seen[key] = true
+    sources = sources + [{slug: projection.source_slug, path: projection.source_path}]
+  }
+  return sources
+}
+
+/** The consumers that project one source, in declaration order and deduplicated. */
+pub fn consumers_of_source(
+  projections: list<FleetFileProjection>,
+  source: ProjectionSource,
+) -> list<string> {
+  const wanted = projection_source_key(source.slug, source.path)
+  let consumers = []
+  let seen = {}
+  for projection in projections {
+    if projection_source_key(projection.source_slug, projection.source_path) != wanted {
+      continue
+    }
+    if seen[projection.target_slug] ?? false {
+      continue
+    }
+    seen[projection.target_slug] = true
+    consumers = consumers + [projection.target_slug]
+  }
+  return consumers
+}
+
+fn decide_one_source(
+  source: ProjectionSource,
+  observation: ProjectionSourceObservation?,
+  converged: dict,
+) -> ProjectionSourceDecision {
+  const key = projection_source_key(source.slug, source.path)
+  const index = projection_source_index(source)
+  const recorded = to_string(converged[index] ?? "")
+  const base = {key: key, slug: source.slug, path: source.path, converged_from: recorded}
+  if observation == nil {
+    return base
+      + {
+        state: "unknown",
+        head: "",
+        detail: "no head was observed for this source, so it cannot be shown converged",
+      }
+  }
+  const seen = observation ?? {slug: "", path: "", head: "", resolved: false, detail: ""}
+  if !seen.resolved {
+    return base
+      + {
+        state: "unknown",
+        head: "",
+        detail: "the current head could not be resolved: " + seen.detail,
+      }
+  }
+  const head = lowercase(trim(seen.head))
+  if len(regex_captures("^[0-9a-f]{40}$", head)) == 0 {
+    return base
+      + {
+        state: "unknown",
+        head: head,
+        detail: "the observed head is not a full commit id, so it cannot be compared",
+      }
+  }
+  if recorded == "" {
+    return base
+      + {
+        state: "unknown",
+        head: head,
+        detail: "no convergence has been recorded for this source, or it was recorded twice",
+      }
+  }
+  if recorded == head {
+    return base + {state: "converged", head: head, detail: "the source has not moved"}
+  }
+  return base
+    + {state: "moved", head: head, detail: "the source moved from ${recorded} to ${head}"}
+}
+
+/**
+ * Which consumers to converge, given the declared projections and what was seen.
+ *
+ * A source decides for the consumers that read it and for nobody else. That is
+ * the whole point of doing this per source path rather than per repository: a
+ * change to an unrelated file in a source repository moves no declared source
+ * and must dispatch nothing.
+ */
+pub fn plan_projection_source_drift(
+  projections: list<FleetFileProjection>,
+  observations: list<ProjectionSourceObservation>,
+  converged: dict,
+) -> ProjectionSourcePlan {
+  let observed = {}
+  for observation in observations {
+    observed[projection_source_key(observation.slug, observation.path)] = observation
+  }
+  let decisions = []
+  let consumers = []
+  let seen_consumer = {}
+  let moved = 0
+  let unknown = 0
+  let settled = 0
+  for source in declared_projection_sources(projections) {
+    const decision = decide_one_source(
+      source,
+      observed[projection_source_key(source.slug, source.path)],
+      converged,
+    )
+    decisions = decisions + [decision]
+    if decision.state == "converged" {
+      settled = settled + 1
+      continue
+    }
+    if decision.state == "moved" {
+      moved = moved + 1
+    } else {
+      unknown = unknown + 1
+    }
+    for consumer in consumers_of_source(projections, source) {
+      if seen_consumer[consumer] ?? false {
+        continue
+      }
+      seen_consumer[consumer] = true
+      consumers = consumers + [consumer]
+    }
+  }
+  return {
+    decisions: decisions,
+    consumers: consumers.sort(),
+    moved_count: moved,
+    unknown_count: unknown,
+    converged_count: settled,
+    dispatch: len(consumers) > 0,
+  }
+}
+
+/**
+ * The records to write once a dispatch is accepted, and the ones it replaces.
+ *
+ * Nothing is recorded before the dispatch is accepted. A run that recorded the
+ * new head and then failed to dispatch would report the source as converged
+ * forever after, which is the same silent staleness in a new place.
+ */
+pub fn projection_source_record_writes(
+  plan: ProjectionSourcePlan,
+) -> list<{ref: string, replaces: string, key: string}> {
+  let writes = []
+  for decision in plan.decisions {
+    if decision.state == "converged" || len(regex_captures("^[0-9a-f]{40}$", decision.head)) == 0 {
+      continue
+    }
+    const source = pick(decision, ["slug", "path"])
+    writes = writes
+      + [
+        {
+          ref: projection_source_ref(source, decision.head),
+          replaces: if len(regex_captures("^[0-9a-f]{40}$", decision.converged_from)) == 1 {
+            projection_source_ref(source, decision.converged_from)
+          } else {
+            ""
+          },
+          key: decision.key,
+        },
+      ]
+  }
+  return writes
+}
