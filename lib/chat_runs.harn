@@ -1,0 +1,289 @@
+// Run-artifact discovery, carousel summaries, and chat configuration.
+import { env_str } from "std/config"
+import { is_tty } from "std/io"
+import {
+  run_artifact_path,
+  run_artifact_read_json_result,
+  run_artifact_transcript_path,
+  run_artifacts_from_dir,
+  run_artifacts_list,
+} from "std/run_artifacts"
+import { select_from } from "std/tui"
+import { FLEET_AUDIT_DESCRIPTOR, RELEASE_AUDIT_DESCRIPTOR } from "./run_receipts"
+
+const CAROUSEL_LIMIT = 12
+
+pub type ChatHarnessKind = "bump-fleet" | "release-harn"
+
+pub type ChatBaseConfig = {
+  provider?: string,
+  model?: string,
+  repo?: string,
+  mock?: bool,
+  timeout_s?: int,
+  tools?: dict,
+  no_chat?: bool,
+}
+
+pub type ChatRunConfig = {
+  provider?: string,
+  model?: string,
+  repo?: string,
+  mock?: bool,
+  timeout_s?: int,
+  tools?: dict,
+  no_chat?: bool,
+  harness_kind: ChatHarnessKind,
+  run_id: string,
+  run_dir: string,
+  audit_md_path: string,
+  audit_json_path: string,
+  llm_transcript_path: string?,
+  outcome: string,
+  mode_hint?: string,
+}
+
+pub type ChatRunSummary = {
+  ok: bool,
+  when: string,
+  version: string,
+  outcome: string,
+  headline: string,
+  mode?: string,
+}
+
+pub type ChatRunPick = {dir: string, run_id: string, summary: ChatRunSummary}
+
+type ChatCarouselRow = {dir: string, run_id: string, summary: ChatRunSummary, label: string}
+
+pub fn chat_run_artifact_root(fs: HarnessFs) -> string {
+  return path_join(fs.cwd(), ".harn-runs")
+}
+
+fn existing_chat_run_path(fs: HarnessFs, path: string) -> string? {
+  if !fs.exists(path) {
+    return nil
+  }
+  if ends_with(path, ".json") {
+    return dirname(path)
+  }
+  return path
+}
+
+/** Resolve --chat-run values to a run directory, accepting ids, dirs, or artifact JSON paths. */
+pub fn resolve_chat_run_path(fs: HarnessFs, harness_kind: ChatHarnessKind, raw: string) -> string? {
+  const value = trim(raw)
+  if value == "" {
+    return nil
+  }
+  if starts_with(value, "/") {
+    return existing_chat_run_path(fs, value)
+  }
+  const by_id = path_join(chat_run_artifact_root(fs), harness_kind, value)
+  const id_match = existing_chat_run_path(fs, by_id)
+  if id_match != nil {
+    return id_match
+  }
+  return existing_chat_run_path(fs, path_join(fs.cwd(), value))
+}
+
+/** Decide whether chat may start from explicit inputs. */
+pub fn chat_enabled_for(
+  cfg: ChatBaseConfig,
+  environment_setting: string?,
+  stdin_is_terminal: bool,
+) -> bool {
+  if cfg.no_chat ?? false {
+    return false
+  }
+  if environment_setting == "0" {
+    return false
+  }
+  return stdin_is_terminal
+}
+
+/** Combine the user's opt-out, environment switch, and terminal state. */
+pub fn chat_enabled(harness: {term: HarnessTerm, env: HarnessEnv}, cfg: ChatBaseConfig) -> bool {
+  return chat_enabled_for(cfg, env_str(harness.env, "HARN_EXT_CHAT"), is_tty(harness.term, 0))
+}
+
+/** Summarize a release-harn run dir for the carousel: timestamp, version, outcome. */
+pub fn summarize_release_run(fs: HarnessFs, run_dir: string) -> ChatRunSummary {
+  const run = run_artifacts_from_dir("release-harn", run_dir)
+  const audit_path = run_artifact_path(run, "release-audit.json")
+  if !fs.exists(audit_path) {
+    return {ok: false, when: "?", version: "?", outcome: "missing audit", headline: ""}
+  }
+  const decoded = run_artifact_read_json_result(fs, run, RELEASE_AUDIT_DESCRIPTOR)
+  if is_err(decoded) {
+    const failure = unwrap_err(decoded)
+    return {ok: false, when: "?", version: "?", outcome: failure.kind, headline: failure.detail}
+  }
+  const receipt = unwrap(decoded)
+  const current_version = receipt.analysis.current_version
+  const next_version = receipt.analysis.next_version
+  const failed = receipt.execution.any({ step -> !step.success })
+  const mode = receipt.config.mode
+  const outcome = if failed {
+    "FAILED"
+  } else if mode == "audit" {
+    "audit"
+  } else {
+    "ok"
+  }
+  return {
+    ok: true,
+    when: receipt.started_iso,
+    version: "v${next_version}",
+    outcome: outcome,
+    headline: "${mode} • v${current_version} → v${next_version}",
+    mode: mode,
+  }
+}
+
+/** Summarize a bump-fleet run dir for the carousel. */
+pub fn summarize_bump_run(fs: HarnessFs, run_dir: string) -> ChatRunSummary {
+  const run = run_artifacts_from_dir("bump-fleet", run_dir)
+  const audit_path = run.paths.audit
+  if !fs.exists(audit_path) {
+    return {ok: false, when: "?", version: "?", outcome: "missing audit", headline: ""}
+  }
+  const decoded = run_artifact_read_json_result(fs, run, FLEET_AUDIT_DESCRIPTOR)
+  if is_err(decoded) {
+    const failure = unwrap_err(decoded)
+    return {ok: false, when: "?", version: "?", outcome: failure.kind, headline: failure.detail}
+  }
+  const receipt = unwrap(decoded)
+  const problems = len(
+    receipt.outcomes.filter(
+      { fleet_outcome -> fleet_outcome.status == "error" || fleet_outcome.status == "failed" },
+    ),
+  )
+  const outcome = if problems > 0 {
+    "FAILED (${problems})"
+  } else {
+    "ok"
+  }
+  return {
+    ok: true,
+    when: receipt.started_iso,
+    version: receipt.target_version,
+    outcome: outcome,
+    headline: "${receipt.mode} • ${receipt.repos_dispatched}/${receipt.repos_total} dispatched",
+    mode: receipt.mode,
+  }
+}
+
+fn list_recent_run_dirs(fs: HarnessFs, harness_kind: ChatHarnessKind, limit: int) -> list<string> {
+  return run_artifacts_list(fs, harness_kind, {root: chat_run_artifact_root(fs), limit: limit}).map(
+    { run -> run.dir },
+  )
+    .to_list()
+}
+
+fn carousel_row(fs: HarnessFs, dir: string, harness_kind: ChatHarnessKind) -> ChatCarouselRow {
+  const summary = if harness_kind == "release-harn" {
+    summarize_release_run(fs, dir)
+  } else {
+    summarize_bump_run(fs, dir)
+  }
+  const run_id = basename(dir)
+  const when_short = if len(summary.when) >= 19 {
+    summary.when[0:19].replace("T", " ")
+  } else {
+    summary.when
+  }
+  const mark = if summary.ok {
+    if contains(summary.outcome, "FAIL") {
+      "✗"
+    } else {
+      "✓"
+    }
+  } else {
+    "?"
+  }
+  return {
+    dir: dir,
+    run_id: run_id,
+    summary: summary,
+    label: "${mark}  ${when_short}  ${summary.version}  ${summary.headline}",
+  }
+}
+
+/**
+ * Render a numbered carousel and prompt for a choice. Returns nil if the
+ * operator cancelled; otherwise returns {dir, run_id, summary}.
+ */
+pub fn pick_recent_run(
+  _harness: Harness,
+  harness: {stdio: HarnessStdio, fs: HarnessFs},
+  harness_kind: ChatHarnessKind,
+  limit: int = CAROUSEL_LIMIT,
+) -> ChatRunPick? {
+  const dirs = list_recent_run_dirs(harness.fs, harness_kind, limit)
+  if len(dirs) == 0 {
+    harness.stdio.println(
+      "(no recent ${harness_kind} runs found under .harn-runs/${harness_kind}/)",
+    )
+    return nil
+  }
+  let rows = []
+  for dir in dirs {
+    rows = rows + [carousel_row(harness.fs, dir, harness_kind)]
+  }
+  const picked = select_from(
+    _harness,
+    rows,
+    {
+      prompt: "pick a run",
+      header: "recent ${harness_kind} runs",
+      display: { row -> row.label },
+      preview: { row -> "${row.run_id}\n${row.summary.headline}\noutcome: ${row.summary.outcome}" },
+    },
+  )
+  if !(picked.ok ?? false) {
+    return nil
+  }
+  return picked.value
+}
+
+/** Rebuild a chat configuration by inferring artifact paths from a run directory. */
+pub fn chat_cfg_from_run_dir(
+  fs: HarnessFs,
+  base: ChatBaseConfig,
+  harness_kind: ChatHarnessKind,
+  run_dir: string,
+) -> ChatRunConfig {
+  const run = run_artifacts_from_dir(harness_kind, run_dir)
+  const audit_md = if harness_kind == "release-harn" {
+    run_artifact_path(run, "release-audit.md")
+  } else {
+    run_artifact_path(run, "audit.md")
+  }
+  const audit_json = if harness_kind == "release-harn" {
+    run_artifact_path(run, "release-audit.json")
+  } else {
+    run.paths.audit
+  }
+  const transcript_candidate = run_artifact_transcript_path(run)
+  const transcript = if fs.exists(transcript_candidate) {
+    transcript_candidate
+  } else {
+    nil
+  }
+  const outcome = if harness_kind == "release-harn" {
+    summarize_release_run(fs, run_dir).outcome
+  } else {
+    summarize_bump_run(fs, run_dir).outcome
+  }
+  return base
+    + {
+      harness_kind: harness_kind,
+      run_id: run.run_id,
+      run_dir: run.dir,
+      audit_md_path: audit_md,
+      audit_json_path: audit_json,
+      llm_transcript_path: transcript,
+      outcome: outcome,
+    }
+}
