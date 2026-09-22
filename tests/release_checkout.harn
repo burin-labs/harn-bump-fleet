@@ -1,0 +1,180 @@
+import { setup_release_branch } from "../lib/release_checkout"
+import { ReleaseConfig, parse_release_args } from "../lib/release_runtime"
+import {
+  release_workspace_fingerprint,
+  release_workspace_fingerprint_equal,
+} from "../lib/release_workspace"
+
+fn checkout_sh(process: HarnessProcess, command: string) -> dict {
+  const result = process.shell(command)
+  if !result.success {
+    throw "fixture command failed: ${command}\n${result.stderr}"
+  }
+  return result
+}
+
+fn checkout_fixture(harness: Harness) -> dict {
+  const root = path_join(harness.fs.temp_dir(), "release-checkout-" + harness.random.uuid_v7())
+  const remote = path_join(root, "origin.git")
+  const source = path_join(root, "source")
+  const workspace = path_join(root, "release-workspace")
+  checkout_sh(harness.process, "git init --bare -q '" + remote + "'")
+  checkout_sh(harness.process, "git init -q '" + source + "'")
+  checkout_sh(harness.process, "git -C '" + source + "' config user.email test@example.com")
+  checkout_sh(harness.process, "git -C '" + source + "' config user.name test")
+  checkout_sh(harness.process, "git -C '" + source + "' checkout -q -b main")
+  harness.fs.write_text(path_join(source, "tracked.bin"), "base\n")
+  harness.fs.write_text(path_join(source, "mode.txt"), "mode\n")
+  checkout_sh(harness.process, "git -C '" + source + "' add tracked.bin mode.txt")
+  checkout_sh(harness.process, "git -C '" + source + "' commit -q -m base")
+  checkout_sh(harness.process, "git -C '" + source + "' remote add origin '" + remote + "'")
+  checkout_sh(harness.process, "git -C '" + source + "' push -q -u origin main")
+  const pin = trim(checkout_sh(harness.process, "git -C '" + source + "' rev-parse HEAD").stdout)
+  checkout_sh(harness.process, "printf 'sentinel\n' > '" + source + "/sentinel.txt'")
+  checkout_sh(harness.process, "git -C '" + source + "' stash push -q -u -m sentinel")
+  const stash = trim(
+    checkout_sh(harness.process, "git -C '" + source + "' rev-parse refs/stash").stdout,
+  )
+  checkout_sh(
+    harness.process,
+    "git -C '" + source + "' worktree add -q --detach '" + workspace + "' '" + pin + "'",
+  )
+  return {root: root, remote: remote, source: source, workspace: workspace, pin: pin, stash: stash}
+}
+
+fn managed_cfg(env: HarnessEnv, fixture: dict) -> ReleaseConfig {
+  let cfg = parse_release_args(
+    env,
+    [
+      "--repo",
+      fixture.workspace,
+      "--mode",
+      "ship-pr",
+      "--yes-live-release",
+      "--at-sha",
+      fixture.pin,
+    ],
+  )
+  cfg["pin_sha"] = fixture.pin
+  cfg["source_repo"] = fixture.source
+  cfg["release_workspace"] = fixture.workspace
+  cfg["release_workspace_managed"] = true
+  return cfg
+}
+
+fn dirty_release_workspace(process: HarnessProcess, workspace: string) {
+  checkout_sh(process, "printf '\\001\\002staged\\000' > '" + workspace + "/tracked.bin'")
+  checkout_sh(process, "git -C '" + workspace + "' add tracked.bin")
+  checkout_sh(process, "printf '\\003unstaged' >> '" + workspace + "/tracked.bin'")
+  checkout_sh(process, "chmod +x '" + workspace + "/mode.txt'")
+  checkout_sh(process, "printf '\\004\\005new\\000' > '" + workspace + "/generated.bin'")
+  checkout_sh(process, ": > '" + workspace + "/generated-empty'")
+  checkout_sh(process, "chmod +x '" + workspace + "/generated-empty'")
+  checkout_sh(process, "printf '#!/bin/sh\nexit 0\n' > '" + workspace + "/generated-tool'")
+  checkout_sh(process, "chmod +x '" + workspace + "/generated-tool'")
+  checkout_sh(process, "ln -s generated-tool '" + workspace + "/generated-link'")
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_setup_release_branch_preserves_dirty_exact_pin_without_shared_stash(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = checkout_fixture(harness)
+  const cfg = managed_cfg(harness.env, fixture)
+  dirty_release_workspace(harness.process, fixture.workspace)
+  const git = { args ->
+    return harness.process.run({program: "git", args: ["-C", fixture.workspace] + args})
+  }
+  const before = release_workspace_fingerprint(git)
+  // Negative control: even an empty untracked file carries executable state.
+  checkout_sh(harness.process, "chmod -x '" + fixture.workspace + "/generated-empty'")
+  const wrong_mode = release_workspace_fingerprint(git)
+  assert(!release_workspace_fingerprint_equal(before, wrong_mode))
+  checkout_sh(harness.process, "chmod +x '" + fixture.workspace + "/generated-empty'")
+  assert(release_workspace_fingerprint_equal(before, release_workspace_fingerprint(git)))
+  const analysis: any = {expected_branch: "release/v1.2.3", next_version: "1.2.3"}
+  const steps = setup_release_branch(harness, cfg, analysis)
+  const after = release_workspace_fingerprint(git)
+  assert_eq(steps.filter({ step -> !step.success }).count, 0)
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "release/v1.2.3")
+  assert_eq(trim(git(["rev-parse", "HEAD"]).stdout), fixture.pin)
+  assert(release_workspace_fingerprint_equal(before, after))
+  assert_eq(
+    trim(
+      checkout_sh(harness.process, "git -C '" + fixture.source + "' rev-parse refs/stash").stdout,
+    ),
+    fixture.stash,
+  )
+  assert_eq(steps.filter({ step -> contains(lowercase(step.command ?? ""), "stash") }).count, 0)
+  checkout_sh(
+    harness.process,
+    "git -C '" + fixture.source + "' worktree remove --force '" + fixture.workspace + "'",
+  )
+  harness.fs.delete(fixture.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_release_workspace_fingerprint_refuses_unmeasured_untracked_diff(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = checkout_fixture(harness)
+  dirty_release_workspace(harness.process, fixture.workspace)
+  const real_git = { args ->
+    return harness.process.run({program: "git", args: ["-C", fixture.workspace] + args})
+  }
+  const missing_exit_git = { args ->
+    if contains(join(args, " "), "diff --no-index") {
+      const missing_exit: any = {success: false, stdout: "", stderr: "no measurement"}
+      return missing_exit
+    }
+    return real_git(args)
+  }
+  const fingerprint = release_workspace_fingerprint(missing_exit_git)
+  assert_eq(fingerprint.ok, false)
+  assert(contains(fingerprint.reason, "could not fingerprint untracked release file"))
+  checkout_sh(
+    harness.process,
+    "git -C '" + fixture.source + "' worktree remove --force '" + fixture.workspace + "'",
+  )
+  harness.fs.delete(fixture.root)
+}
+
+@serial(group: "git-worktree-dogfood")
+pipeline test_setup_release_branch_refuses_dirty_workspace_off_pin_without_shared_stash(
+  harness: Harness,
+  task: any,
+) {
+  const fixture = checkout_fixture(harness)
+  let cfg = managed_cfg(harness.env, fixture)
+  dirty_release_workspace(harness.process, fixture.workspace)
+  harness.fs.write_text(path_join(fixture.source, "later.txt"), "later\n")
+  checkout_sh(harness.process, "git -C '" + fixture.source + "' add later.txt")
+  checkout_sh(harness.process, "git -C '" + fixture.source + "' commit -q -m later")
+  cfg["pin_sha"] = trim(
+    checkout_sh(harness.process, "git -C '" + fixture.source + "' rev-parse HEAD").stdout,
+  )
+  const git = { args ->
+    return harness.process.run({program: "git", args: ["-C", fixture.workspace] + args})
+  }
+  const before = release_workspace_fingerprint(git)
+  const analysis: any = {expected_branch: "release/v1.2.3", next_version: "1.2.3"}
+  const steps = setup_release_branch(harness, cfg, analysis)
+  const after = release_workspace_fingerprint(git)
+  assert_eq(steps[steps.count - 1].name, "refuse-dirty-workspace-outside-pin")
+  assert_eq(steps[steps.count - 1].success, false)
+  assert_eq(trim(git(["branch", "--show-current"]).stdout), "")
+  assert(release_workspace_fingerprint_equal(before, after))
+  assert_eq(
+    trim(
+      checkout_sh(harness.process, "git -C '" + fixture.source + "' rev-parse refs/stash").stdout,
+    ),
+    fixture.stash,
+  )
+  checkout_sh(
+    harness.process,
+    "git -C '" + fixture.source + "' worktree remove --force '" + fixture.workspace + "'",
+  )
+  harness.fs.delete(fixture.root)
+}

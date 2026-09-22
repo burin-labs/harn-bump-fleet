@@ -1,0 +1,321 @@
+import { github_connector_options } from "./github"
+import {
+  PrerequisitePrDecision,
+  PrerequisiteProjectionLease,
+  load_prerequisite_pr,
+} from "./prerequisite_prs"
+import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+pub type PrerequisiteWaitStatus = "not_required" | "satisfied" | "timeout" | "terminal_error"
+
+pub type PrerequisiteWaitReceipt = {
+  schema_version: "harn_bump_fleet.prerequisite_wait.v2",
+  ok: bool,
+  status: PrerequisiteWaitStatus,
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  attempts: int,
+  retry_count: int,
+  last_status: string,
+  last_http_status?: int?,
+  checks_observed: bool,
+  check_count: int,
+  pending_check_count: int,
+  failing_check_count: int,
+  failing_check_names: list<string>,
+  elapsed_ms: int,
+  detail: string,
+  /** Whether this wait admitted the projection pull request itself. */
+  admitted_projection: bool,
+  decision?: PrerequisitePrDecision?,
+}
+
+pub type PrerequisiteWaitAdapter = {
+  now_ms: fn() -> int,
+  observe: fn() -> PrerequisitePrDecision,
+  wait: fn(int) -> nil,
+  /**
+   * Admit a green, mergeable, exact-head projection pull request, returning
+   * whether admission was accepted. Required rather than optional: a caller
+   * without merge authority passes a closure that returns false, which keeps
+   * the old refusal. An absent capability would instead read as "nothing to
+   * admit" and put the deadlock back.
+   */
+  admit_projection: fn(PrerequisitePrDecision) -> bool,
+}
+
+fn receipt(
+  status: PrerequisiteWaitStatus,
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  started_ms: int,
+  attempts: int,
+  retry_count: int,
+  decision: PrerequisitePrDecision?,
+  adapter: PrerequisiteWaitAdapter,
+  admitted_projection: bool = false,
+) -> PrerequisiteWaitReceipt {
+  const schema_version: "harn_bump_fleet.prerequisite_wait.v2" =
+    "harn_bump_fleet.prerequisite_wait.v2"
+  const elapsed_ms: int = adapter.now_ms() - started_ms
+  const result: PrerequisiteWaitReceipt = {
+    schema_version: schema_version,
+    ok: status == "not_required" || status == "satisfied",
+    status: status,
+    repo: repo,
+    number: number,
+    expected_head_oid: expected_head_oid,
+    attempts: attempts,
+    retry_count: retry_count,
+    last_status: to_string(decision?.status ?? status),
+    last_http_status: decision?.github_http_status,
+    checks_observed: decision?.checks_observed ?? false,
+    check_count: decision?.check_count ?? 0,
+    pending_check_count: decision?.pending_check_count ?? 0,
+    failing_check_count: decision?.failing_check_count ?? 0,
+    failing_check_names: decision?.failing_check_names ?? [],
+    elapsed_ms: elapsed_ms,
+    detail: decision?.detail ?? "projection prerequisite did not require a pull request",
+    admitted_projection: admitted_projection,
+    decision: decision,
+  }
+  return result
+}
+
+/** A mechanically shaped receipt for a projection already current on its base. */
+pub fn prerequisite_wait_not_required(
+  repo: string,
+  expected_head_oid: string = "",
+) -> PrerequisiteWaitReceipt {
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return 0 },
+    observe: fn() {
+      throw "not-required prerequisite receipt must not observe GitHub"
+    },
+    wait: fn(_delay_ms) {
+    },
+    admit_projection: fn(_decision) {
+      throw "not-required prerequisite receipt must not admit a pull request"
+    },
+  }
+  return receipt("not_required", repo, 0, expected_head_oid, 0, 0, 0, nil, adapter)
+}
+
+/** Whether the observed head still answers the lease this wait was given. */
+fn observed_head_is_leased(observed: PrerequisitePrDecision, expected_head_oid: string) -> bool {
+  const projection_equivalent = observed.head_verification == "projection_equivalent"
+    && trim(observed.head_oid ?? "")
+      != ""
+  return projection_equivalent || observed.head_oid == expected_head_oid
+}
+
+/** A prerequisite is satisfied only by a merge, with both merge facts present. */
+fn observed_is_merged(observed: PrerequisitePrDecision, head_is_leased: bool) -> bool {
+  return observed.ok && observed.status == "satisfied" && head_is_leased
+    && trim(observed.merged_at ?? "")
+      != ""
+    && trim(observed.merge_commit_oid ?? "")
+      != ""
+}
+
+/** Observable work in progress at the exact head, or a typed transient error. */
+fn observation_is_retryable(observed: PrerequisitePrDecision) -> bool {
+  const exact_pending_checks = observed.status == "pending" && observed.checks_observed
+    && trim(observed.checks_head_oid)
+      != ""
+    && observed.checks_head_oid
+      == (observed.head_oid ?? "")
+  return exact_pending_checks || observation_is_retryable_error(observed)
+}
+
+fn observation_is_retryable_error(observed: PrerequisitePrDecision) -> bool {
+  return observed.status == "github_error" && (observed.github_retryable ?? false)
+}
+
+/**
+ * Sleep one bounded interval, or report that the deadline has arrived.
+ *
+ * Shared by the admission path and the ordinary retry path so both spend the
+ * same clock and neither can outlive the proposal deadline.
+ */
+fn wait_within_deadline(
+  adapter: PrerequisiteWaitAdapter,
+  interval_ms: int,
+  stop_at_ms: int,
+) -> bool {
+  const now_ms = adapter.now_ms()
+  if now_ms >= stop_at_ms {
+    return false
+  }
+  const remaining_ms = stop_at_ms - now_ms
+  adapter.wait(
+    if interval_ms < remaining_ms {
+      interval_ms
+    } else {
+      remaining_ms
+    },
+  )
+  return true
+}
+
+/**
+ * Wait for one exact proposal lease through a single bounded observation loop.
+ *
+ * The GitHub connector owns per-request Retry-After and jittered backoff. This
+ * layer repeats only exact-head proposals with observable work in progress and
+ * connector requests that exhausted typed transient retry policy. The proposal
+ * deadline remains authoritative, and `retry_count` records only the latter.
+ */
+pub fn wait_prerequisite_with_adapter(
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  timeout_ms: int,
+  interval_ms: int,
+  adapter: PrerequisiteWaitAdapter,
+) -> PrerequisiteWaitReceipt {
+  if trim(repo) == "" || number < 1
+    || len(regex_captures("^[0-9a-f]{40}$", expected_head_oid))
+      == 0 {
+    throw "prerequisite wait requires a repository, pull request, and exact head lease"
+  }
+  if timeout_ms < 1 || interval_ms < 1 {
+    throw "prerequisite wait bounds must be positive"
+  }
+  const started_ms = adapter.now_ms()
+  const stop_at_ms = started_ms + timeout_ms
+  let attempts = 0
+  let retry_count = 0
+  let admitted_projection = false
+  while true {
+    const observed = adapter.observe()
+    attempts = attempts + 1
+    const head_is_leased = observed_head_is_leased(observed, expected_head_oid)
+    if observed_is_merged(observed, head_is_leased) {
+      return receipt(
+        "satisfied",
+        repo,
+        number,
+        expected_head_oid,
+        started_ms,
+        attempts,
+        retry_count,
+        observed,
+        adapter,
+        admitted_projection,
+      )
+    }
+    // A projection pull request the promotion itself authored, green and
+    // mergeable at the leased head, is waiting for admission rather than
+    // failing. Admit it once; the next observation sees it armed or merged and
+    // the loop continues on its existing pending and merged paths. Admission is
+    // attempted only while the head is leased, so a head that drifted after the
+    // lease still refuses.
+    if observed.status == "mergeable_projection" && head_is_leased {
+      if !admitted_projection {
+        admitted_projection = adapter.admit_projection(observed)
+      }
+      // Once admitted, a still-unmerged projection is work in progress, not a
+      // terminal state. GitHub reports it armed or queued on the next poll in
+      // practice, but the wait must not depend on that timing.
+      if admitted_projection {
+        if wait_within_deadline(adapter, interval_ms, stop_at_ms) {
+          continue
+        }
+        return receipt(
+          "timeout",
+          repo,
+          number,
+          expected_head_oid,
+          started_ms,
+          attempts,
+          retry_count,
+          observed,
+          adapter,
+          admitted_projection,
+        )
+      }
+    }
+    const retryable_error = observation_is_retryable_error(observed)
+    if !observation_is_retryable(observed) {
+      return receipt(
+        "terminal_error",
+        repo,
+        number,
+        expected_head_oid,
+        started_ms,
+        attempts,
+        retry_count,
+        observed,
+        adapter,
+        admitted_projection,
+      )
+    }
+    if retryable_error {
+      retry_count = retry_count + 1
+    }
+    if !wait_within_deadline(adapter, interval_ms, stop_at_ms) {
+      return receipt(
+        "timeout",
+        repo,
+        number,
+        expected_head_oid,
+        started_ms,
+        attempts,
+        retry_count,
+        observed,
+        adapter,
+        admitted_projection,
+      )
+    }
+  }
+}
+
+/** Production adapter for one exact fleet projection prerequisite. */
+pub fn wait_prerequisite(
+  harness: Harness,
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  projection: PrerequisiteProjectionLease,
+  timeout_ms: int,
+  interval_ms: int,
+  options: GithubClientOptions = github_connector_options(),
+) -> PrerequisiteWaitReceipt {
+  const adapter: PrerequisiteWaitAdapter = {
+    now_ms: fn() { return harness.clock.monotonic_ms() },
+    observe: fn() { return load_prerequisite_pr(
+      harness,
+      repo,
+      number,
+      expected_head_oid,
+      projection,
+      options,
+    ) },
+    wait: fn(delay_ms) { harness.clock.sleep_ms(delay_ms) },
+    // The promotion authored this projection pull request, so it is the party
+    // that admits it. The lease-aware auto-merge boundary is the fleet's typed
+    // admission; on a pull request whose checks are already green it merges
+    // immediately, and the next observation reports it merged.
+    admit_projection: fn(observed) {
+      const head_oid = trim(to_string(observed.head_oid ?? ""))
+      if head_oid == "" {
+        return false
+      }
+      return is_ok(
+        github_enable_auto_merge_with_release_lease(harness, repo, number, head_oid, "squash"),
+      )
+    },
+  }
+  return wait_prerequisite_with_adapter(
+    repo,
+    number,
+    expected_head_oid,
+    timeout_ms,
+    interval_ms,
+    adapter,
+  )
+}
