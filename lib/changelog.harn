@@ -1,0 +1,795 @@
+import { changelog_find_section, changelog_parse_sections } from "std/changelog"
+import { parse, parse_release } from "std/semver"
+
+pub type ChangelogFixupReleaseBody = {success: bool, body: string, source: string, message: string}
+
+pub type ChangelogMutation = {
+  success: bool,
+  changed: bool,
+  text: string,
+  message: string,
+  subtract_path?: string,
+}
+
+pub type ChangelogSectionValidation = {valid: bool, findings: list<string>}
+
+pub type ChangelogArchiveSplit = {
+  success: bool,
+  changed: bool,
+  kept: string,
+  archived: string,
+  count: int,
+  suggested_archive_filename: string,
+  message: string,
+}
+
+/** Return the release version from a `## v<version>` changelog heading, or nil. */
+fn changelog_version_heading(line: string?) {
+  const matches = regex_captures("^## v([^\\s]+)\\s*$", trim(line))
+  if len(matches) == 0 {
+    return nil
+  }
+  const version = matches[0].groups[0]
+  return parse_release(version) == nil ? nil : version
+}
+
+/** Return the first released semver heading in a changelog body, without the leading `v`. */
+fn changelog_top_from_text(text: string?) {
+  const sections = changelog_parse_sections(text ?? "")
+  if is_err(sections) {
+    return ""
+  }
+  for section in unwrap(sections) {
+    const version = changelog_version_heading(section.heading)
+    if version != nil {
+      return version
+    }
+  }
+  return ""
+}
+
+/** Return the body under an exact `## ...` heading until the next second-level heading. */
+fn changelog_named_section_from_text(text: string?, target_heading: string) {
+  const section = changelog_find_section(text ?? "", target_heading)
+  return is_ok(section) ? unwrap(section).body : ""
+}
+
+fn changelog_heading_offsets(text: string?) {
+  let headings = []
+  let offset = 0
+  for line in split(text ?? "", "\n") {
+    const version = changelog_version_heading(line)
+    const heading = trim(line)
+    if version != nil || heading == "## Unreleased" {
+      headings = headings.push(
+        {heading: heading, version: version, start: offset, end: offset + len(line)},
+      )
+    }
+    offset = offset + len(line) + 1
+  }
+  return headings
+}
+
+fn first_version_heading(headings: list) {
+  for heading in headings {
+    if heading.version != nil {
+      return heading
+    }
+  }
+  return nil
+}
+
+fn first_unreleased_heading(headings: list) {
+  for heading in headings {
+    if heading.heading == "## Unreleased" {
+      return heading
+    }
+  }
+  return nil
+}
+
+fn next_heading_start(headings: list, after_start: any) {
+  for heading in headings {
+    if heading.start > after_start {
+      return heading.start
+    }
+  }
+  return nil
+}
+
+fn changelog_body_for(text: string, heading: dict?, section_end: any) {
+  if heading == nil {
+    return ""
+  }
+  return trim(text[heading.end:section_end])
+}
+
+fn changelog_subsections(body: string?) {
+  let sections = []
+  let current_heading = ""
+  let current_lines = []
+  for line in split(trim(body ?? ""), "\n") {
+    if starts_with(trim(line), "### ") {
+      sections = sections.push({heading: current_heading, body: trim(current_lines.join("\n"))})
+      current_heading = trim(line)
+      current_lines = []
+    } else {
+      current_lines = current_lines.push(line)
+    }
+  }
+  sections = sections.push({heading: current_heading, body: trim(current_lines.join("\n"))})
+  return sections.filter({ section -> section.heading != "" || section.body != "" })
+}
+
+fn changelog_render_subsections(sections: list) {
+  let parts = []
+  for section in sections {
+    const body = trim(section.body)
+    if body == "" {
+      continue
+    }
+    if section.heading == "" {
+      parts = parts.push(body)
+    } else {
+      parts = parts.push(section.heading + "\n\n" + body)
+    }
+  }
+  return parts.join("\n\n")
+}
+
+fn changelog_merge_release_bodies(unreleased_body: string?, release_body: string?) {
+  const pending = changelog_subsections(unreleased_body)
+  let release_sections = changelog_subsections(release_body)
+  let prepend = []
+  for pending_section in pending {
+    let merged = false
+    let next_sections = []
+    for release_section in release_sections {
+      if !merged && pending_section.heading != ""
+        && pending_section.heading
+          == release_section.heading {
+        const merged_body = trim(pending_section.body) + "\n\n" + trim(release_section.body)
+        next_sections = next_sections.push({heading: release_section.heading, body: merged_body})
+        merged = true
+      } else {
+        next_sections = next_sections.push(release_section)
+      }
+    }
+    if merged {
+      release_sections = next_sections
+    } else {
+      prepend = prepend.push(pending_section)
+    }
+  }
+  return changelog_render_subsections(prepend + release_sections)
+}
+
+fn changelog_subtract_ordered_lines(current_body: string?, baseline: string?) {
+  const baseline_lines = split(trim(baseline ?? ""), "\n")
+  if len(baseline_lines) == 0 {
+    return {success: false, drift: ""}
+  }
+  let baseline_index = 0
+  let drift_lines = []
+  for line in split(trim(current_body ?? ""), "\n") {
+    if baseline_index < len(baseline_lines) && line == baseline_lines[baseline_index] {
+      baseline_index = baseline_index + 1
+    } else {
+      drift_lines = drift_lines.push(line)
+    }
+  }
+  if baseline_index != len(baseline_lines) {
+    return {success: false, drift: ""}
+  }
+  return {success: true, drift: trim(drift_lines.join("\n"))}
+}
+
+/**
+ * Recover the release-note body a fixup PR should land.
+ *
+ * Older release flows promoted an authored `## Unreleased` section from the
+ * pin SHA. Fragment-based releases can have no `## Unreleased` heading at all;
+ * in that case the already-prepared release branch/tag is the source of truth.
+ */
+pub fn changelog_fixup_release_body(
+  pin_changelog: string,
+  prepared_changelog: string,
+  version: string,
+) -> ChangelogFixupReleaseBody {
+  const pin_body = changelog_named_section_from_text(pin_changelog, "## Unreleased")
+  if trim(pin_body) != "" {
+    return {success: true, body: pin_body, source: "pin-unreleased", message: ""}
+  }
+  const prepared_body = changelog_named_section_from_text(prepared_changelog, "## v${version}")
+  if trim(prepared_body) != "" {
+    return {success: true, body: prepared_body, source: "release-section", message: ""}
+  }
+  return {
+    success: false,
+    body: "",
+    source: "",
+    message:
+      "fixup requires either pin-time `## Unreleased` or prepared `## v${version}` release notes",
+  }
+}
+
+/**
+ * Count top-level `-` bullets in a CHANGELOG body. Continuation lines
+ * (indented by two spaces) and `### Subsection` headings are skipped.
+ */
+pub fn changelog_bullet_count(body: string) -> int {
+  let count = 0
+  for line in split(body ?? "", "\n") {
+    if starts_with(line, "- ") {
+      count = count + 1
+    }
+  }
+  return count
+}
+
+/**
+ * Promote a pin-time `## Unreleased` body into a `## v${next_version}`
+ * section while preserving any post-pin drift on the current Unreleased.
+ *
+ * Used by `--mode review-pr` to fix a release PR after the fact: the
+ * release branch is recreated on fresh `<base>` (which may include
+ * post-pin merges from other sessions), so the current Unreleased
+ * may contain bullets that landed AFTER our pin SHA. Those bullets
+ * describe work that isn't in the released artifact and must NOT
+ * disappear into v${next_version}.
+ *
+ * Subtraction strategy, tried in order:
+ *  1. Direct match — pin-time body appears verbatim as a substring of
+ *     current. Covers the append-only case where other sessions only
+ *     added bullets BELOW the pin-time content.
+ *  2. Bullets-only fallback — strip the leading `### Subsection`
+ *     heading from the pin-time body and look for the remaining bullet
+ *     block as a substring. Covers the prepend case where another
+ *     session inserted entries ABOVE the pin-time bullets in the
+ *     leading subsection (the pin-time bullets remain contiguous,
+ *     just no longer at the top).
+ *  3. Fallback — current Unreleased was edited (bullet text changed,
+ *     bullets reordered, prepends across multiple subsections, ...).
+ *     Preserve current Unreleased verbatim AND emit v${next_version}
+ *     so the artifact-shaped section is at least correct. The result
+ *     duplicates the pin-time bullets between Unreleased and
+ *     v${next_version}; the harness must surface this so the operator
+ *     dedupes by hand before merging.
+ *
+ * Idempotent: rerunning over a CHANGELOG that already has
+ * `## v${next_version}` returns unchanged.
+ */
+pub fn changelog_promote_pin_time_unreleased(
+  text: string,
+  next_version: string,
+  pin_time_body: string,
+) -> ChangelogMutation {
+  const baseline = trim(pin_time_body ?? "")
+  if baseline == "" {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message: "review-pr promote requires a non-empty pin-time Unreleased body",
+    }
+  }
+  let headings = changelog_heading_offsets(text)
+  for h in headings {
+    if h.version == next_version {
+      return {
+        success: true,
+        changed: false,
+        text: text,
+        message: "v${next_version} already present in CHANGELOG.md (no changes)",
+      }
+    }
+  }
+  const unreleased = first_unreleased_heading(headings)
+  const first = first_version_heading(headings)
+  const unreleased_end = if unreleased == nil {
+    0
+  } else if first == nil {
+    len(text)
+  } else {
+    first.start
+  }
+  const current_unreleased_body = if unreleased == nil {
+    ""
+  } else {
+    trim(text[unreleased.end:unreleased_end])
+  }
+  const direct_match = current_unreleased_body != "" && contains(current_unreleased_body, baseline)
+  const bullets_only = trim(regex_replace("^###[^\n]*\n+", "", baseline))
+  const bullets_match = !direct_match
+    && bullets_only != ""
+    && bullets_only != baseline
+    && current_unreleased_body != ""
+    && contains(current_unreleased_body, bullets_only)
+  const remaining_unreleased = if direct_match {
+    trim(current_unreleased_body.replace(baseline, ""))
+  } else if bullets_match {
+    trim(current_unreleased_body.replace(bullets_only, ""))
+  } else {
+    current_unreleased_body
+  }
+  const release_text = "## v${next_version}\n\n" + baseline + "\n\n"
+  const prefix_end = if unreleased != nil {
+    unreleased.start
+  } else if first != nil {
+    first.start
+  } else {
+    len(text)
+  }
+  const prefix = text[0:prefix_end]
+  const suffix = if first != nil {
+    text[first.start:len(text)]
+  } else {
+    ""
+  }
+  const unreleased_block = if remaining_unreleased == "" {
+    ""
+  } else {
+    "## Unreleased\n\n" + remaining_unreleased + "\n\n"
+  }
+  const pin_count = changelog_bullet_count(baseline)
+  const detail = if direct_match {
+    "subtracted ${pin_count} pin-time bullets from Unreleased"
+  } else if bullets_match {
+    "subtracted ${pin_count} pin-time bullets from Unreleased (bullets-only fallback: another session inserted entries above the pin-time content)"
+  } else if current_unreleased_body == "" {
+    "Unreleased was empty"
+  } else {
+    "FALLBACK — could not safely subtract pin-time bullets; preserved current Unreleased verbatim. ${pin_count} pin-time bullets are duplicated between `## Unreleased` and `## v${next_version}` and need manual dedupe before merge"
+  }
+  return {
+    success: true,
+    changed: true,
+    text: prefix + unreleased_block + release_text + suffix,
+    message: "promoted pin-time Unreleased to v${next_version}; ${detail}",
+    subtract_path: if direct_match {
+      "direct"
+    } else if bullets_match {
+      "bullets-only"
+    } else if current_unreleased_body == "" {
+      "empty"
+    } else {
+      "fallback"
+    },
+  }
+}
+
+/**
+ * Post-merge paperwork repair: a release PR merged with drift in `## v${version}`
+ * because new bullets landed on `## Unreleased` between pin and merge, and
+ * GitHub's 3-way merge absorbed them into the just-published section. The
+ * shipped binary contains only the pin-time content; the CHANGELOG entry
+ * lies about what the binary actually delivers.
+ *
+ * Restore `## v${version}` to `pin_time_body` (the truth) and move the
+ * absorbed drift bullets into `## Unreleased` (or create it). Uses the
+ * same `direct` / `bullets-only` smart-subtract as
+ * `changelog_promote_pin_time_unreleased` to identify the drift, plus an
+ * exact ordered-line fallback for drift inserted between pin-time subsections.
+ *
+ * Refuses when the current `## v${version}` body has been edited rather
+ * than simply appended-to (drift cannot be safely isolated). Operator
+ * must repair by hand in that case.
+ *
+ * Idempotent: returns `{changed: false}` when the v${version} body
+ * already matches `pin_time_body`.
+ */
+pub fn changelog_repair_post_merge_drift(
+  text: string,
+  version: string,
+  pin_time_body: string,
+) -> ChangelogMutation {
+  const baseline = trim(pin_time_body ?? "")
+  if baseline == "" {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message: "post-merge repair requires a non-empty pin-time Unreleased body",
+    }
+  }
+  let headings = changelog_heading_offsets(text)
+  let target = nil
+  for h in headings {
+    if h.version == version {
+      target = h
+      break
+    }
+  }
+  if target == nil {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message: "post-merge repair requires a `## v${version}` section in CHANGELOG.md",
+    }
+  }
+  const target_end = next_heading_start(headings, target.start) ?? len(text)
+  const current_body = trim(text[target.end:target_end])
+  if current_body == baseline {
+    return {
+      success: true,
+      changed: false,
+      text: text,
+      message: "v${version} already matches pin-time Unreleased; no drift to repair",
+    }
+  }
+  const direct_match = contains(current_body, baseline)
+  const bullets_only = trim(regex_replace("^###[^\n]*\n+", "", baseline))
+  const bullets_match = !direct_match
+    && bullets_only != ""
+    && bullets_only != baseline
+    && contains(current_body, bullets_only)
+  const ordered_match = if direct_match || bullets_match {
+    {success: false, drift: ""}
+  } else {
+    changelog_subtract_ordered_lines(current_body, baseline)
+  }
+  const drift = if direct_match {
+    trim(current_body.replace(baseline, ""))
+  } else if bullets_match {
+    trim(current_body.replace(bullets_only, ""))
+  } else if ordered_match.success {
+    ordered_match.drift
+  } else {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message:
+        "could not safely subtract pin-time bullets from `## v${version}`; the published section appears to have been edited rather than appended-to (bullets reordered/renamed/rewritten). Manual repair required.",
+    }
+  }
+  const unreleased = first_unreleased_heading(headings)
+  const unreleased_body = if unreleased == nil {
+    ""
+  } else {
+    const unreleased_end = next_heading_start(headings, unreleased.start) ?? len(text)
+    trim(text[unreleased.end:unreleased_end])
+  }
+  const new_unreleased_body = if drift == "" {
+    unreleased_body
+  } else if unreleased_body == "" {
+    drift
+  } else {
+    changelog_merge_release_bodies(drift, unreleased_body)
+  }
+  const unreleased_block = if new_unreleased_body == "" {
+    ""
+  } else {
+    "## Unreleased\n\n" + new_unreleased_body + "\n\n"
+  }
+  const release_block = "## v" + version + "\n\n" + baseline + "\n\n"
+  const earliest = if unreleased != nil && unreleased.start < target.start {
+    unreleased.start
+  } else {
+    target.start
+  }
+  const unreleased_end_offset = if unreleased == nil {
+    earliest
+  } else {
+    next_heading_start(headings, unreleased.start) ?? len(text)
+  }
+  const between = if unreleased == nil {
+    ""
+  } else if unreleased.start < target.start {
+    text[unreleased_end_offset:target.start]
+  } else {
+    ""
+  }
+  const suffix = text[target_end:len(text)]
+  const prefix = text[0:earliest]
+  const drift_count = changelog_bullet_count(drift)
+  return {
+    success: true,
+    changed: true,
+    text: prefix + unreleased_block + between + release_block + suffix,
+    message:
+      "post-merge repair: moved ${drift_count} drift bullet(s) from `## v${version}` back to `## Unreleased`",
+    subtract_path: if direct_match {
+      "direct"
+    } else if bullets_match {
+      "bullets-only"
+    } else {
+      "ordered-lines"
+    },
+  }
+}
+
+// Unreleased sits before v${version}; the heading after Unreleased is
+// either v${version} itself or another version that lives between.
+/**
+ * Return an updated changelog body with draft notes inserted, promoted, or refreshed for next_version.
+ */
+pub fn changelog_release_section_update(
+  text: string,
+  next_version: string,
+  draft_notes: string? = nil,
+) -> ChangelogMutation {
+  let headings = changelog_heading_offsets(text)
+  const first = first_version_heading(headings)
+  const unreleased = first_unreleased_heading(headings)
+  const unreleased_before_first = unreleased != nil
+    && (first == nil || unreleased.start < first.start)
+  if first != nil && first.version == next_version && !unreleased_before_first {
+    return {
+      success: true,
+      changed: false,
+      text: text,
+      message: "CHANGELOG.md already starts with v${next_version}",
+    }
+  }
+  if first != nil && first.version == next_version && unreleased_before_first {
+    const first_end = next_heading_start(headings, first.start) ?? len(text)
+    const merged_body = changelog_merge_release_bodies(
+      changelog_body_for(text, unreleased, first.start),
+      changelog_body_for(text, first, first_end),
+    )
+    const release_text = "## v${next_version}\n\n" + merged_body + "\n\n"
+    return {
+      success: true,
+      changed: true,
+      text: text[0:unreleased.start] + release_text + text[first_end:len(text)],
+      message: "merged Unreleased notes into existing v${next_version} section",
+    }
+  }
+  // Rename `## Unreleased` → `## v${next_version}` when the operator has
+  // already authored entries there. Authored Unreleased is the source of
+  // truth — agent drafts (which can truncate mid-sentence under tight
+  // generation budgets) do not get to overwrite human-curated entries.
+  // The agent draft is still validated upstream as a sanity check, but
+  // here we always preserve the operator's bullets verbatim.
+  if unreleased_before_first {
+    const unreleased_end = if first == nil {
+      len(text)
+    } else {
+      first.start
+    }
+    const unreleased_body = trim(text[unreleased.end:unreleased_end])
+    if unreleased_body != "" {
+      const release_text = "## v${next_version}\n\n" + unreleased_body + "\n\n"
+      return {
+        success: true,
+        changed: true,
+        text: text[0:unreleased.start] + release_text + text[unreleased_end:len(text)],
+        message:
+          "renamed `## Unreleased` to `## v${next_version}` (preserved authored entries verbatim)",
+      }
+    }
+  }
+  const agent_notes = trim(draft_notes ?? "")
+  if contains(agent_notes, "<assistant prose truncated by turn policy") {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message: "agent draft changelog was truncated by turn policy; refusing to apply",
+    }
+  }
+  if agent_notes == "" {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message:
+        "missing validated agent draft changelog; rerun with --agent or add CHANGELOG.md section ## v${next_version} manually before prepare",
+    }
+  }
+  if changelog_top_from_text(agent_notes) != next_version {
+    return {
+      success: false,
+      changed: false,
+      text: text,
+      message: "agent draft changelog does not start with ## v${next_version}",
+    }
+  }
+  const draft_text = agent_notes + "\n\n"
+  // Only reached when `## Unreleased` is empty/missing — the agent draft
+  // is the only source of post-tag content in that case.
+  if unreleased_before_first {
+    const replace_end = if first == nil {
+      len(text)
+    } else {
+      first.start
+    }
+    return {
+      success: true,
+      changed: true,
+      text: text[0:unreleased.start] + draft_text + text[replace_end:len(text)],
+      message:
+        "promoted agent-authored CHANGELOG.md section for v${next_version} (Unreleased was empty)",
+    }
+  }
+  const insert_at = if first == nil {
+    len(text)
+  } else {
+    first.start
+  }
+  return {
+    success: true,
+    changed: true,
+    text: text[0:insert_at] + draft_text + text[insert_at:len(text)],
+    message: "inserted agent-authored CHANGELOG.md section for v${next_version}",
+  }
+}
+
+fn section_bullet_lines(body: string?) {
+  let count = 0
+  for line in split(body ?? "", "\n") {
+    const t = trim(line)
+    if starts_with(t, "- ") || starts_with(t, "* ") {
+      count = count + 1
+    }
+  }
+  return count
+}
+
+fn fragment_representative_line(body: string?) {
+  for line in split(body ?? "", "\n") {
+    const t = trim(line)
+    if t == "" {
+      continue
+    }
+    if starts_with(t, "- ") || starts_with(t, "* ") {
+      return trim(t[2:len(t)])
+    }
+    return t
+  }
+  return ""
+}
+
+/**
+ * Deterministic validation gate for a folded `## vX.Y.Z` release section.
+ * `fragments` is the list of `{id, category, body}` assembled into this
+ * release (as read from `changelog.d/`). Returns `{valid, findings}`:
+ *   - the CHANGELOG top section must be exactly `## v${version}`;
+ *   - it must carry at least one bullet (non-empty categorized body);
+ *   - every assembled fragment must be represented — the first content line of
+ *     its body must appear in the section — so a lossy or unfolded fragment is
+ *     caught before the release proceeds.
+ *
+ * Pure so the malformed-vs-valid matrix is unit-testable. This is the gate a
+ * recovery pass (deterministic re-fold, then a bounded agent massage) must
+ * satisfy before its output is accepted.
+ */
+pub fn changelog_release_section_valid(
+  text: string,
+  version: string,
+  fragments: list<dict>,
+) -> ChangelogSectionValidation {
+  let findings = []
+  const top = changelog_top_from_text(text ?? "")
+  if top != version {
+    return {
+      valid: false,
+      findings: ["CHANGELOG top section is `## v${top}`; expected `## v${version}`"],
+    }
+  }
+  const body = changelog_named_section_from_text(text ?? "", "## v${version}")
+  if section_bullet_lines(body) <= 0 {
+    findings = findings + ["`## v${version}` section has no categorized bullets"]
+  }
+  for fragment in fragments ?? [] {
+    const marker = fragment_representative_line(fragment.body ?? "")
+    if marker != "" && !contains(body, marker) {
+      findings = findings
+        + [
+          "changelog.d fragment ${to_string(fragment.id ?? "?")} (${fragment.category ?? "?"}) is not represented in the `## v${version}` section",
+        ]
+    }
+  }
+  return {valid: len(findings) == 0, findings: findings}
+}
+
+/**
+ * Deterministically replace the top `## Unreleased`/`## vX.Y.Z` block with
+ * `new_section` (a full `## vX.Y.Z ...` markdown block). Everything from the
+ * first second-level heading down to the next second-level heading is swapped;
+ * text above the first heading (the title/preamble) and all lower sections are
+ * preserved. Used by the bounded changelog recovery to splice a corrected top
+ * section produced by re-fold or agent massage. Returns the new text.
+ */
+pub fn changelog_replace_top_section(text: string, new_section: string) -> string {
+  let headings = changelog_heading_offsets(text ?? "")
+  const block = trim(new_section ?? "")
+  if len(headings) == 0 {
+    const base = trim(text ?? "")
+    if base == "" {
+      return block + "\n"
+    }
+    return base + "\n\n" + block + "\n"
+  }
+  const top = headings[0]
+  const end = next_heading_start(headings, top.start) ?? len(text ?? "")
+  return (text ?? "")[0:top.start] + block + "\n\n" + (text ?? "")[end:len(text ?? "")]
+}
+
+fn version_lt(a_major: any, a_minor: any, b_major: any, b_minor: any) {
+  if a_major != b_major {
+    return a_major < b_major
+  }
+  return a_minor < b_minor
+}
+
+fn parse_threshold(threshold: string?) {
+  const value = trim(threshold ?? "")
+  if regex_match("^[0-9]+[.][0-9]+$", value) == nil {
+    return nil
+  }
+  return parse(value + ".0")
+}
+
+/**
+ * Split `text` at the first `## vX.Y.Z` heading whose (major, minor) is
+ * strictly less than `threshold` (a "MAJOR.MINOR" string like "0.9").
+ * Returns `{kept, archived, count, suggested_archive_filename}` where
+ * `kept` retains the prologue (intro paragraph, `## Unreleased`, and every
+ * version section at or above the threshold) and `archived` carries the
+ * snipped tail. `count` is how many `## vX.Y.Z` sections moved.
+ *
+ * Intended for use at a major (or major-bump-equivalent in 0.x) cut: at
+ * the v0.9.0 release, call with threshold "0.9" to move v0.8.*, v0.7.*,
+ * v0.6.* out of CHANGELOG.md into CHANGELOG-pre-0.9.md.
+ *
+ * Returns `success: false` when threshold is malformed; otherwise always
+ * succeeds (an empty `archived` is fine — caller checks `count`).
+ */
+pub fn changelog_archive_below_version(text: string, threshold: string) -> ChangelogArchiveSplit {
+  const parsed = parse_threshold(threshold)
+  if parsed == nil {
+    return {
+      success: false,
+      changed: false,
+      kept: text,
+      archived: "",
+      count: 0,
+      suggested_archive_filename: "",
+      message: "threshold must look like MAJOR.MINOR (e.g. 0.9), got '${threshold}'",
+    }
+  }
+  let headings = changelog_heading_offsets(text)
+  let split_at = nil
+  let moved = 0
+  for h in headings {
+    if h.version == nil {
+      continue
+    }
+    const v = parse(h.version)
+    if v == nil {
+      continue
+    }
+    if version_lt(v.major, v.minor, parsed.major, parsed.minor) {
+      if split_at == nil {
+        split_at = h.start
+      }
+      moved = moved + 1
+    }
+  }
+  const filename = "CHANGELOG-pre-${parsed.major}.${parsed.minor}.md"
+  if split_at == nil {
+    return {
+      success: true,
+      changed: false,
+      kept: text,
+      archived: "",
+      count: 0,
+      suggested_archive_filename: filename,
+      message: "no `## vX.Y.Z` sections below ${threshold}; nothing to archive",
+    }
+  }
+  const kept = trim(text[0:split_at]) + "\n"
+  const archived = trim(text[split_at:len(text)]) + "\n"
+  return {
+    success: true,
+    changed: true,
+    kept: kept,
+    archived: archived,
+    count: moved,
+    suggested_archive_filename: filename,
+    message: "archived ${moved} `## vX.Y.Z` section(s) below ${threshold} to ${filename}",
+  }
+}
