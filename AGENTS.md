@@ -79,6 +79,19 @@ The entry points are:
   `--apply` also arms auto-merge, leased to the commit it published, so each
   repair lands once that repository's own checks pass. `--no-auto-merge` holds
   arming; it never merges anything itself.
+- `check_projection_source_drift.harn`: the trigger half of the same repair. A
+  projection has two inputs, the renderer here and the canonical source file in
+  another repository, and only the renderer had an event. This compares each
+  declared source's current head against the head it last converged from and
+  dispatches convergence for the consumers of the sources that moved. A head it
+  cannot resolve, a source with no record, and a source recorded twice all read
+  as unknown and converge; none of them may read as unchanged. Records live in
+  `refs/heads/projection-source-converged/`, one per source, read in a single
+  `git ls-remote`. This harness writes none of them:
+  `converge_fleet_projections.harn` records a source once every consumer that
+  projects it reports `clean`, because only that run knows whether the bytes
+  are in place. A proposed repair is not a converged one, so a run that opened
+  a pull request records nothing and the comparison asks again.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
