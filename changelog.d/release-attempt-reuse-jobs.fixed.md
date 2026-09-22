@@ -1,0 +1,1 @@
+Release recovery now re-enters the candidate-certification orchestrator, whose child gates reuse exact workflow and artifact receipts, instead of accepting or rejecting a candidate from ambiguous commit-check names.
