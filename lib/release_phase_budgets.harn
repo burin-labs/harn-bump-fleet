@@ -1,0 +1,179 @@
+/**
+ * The wall budget of every hosted release phase, as one registry.
+ *
+ * A release credential is a GitHub App installation token, and an installation
+ * token lives one hour. Whether that is enough is not a property of the token
+ * and not a property of the mode: it is a comparison between the token's
+ * lifetime and the wall budget of the phase it has to survive. Nothing stated
+ * that comparison, so it was answered by hand, per mode, and answered wrong. A
+ * `prepare` run spent 51 minutes in the linked suite and then died on a 401 at
+ * 65 minutes, because the credential refresher was armed for `ship-pr` only on
+ * the theory that `prepare` was short.
+ *
+ * Each row's budget is the `timeout-minutes` the owning workflow job declares,
+ * which is the only wall budget the release actually enforces.
+ * `release_phase_budget_drift` reads those declarations back out of the
+ * workflow source, so a job whose ceiling moves fails this registry rather than
+ * leaving it quietly stale.
+ */
+pub type ReleasePhaseBudget = {
+  phase: string,
+  label: string,
+  workflow: string,
+  job: string,
+  modes: list<string>,
+  wall_budget_s: int,
+}
+
+/** GitHub App installation tokens expire one hour after they are minted. */
+pub const RELEASE_CREDENTIAL_LIFETIME_S: int = 3600
+
+/** The interval `scripts/refresh_hosted_release_credentials.sh` is reminted on. */
+pub const RELEASE_CREDENTIAL_REFRESH_INTERVAL_S: int = 2400
+
+/**
+ * Headroom between a remint and the ceiling it must beat.
+ *
+ * A refresh interval equal to the lifetime is not a refresher, it is a race.
+ * Ten minutes covers a slow mint plus the API call that follows it.
+ */
+pub const RELEASE_CREDENTIAL_REFRESH_MARGIN_S: int = 600
+
+pub const RELEASE_PHASE_BUDGETS: list<ReleasePhaseBudget> = [
+  {
+    phase: "release_job",
+    label: "hosted release job",
+    workflow: ".github/workflows/hosted-release.yml",
+    job: "release",
+    modes: ["audit", "prepare", "ship-pr"],
+    wall_budget_s: 18000,
+  },
+  {
+    phase: "fleet_convergence_proof",
+    label: "hosted fleet convergence proof",
+    workflow: ".github/workflows/hosted-release.yml",
+    job: "fleet",
+    modes: ["ship-pr"],
+    wall_budget_s: 12600,
+  },
+  {
+    phase: "projection_convergence",
+    label: "fleet projection convergence",
+    workflow: ".github/workflows/fleet-projection-convergence.yml",
+    job: "converge",
+    modes: [],
+    wall_budget_s: 1800,
+  },
+]
+
+/** Every declared phase a given release mode has to pass through. */
+pub fn release_phases_for_mode(mode: string) -> list<ReleasePhaseBudget> {
+  return RELEASE_PHASE_BUDGETS.filter({ phase -> return contains(phase.modes, mode) }).to_list()
+}
+
+/**
+ * The phases a mode reaches whose wall budget outlives one mint.
+ *
+ * These are exactly the phases that need the credential refresher armed. A
+ * phase whose budget fits inside a mint needs nothing.
+ */
+pub fn release_phases_outliving_credential(
+  mode: string,
+  credential_lifetime_s: int,
+) -> list<ReleasePhaseBudget> {
+  return release_phases_for_mode(mode).filter(
+    { phase -> return phase.wall_budget_s > credential_lifetime_s },
+  )
+    .to_list()
+}
+
+pub type CredentialSurvivalDecision = {
+  ok: bool,
+  detail: string,
+  remedy: string,
+  phases_outliving_credential: list<string>,
+}
+
+/**
+ * Can the credential path survive every phase this mode reaches?
+ *
+ * Three separate ways it cannot, each reported by name rather than folded into
+ * one boolean: the mint is shorter than the interval that refreshes it, the
+ * refresher is not armed for this mode at all, or the mint is too short to
+ * reach even the first remint.
+ */
+pub fn release_credential_survival_decision(
+  mode: string,
+  credential_lifetime_s: int,
+  refresh_interval_s: int,
+  refresher_modes: list<string>,
+) -> CredentialSurvivalDecision {
+  const exposed = release_phases_outliving_credential(mode, credential_lifetime_s)
+  const names = exposed.map({ phase -> return phase.phase }).to_list()
+  if refresh_interval_s + RELEASE_CREDENTIAL_REFRESH_MARGIN_S > credential_lifetime_s {
+    return {
+      ok: false,
+      detail: "credential refresh interval ${to_string(refresh_interval_s)}s leaves under "
+        + "${to_string(RELEASE_CREDENTIAL_REFRESH_MARGIN_S)}s of headroom against a "
+        + "${to_string(credential_lifetime_s)}s mint",
+      remedy: "lower the refresh interval in scripts/refresh_hosted_release_credentials.sh's "
+        + "caller, or raise the mint lifetime",
+      phases_outliving_credential: names,
+    }
+  }
+  if len(exposed) == 0 {
+    return {
+      ok: true,
+      detail: "every ${mode} phase fits inside one ${to_string(credential_lifetime_s)}s mint",
+      remedy: "",
+      phases_outliving_credential: [],
+    }
+  }
+  if !contains(refresher_modes, mode) {
+    return {
+      ok: false,
+      detail: "${mode} reaches " + join(names, ", ")
+        + ", whose wall budget outlives a ${to_string(credential_lifetime_s)}s mint, and the "
+        + "credential refresher is not armed for this mode",
+      remedy: "arm scripts/refresh_hosted_release_credentials.sh for ${mode} in "
+        + ".github/workflows/hosted-release.yml",
+      phases_outliving_credential: names,
+    }
+  }
+  return {
+    ok: true,
+    detail: "${mode} reaches " + join(names, ", ")
+      + "; the credential refresher is armed and remints every "
+      + "${to_string(refresh_interval_s)}s against a ${to_string(credential_lifetime_s)}s mint",
+    remedy: "",
+    phases_outliving_credential: names,
+  }
+}
+
+/**
+ * Rows whose declared budget no longer matches the workflow that enforces it.
+ *
+ * `job_timeouts` maps `<workflow>#<job>` to the job's `timeout-minutes`. A row
+ * whose job is absent from that map is reported too: an unmeasured row and a
+ * matching row must not read the same.
+ */
+pub fn release_phase_budget_drift(job_timeouts: dict<string, int>) -> list<string> {
+  let drift: list<string> = []
+  for phase in RELEASE_PHASE_BUDGETS {
+    const key = "${phase.workflow}#${phase.job}"
+    const declared = job_timeouts.get(key)
+    if declared == nil {
+      drift = drift + ["${phase.phase}: ${key} declares no timeout-minutes"]
+      continue
+    }
+    const observed_s = (declared ?? 0) * 60
+    if observed_s != phase.wall_budget_s {
+      drift = drift
+        + [
+          "${phase.phase}: registry says ${to_string(phase.wall_budget_s)}s, ${key} declares "
+            + "${to_string(observed_s)}s",
+        ]
+    }
+  }
+  return drift
+}

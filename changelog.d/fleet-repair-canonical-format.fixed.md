@@ -1,0 +1,1 @@
+Fleet repair now runs the target Harn formatter and deterministic validator before invoking an agent, publishing format-only runtime migrations without model spend and giving genuine source repairs exact local failure evidence on their first attempt.
