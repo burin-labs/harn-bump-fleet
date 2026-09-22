@@ -1,0 +1,1 @@
+- Fix `release_harn.harn -- --help` handling and anchor absolute-path release harness runs to the harness checkout for prompt assets and run artifacts.
