@@ -1,0 +1,1 @@
+Release merge leases now produce one typed landing receipt consumed by publication and recovery, admitting squash only when the landed tree matches the certified tag tree, retaining strict ancestry for other merge methods, and preserving the newest valid receipt across workflow reruns.
