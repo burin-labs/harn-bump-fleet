@@ -1,0 +1,240 @@
+import { CommandResult, command_result_fail, command_result_ok } from "std/command"
+import { argv_step, scripted_argv } from "std/testing"
+import { fleet_self_check, fleet_self_update_decision } from "../lib/fleet_selfcheck"
+
+fn behind_fleet_commands(dirty: bool, fast_forward: bool) {
+  let entries = [
+    argv_step(["rev-parse", "--show-toplevel"], command_result_ok("/fleet\n")),
+    argv_step(["fetch", "origin", "--quiet"], command_result_ok("")),
+    argv_step(["rev-parse", "HEAD"], command_result_ok("aaaa\n")),
+    argv_step(["rev-parse", "origin/main"], command_result_ok("bbbb\n")),
+    argv_step(["rev-list", "--count", "HEAD..origin/main"], command_result_ok("2\n")),
+    argv_step(["rev-list", "--count", "origin/main..HEAD"], command_result_ok("0\n")),
+    argv_step(
+      ["status", "--porcelain", "--untracked-files=normal"],
+      command_result_ok(
+        if dirty {
+          " M release_harn.harn\n"
+        } else {
+          ""
+        },
+      ),
+    ),
+  ]
+  if fast_forward {
+    entries = entries
+      + [
+        argv_step(["merge", "--ff-only", "origin/main"], command_result_ok("Updated\n")),
+        argv_step(["rev-list", "--count", "HEAD..origin/main"], command_result_ok("0\n")),
+      ]
+  } else {
+    entries = entries
+      + [argv_step(["rev-list", "--count", "HEAD..origin/main"], command_result_ok("2\n"))]
+  }
+  return scripted_argv<CommandResult>(entries)
+}
+
+fn fleet_marker_exists(path: string) {
+  return path == "/fleet/release_harn.harn"
+}
+
+pipeline test_fleet_self_update_decision(task: any) {
+  // Read-only audit never gates.
+  assert_eq(
+    fleet_self_update_decision({mode: "audit", fetch_ok: true, behind: true}).action,
+    "skip",
+  )
+  // Unknown fetch state -> warn, proceed without a freshness guarantee.
+  const no_fetch = fleet_self_update_decision({mode: "prepare", fetch_ok: false})
+  assert_eq(no_fetch.action, "warn")
+  // Up to date -> proceed.
+  assert_eq(
+    fleet_self_update_decision({mode: "prepare", fetch_ok: true, equal: true}).action,
+    "proceed",
+  )
+  // Behind and fast-forwardable (clean) -> auto fast-forward by default.
+  const behind = fleet_self_update_decision(
+    {
+      mode: "prepare",
+      fetch_ok: true,
+      equal: false,
+      behind: true,
+      ahead: false,
+      dirty: false,
+      fleet_root: "/x",
+    },
+  )
+  assert_eq(behind.action, "autoff")
+  assert_eq(contains(behind.remediation ?? "", "git -C /x pull --ff-only"), true)
+  // Behind but dirty -> fail with preservation guidance, never shared stash.
+  const behind_dirty = fleet_self_update_decision(
+    {
+      mode: "prepare",
+      fetch_ok: true,
+      equal: false,
+      behind: true,
+      ahead: false,
+      dirty: true,
+      fleet_root: "/x",
+    },
+  )
+  assert_eq(behind_dirty.action, "fail")
+  assert_eq(contains(behind_dirty.remediation ?? "", "dedicated worktree"), true)
+  assert_eq(contains(behind_dirty.remediation ?? "", "signed WIP commit"), true)
+  assert_eq(contains(lowercase(behind_dirty.remediation ?? ""), "stash"), false)
+  assert_eq(contains(behind_dirty.remediation ?? "", "git -C /x pull --ff-only"), true)
+  // Behind + dirty + opt-in -> force the fast-forward.
+  const behind_dirty_opt = fleet_self_update_decision(
+    {
+      mode: "ship-pr",
+      fetch_ok: true,
+      equal: false,
+      behind: true,
+      ahead: false,
+      dirty: true,
+      opt_in: true,
+    },
+  )
+  assert_eq(behind_dirty_opt.action, "autoff")
+  // Ahead only (local unpushed) -> proceed on newer code.
+  assert_eq(
+    fleet_self_update_decision(
+      {mode: "prepare", fetch_ok: true, equal: false, behind: false, ahead: true},
+    ).action,
+    "proceed",
+  )
+  // Diverged -> fail with a rebase remediation.
+  const diverged = fleet_self_update_decision(
+    {mode: "prepare", fetch_ok: true, equal: false, behind: true, ahead: true, fleet_root: "/x"},
+  )
+  assert_eq(diverged.action, "fail")
+  assert_eq(contains(diverged.remediation ?? "", "pull --rebase"), true)
+}
+
+pipeline test_fleet_self_check_fast_forwards_then_requires_a_fresh_process(
+  harness: Harness,
+  task: any,
+) {
+  const commands = behind_fleet_commands(false, true)
+  const ff = fleet_self_check(
+    harness.tools,
+    commands.run,
+    fleet_marker_exists,
+    {mode: "prepare", default_branch: "main"},
+  )
+  assert_eq(ff.action, "restart")
+  assert_eq(ff.fleet_root, "/fleet")
+  assert_eq(ff.local_sha, "aaaa")
+  assert_eq(ff.ff?.success, true)
+  assert_eq(trim(commands.run(["rev-list", "--count", "HEAD..origin/main"]).stdout), "0")
+  commands.assert_consumed()
+}
+
+pipeline test_fleet_self_check_refuses_dirty_tree_in_process(harness: Harness, task: any) {
+  const commands = behind_fleet_commands(true, false)
+  const res = fleet_self_check(
+    harness.tools,
+    commands.run,
+    fleet_marker_exists,
+    {mode: "prepare", default_branch: "main"},
+  )
+  assert_eq(res.action, "fail")
+  assert_eq(contains(res.reason, "dirty"), true)
+  assert_eq(trim(commands.run(["rev-list", "--count", "HEAD..origin/main"]).stdout), "2")
+  commands.assert_consumed()
+}
+
+pipeline test_fleet_self_check_opt_in_fast_forwards_dirty_tree_then_restarts(
+  harness: Harness,
+  task: any,
+) {
+  const commands = behind_fleet_commands(true, true)
+  const ff = fleet_self_check(
+    harness.tools,
+    commands.run,
+    fleet_marker_exists,
+    {mode: "ship-pr", opt_in: true, default_branch: "main"},
+  )
+  assert_eq(ff.action, "restart")
+  assert_eq(ff.ff?.success, true)
+  assert_eq(trim(commands.run(["rev-list", "--count", "HEAD..origin/main"]).stdout), "0")
+  commands.assert_consumed()
+}
+
+pipeline test_supported_launcher_restarts_release_exactly_once(harness: Harness, task: any) {
+  const state = path_join(harness.fs.temp_dir(), "fleet-restart-" + harness.random.uuid_v7())
+  const launcher = path_join(dirname(harness.fs.cwd()), "scripts", "with_env.sh")
+  const command = "HARN_EXT_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL=1 '"
+    + launcher
+    + "' bash -c 'n=0; [ ! -f \"$1\" ] || n=$(cat \"$1\"); n=$((n + 1)); printf %s \"$n\" > \"$1\"; [ \"$n\" -gt 1 ] || exit 75' release_harn.harn '"
+    + state
+    + "'"
+  const result = harness.process.shell(command)
+  assert_eq(result.success, true, result.stderr)
+  assert_eq(result.exit_code, 0, result.stderr)
+  assert_eq(trim(harness.fs.read_text(state)), "2")
+}
+
+pipeline test_supported_launcher_refuses_a_restart_loop(harness: Harness, task: any) {
+  const state = path_join(harness.fs.temp_dir(), "fleet-restart-loop-" + harness.random.uuid_v7())
+  const launcher = path_join(dirname(harness.fs.cwd()), "scripts", "with_env.sh")
+  const command = "HARN_EXT_BUMP_FLEET_SKIP_HARN_AUTO_INSTALL=1 '"
+    + launcher
+    + "' bash -c 'n=0; [ ! -f \"$1\" ] || n=$(cat \"$1\"); n=$((n + 1)); printf %s \"$n\" > \"$1\"; exit 75' release_harn.harn '"
+    + state
+    + "'"
+  const result = harness.process.shell(command)
+  assert_eq(result.success, false, result.stderr)
+  assert_eq(result.exit_code, 75, result.stderr)
+  assert_eq(trim(harness.fs.read_text(state)), "2")
+  assert(contains(result.stderr, "refusing a loop"))
+}
+
+pipeline test_fleet_self_check_wrapper(harness: Harness, task: any) {
+  const always_exists = { _p -> true }
+  // Audit short-circuits before touching git.
+  const skip = fleet_self_check(
+    harness.tools,
+    { _a -> command_result_ok("") },
+    always_exists,
+    {mode: "audit"},
+  )
+  assert_eq(skip.action, "skip")
+  // Equal HEADs -> proceed.
+  const equal_git = scripted_argv<CommandResult>(
+    [
+      argv_step(["rev-parse", "--show-toplevel"], command_result_ok("/fleet\n")),
+      argv_step(["fetch", "origin", "--quiet"], command_result_ok("")),
+      argv_step(["rev-parse", "HEAD"], command_result_ok("cccc\n")),
+      argv_step(["rev-parse", "origin/main"], command_result_ok("cccc\n")),
+      argv_step(["rev-list", "--count", "HEAD..origin/main"], command_result_ok("0\n")),
+      argv_step(["rev-list", "--count", "origin/main..HEAD"], command_result_ok("0\n")),
+    ],
+  )
+  assert_eq(
+    fleet_self_check(harness.tools, equal_git.run, always_exists, {mode: "prepare"}).action,
+    "proceed",
+  )
+  equal_git.assert_consumed()
+  // Resolved root is not the fleet checkout (marker missing) -> warn, no gating.
+  const wrong_git = scripted_argv<CommandResult>(
+    [argv_step(["rev-parse", "--show-toplevel"], command_result_ok("/elsewhere\n"))],
+  )
+  const wrong = fleet_self_check(harness.tools, wrong_git.run, { _p -> false }, {mode: "prepare"})
+  assert_eq(wrong.action, "warn")
+  wrong_git.assert_consumed()
+  // Fetch failure -> warn (cannot verify freshness).
+  const no_fetch_git = scripted_argv<CommandResult>(
+    [
+      argv_step(["rev-parse", "--show-toplevel"], command_result_ok("/fleet\n")),
+      argv_step(["fetch", "origin", "--quiet"], command_result_fail(1, "network down")),
+      argv_step(["rev-parse", "HEAD"], command_result_ok("aaaa\n")),
+      argv_step(["rev-parse", "origin/main"], command_result_fail(1, "unknown revision")),
+    ],
+  )
+  assert_eq(
+    fleet_self_check(harness.tools, no_fetch_git.run, always_exists, {mode: "ship-pr"}).action,
+    "warn",
+  )
+  no_fetch_git.assert_consumed()
+}

@@ -1,0 +1,1 @@
+Read-only release audits now reuse the stable release workspace when its typed host lease is free, preserving Cargo fingerprints across runs while contending audits fall back to isolated per-run checkouts and live releases keep priority over the warm path.

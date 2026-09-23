@@ -1,0 +1,1 @@
+- Pass the reconciled release version to the frozen CLI AOT generator when validating prepared Harn releases.
