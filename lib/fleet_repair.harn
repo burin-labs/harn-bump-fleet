@@ -3,7 +3,11 @@ import { agent_loop } from "std/agent/loop"
 import { agent_preset } from "std/agent/presets"
 import { is_v_semver } from "std/semver"
 import { workflow_run_repair } from "std/workflow/repair"
-import { CHAIN_CODE_REPAIRABLE_REASON, CHAIN_RECOVERABLE_REASON } from "./fleet_chain_stop"
+import {
+  CHAIN_CODE_REPAIRABLE_REASON,
+  CHAIN_RECOVERABLE_REASON,
+  CHAIN_REVIEW_REPAIRABLE_REASON,
+} from "./fleet_chain_stop"
 import { FleetConvergenceRow, FleetConvergenceSnapshot } from "./fleet_convergence"
 import {
   FleetManifest,
@@ -19,6 +23,7 @@ pub import {
   FleetRepairPlan,
   FleetRepairPolicy,
   FleetRepairReceipt,
+  FleetRepairRefusal,
 } from "./fleet_repair_contract"
 pub import {
   FleetRepairAttempt,
@@ -31,7 +36,17 @@ pub import {
   fleet_repair_terminal_outcome,
 } from "./fleet_repair_terminal"
 import { project_fleet_repair_terminal_result } from "./fleet_repair_terminal"
-import { github_pr_upsert, github_pr_view, github_worktree_commit } from "./github"
+import {
+  FleetReviewFinding,
+  fleet_answer_review_findings,
+  fleet_review_findings_prompt,
+} from "./fleet_review_findings"
+import {
+  github_connector_options,
+  github_pr_upsert,
+  github_pr_view,
+  github_worktree_commit,
+} from "./github"
 import {
   HarnUpdateRuntimeProvenance,
   harn_update_budget_decision,
@@ -47,6 +62,7 @@ import {
   unsigned_commits,
 } from "./signed_bot_prs"
 import { release_compaction_policy, tool_repair_projection_policy } from "./transcript_context"
+import { GithubClientOptions } from "harn-github-connector/default"
 
 // Change this when the repair prompt, tool surface, or receipt meaning changes.
 // A resumable agent session is evidence for one immutable repair contract, not
@@ -131,8 +147,18 @@ fn repository_for(repositories: list<FleetRepository>, slug: string) -> FleetRep
   return nil
 }
 
-fn repair_refusal(row: FleetConvergenceRow, reason: string) {
-  return {repo: row.repo, reason: reason}
+fn repair_refusal(row: FleetConvergenceRow, reason: string) -> FleetRepairRefusal {
+  if len(row.review_findings ?? []) == 0 {
+    return {repo: row.repo, reason: reason}
+  }
+  // A refused row still owes its reviewer an answer, so the findings ride along.
+  return {
+    repo: row.repo,
+    reason: reason,
+    pr_number: row.pr_number,
+    head_sha: row.head_sha,
+    review_findings: row.review_findings,
+  }
 }
 
 /**
@@ -162,7 +188,7 @@ pub fn fleet_repair_plan(
     }
   let candidates: list<FleetRepairCandidate> = []
   let recoveries: list<FleetRecoveryCandidate> = []
-  let refused: list<{repo: string, reason: string}> = []
+  let refused: list<FleetRepairRefusal> = []
   for row in snapshot.repositories {
     if row.state != "failed" {
       continue
@@ -199,7 +225,7 @@ pub fn fleet_repair_plan(
       }
       continue
     }
-    if row.reason != CHAIN_CODE_REPAIRABLE_REASON {
+    if row.reason != CHAIN_CODE_REPAIRABLE_REASON && row.reason != CHAIN_REVIEW_REPAIRABLE_REASON {
       refused = refused + [repair_refusal(row, "failure_not_code_repairable:" + row.reason)]
       continue
     }
@@ -230,6 +256,7 @@ pub fn fleet_repair_plan(
           branch: update.branch,
           auto_arm: update.auto_arm,
           require_signed_head: update.require_signed_head,
+          review_findings: row.review_findings ?? [],
         },
       ]
   }
@@ -570,6 +597,7 @@ fn repair_prompt(
       pr_url: candidate.pr_url,
       head_sha: candidate.head_sha,
       failing_checks_json: json_stringify(candidate.failing_checks),
+      review_findings: fleet_review_findings_prompt(candidate.review_findings ?? []),
       prior_findings: join(prior_findings, "\n"),
     },
   )
@@ -844,7 +872,11 @@ fn publish_candidate(
     {
       slug: candidate.repo,
       branch: candidate.branch,
-      headline: "Repair Harn runtime bump validation",
+      headline: if len(candidate.review_findings ?? []) > 0 {
+        "Address review findings on the Harn runtime bump"
+      } else {
+        "Repair Harn runtime bump validation"
+      },
       repo_dir: candidate.directory,
       source: "index",
       base_oid: candidate.head_sha,
@@ -947,6 +979,91 @@ fn deterministic_validation_evidence(
 }
 
 /**
+ * A result decided before any formatter or agent runs, or nil to go on.
+ *
+ * A checkout that already validates needs nothing, unless a reviewer finding is
+ * open on it: the finding is then the repair, and only the agent pass can make
+ * it, so the deterministic pass hands it on.
+ */
+fn settled_before_repair(
+  candidate: FleetRepairCandidate,
+  policy: FleetRepairPolicy,
+  initial_validation: dict,
+) -> FleetRepairResult? {
+  const reviewed = len(candidate.review_findings ?? []) > 0
+  if !reviewed {
+    return if initial_validation?.ok ?? false {
+      {
+        repo: candidate.repo,
+        status: "no_change",
+        reason: "leased_checkout_already_valid",
+        pr_number: candidate.pr_number,
+        old_head_sha: candidate.head_sha,
+        validation_evidence: deterministic_validation_evidence(
+          candidate,
+          initial_validation,
+          [],
+          initial_validation,
+        ),
+        attempts: [],
+        known_cost_usd: 0.0,
+        cost_status: "exact",
+      }
+    } else {
+      nil
+    }
+  }
+  if !(policy.deterministic_only ?? false) {
+    return nil
+  }
+  return {
+    repo: candidate.repo,
+    status: "failed",
+    reason: "agent_repair_required",
+    pr_number: candidate.pr_number,
+    old_head_sha: candidate.head_sha,
+    attempts: [],
+    known_cost_usd: 0.0,
+    cost_status: "exact",
+  }
+}
+
+/** What the agent is first told to fix: reviewer findings, then formatter and validator output. */
+fn initial_repair_findings(
+  candidate: FleetRepairCandidate,
+  formatted: dict,
+  validation_ok: bool,
+  validation_output: string,
+) -> list<string> {
+  const reviewed = len(candidate.review_findings ?? []) > 0
+  return fleet_repair_validation_findings(
+    false,
+    join(
+      [
+        if reviewed {
+          "the repository's automated reviewer left these findings on the pull request:\n"
+            + fleet_review_findings_prompt(candidate.review_findings ?? [])
+        } else {
+          ""
+        },
+        if (formatted?.ok ?? false) || trim(to_string(formatted?.output ?? "")) == "" {
+          ""
+        } else {
+          "canonical formatter failed:\n" + to_string(formatted?.output ?? "")
+        },
+        if validation_ok {
+          ""
+        } else {
+          validation_output
+        },
+      ]
+        .filter({ finding -> trim(finding) != "" }),
+      "\n\n",
+    ),
+  )
+}
+
+/**
  * Repair a checkout whose exact revision was already established by the caller.
  *
  * The production entry point above owns the Git fetch/detach/clean lease. This
@@ -968,23 +1085,12 @@ pub fn repair_fleet_candidate_in_checkout(
       output: "validator could not start under prepared process authority: " + to_string(error),
     }
   }
-  if initial_validation.ok {
-    return {
-      repo: candidate.repo,
-      status: "no_change",
-      reason: "leased_checkout_already_valid",
-      pr_number: candidate.pr_number,
-      old_head_sha: candidate.head_sha,
-      validation_evidence: deterministic_validation_evidence(
-        candidate,
-        initial_validation,
-        [],
-        initial_validation,
-      ),
-      attempts: [],
-      known_cost_usd: 0.0,
-      cost_status: "exact",
-    }
+  // A reviewer finding is the repair itself: a checkout that already validates
+  // still owes the change the finding asks for, so it goes to the agent.
+  const reviewed = len(candidate.review_findings ?? []) > 0
+  const settled = settled_before_repair(candidate, policy, initial_validation)
+  if settled != nil {
+    return settled
   }
   const formatted = try {
     format_candidate(harness.process, candidate)
@@ -1010,7 +1116,7 @@ pub fn repair_fleet_candidate_in_checkout(
     formatted_paths,
     formatted_validation,
   )
-  if formatted_validation.ok && len(formatted_paths) > 0 {
+  if formatted_validation.ok && len(formatted_paths) > 0 && !reviewed {
     const publication = try {
       publish_candidate(harness, candidate)
     } catch (error) {
@@ -1054,24 +1160,15 @@ pub fn repair_fleet_candidate_in_checkout(
       cost_status: "exact",
     }
   }
-  const initial_findings = fleet_repair_validation_findings(
-    false,
-    join(
-      [
-        if formatted.ok || trim(formatted.output) == "" {
-          ""
-        } else {
-          "canonical formatter failed:\n" + formatted.output
-        },
-        if len(formatted_paths) == 0 {
-          initial_validation.output
-        } else {
-          formatted_validation.output
-        },
-      ]
-        .filter({ finding -> trim(finding) != "" }),
-      "\n\n",
-    ),
+  const initial_findings = initial_repair_findings(
+    candidate,
+    formatted,
+    formatted_validation.ok,
+    if len(formatted_paths) == 0 {
+      initial_validation.output
+    } else {
+      formatted_validation.output
+    },
   )
   const executor = { ctx ->
     const findings = if len(ctx.prior_findings ?? []) > 0 {
@@ -1164,7 +1261,11 @@ pub fn repair_fleet_candidate_in_checkout(
     return {
       repo: candidate.repo,
       status: "failed",
-      reason: "red_checkout_received_no_repair_delta",
+      reason: if reviewed {
+        "review_findings_received_no_repair_delta"
+      } else {
+        "red_checkout_received_no_repair_delta"
+      },
       pr_number: candidate.pr_number,
       old_head_sha: candidate.head_sha,
       validation_evidence: deterministic_validations,
@@ -1294,6 +1395,7 @@ pub fn repair_fleet_plan(
   harness: Harness,
   plan: FleetRepairPlan,
   policy: FleetRepairPolicy,
+  options: GithubClientOptions = github_connector_options(),
 ) -> FleetRepairReceipt {
   let results: list<FleetRepairResult> = plan.refused.map(
     { row ->
@@ -1410,5 +1512,82 @@ pub fn repair_fleet_plan(
       stopped_reason = "run_cost_not_exact"
     }
   }
-  return fleet_repair_receipt(plan, results, policy, stopped_reason)
+  return fleet_repair_receipt(
+    plan,
+    answer_review_findings(harness, plan, results, options),
+    policy,
+    stopped_reason,
+  )
+}
+
+/** Every open reviewer finding in the plan, keyed to the pull request it is on. */
+fn plan_review_findings(
+  plan: FleetRepairPlan,
+) -> list<{repo: string, pr_number: int, head_sha: string, findings: list<FleetReviewFinding>}> {
+  const from_candidates = plan.candidates.map(
+    { candidate ->
+      {
+        repo: candidate.repo,
+        pr_number: candidate.pr_number,
+        head_sha: candidate.head_sha,
+        findings: candidate.review_findings ?? [],
+      }
+    },
+  )
+    .to_list()
+  const from_refusals = plan.refused.map(
+    { row ->
+      {
+        repo: row.repo,
+        pr_number: row.pr_number ?? 0,
+        head_sha: row.head_sha ?? "",
+        findings: row.review_findings ?? [],
+      }
+    },
+  )
+    .to_list()
+  return (from_candidates + from_refusals).filter(
+    { entry -> len(entry.findings) > 0 && entry.pr_number > 0 && trim(entry.head_sha) != "" },
+  )
+    .to_list()
+}
+
+/**
+ * Answer every open reviewer finding the round saw, whatever the round did.
+ *
+ * A repaired pull request's threads name the head that addresses them; every
+ * other outcome, including a refusal before any agent ran, names its typed
+ * reason. This is the guarantee: no finding ends a round without a fleet reply.
+ */
+fn answer_review_findings(
+  harness: Harness,
+  plan: FleetRepairPlan,
+  results: list<FleetRepairResult>,
+  options: GithubClientOptions,
+) -> list<FleetRepairResult> {
+  const owed = plan_review_findings(plan)
+  return results.map(
+    { result ->
+      const entry = owed.find({ entry -> entry.repo == result.repo })
+      if entry == nil {
+        return result
+      }
+      const repaired = result.status == "repaired" && trim(result.new_head_sha ?? "") != ""
+      const replies = fleet_answer_review_findings(
+        harness,
+        entry.repo,
+        entry.pr_number,
+        entry.findings,
+        if repaired {
+          {status: "repaired", head_sha: result.new_head_sha ?? "", reason: result.reason}
+        } else {
+          {status: "escalated", reason: result.reason}
+        },
+        entry.head_sha,
+        options,
+      )
+      return result + {review_replies: replies}
+    },
+  )
+    .to_list()
 }

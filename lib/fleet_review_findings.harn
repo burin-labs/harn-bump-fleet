@@ -1,0 +1,242 @@
+// The automated reviewer's open findings on a fleet pull request, and the
+// fleet's answer to each one.
+//
+// A consumer that requires an approving review and resolved threads gates the
+// fleet's pull requests on its automated reviewer. When that reviewer leaves a
+// finding, the checks are green and the merge is blocked on the thread. Before
+// this module the fleet saw only `merge_state_blocked`: the finding text never
+// reached the repair agent, and nothing ever replied, so the pull request sat
+// until a person noticed. Every unresolved reviewer thread now ends a repair
+// round with a fleet reply: the head that addressed it, or the typed reason it
+// could not be addressed.
+import { github_connector_options, github_slug_parts } from "./github"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+/**
+ * Accounts whose review threads the fleet answers.
+ *
+ * The automated reviewer posts as the Actions bot; GitHub's GraphQL names it
+ * without the `[bot]` suffix. A person's thread is theirs to settle, so only
+ * these authors' threads are read as findings.
+ */
+pub const FLEET_REVIEWER_LOGINS: list<string> = ["github-actions"]
+
+/** One unresolved reviewer thread, as the repair agent and the reply need it. */
+pub type FleetReviewFinding = {
+  thread_id: string,
+  comment_id: int,
+  path: string,
+  line: int?,
+  body: string,
+  url: string,
+  /**
+   * The head the fleet last answered this thread at, read from its marker in
+   * the thread's newest comment; nil when the fleet has not answered it.
+   */
+  answered_head?: string,
+}
+
+/** The hidden marker a fleet reply carries, naming the head it answered at. */
+pub fn fleet_review_answer_marker(head_sha: string) -> string {
+  return "<!-- harn-fleet-review-answer:${lowercase(trim(head_sha))} -->"
+}
+
+fn answered_head(comment: any) -> string? {
+  const found = regex_captures(
+    "<!-- harn-fleet-review-answer:([0-9a-f]{40}) -->",
+    to_string(comment?.body ?? ""),
+  )
+  return if len(found) == 1 {
+    found[0].groups[0]
+  } else {
+    nil
+  }
+}
+
+/** The first comment's author starts the thread; replies do not change whose it is. */
+pub fn fleet_review_findings_from_threads(threads: list) -> list<FleetReviewFinding> {
+  let findings: list<FleetReviewFinding> = []
+  for thread in threads {
+    if thread?.isResolved ?? true {
+      continue
+    }
+    const first = (thread?.comments?.nodes ?? [])[0]
+    const author = to_string(first?.author?.login ?? "")
+    const comment_id = to_int(first?.databaseId ?? 0) ?? 0
+    if !FLEET_REVIEWER_LOGINS.contains(author) || comment_id <= 0 {
+      continue
+    }
+    findings = findings
+      + [
+        {
+          thread_id: to_string(thread?.id ?? ""),
+          comment_id: comment_id,
+          path: to_string(thread?.path ?? ""),
+          line: to_int(thread?.line),
+          body: to_string(first?.body ?? ""),
+          url: to_string(first?.url ?? ""),
+          answered_head: answered_head((thread?.latest?.nodes ?? [])[0]),
+        },
+      ]
+  }
+  return findings
+}
+
+const THREADS_QUERY: string = "query($owner:String!,$name:String!,$number:Int!){"
+  + "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+  + "reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved path line "
+  + "comments(first:1){nodes{databaseId author{login} body url}} "
+  + "latest:comments(last:1){nodes{body}}}}}}}"
+
+/**
+ * Read the reviewer's unresolved findings on one pull request.
+ *
+ * A second page is refused rather than truncated: a finding past the first
+ * hundred threads would otherwise read as answered.
+ */
+pub fn fleet_review_findings(
+  harness: Harness,
+  repo: string,
+  pr_number: int,
+  options: GithubClientOptions = github_connector_options(),
+) -> Result<list<FleetReviewFinding>, string> {
+  const parts = github_slug_parts(repo)
+  if parts == nil || pr_number <= 0 {
+    return Err("review thread read requires owner/name and a pull request number")
+  }
+  const read = api_call(
+    harness,
+    {
+      path: "/graphql",
+      method: "POST",
+      body: {
+        query: THREADS_QUERY,
+        variables: {owner: parts.owner, name: parts.repo, number: pr_number},
+      },
+      options: options,
+    },
+  )
+  if is_err(read) {
+    return Err("review thread read failed: " + to_string(unwrap_err(read)))
+  }
+  const threads = unwrap(read)?.data?.repository?.pullRequest?.reviewThreads
+  if threads == nil {
+    return Err("review thread read returned no thread list")
+  }
+  if threads?.pageInfo?.hasNextPage ?? false {
+    return Err("review thread read spans more than one page")
+  }
+  return Ok(fleet_review_findings_from_threads(threads?.nodes ?? []))
+}
+
+/** What the fleet did about a pull request's findings in one repair round. */
+pub type FleetReviewAnswer = {
+  status: "repaired" | "escalated",
+  /** The head that addresses the findings; set when `status` is `repaired`. */
+  head_sha?: string,
+  /** The typed reason the round could not address them. */
+  reason: string,
+}
+
+/**
+ * How a pull request's findings stand for the round that reads them.
+ *
+ * `unanswered` findings go to the repair agent. When every open finding was
+ * already answered at the current head, the fleet escalated them there and
+ * nothing has changed since, so another round would only repeat the answer.
+ */
+pub type FleetReviewStanding = {
+  state: "none" | "unanswered" | "escalated",
+  findings: list<FleetReviewFinding>,
+}
+
+pub fn fleet_review_standing(
+  findings: list<FleetReviewFinding>,
+  head_sha: string,
+) -> FleetReviewStanding {
+  if len(findings) == 0 {
+    return {state: "none", findings: []}
+  }
+  const head = lowercase(trim(head_sha))
+  const open = findings.filter({ finding -> (finding.answered_head ?? "") != head }).to_list()
+  return if len(open) == 0 {
+    {state: "escalated", findings: findings}
+  } else {
+    {state: "unanswered", findings: open}
+  }
+}
+
+/**
+ * The one reply the fleet posts on each finding's thread.
+ *
+ * The marker names the head the answer was given at: a repair names the head
+ * it pushed, so the reviewer's next verdict supersedes it; an escalation names
+ * the head it could not repair, so the next round reads it as already answered.
+ */
+pub fn fleet_review_reply_body(answer: FleetReviewAnswer, at_head: string) -> string {
+  const text = if answer.status == "repaired" {
+    "The fleet's repair agent pushed ${answer.head_sha ?? ""} to address this finding "
+      + "and the repository's validation passed at that head. Please re-verify."
+  } else {
+    "The fleet could not address this finding in this round (`${answer.reason}`), "
+      + "so the update is escalated with that reason rather than left waiting."
+  }
+  return text + "\n\n" + fleet_review_answer_marker(answer.head_sha ?? at_head)
+}
+
+/** One posted reply, or the reason it could not be posted. */
+pub type FleetReviewReply = {comment_id: int, posted: bool, detail: string}
+
+/** Reply once on every finding's thread. A reply that fails is reported, never dropped. */
+pub fn fleet_answer_review_findings(
+  harness: Harness,
+  repo: string,
+  pr_number: int,
+  findings: list<FleetReviewFinding>,
+  answer: FleetReviewAnswer,
+  at_head: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> list<FleetReviewReply> {
+  const body = fleet_review_reply_body(answer, at_head)
+  let replies: list<FleetReviewReply> = []
+  for finding in findings {
+    const posted = api_call(
+      harness,
+      {
+        path:
+          "/repos/${repo}/pulls/${to_string(pr_number)}/comments/${to_string(finding.comment_id)}/replies",
+        method: "POST",
+        body: {body: body},
+        options: options,
+      },
+    )
+    replies = replies
+      + [
+        {
+          comment_id: finding.comment_id,
+          posted: !is_err(posted),
+          detail: if is_err(posted) {
+            to_string(unwrap_err(posted))
+          } else {
+            "replied"
+          },
+        },
+      ]
+  }
+  return replies
+}
+
+/** Findings rendered for the repair agent's prompt, one block per thread. */
+pub fn fleet_review_findings_prompt(findings: list<FleetReviewFinding>) -> string {
+  return join(
+    findings.map(
+      { finding ->
+        "- ${finding.path}${if finding.line == nil { "" } else { ":" + to_string(finding.line) }} "
+          + "(${finding.url})\n"
+          + finding.body
+      },
+    )
+      .to_list(),
+    "\n\n",
+  )
+}
