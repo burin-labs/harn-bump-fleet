@@ -13,6 +13,7 @@ import {
   GithubAutoMergeReceipt,
   GithubClientOptions,
   GithubConnectorResult,
+  api_call,
 } from "harn-github-connector/default"
 
 /** One cross-process owner for merge mutations while a release candidate exists. */
@@ -100,6 +101,38 @@ pub fn release_merge_method(value: any) -> ReleaseMergeMethod? {
   }
 }
 
+/** Whether a pull request view or REST row reports a completed merge. */
+pub fn release_pull_request_merged(pull_request: any) -> bool {
+  return (pull_request?.merged ?? false)
+    || lowercase(trim(to_string(pull_request?.github_state ?? pull_request?.state ?? "")))
+      == "merged"
+    || (lowercase(trim(to_string(pull_request?.state ?? ""))) == "closed"
+      && trim(to_string(pull_request?.merged_at ?? "")) != "")
+}
+
+/**
+ * Whether a lease's incumbent candidate has already shipped.
+ *
+ * The terminal watcher finishes a lease only on its own success, so a release
+ * that shipped through any other path (a recovery, a hand merge, a watcher that
+ * died after the merge) leaves its lease behind with no expiry, and every later
+ * cut refuses on it. Shipped means the incumbent's own pull request merged at
+ * the exact candidate head and its release tag exists. An open, unmerged, or
+ * retargeted candidate is still live and keeps the lease.
+ */
+pub fn release_merge_lease_incumbent_shipped(
+  incumbent: ReleaseMergeLease,
+  pull_request: any,
+  tag_present: bool,
+) -> bool {
+  return tag_present
+    && to_int(pull_request?.number ?? 0) == incumbent.candidate_pr
+    && lowercase(trim(to_string(pull_request?.head?.sha ?? "")))
+      == lowercase(incumbent.candidate_head)
+    && to_string(pull_request?.base?.ref ?? "") == incumbent.base_branch
+    && release_pull_request_merged(pull_request)
+}
+
 /** Construct the one landing receipt from the lease and exact merged PR view. */
 pub fn release_landing_receipt(
   lease: ReleaseMergeLease,
@@ -113,11 +146,7 @@ pub fn release_landing_receipt(
   )
   const head_oid = lowercase(trim(to_string(pull_request?.head?.sha ?? "")))
   const number = to_int(pull_request?.number ?? 0) ?? 0
-  const merged = (pull_request?.merged ?? false)
-    || lowercase(trim(to_string(pull_request?.github_state ?? pull_request?.state ?? "")))
-      == "merged"
-    || (lowercase(trim(to_string(pull_request?.state ?? ""))) == "closed"
-      && trim(to_string(pull_request?.merged_at ?? "")) != "")
+  const merged = release_pull_request_merged(pull_request)
   const candidate_tree = lowercase(trim(candidate_tree_oid))
   const merged_tree = lowercase(trim(merged_tree_oid))
   if number != lease.candidate_pr
@@ -536,6 +565,69 @@ pub fn observe_release_merge_lease(
   )
 }
 
+/**
+ * Take over a lease whose incumbent has shipped, or answer nil to keep refusing.
+ *
+ * The release is exact-oid, so an incumbent that changed between the claim and
+ * this read is never deleted, and the second claim is the same atomic create as
+ * the first: a concurrent cut that wins the gap is the owner, and this one
+ * refuses as held.
+ */
+fn supersede_shipped_release_merge_lease(
+  harness: Harness,
+  lease: ReleaseMergeLease,
+  incumbent: ReleaseMergeLease,
+  incumbent_oid: string,
+  options: GithubClientOptions,
+) -> Result<ReleaseMergeLeaseClaim, GithubConnectorError>? {
+  if !exact_oid(incumbent_oid) {
+    return nil
+  }
+  const pull_request = github_pr_view(harness, incumbent.repo, incumbent.candidate_pr, options)
+  const tag = api_call(
+    harness,
+    {path: "/repos/${incumbent.repo}/git/ref/tags/${incumbent.tag}", options: options},
+  )
+  // A read failure, including an absent tag, keeps the incumbent: only a
+  // positively observed tag object can retire it.
+  const tag_present = !is_err(tag) && exact_oid(unwrap(tag)?.object?.sha)
+  if is_err(pull_request)
+    || !release_merge_lease_incumbent_shipped(incumbent, unwrap(pull_request), tag_present) {
+    return nil
+  }
+  const ref = release_merge_lease_ref(lease.base_branch)
+  const released = github_release_ref(harness, lease.repo, ref, incumbent_oid, options)
+  if is_err(released) || !unwrap(released).released {
+    return nil
+  }
+  const reclaimed = github_claim_ref(
+    harness,
+    lease.repo,
+    ref,
+    {
+      payload: {
+        message: release_merge_lease_headline(lease),
+        base_ref: "refs/heads/" + lease.base_branch,
+      },
+    },
+    options,
+  )
+  if is_err(reclaimed) || !unwrap(reclaimed).claimed {
+    return nil
+  }
+  return Ok(
+    {
+      acquired: true,
+      idempotent: false,
+      ref: ref,
+      oid: unwrap(reclaimed).oid,
+      lease: lease,
+      reason: "claimed release merge lease after superseding shipped candidate "
+        + "${incumbent.repo}#${to_string(incumbent.candidate_pr)} (${incumbent.tag})",
+    },
+  )
+}
+
 /** Atomically claim the base's lease, or identify the exact existing owner. */
 pub fn claim_release_merge_lease(
   harness: Harness,
@@ -562,6 +654,19 @@ pub fn claim_release_merge_lease(
   const incumbent = parse_release_merge_lease_headline(result.holder_headline ?? "")
   const idempotent = !result.claimed && incumbent == lease
   if !result.claimed && !idempotent {
+    if incumbent != nil && incumbent.repo == lease.repo
+      && incumbent.base_branch == lease.base_branch {
+      const superseded = supersede_shipped_release_merge_lease(
+        harness,
+        lease,
+        unwrap(incumbent),
+        result.oid,
+        options,
+      )
+      if superseded != nil {
+        return superseded
+      }
+    }
     return Err(
       {
         code: "release_merge_lease_held",
