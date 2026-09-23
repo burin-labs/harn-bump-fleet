@@ -1,0 +1,854 @@
+import { read_toml } from "std/fs"
+import {
+  FleetDispatchScope,
+  fleet_operation_scope,
+  fleet_scope_members,
+} from "./fleet_operation_scope"
+
+pub type ConnectorSecretDirection = "outbound" | "inbound"
+
+/** One first-party connector secret and the direction in which trust crosses the provider seam. */
+pub type ConnectorRequiredSecret = {id: string, direction: ConnectorSecretDirection}
+
+pub type ConnectorSecretSchema = "legacy" | "direction-v1"
+
+/** One consumer-owned job and step whose success proves a release candidate. */
+pub type ConsumerPretagProofJob = {name: string, step: string}
+
+/** One repository and the Harn-owned fleet capabilities projected into it. */
+pub type FleetRepository = {
+  slug: string,
+  directory: string,
+  harn_package?: bool,
+  package_ci_ownership?: "fleet" | "pin",
+  package_validate_command?: string,
+  harn_bump?: bool,
+  harn_pin_kind?: "auto" | "version_file" | "cargo" | "formula",
+  harn_pin_path?: string,
+  bump_workflow_ownership?: "fleet" | "repository",
+  bump_workflow_path?: string,
+  bump_branch?: string,
+  bump_branch_template?: string,
+  bump_repair_enabled?: bool,
+  bump_prerequisites?: list<string>,
+  bump_max_releases_behind?: int,
+  bump_require_signed_head?: bool,
+  run_poll_tick?: bool,
+  test_jobs?: int,
+  bump_refresh_command?: string,
+  bump_refresh_notes?: string,
+  bump_validate_command?: string,
+  bump_node_version?: string,
+  bump_allowed_new_files?: list<string>,
+  bump_apply_behavior_preserving_fixes?: bool,
+  bump_enable_auto_merge?: bool,
+  connector_required_secrets?: list<ConnectorRequiredSecret>,
+  consumer_owned_contract?: bool,
+  // Runtime-only, like the bump fields above: a consumer names its own pre-tag
+  // gate in its own manifest, so fleet.toml never carries these.
+  pretag_gate_workflow?: string,
+  pretag_gate_inputs?: dict<string, string>,
+  pretag_gate_proof_job?: ConsumerPretagProofJob,
+  // Runtime-only identity of the exact consumer manifest that hydrated this
+  // row. It is never accepted from fleet.toml; the remote manifest reader
+  // computes it from bytes fetched at consumer_contract_ref.
+  consumer_contract_sha256?: string,
+  // A repository whose pull requests must lead with `[Area] Sentence case`
+  // declares `pr_title_gate = true` and the one area the fleet's own pull
+  // requests belong under. The two are declared together: a gate without an
+  // area leaves the fleet unable to title a pull request this repository would
+  // accept, and an area without a gate names an area nothing enforces.
+  pr_title_gate?: bool,
+  pr_title_area?: string,
+  // Contexts this repository's releases require green on the commit being cut,
+  // over and above whatever its rulesets require to merge. Declared here
+  // because a ruleset answers what may land on main, not what may ship: a slow
+  // lane that runs on every default-branch push is branch-covered and is not
+  // release-only, so without a declaration no release gate reads it at all.
+  // The release decision runs on the union of this list and the ruleset set.
+  release_required_contexts?: list<string>,
+}
+
+/** One exact file shape used to read a consumer's Harn version. */
+pub type HarnPinSpec = {kind: "auto" | "version_file" | "cargo" | "formula", path?: string}
+
+/** One already-resolved dependency that must reach the target before dispatch. */
+pub type HarnUpdatePrerequisite = {repository: string, base_branch: string, pin: HarnPinSpec}
+
+/** Resolved semantic contract for one repository's thin bump adapter. */
+pub type BumpAdapterContract = {
+  repository_owned: bool,
+  workflow_reference: string,
+  orchestration_sha: string,
+  refresh_command: string,
+  validation_command: string,
+  node_version: string,
+  publish_failure_for_repair: bool,
+  apply_behavior_preserving_fixes: bool,
+  enable_auto_merge: bool,
+}
+
+/**
+ * The complete per-repository update contract consumed by dispatch, proof,
+ * staleness, and repair. Callers do not interpret manifest defaults.
+ */
+pub type HarnUpdateSpec = {
+  repository: string,
+  base_branch: string,
+  workflow_path: string,
+  workflow_name: string,
+  branch: string,
+  pin: HarnPinSpec,
+  repair_enabled: bool,
+  auto_arm: bool,
+  require_signed_head: bool,
+  prerequisites: list<HarnUpdatePrerequisite>,
+  max_releases_behind: int,
+  adapter: BumpAdapterContract,
+}
+
+pub const DEFAULT_HARN_BUMP_WORKFLOW_PATH: string = ".github/workflows/bump-harn.yml"
+
+/** Resolve and validate the manifest-owned workflow path for one update target. */
+pub fn harn_update_workflow_path(repo: FleetRepository) -> string {
+  const workflow_path = repo.bump_workflow_path ?? DEFAULT_HARN_BUMP_WORKFLOW_PATH
+  if !starts_with(workflow_path, ".github/workflows/")
+    || len(regex_captures("^\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml$", workflow_path))
+      == 0 {
+    throw "fleet repository '${repo.slug}' has unsafe bump workflow path '${workflow_path}'"
+  }
+  return workflow_path
+}
+
+pub type HarnUpdateArmDecision = {
+  action: "arm" | "already_armed" | "withhold" | "refuse",
+  reason: string,
+}
+
+/** Decide arming from the resolved policy and exact signed-head evidence. */
+pub fn harn_update_arm_decision(
+  spec: HarnUpdateSpec,
+  observed_head: string,
+  auto_merge_armed: bool,
+  signature_head: string? = nil,
+  unsigned_count: int = 0,
+) -> HarnUpdateArmDecision {
+  if !spec.auto_arm {
+    return if auto_merge_armed {
+      {action: "refuse", reason: "auto-merge is armed against the resolved update contract"}
+    } else {
+      {action: "withhold", reason: "held_by_manifest"}
+    }
+  }
+  if spec.require_signed_head {
+    if trim(signature_head ?? "") == "" {
+      return {action: "refuse", reason: "signed head evidence is missing"}
+    }
+    if lowercase(trim(signature_head ?? "")) != lowercase(trim(observed_head)) {
+      return {action: "refuse", reason: "signed head evidence moved from the observed PR lease"}
+    }
+    if unsigned_count > 0 {
+      return {
+        action: "refuse",
+        reason: "observed PR head contains ${unsigned_count} unsigned commit(s)",
+      }
+    }
+  }
+  return if auto_merge_armed {
+    {action: "already_armed", reason: "already_enabled"}
+  } else {
+    {action: "arm", reason: "exact signed head is eligible"}
+  }
+}
+
+/** One byte-exact file projection whose semantic owner is the source. */
+pub type FleetFileProjection = {
+  source_slug: string,
+  source_path: string,
+  target_slug: string,
+  target_path: string,
+}
+
+/** The typed authority for every repository-wide Harn projection. */
+pub type FleetManifest = {
+  schema_version: 1,
+  fleet: {default_root: string, default_branch: string},
+  policy: {
+    package_workflow: string,
+    bump_workflow: string,
+    publish_failures_for_repair?: bool,
+    apply_behavior_preserving_fixes?: bool,
+    connector_secret_schema?: ConnectorSecretSchema,
+  },
+  repositories: list<FleetRepository>,
+}
+
+/** Resolve the manifest syntax projected into first-party connector packages. */
+pub fn connector_secret_schema(manifest: FleetManifest) -> ConnectorSecretSchema {
+  return manifest.policy.connector_secret_schema ?? "legacy"
+}
+
+/** Resolve the one manifest-owned validator used by both bump and repair paths. */
+pub fn bump_validation_command(repo: FleetRepository) -> string {
+  if repo.bump_validate_command != nil {
+    return trim(repo.bump_validate_command ?? "")
+  }
+  if repo.harn_package ?? false {
+    return "harn package verify ."
+  }
+  return ""
+}
+
+/** Resolve every semantic input one repository's dispatch adapter must project. */
+pub fn bump_adapter_contract(
+  manifest: FleetManifest,
+  repo: FleetRepository,
+) -> BumpAdapterContract {
+  return {
+    repository_owned: repo.bump_workflow_ownership == "repository",
+    workflow_reference: manifest.policy.bump_workflow,
+    orchestration_sha: parse_workflow_policy_reference(manifest.policy.bump_workflow).ref,
+    refresh_command: trim(repo.bump_refresh_command ?? ""),
+    validation_command: bump_validation_command(repo),
+    node_version: trim(repo.bump_node_version ?? ""),
+    publish_failure_for_repair: manifest.policy.publish_failures_for_repair ?? false,
+    apply_behavior_preserving_fixes: bump_applies_behavior_preserving_fixes(manifest, repo),
+    enable_auto_merge: bump_arms_auto_merge(repo),
+  }
+}
+
+/** Parsed owner/repository, workflow path, and immutable revision for one policy workflow. */
+pub type FleetWorkflowPolicyReference = {slug: string, path: string, ref: string}
+
+/** Decode one already-validated reusable-workflow reference for live policy checks. */
+pub fn parse_workflow_policy_reference(value: string) -> FleetWorkflowPolicyReference {
+  const matches = regex_captures(
+    "^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml)@([0-9a-f]{40})$",
+    value,
+  )
+  if len(matches) != 1 || len(matches[0].groups) != 3 {
+    throw "invalid fleet reusable-workflow policy reference: '${value}'"
+  }
+  return {slug: matches[0].groups[0], path: matches[0].groups[1], ref: matches[0].groups[2]}
+}
+
+/** Derive the co-versioned CI status action from the canonical package workflow pin. */
+pub fn package_status_action_reference(package_workflow: string) -> string {
+  const reference = parse_workflow_policy_reference(package_workflow)
+  return reference.slug
+    + "/.github/actions/require-successful-needs@"
+    + reference.ref
+}
+
+pub fn validate_repository_slug(slug: string) {
+  if len(regex_captures("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", slug)) == 0 {
+    throw "invalid fleet repository slug '${slug}'"
+  }
+}
+
+pub fn validate_repository_path(path: string) {
+  if trim(path) != path || path == "" || starts_with(path, "/") || contains(path, "..") {
+    throw "invalid fleet repository path '${path}'"
+  }
+}
+
+fn safe_git_branch(branch: string) -> bool {
+  return trim(branch) == branch
+    && branch != ""
+    && !starts_with(branch, "/")
+    && !ends_with(branch, "/")
+    && !contains(branch, "..")
+    && len(regex_captures("^[A-Za-z0-9._/-]+$", branch)) > 0
+}
+
+fn expand_bump_branch_template(template: string, target: string) -> string {
+  const parts = split(template, "{target}")
+  if len(parts) != 2 {
+    throw "bump branch template must contain exactly one '{target}' placeholder"
+  }
+  const branch = parts[0] + target + parts[1]
+  if !safe_git_branch(branch) {
+    throw "bump branch template resolves to unsafe Git branch '${branch}'"
+  }
+  return branch
+}
+
+fn validate_update_pin(repo: FleetRepository) {
+  const kind = repo.harn_pin_kind ?? "auto"
+  const path = trim(repo.harn_pin_path ?? "")
+  if kind == "auto" && path != "" {
+    throw "fleet repository '${repo.slug}' declares a pin path without an explicit pin kind"
+  }
+  if kind != "auto" && path == "" {
+    throw "fleet repository '${repo.slug}' declares pin kind '${kind}' without a pin path"
+  }
+  if path != "" {
+    validate_repository_path(path)
+  }
+  if kind == "formula" && !ends_with(path, ".rb") {
+    throw "fleet repository '${repo.slug}' formula pin path must end in .rb"
+  }
+}
+
+fn validate_package_projection(repo: FleetRepository) {
+  if (repo.run_poll_tick ?? false) && !(repo.harn_package ?? false) {
+    throw "fleet repository '${repo.slug}' enables run_poll_tick without harn_package"
+  }
+  if repo.package_ci_ownership != nil && !(repo.harn_package ?? false) {
+    throw "fleet repository '${repo.slug}' delegates package CI without harn_package"
+  }
+  // Both ownership modes may declare the validation command, because the
+  // release's consumer contract compares that input against this manifest for
+  // every packaged repository, not only fleet-owned ones. Restricting the
+  // declaration to fleet ownership made the comparison unsatisfiable for a
+  // pin-owned repository: the fleet rewrites only its pinned reference, so it
+  // may author its own validation, yet the manifest had no way to record what
+  // it authored and the contract therefore demanded an empty command forever.
+  if repo.package_validate_command != nil
+    && (repo.package_ci_ownership == nil
+      || trim(repo.package_validate_command ?? "")
+        == "") {
+    throw "fleet repository '${repo.slug}' has package validation without delegated package CI"
+  }
+  if repo.test_jobs != nil && (!(repo.harn_package ?? false) || (repo.test_jobs ?? 0) <= 0) {
+    throw "fleet repository '${repo.slug}' sets test_jobs without a positive harn_package worker count"
+  }
+  if (repo.harn_package ?? false) && repo.package_ci_ownership == nil {
+    throw "fleet repository '${repo.slug}' is a Harn package without explicit package CI ownership"
+  }
+}
+
+fn is_first_party_connector(repo: FleetRepository) -> bool {
+  return starts_with(repo.slug, "burin-labs/harn-") && ends_with(repo.slug, "-connector")
+}
+
+fn validate_connector_secret_contract(repo: FleetRepository) {
+  const secrets = repo.connector_required_secrets
+  if is_first_party_connector(repo) && secrets == nil {
+    throw "first-party connector '${repo.slug}' is missing connector_required_secrets"
+  }
+  if secrets == nil {
+    return
+  }
+  if !is_first_party_connector(repo) {
+    throw "non-connector repository '${repo.slug}' declares connector_required_secrets"
+  }
+  if !(repo.harn_package ?? false) || !(repo.harn_bump ?? false) {
+    throw "connector secret projection for '${repo.slug}' requires package and bump ownership"
+  }
+  if len(secrets ?? []) == 0 {
+    throw "connector secret projection for '${repo.slug}' must not be empty"
+  }
+  let ids = {}
+  let outbound = 0
+  for secret in secrets ?? [] {
+    if len(regex_captures("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", secret.id)) == 0 {
+      throw "connector secret '${secret.id}' in '${repo.slug}' must use namespace/name form"
+    }
+    if ids[secret.id] ?? false {
+      throw "connector secret projection for '${repo.slug}' repeats '${secret.id}'"
+    }
+    ids[secret.id] = true
+    if secret.direction == "outbound" {
+      outbound = outbound + 1
+    }
+  }
+  if outbound == 0 {
+    throw "connector secret projection for '${repo.slug}' declares no outbound credential"
+  }
+}
+
+fn validate_update_routing(repo: FleetRepository) {
+  if repo.bump_workflow_ownership != nil && !(repo.harn_bump ?? false) {
+    throw "fleet repository '${repo.slug}' delegates its bump workflow without harn_bump"
+  }
+  for value in [repo.bump_workflow_path, repo.bump_branch, repo.bump_branch_template] {
+    if value != nil && !(repo.harn_bump ?? false) {
+      throw "fleet repository '${repo.slug}' customizes update routing without harn_bump"
+    }
+  }
+  harn_update_workflow_path(repo)
+  const branch = repo.bump_branch ?? "automation/bump-harn-runtime"
+  if !safe_git_branch(branch) {
+    throw "fleet repository '${repo.slug}' has unsafe bump branch '${branch}'"
+  }
+  if repo.bump_branch != nil && repo.bump_branch_template != nil {
+    throw "fleet repository '${repo.slug}' declares both a bump branch and branch template"
+  }
+  if repo.bump_branch_template != nil {
+    expand_bump_branch_template(repo.bump_branch_template ?? "", "v0.0.0")
+  }
+  if repo.bump_repair_enabled != nil && !(repo.harn_bump ?? false) {
+    throw "fleet repository '${repo.slug}' overrides repair without harn_bump"
+  }
+  if repo.bump_require_signed_head != nil && !(repo.harn_bump ?? false) {
+    throw "fleet repository '${repo.slug}' overrides signing without harn_bump"
+  }
+  if repo.bump_max_releases_behind != nil && (repo.bump_max_releases_behind ?? -1) < 0 {
+    throw "fleet repository '${repo.slug}' has a negative staleness budget"
+  }
+}
+
+fn validate_pr_title_policy(repo: FleetRepository) {
+  const gated = repo.pr_title_gate ?? false
+  const area = trim(repo.pr_title_area ?? "")
+  if gated && area == "" {
+    throw "fleet repository '${repo.slug}' declares a pull-request title gate without an area"
+  }
+  if !gated && area != "" {
+    throw "fleet repository '${repo.slug}' declares a pull-request title area no gate enforces"
+  }
+  if area != "" && len(regex_captures("^[A-Za-z][A-Za-z0-9 ]*$", area)) == 0 {
+    throw "fleet repository '${repo.slug}' has a pull-request title area that is not a plain word"
+  }
+}
+
+fn validate_update_execution(repo: FleetRepository) {
+  if repo.consumer_owned_contract ?? false {
+    const leaked_fields = [
+      repo.harn_pin_kind,
+      repo.harn_pin_path,
+      repo.package_validate_command,
+      repo.bump_refresh_command,
+      repo.bump_refresh_notes,
+      repo.bump_validate_command,
+      repo.bump_node_version,
+      repo.consumer_contract_sha256,
+      repo.pretag_gate_workflow,
+      repo.pretag_gate_proof_job,
+    ]
+      .filter({ value -> value != nil })
+      .to_list()
+    if len(leaked_fields) > 0
+      || len(repo.bump_allowed_new_files ?? []) > 0
+      || len((repo.pretag_gate_inputs ?? {}).keys()) > 0 {
+      throw "fleet repository '${repo.slug}' puts consumer-owned paths or commands in public policy"
+    }
+  }
+  for command in [repo.bump_refresh_command, repo.bump_validate_command] {
+    if command != nil && (!(repo.harn_bump ?? false) || trim(command ?? "") == "") {
+      throw "fleet repository '${repo.slug}' has a bump command without harn_bump or content"
+    }
+  }
+  if repo.bump_workflow_ownership == "fleet"
+    && !(repo.harn_package ?? false)
+    && repo.bump_validate_command == nil
+    && !(repo.consumer_owned_contract ?? false) {
+    throw "fleet repository '${repo.slug}' delegates a non-package bump without validation"
+  }
+  if repo.bump_node_version != nil {
+    const node_version = trim(repo.bump_node_version ?? "")
+    if !(repo.harn_bump ?? false)
+      || node_version
+        == ""
+      || len(regex_captures("^[A-Za-z0-9._-]+$", node_version))
+        == 0 {
+      throw "fleet repository '${repo.slug}' has invalid bump_node_version"
+    }
+  }
+  if repo.bump_apply_behavior_preserving_fixes != nil && !(repo.harn_bump ?? false) {
+    throw "fleet repository '${repo.slug}' overrides the behavior-preserving fix pass without harn_bump"
+  }
+  if repo.bump_enable_auto_merge != nil && !(repo.harn_bump ?? false) {
+    throw "fleet repository '${repo.slug}' overrides bump auto-merge without harn_bump"
+  }
+  for path in repo.bump_allowed_new_files ?? [] {
+    validate_repository_path(path)
+  }
+}
+
+/**
+ * Refuse a release-context declaration that cannot name a check.
+ *
+ * A blank entry would resolve to `MISSING` on every commit and hold the
+ * release forever, and a duplicate would report the same pending row twice in
+ * a count a reader is meant to trust. Both are caught at the manifest seam so
+ * no consumer has to re-check the shape.
+ */
+fn validate_release_contexts(repo: FleetRepository) {
+  let seen = {}
+  for raw in repo.release_required_contexts ?? [] {
+    const context = trim(to_string(raw ?? ""))
+    if context == "" {
+      throw "fleet repository '${repo.slug}' declares an empty release required context"
+    }
+    if seen[context] ?? false {
+      throw "fleet repository '${repo.slug}' declares release required context"
+        + " '${context}' more than once"
+    }
+    seen[context] = true
+  }
+}
+
+fn validate_bump_projection(repo: FleetRepository) {
+  validate_update_pin(repo)
+  validate_update_routing(repo)
+  validate_update_execution(repo)
+  validate_pr_title_policy(repo)
+}
+
+fn repository_by_slug(repositories: list<FleetRepository>, slug: string) -> FleetRepository? {
+  for repo in repositories {
+    if repo.slug == slug {
+      return repo
+    }
+  }
+  return nil
+}
+
+fn validate_update_prerequisites(repositories: list<FleetRepository>) {
+  for repo in repositories {
+    let seen = {}
+    for prerequisite in repo.bump_prerequisites ?? [] {
+      validate_repository_slug(prerequisite)
+      if prerequisite == repo.slug {
+        throw "fleet repository '${repo.slug}' cannot depend on its own update"
+      }
+      if seen[prerequisite] ?? false {
+        throw "fleet repository '${repo.slug}' repeats update prerequisite '${prerequisite}'"
+      }
+      const required = repository_by_slug(repositories, prerequisite)
+      if required == nil || !(required.harn_bump ?? false) {
+        throw "fleet repository '${repo.slug}' has unmanaged update prerequisite '${prerequisite}'"
+      }
+      seen[prerequisite] = true
+    }
+  }
+  let pending = repositories.filter({ repo -> repo.harn_bump ?? false }).to_list()
+  while len(pending) > 0 {
+    const pending_slugs = pending.map({ repo -> repo.slug }).to_list()
+    const ready = pending.filter(
+      { repo ->
+        (repo.bump_prerequisites ?? []).all(
+          { prerequisite -> !pending_slugs.contains(prerequisite) },
+        )
+      },
+    )
+      .to_list()
+    if len(ready) == 0 {
+      throw "fleet update prerequisites contain a cycle"
+    }
+    const ready_slugs = ready.map({ repo -> repo.slug }).to_list()
+    pending = pending.filter({ repo -> !ready_slugs.contains(repo.slug) }).to_list()
+  }
+}
+
+/** Validate the fleet manifest's unique repository and mechanically owned projection contracts. */
+pub fn validate_fleet_manifest(manifest: FleetManifest) -> FleetManifest {
+  if trim(manifest.fleet.default_root) == "" {
+    throw "fleet.default_root must not be empty"
+  }
+  const default_branch = manifest.fleet.default_branch
+  if len(regex_captures("^[A-Za-z0-9._/-]+$", default_branch)) == 0
+    || starts_with(default_branch, "/")
+    || ends_with(default_branch, "/")
+    || contains(default_branch, "..") {
+    throw "fleet.default_branch is not a safe Git ref name: '${default_branch}'"
+  }
+  for policy_ref in [manifest.policy.package_workflow, manifest.policy.bump_workflow] {
+    if len(regex_captures("^[^@]+@[0-9a-f]{40}$", policy_ref)) == 0 {
+      throw "fleet policy references must use an immutable full commit SHA: '${policy_ref}'"
+    }
+    parse_workflow_policy_reference(policy_ref)
+  }
+  let slugs = {}
+  let directories = {}
+  for repo in manifest.repositories {
+    validate_repository_slug(repo.slug)
+    if len(regex_captures("^[A-Za-z0-9_.-]+$", repo.directory)) == 0 {
+      throw "invalid fleet repository directory '${repo.directory}'"
+    }
+    if slugs[repo.slug] ?? false {
+      throw "duplicate fleet repository slug '${repo.slug}'"
+    }
+    if directories[repo.directory] ?? false {
+      throw "duplicate fleet repository directory '${repo.directory}'"
+    }
+    validate_package_projection(repo)
+    validate_bump_projection(repo)
+    validate_connector_secret_contract(repo)
+    validate_release_contexts(repo)
+    slugs[repo.slug] = true
+    directories[repo.directory] = true
+  }
+  validate_update_prerequisites(manifest.repositories)
+  return manifest
+}
+
+fn pin_spec(repo: FleetRepository) -> HarnPinSpec {
+  const kind: "auto" | "version_file" | "cargo" | "formula" = repo.harn_pin_kind ?? "auto"
+  if kind == "auto" {
+    const automatic: HarnPinSpec = {kind: "auto"}
+    return automatic
+  }
+  if kind == "formula" {
+    return schema_expect({kind: "formula", path: to_string(repo.harn_pin_path ?? "")}, HarnPinSpec)
+  }
+  if kind == "cargo" {
+    return schema_expect({kind: "cargo", path: to_string(repo.harn_pin_path ?? "")}, HarnPinSpec)
+  }
+  return schema_expect(
+    {kind: "version_file", path: to_string(repo.harn_pin_path ?? "")},
+    HarnPinSpec,
+  )
+}
+
+/** Resolve every update decision once for one exact release target. */
+pub fn resolve_harn_update_spec(
+  manifest: FleetManifest,
+  repo: FleetRepository,
+  target: string,
+) -> HarnUpdateSpec {
+  if (repo.consumer_owned_contract ?? false)
+    && (repo.harn_pin_kind == nil
+      || trim(repo.harn_pin_path ?? "") == ""
+      || trim(repo.bump_refresh_command ?? "") == ""
+      || trim(repo.bump_validate_command ?? "") == "") {
+    throw "fleet repository '${repo.slug}' consumer contract was not hydrated"
+  }
+  const workflow_path = harn_update_workflow_path(repo)
+  const branch = if repo.bump_branch_template != nil {
+    expand_bump_branch_template(repo.bump_branch_template ?? "", target)
+  } else {
+    const fixed = repo.bump_branch ?? "automation/bump-harn-runtime"
+    if !safe_git_branch(fixed) {
+      throw "fleet repository '${repo.slug}' has unsafe bump branch '${fixed}'"
+    }
+    fixed
+  }
+  let prerequisites: list<HarnUpdatePrerequisite> = []
+  for slug in repo.bump_prerequisites ?? [] {
+    const required = repository_by_slug(manifest.repositories, slug)
+    if required == nil {
+      throw "fleet repository '${repo.slug}' prerequisite '${slug}' disappeared after validation"
+    }
+    prerequisites = prerequisites
+      + [{repository: slug, base_branch: manifest.fleet.default_branch, pin: pin_spec(required)}]
+  }
+  return {
+    repository: repo.slug,
+    base_branch: manifest.fleet.default_branch,
+    workflow_path: workflow_path,
+    workflow_name: basename(workflow_path),
+    branch: branch,
+    pin: pin_spec(repo),
+    repair_enabled: repo.bump_repair_enabled ?? true,
+    auto_arm: bump_arms_auto_merge(repo),
+    require_signed_head: repo.bump_require_signed_head ?? true,
+    prerequisites: prerequisites,
+    max_releases_behind: repo.bump_max_releases_behind ?? 1,
+    adapter: bump_adapter_contract(manifest, repo),
+  }
+}
+
+/** Decode public fleet policy while refusing the retired destination registry. */
+pub fn parse_fleet_manifest(value: unknown) -> FleetManifest {
+  if type_of(value) == "dict" && value.keys().contains("file_projections") {
+    throw "fleet file projections must be declared by consumers in .harn/fleet-projections.toml"
+  }
+  return validate_fleet_manifest(schema_expect(value, FleetManifest))
+}
+
+/** Read and validate a typed fleet manifest from `path`. */
+pub fn read_fleet_manifest(fs: HarnessFs, path: string = "fleet.toml") -> FleetManifest {
+  return parse_fleet_manifest(read_toml(fs, path))
+}
+
+/**
+ * The area one repository's pull-request title gate requires, or "" when it
+ * declares none.
+ *
+ * A repository the manifest does not name also returns "", which yields a bare
+ * title. That is the same answer as a repository with no gate, and it is the
+ * safe one: this fleet cannot invent an area list for a repository whose policy
+ * it does not carry.
+ */
+pub fn fleet_pr_title_area(manifest: FleetManifest, slug: string) -> string {
+  const repo = repository_by_slug(manifest.repositories, slug)
+  if repo == nil {
+    return ""
+  }
+  return trim(repo.pr_title_area ?? "")
+}
+
+/**
+ * The contexts one repository declares its releases require, or `[]`.
+ *
+ * A repository the manifest does not name returns the empty list, which is the
+ * same answer as a repository that declares nothing: this fleet cannot invent a
+ * release bar for a repository whose policy it does not carry. The empty list
+ * leaves the decision exactly where it stands today, on the ruleset set alone.
+ */
+pub fn fleet_release_required_contexts(manifest: FleetManifest, slug: string) -> list<string> {
+  const repo = repository_by_slug(manifest.repositories, slug)
+  if repo == nil {
+    return []
+  }
+  return repo.release_required_contexts ?? []
+}
+
+/** Return repositories admitted through the canonical Harn package workflow. */
+pub fn harn_package_repositories(manifest: FleetManifest) -> list<FleetRepository> {
+  return manifest.repositories.filter({ repo -> repo.harn_package ?? false }).to_list()
+}
+
+/**
+ * Resolve whether one repository takes the unattended behavior-preserving fix
+ * pass during a runtime bump.
+ *
+ * The fleet default is off. That pass applies behavior-CHANGING edits under a
+ * behavior-preserving safety tier (harn#6837), and every managed repository
+ * runs it unattended against source the fleet does not own. A repository that
+ * has established the pass is safe for its own sources opts back in here; the
+ * fleet-wide default returns to on only once the rule's soundness defect is
+ * fixed and proven.
+ *
+ * Both projection and live policy evaluation read this one resolution, so a
+ * generated adapter and the audit that checks it cannot disagree.
+ */
+pub fn bump_applies_behavior_preserving_fixes(
+  manifest: FleetManifest,
+  repo: FleetRepository,
+) -> bool {
+  return repo.bump_apply_behavior_preserving_fixes
+    ?? (manifest.policy.apply_behavior_preserving_fixes
+      ?? false)
+}
+
+/**
+ * Resolve whether a repository's bump pull request arms auto-merge itself.
+ *
+ * Armed is the fleet default and stays that way: a routine runtime bump should
+ * land on its own checks. A repository opts out when merging the bump would
+ * decide something reserved for a person — a repin whose consequences someone
+ * has to rule on — because an auto-merge overnight makes that decision by
+ * automation instead. This withholds arming only; the pull request still opens
+ * and still runs its checks.
+ *
+ * Unlike the behavior-preserving fix pass, this is NOT projected when armed.
+ * If the reusable workflow ever changed its own default here the failure is
+ * benign — bumps would wait for a human — whereas the same drift on the fix
+ * pass would silently rewrite caller-owned source.
+ */
+pub fn bump_arms_auto_merge(repo: FleetRepository) -> bool {
+  return repo.bump_enable_auto_merge ?? true
+}
+
+/** Return repositories managed by the reusable Harn runtime bump workflow. */
+pub fn harn_bump_repositories(manifest: FleetManifest) -> list<FleetRepository> {
+  return manifest.repositories.filter({ repo -> repo.harn_bump ?? false }).to_list()
+}
+
+/**
+ * Every repository whose Harn pin is worth watching, which is a wider set than
+ * the one the fleet can bump.
+ *
+ * A repository the fleet cannot dispatch a bump to still has a pin that can go
+ * stale, and a stale pin nobody watches is the failure this distinction exists
+ * to prevent. `harn_pin_path` names where to read a pin that does not live in
+ * `.harn-version`, and declaring it opts a repository into the watch without
+ * claiming the fleet can bump it.
+ */
+pub fn harn_pin_watch_repositories(manifest: FleetManifest) -> list<FleetRepository> {
+  return manifest.repositories.filter(
+    { repo -> (repo.harn_bump ?? false) || trim(repo.harn_pin_path ?? "") != "" },
+  )
+    .to_list()
+}
+
+/**
+ * Every manifest repository the pin watch does not cover.
+ *
+ * Membership in the watch is opt-in, so a repository that pins a runtime and
+ * declares neither flag is not reported as stale — it is not reported at all,
+ * and an empty finding is indistinguishable from a healthy one. Two
+ * repositories sat 77 releases behind that way. The census probes this set for
+ * a pin surface so that "no flag" has to be a deliberate claim about a
+ * repository that does not track the runtime, provable by the absence of a pin
+ * file, rather than something a manifest entry can drift into by omission.
+ */
+pub fn unwatched_repositories(manifest: FleetManifest) -> list<FleetRepository> {
+  const watched = harn_pin_watch_repositories(manifest).map({ repo -> repo.slug }).to_list()
+  return manifest.repositories.filter({ repo -> !watched.contains(repo.slug) }).to_list()
+}
+
+/** Narrow the watch set to one repository, or keep all of it. */
+pub fn scoped_harn_pin_watch_repositories(
+  manifest: FleetManifest,
+  only: string?,
+) -> list<FleetRepository> {
+  const repositories = harn_pin_watch_repositories(manifest)
+  if only == nil {
+    return repositories
+  }
+  const selected = repositories.filter({ repo -> repo.slug == only }).to_list()
+  if len(selected) != 1 {
+    throw "fleet scope '${only ?? ""}' is not a watched Harn pin repository"
+  }
+  return selected
+}
+
+/** Select the exact Harn bump scope, failing closed when a named target is not managed. */
+pub fn scoped_harn_bump_repositories(
+  manifest: FleetManifest,
+  only: string?,
+  repositories_json: string? = nil,
+) -> list<FleetRepository> {
+  return operation_harn_bump_repositories(manifest, fleet_operation_scope(only, repositories_json))
+}
+
+/** Admit every member of an immutable operation scope against the canonical manifest. */
+pub fn operation_harn_bump_repositories(
+  manifest: FleetManifest,
+  scope: FleetDispatchScope,
+) -> list<FleetRepository> {
+  const repositories = harn_bump_repositories(manifest)
+  const members = fleet_scope_members(scope)
+  if members == nil {
+    return repositories
+  }
+  if len(members) == 0 {
+    throw "explicit repository scope cannot be empty"
+  }
+  let selected: list<FleetRepository> = []
+  let seen: list<string> = []
+  for member in members {
+    const matches = repositories.filter({ repo -> repo.slug == member }).to_list()
+    if len(matches) != 1 || contains(seen, member) {
+      throw "fleet scope '${member}' is duplicate or not a managed Harn bump repository"
+    }
+    selected = selected + matches
+    seen = seen + [member]
+  }
+  return selected
+}
+
+/** Resolve consumer exclusions once into the existing exact included-scope contract. */
+pub fn fleet_scope_excluding(
+  manifest: FleetManifest,
+  skip_consumers_json: string,
+) -> FleetDispatchScope {
+  const skipped = fleet_operation_scope(nil, skip_consumers_json)
+  operation_harn_bump_repositories(manifest, skipped)
+  const skipped_members = fleet_scope_members(skipped) ?? []
+  if contains(skipped_members, "burin-labs/harn-bump-fleet") {
+    throw "skip_consumers cannot exclude the required harn-bump-fleet controller"
+  }
+  const included = harn_bump_repositories(manifest).filter(
+    { repo -> !contains(skipped_members, repo.slug) },
+  )
+    .map({ repo -> repo.slug })
+    .to_list()
+  return fleet_operation_scope(nil, json_stringify(included))
+}
+
+/** Resolve the configured fleet root, expanding a leading home-directory marker. */
+pub fn resolve_fleet_root(configured: string, home: string) -> string {
+  if configured == "~" {
+    return home
+  }
+  if starts_with(configured, "~/") {
+    return path_join(home, configured[2:len(configured)])
+  }
+  return configured
+}
