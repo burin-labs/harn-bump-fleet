@@ -1,0 +1,1 @@
+Build the exact-pin release CLI through the repository's own binary resolver and stage it with the repository's snapshot helper, so the shielded CLI carries the build-freshness proof that the residual release audit requires.
