@@ -39,6 +39,14 @@ import {
 import { read_fleet_manifest } from "lib/fleet_manifest"
 import { github_file_text_at_ref } from "lib/github"
 import { read_rehearsal_inputs } from "lib/rehearsal_inputs"
+import {
+  clamp_zero,
+  read_rehearsal_api_budget,
+  rehearsal_api_budget_line,
+  rehearsal_api_spend_line,
+  rehearsal_now_epoch_s,
+  rehearsal_revision_within_budget,
+} from "lib/rehearsal_rate_limit"
 import { workspace_version_from_manifest } from "lib/release_analysis"
 
 const HARN_REPO = "burin-labs/harn"
@@ -108,6 +116,15 @@ pub type RehearsalOptions = {
   mock: bool,
   at_sha: string,
   consumer_proof_runs: ConsumerPretagProofRuns,
+  /**
+   * The job's own timeout, in seconds, as the workflow declares it.
+   *
+   * Zero means the caller did not say. The rate-limit decision then has no
+   * window to fit a wait inside and refuses rather than waiting on a deadline
+   * it invented, because a wait that outlives the job is worse than a refusal
+   * that names the reset.
+   */
+  job_timeout_s: int,
 }
 
 type RehearsalCliOptions = {
@@ -115,6 +132,7 @@ type RehearsalCliOptions = {
   mock: bool,
   at_sha?: string,
   consumer_proof_runs_json?: string,
+  job_timeout_s: int,
 }
 
 const ARG_SPEC: ParserSpec = {
@@ -124,6 +142,7 @@ const ARG_SPEC: ParserSpec = {
     {kind: "flag", name: "at_sha", long: "--at-sha"},
     {kind: "switch", name: "mock", long: "--mock"},
     {kind: "flag", name: "consumer_proof_runs_json", long: "--consumer-proof-runs-json"},
+    {kind: "flag", name: "job_timeout_s", long: "--job-timeout-seconds", parse: "int", default: 0},
   ],
 }
 
@@ -136,19 +155,51 @@ pub fn parse_rehearsal_args(args: list<string>) -> RehearsalOptions {
     consumer_proof_runs: parse_consumer_pretag_proof_runs_json(
       options.consumer_proof_runs_json ?? "",
     ),
+    job_timeout_s: options.job_timeout_s,
   }
 }
 
 pipeline main(harness: Harness) {
   const options = parse_rehearsal_args(argv)
+  // Read the budget before spending any of it. A run that ends rate limited
+  // and a run that started that way want different answers from an operator,
+  // and without this line the receipt cannot tell them apart.
+  const started_at_s = rehearsal_now_epoch_s(harness.clock)
+  const opening_budget = read_rehearsal_api_budget(harness)
+  let api_calls = 1
+  harness.stdio.println(rehearsal_api_budget_line("opening API budget", opening_budget))
+  if options.job_timeout_s <= 0 {
+    harness.stdio.println(
+      "job timeout was not supplied, so this run will not wait out an API budget reset; "
+        + "pass --job-timeout-seconds to let it",
+    )
+  }
   // Pinned rather than "whatever main is now", because the proof this
   // rehearsal writes is keyed to the revision's input digest and the cut asks
   // for the digest of the revision it will tag. Main moves while a rehearsal
   // runs, so an unpinned rehearsal can prove a revision the cut never names.
-  const head = rehearsal_revision(harness, HARN_REPO, "main", options.at_sha)
+  const attempt = rehearsal_revision_within_budget(
+    harness,
+    fn() { return rehearsal_revision(harness, HARN_REPO, "main", options.at_sha) },
+    clamp_zero(options.job_timeout_s - (rehearsal_now_epoch_s(harness.clock) - started_at_s)),
+  )
+  api_calls = api_calls + attempt.api_calls
+  for decision in attempt.decisions {
+    harness.stdio.println("API budget: " + decision.summary)
+    harness.stdio.println(rehearsal_api_budget_line("API budget at the refusal", decision.budget))
+  }
+  if attempt.waited_s > 0 {
+    harness.stdio.println(
+      "waited ${to_string(attempt.waited_s)}s for the API budget to reset, then retried",
+    )
+  }
+  const head = attempt.revision
   if is_err(head) {
     harness.stdio.eprintln(
       "error: could not read the Harn default branch head: ${to_string(unwrap_err(head))}",
+    )
+    harness.stdio.eprintln(
+      rehearsal_api_spend_line(api_calls, opening_budget, read_rehearsal_api_budget(harness)),
     )
     return 1
   }
@@ -321,5 +372,8 @@ pipeline main(harness: Harness) {
     return 1
   }
   harness.stdio.println("consumer rehearsal passed for ${candidate.version} at ${revision}")
+  harness.stdio.println(
+    rehearsal_api_spend_line(api_calls, opening_budget, read_rehearsal_api_budget(harness)),
+  )
   return 0
 }
