@@ -1,0 +1,353 @@
+import { FleetObservationClass, fleet_observation_set_class } from "./fleet_observation_class"
+import {
+  github_branch_head,
+  github_commit_reachable_from_branch,
+  github_connector_options,
+} from "./github"
+import { github_branch_commits, github_commit_check_runs } from "./github_commits"
+import { admission_check_row, required_check_state } from "./pr_admission"
+import { release_required_contexts_from_rulesets } from "./release_drift_evidence"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+pub type FleetDefaultBranchProof = {
+  ok: bool,
+  state: "proven" | "pending" | "failed",
+  head_sha: string,
+  total_checks: int,
+  required_contexts: list<string>,
+  unproven: list<string>,
+  bad_names: list<string>,
+  /**
+   * The connector's own classification of the refusal, when one was refused.
+   *
+   * It rides on the proof because the proof is what a round persists. The
+   * chain's stop decision reads this round's receipt and nothing else, and a
+   * class reconstructed from the message text on the other side would be the
+   * guess this module exists to avoid.
+   */
+  refusal?: FleetObservationClass,
+}
+
+/**
+ * `errors` carries the connector's own structured records, not their text, so a
+ * caller can classify the refusal on `code` and `category` rather than by
+ * matching a message written for people.
+ */
+pub type FleetDefaultBranchObservation = {refused: bool, unproven: list<string>, errors: list}
+
+/**
+ * Name each default-branch observation that failed, and carry its error text.
+ *
+ * The three reads behind a default-branch proof are the branch ruleset, the
+ * exact-head check census, and the final branch-head read. An empty string
+ * means that call succeeded. A refusal names every call that did not, so a
+ * transient API failure is never indistinguishable from a policy gap.
+ */
+pub fn fleet_default_branch_observation(
+  branch_policy_error: any = nil,
+  exact_head_checks_error: any = nil,
+  final_head_error: any = nil,
+) -> FleetDefaultBranchObservation {
+  let unproven: list<string> = []
+  let errors: list = []
+  for named in [
+    {label: "branch policy read failed: ", error: branch_policy_error},
+    {label: "exact-head check census read failed: ", error: exact_head_checks_error},
+    {label: "final default branch head read failed: ", error: final_head_error},
+  ] {
+    if named.error == nil || trim(to_string(named.error)) == "" {
+      continue
+    }
+    unproven = unproven + [named.label + to_string(named.error)]
+    errors = errors + [named.error]
+  }
+  return {refused: len(unproven) > 0, unproven: unproven, errors: errors}
+}
+
+/**
+ * The proof a refused observation reports.
+ *
+ * This is its own function because it holds the decision that governs how long
+ * a convergence round runs. A refusal a later attempt cannot find satisfied is
+ * not a wait: reporting it as pending is what made rounds poll their whole
+ * window for an answer that was already final in the first response, and a
+ * decision that load-bearing has to be reachable by a test without a network.
+ *
+ * The action line rides along for the same reason the class exists. A receipt
+ * that names a refusal without naming its remedy still leaves someone to work
+ * out what to do.
+ */
+pub fn fleet_default_branch_refusal(
+  observation: FleetDefaultBranchObservation,
+  head_sha: string,
+) -> FleetDefaultBranchProof {
+  const classified = fleet_observation_set_class(observation.errors)
+  const refusing = classified.disposition == "refuse"
+  return {
+    ok: false,
+    state: if refusing {
+      "failed"
+    } else {
+      "pending"
+    },
+    head_sha: head_sha,
+    total_checks: 0,
+    required_contexts: [],
+    unproven: if refusing && classified.action != "" {
+      observation.unproven + ["action: " + classified.action]
+    } else {
+      observation.unproven
+    },
+    bad_names: [],
+    refusal: classified,
+  }
+}
+
+/** Check names use admission's owner; publication proof requires an actual success. */
+pub fn fleet_default_branch_verdict(
+  head_sha: string,
+  observed_head_sha: string,
+  required: list<string>,
+  checks: list,
+  total_count: int,
+) -> FleetDefaultBranchProof {
+  let unproven: list<string> = []
+  let bad_names: list<string> = []
+  if !regex_match("^[0-9a-f]{40}$", head_sha) || observed_head_sha != head_sha {
+    unproven = unproven + ["default branch head moved or was not observed"]
+  }
+  if len(required) == 0 {
+    unproven = unproven + ["required check policy was not observed"]
+  }
+  if total_count < 1 || total_count != len(checks) {
+    unproven = unproven + ["exact-head check census is empty or incomplete"]
+  }
+  for check in checks {
+    if to_string(check?.head_sha ?? "") != head_sha {
+      unproven = unproven + ["check belongs to a different head"]
+    }
+  }
+  for name in required {
+    const matching = checks.filter({ check -> to_string(check?.name ?? "") == name }).to_list()
+    let complete = len(matching) > 0
+    let bad = false
+    let ids: list<int> = []
+    // The connector selects current workflow generations. Different events
+    // can legitimately publish the same context; every instance must pass.
+    for check in matching {
+      const id = to_int(check?.id)
+      if len(matching) > 1 && (id == nil || id <= 0 || ids.contains(id)) {
+        complete = false
+      }
+      if id != nil {
+        ids = ids + [id]
+      }
+      if required_check_state([check], name) != "SUCCESS"
+        || to_string(check?.status ?? "") != "completed" {
+        complete = false
+      }
+      if to_string(check?.head_sha ?? "") == head_sha
+        && observed_head_sha == head_sha
+        && to_string(check?.status ?? "") == "completed"
+        && admission_check_row(check).bad {
+        bad = true
+      }
+    }
+    if !complete {
+      unproven = unproven + [name]
+    }
+    if bad {
+      bad_names = bad_names + [name]
+    }
+  }
+  return {
+    ok: len(unproven) == 0,
+    state: if len(unproven) == 0 {
+      "proven"
+    } else if len(bad_names) > 0 {
+      "failed"
+    } else {
+      "pending"
+    },
+    head_sha: head_sha,
+    total_checks: len(checks),
+    required_contexts: required,
+    unproven: unproven,
+    bad_names: bad_names,
+  }
+}
+
+/** Observe effective branch policy and a complete latest-check census at the pinned head. */
+pub fn fleet_default_branch_proof(
+  harness: Harness,
+  repository: string,
+  branch: string,
+  head_sha: string,
+  options: GithubClientOptions = github_connector_options(),
+) -> FleetDefaultBranchProof {
+  const rules = api_call(
+    harness,
+    {path: "/repos/${repository}/rules/branches/${branch}", options: options},
+  )
+  const checks = github_commit_check_runs(harness, repository, head_sha, options)
+  const head = github_branch_head(harness, repository, branch, options)
+  const observation = fleet_default_branch_observation(
+    if is_err(rules) {
+      unwrap_err(rules)
+    } else {
+      nil
+    },
+    if is_err(checks) {
+      unwrap_err(checks)
+    } else {
+      nil
+    },
+    if is_err(head) {
+      unwrap_err(head)
+    } else {
+      nil
+    },
+  )
+  if observation.refused {
+    return fleet_default_branch_refusal(observation, head_sha)
+  }
+  const required = release_required_contexts_from_rulesets(
+    [{enforcement: "active", rules: unwrap(rules)}],
+  )
+  const observed = unwrap(checks)
+  return fleet_default_branch_verdict(head_sha, unwrap(head).oid, required, observed, len(observed))
+}
+
+/** How far back from the head a settled proof may look. One page of history. */
+pub const FLEET_SETTLED_PROOF_WINDOW: int = 20
+
+/**
+ * The commits a settled proof may stand on, newest first.
+ *
+ * `commits` is the branch history listed from the head. Candidates are the
+ * commits after the head down to and including the update's merge commit;
+ * anything older predates the update and proves nothing about it. A window that
+ * does not reach the merge commit yields nothing, so the head stays the only
+ * answer rather than a guess from an unrelated commit.
+ */
+pub fn fleet_settled_proof_candidates(
+  commits: list,
+  head_sha: string,
+  merge_commit_sha: string,
+) -> list<string> {
+  const shas = commits.map({ commit -> lowercase(trim(to_string(commit?.sha ?? ""))) }).to_list()
+  const floor = lowercase(trim(merge_commit_sha))
+  if len(shas) == 0 || shas[0] != lowercase(trim(head_sha)) || !shas.contains(floor) {
+    return []
+  }
+  let candidates: list<string> = []
+  for sha in shas.slice(1, len(shas)) {
+    candidates = candidates + [sha]
+    if sha == floor {
+      return candidates
+    }
+  }
+  return []
+}
+
+fn fleet_commit_check_proof(
+  harness: Harness,
+  repository: string,
+  branch: string,
+  sha: string,
+  options: GithubClientOptions,
+) -> FleetDefaultBranchProof {
+  const rules = api_call(
+    harness,
+    {path: "/repos/${repository}/rules/branches/${branch}", options: options},
+  )
+  const checks = github_commit_check_runs(harness, repository, sha, options)
+  const observation = fleet_default_branch_observation(
+    if is_err(rules) {
+      unwrap_err(rules)
+    } else {
+      nil
+    },
+    if is_err(checks) {
+      unwrap_err(checks)
+    } else {
+      nil
+    },
+  )
+  if observation.refused {
+    return fleet_default_branch_refusal(observation, sha)
+  }
+  const required = release_required_contexts_from_rulesets(
+    [{enforcement: "active", rules: unwrap(rules)}],
+  )
+  const observed = unwrap(checks)
+  return fleet_default_branch_verdict(sha, sha, required, observed, len(observed))
+}
+
+/**
+ * Prove the default branch green with the update in it, without waiting on a head that never settles.
+ *
+ * The head is tried first and its answer stands whenever it is final. When the
+ * head's evidence is still arriving -- CI for the newest merge, or a scheduled
+ * workflow GitHub attached to it -- the newest older commit that contains the
+ * update's merge commit and whose required checks are complete and green
+ * proves the same thing. A settled commit that is red does not fail the row:
+ * a later commit may be its fix, so the head's pending answer is returned and
+ * the round keeps waiting on it.
+ */
+/**
+ * The consumer branch, its observed head, and the update merge commit a settled proof must contain.
+ */
+pub type FleetSettledProofTarget = {
+  repository: string,
+  branch: string,
+  head_sha: string,
+  merge_commit_sha: string,
+}
+
+pub fn fleet_settled_default_branch_proof(
+  harness: Harness,
+  target: FleetSettledProofTarget,
+  options: GithubClientOptions = github_connector_options(),
+) -> FleetDefaultBranchProof {
+  const repository = target.repository
+  const branch = target.branch
+  const head_sha = target.head_sha
+  const merge_commit_sha = target.merge_commit_sha
+  const head_proof = fleet_default_branch_proof(harness, repository, branch, head_sha, options)
+  if head_proof.ok || head_proof.state != "pending" {
+    return head_proof
+  }
+  const history = github_branch_commits(
+    harness,
+    repository,
+    head_sha,
+    FLEET_SETTLED_PROOF_WINDOW,
+    options,
+  )
+  if is_err(history) {
+    return head_proof
+  }
+  for sha in fleet_settled_proof_candidates(unwrap(history), head_sha, merge_commit_sha) {
+    const proof = fleet_commit_check_proof(harness, repository, branch, sha, options)
+    if proof.state == "pending" {
+      continue
+    }
+    if !proof.ok {
+      return head_proof
+    }
+    const contains = github_commit_reachable_from_branch(
+      harness,
+      repository,
+      merge_commit_sha,
+      sha,
+      options,
+    )
+    return if !is_err(contains) && unwrap(contains).reachable {
+      proof
+    } else {
+      head_proof
+    }
+  }
+  return head_proof
+}
