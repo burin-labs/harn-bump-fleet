@@ -1,0 +1,657 @@
+import {
+  GithubConnectorError,
+  github_connector_options,
+  github_file_text_at_ref_result,
+  github_is_rate_limited_read_error,
+  github_is_transient_read_error,
+  github_pr_checks,
+  github_pr_commits,
+  github_pr_files,
+  github_pr_view,
+} from "./github"
+import { admission_state_is_passing } from "./pr_admission"
+import { GithubClientOptions, GithubPullRequestChecks } from "harn-github-connector/default"
+
+pub type PrerequisitePrStatus = "satisfied" \
+  | "pending" \
+  | "mergeable_projection" \
+  | "terminal_failure" \
+  | "missing_check_evidence" \
+  | "missing_pull_request" \
+  | "unexpected_head" \
+  | "missing_merge_evidence" \
+  | "github_error"
+
+pub type PrerequisitePrDecision = {
+  ok: bool,
+  status: PrerequisitePrStatus,
+  repo: string,
+  number: int,
+  url?: string,
+  title?: string,
+  head_oid?: string,
+  expected_head_oid?: string,
+  github_state?: string,
+  merge_state?: string,
+  merged_at?: string,
+  merge_commit_oid?: string,
+  head_verification?: "exact" | "projection_equivalent" | "unexpected",
+  github_error_code?: string,
+  github_error_category?: string,
+  github_http_status?: int?,
+  github_retryable?: bool,
+  checks_observed: bool,
+  checks_head_oid: string,
+  check_state: string,
+  check_count: int,
+  pending_check_count: int,
+  failing_check_count: int,
+  failing_check_names: list<string>,
+  detail: string,
+}
+
+pub type PrerequisiteCheckEvidence = {
+  head_oid: string,
+  state: string,
+  check_count: int,
+  pending_count: int,
+  failing_count: int,
+  failing_names: list<string>,
+}
+
+pub type PrerequisitePr = {
+  head?: {sha?: string, ...rest},
+  head_oid?: string,
+  github_state?: string,
+  state?: string,
+  merge_commit_oid?: string,
+  merge_commit?: {oid?: string, ...rest},
+  mergeCommit?: {oid?: string, ...rest},
+  mergeable_state?: string,
+  merge_state_status?: string,
+  mergeStateStatus?: string,
+  mergeable?: bool?,
+  auto_merge_armed?: bool,
+  in_merge_queue?: bool?,
+  queue_membership?: {queued?: bool, auto_merge_armed?: bool, ...rest},
+  draft?: bool,
+  merged?: bool,
+  merged_at?: string,
+  mergedAt?: string,
+  url?: string,
+  title?: string,
+  ...rest,
+}
+
+pub type PrerequisiteProjectionFile = {path: string, contents: string}
+
+pub type PrerequisiteProjectionLease = {
+  head_ref: string,
+  base_ref: string,
+  files: list<PrerequisiteProjectionFile>,
+}
+
+pub type PrerequisiteProjectionEvidence = {
+  commits_head_oid: string,
+  final_head_oid: string,
+  commits: list<{sha: string, signature?: {verified?: bool, ...rest}, ...rest}>,
+  changed_paths: list<string>,
+  files_complete: bool,
+  head_contents: dict,
+  missing_paths: list<string>,
+}
+
+pub type PrerequisiteHeadVerification = {
+  ok: bool,
+  detail: string,
+  github_error?: GithubConnectorError,
+}
+
+fn github_error_decision(
+  repo: string,
+  number: int,
+  expected_head_oid: string,
+  prefix: string,
+  error: GithubConnectorError,
+) -> PrerequisitePrDecision {
+  const error_status: PrerequisitePrStatus = "github_error"
+  const decision: PrerequisitePrDecision = {
+    ok: false,
+    status: error_status,
+    repo: repo,
+    number: number,
+    expected_head_oid: expected_head_oid,
+    github_error_code: error.code,
+    github_error_category: error.category,
+    github_http_status: error.http_status,
+    github_retryable: github_is_transient_read_error(error)
+      || github_is_rate_limited_read_error(error),
+    checks_observed: false,
+    checks_head_oid: "",
+    check_state: "unknown",
+    check_count: 0,
+    pending_check_count: 0,
+    failing_check_count: 0,
+    failing_check_names: [],
+    detail: prefix + ": " + to_string(error),
+  }
+  return decision
+}
+
+fn text_or_empty(value: any) -> string {
+  if value == nil {
+    return ""
+  }
+  return trim(to_string(value))
+}
+
+fn pr_head_oid(pr: any) -> string {
+  return text_or_empty(pr?.head?.sha ?? pr?.head_oid)
+}
+
+fn pr_head_ref(pr: PrerequisitePr) -> string {
+  return text_or_empty(pr?.head?.ref)
+}
+
+fn pr_base_ref(pr: PrerequisitePr) -> string {
+  return text_or_empty(pr?.base?.ref)
+}
+
+fn pr_state(pr: PrerequisitePr?) -> string {
+  return lowercase(text_or_empty(pr?.github_state ?? pr?.state ?? "unknown"))
+}
+
+fn pr_merge_commit_oid(pr: PrerequisitePr?) -> string {
+  return text_or_empty(pr?.merge_commit_oid ?? pr?.merge_commit?.oid ?? pr?.mergeCommit?.oid)
+}
+
+fn pr_merge_state(pr: PrerequisitePr?) -> string {
+  return text_or_empty(pr?.mergeable_state ?? pr?.merge_state_status ?? pr?.mergeStateStatus)
+}
+
+fn pr_is_merged(pr: PrerequisitePr?) -> bool {
+  return (pr?.merged ?? false) || pr_state(pr) == "merged"
+}
+
+fn decision(
+  repo: string,
+  number: int,
+  pr: PrerequisitePr?,
+  ok: bool,
+  status: PrerequisitePrStatus,
+  detail: string,
+  expected_head_oid: string = "",
+  head_verification: "exact" | "projection_equivalent" | "unexpected" = "exact",
+  checks: PrerequisiteCheckEvidence? = nil,
+) -> PrerequisitePrDecision {
+  return {
+    ok: ok,
+    status: status,
+    repo: repo,
+    number: number,
+    url: pr?.url,
+    title: pr?.title,
+    head_oid: pr_head_oid(pr),
+    expected_head_oid: expected_head_oid,
+    github_state: pr_state(pr),
+    merge_state: pr_merge_state(pr),
+    merged_at: text_or_empty(pr?.merged_at ?? pr?.mergedAt),
+    merge_commit_oid: pr_merge_commit_oid(pr),
+    head_verification: head_verification,
+    checks_observed: checks != nil,
+    checks_head_oid: checks?.head_oid ?? "",
+    check_state: checks?.state ?? "unknown",
+    check_count: checks?.check_count ?? 0,
+    pending_check_count: checks?.pending_count ?? 0,
+    failing_check_count: checks?.failing_count ?? 0,
+    failing_check_names: checks?.failing_names ?? [],
+    detail: detail,
+  }
+}
+
+fn prerequisite_check_evidence(checks: GithubPullRequestChecks) -> PrerequisiteCheckEvidence {
+  const failing = checks.checks.filter(
+    { check ->
+      return lowercase(check.status) == "completed"
+        && !admission_state_is_passing(check.conclusion)
+    },
+  )
+    .to_list()
+  return {
+    head_oid: checks.head_sha,
+    state: lowercase(checks.rollup.state),
+    check_count: checks.rollup.total,
+    pending_count: checks.rollup.pending,
+    failing_count: checks.rollup.failed,
+    failing_names: failing.map({ check -> check.name }).to_list().sort(),
+  }
+}
+
+/**
+ * Prove that an advanced PR head still represents exactly one fleet projection.
+ *
+ * A protected branch may merge its current base into an open automation branch
+ * while checks run. The proposal commit then remains in the ordered PR history,
+ * but the head lease advances. Accept that descendant only when the connector
+ * observed one stable, signed commit list and the final PR patch still contains
+ * exactly the owned paths with exactly the rendered bytes.
+ */
+pub fn verify_projection_equivalent_head(
+  pr: PrerequisitePr,
+  expected_head_oid: string,
+  lease: PrerequisiteProjectionLease,
+  evidence: PrerequisiteProjectionEvidence,
+) -> PrerequisiteHeadVerification {
+  const observed = pr_head_oid(pr)
+  if pr_head_ref(pr) != lease.head_ref || pr_base_ref(pr) != lease.base_ref {
+    return {ok: false, detail: "pull request branch or base no longer matches the projection lease"}
+  }
+  if evidence.commits_head_oid != observed || evidence.final_head_oid != observed {
+    return {ok: false, detail: "pull request head changed while projection evidence was read"}
+  }
+  if !evidence.files_complete || len(evidence.missing_paths) > 0 {
+    return {ok: false, detail: "projection file evidence is incomplete"}
+  }
+  let expected_seen = false
+  for commit in evidence.commits {
+    if commit.sha == expected_head_oid {
+      expected_seen = true
+    }
+    if expected_seen && !(commit?.signature?.verified ?? false) {
+      return {ok: false, detail: "projection descendant contains an unverified commit"}
+    }
+  }
+  if !expected_seen {
+    return {ok: false, detail: "expected projection commit is not in the pull request history"}
+  }
+  const expected_paths = lease.files.map({ file -> file.path }).to_list().sort()
+  const changed_paths = evidence.changed_paths.sort()
+  if len(expected_paths) != len(changed_paths)
+    || json_stringify(expected_paths)
+      != json_stringify(changed_paths) {
+    return {ok: false, detail: "pull request patch widened beyond the owned projection paths"}
+  }
+  for file in lease.files {
+    if evidence.head_contents[file.path] != file.contents {
+      return {ok: false, detail: "projected bytes changed at " + file.path}
+    }
+  }
+  return {
+    ok: true,
+    detail: "advanced head preserves the signed proposal and exact owned projection patch",
+  }
+}
+
+fn classify_open_pr(
+  repo: string,
+  number: int,
+  pr: PrerequisitePr,
+  head_oid: string,
+  expected: string,
+  head_verification: "exact" | "projection_equivalent",
+  checks: PrerequisiteCheckEvidence?,
+) -> PrerequisitePrDecision {
+  if pr_state(pr) != "open" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request is ${pr_state(pr)} without merge evidence",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if pr?.draft ?? false {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request is a draft and cannot enter the merge queue",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  const merge_state = lowercase(pr_merge_state(pr))
+  if !(pr?.mergeable ?? true)
+    || ["dirty", "conflict", "conflicting"].contains(merge_state) {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "pull request has terminal merge state ${merge_state}",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if checks == nil || checks.head_oid != head_oid {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "missing_check_evidence",
+      "open pull request is missing check evidence for exact head ${head_oid}",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  if checks.failing_count > 0 || checks.state == "failing" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "terminal_failure",
+      "exact-head checks failed: " + json_stringify(checks.failing_names),
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  const queued = (pr?.in_merge_queue ?? false) || (pr?.queue_membership?.queued ?? false)
+  const armed = (pr?.auto_merge_armed ?? false)
+    || (pr?.queue_membership?.auto_merge_armed ?? false)
+  if checks.state == "pending" || checks.pending_count > 0 || queued || armed {
+    const progress = if checks.state == "pending" || checks.pending_count > 0 {
+      "checks are running"
+    } else if queued {
+      "pull request is queued"
+    } else {
+      "auto-merge is armed"
+    }
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "pending",
+      "${progress}; ${checks.pending_count} checks pending",
+      expected,
+      head_verification,
+      checks,
+    )
+  }
+  // Green, mergeable, exact head, and nothing is going to merge it. For a
+  // fleet-owned projection that is not a failure, it is a pull request waiting
+  // for admission, and the promotion that authored it is the admitting party.
+  // Reporting it as a terminal failure is what let a published release's tail
+  // die on its own projection: see the v0.10.127 cut, where a pull request that
+  // had been green for eleven minutes failed the prerequisite on attempt 1.
+  return decision(
+    repo,
+    number,
+    pr,
+    false,
+    "mergeable_projection",
+    "pull request is green and mergeable but neither queued nor armed for merge",
+    expected,
+    head_verification,
+    checks,
+  )
+}
+
+/**
+ * Classify a release prerequisite PR from the connector's normalized PR view.
+ *
+ * This is intentionally stricter than "GitHub says green": a release prerequisite is
+ * satisfied only when the PR is merged and its merge timestamp/commit are present.
+ * When the operator gave an expected head, a different PR head is blocking evidence.
+ */
+pub fn classify_prerequisite_pr(
+  repo: string,
+  number: int,
+  pr: PrerequisitePr?,
+  expected_head_oid: string = "",
+  equivalent_head: bool = false,
+  checks: PrerequisiteCheckEvidence? = nil,
+) -> PrerequisitePrDecision {
+  if pr == nil {
+    return decision(
+      repo,
+      number,
+      nil,
+      false,
+      "missing_pull_request",
+      "GitHub returned no pull request",
+      expected_head_oid,
+    )
+  }
+  const head_oid = pr_head_oid(pr)
+  const expected = text_or_empty(expected_head_oid)
+  const head_verification: "exact" | "projection_equivalent" | "unexpected" = if expected == ""
+    || head_oid
+      == expected {
+    "exact"
+  } else if equivalent_head {
+    "projection_equivalent"
+  } else {
+    "unexpected"
+  }
+  if head_verification == "unexpected" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "unexpected_head",
+      "pull request head ${head_oid} does not match expected ${expected}",
+      expected,
+      "unexpected",
+    )
+  }
+  const accepted_head_verification: "exact" | "projection_equivalent" = if head_verification
+    == "projection_equivalent" {
+    "projection_equivalent"
+  } else {
+    "exact"
+  }
+  if !pr_is_merged(pr) {
+    return classify_open_pr(
+      repo,
+      number,
+      pr,
+      head_oid,
+      expected,
+      accepted_head_verification,
+      checks,
+    )
+  }
+  const merged_at = text_or_empty(pr?.merged_at ?? pr?.mergedAt)
+  const merge_commit = pr_merge_commit_oid(pr)
+  if merged_at == "" || merge_commit == "" {
+    return decision(
+      repo,
+      number,
+      pr,
+      false,
+      "missing_merge_evidence",
+      "merged pull request is missing merged_at or merge_commit_oid evidence",
+      expected,
+      head_verification,
+    )
+  }
+  return decision(
+    repo,
+    number,
+    pr,
+    true,
+    "satisfied",
+    "pull request is merged at ${merged_at} with merge commit ${merge_commit} and ${head_verification} head evidence",
+    expected,
+    head_verification,
+    checks,
+  )
+}
+
+fn load_projection_head_verification(
+  harness: Harness,
+  repo: string,
+  number: int,
+  pr: PrerequisitePr,
+  expected_head_oid: string,
+  lease: PrerequisiteProjectionLease,
+  options: GithubClientOptions,
+) -> PrerequisiteHeadVerification {
+  const observed = pr_head_oid(pr)
+  const commits = github_pr_commits(harness, repo, number, observed, 100, options)
+  if is_err(commits) {
+    const error = unwrap_err(commits)
+    return {
+      ok: false,
+      detail: "GitHub PR commit proof failed: " + to_string(error),
+      github_error: error,
+    }
+  }
+  const files = github_pr_files(harness, repo, number, 1, 100, options)
+  if is_err(files) {
+    const error = unwrap_err(files)
+    return {
+      ok: false,
+      detail: "GitHub PR file proof failed: " + to_string(error),
+      github_error: error,
+    }
+  }
+  const commit_evidence = unwrap(commits)
+  const file_evidence = unwrap(files)
+  let head_contents = {}
+  let missing_paths: list<string> = []
+  for file in lease.files {
+    const read = github_file_text_at_ref_result(harness, repo, file.path, observed, options)
+    if is_err(read) {
+      const error = unwrap_err(read)
+      return {
+        ok: false,
+        detail: "GitHub projection content proof failed: " + to_string(error),
+        github_error: error,
+      }
+    }
+    const contents = unwrap(read)
+    if contents == nil {
+      missing_paths = missing_paths + [file.path]
+    } else {
+      head_contents[file.path] = contents ?? ""
+    }
+  }
+  const final_view = github_pr_view(harness, repo, number, options)
+  if is_err(final_view) {
+    const error = unwrap_err(final_view)
+    return {
+      ok: false,
+      detail: "GitHub final PR head proof failed: " + to_string(error),
+      github_error: error,
+    }
+  }
+  return verify_projection_equivalent_head(
+    pr,
+    expected_head_oid,
+    lease,
+    {
+      commits_head_oid: commit_evidence.head_sha,
+      final_head_oid: pr_head_oid(unwrap(final_view)),
+      commits: commit_evidence.commits,
+      changed_paths: file_evidence.files.map({ file -> file.filename }).to_list(),
+      files_complete: len(file_evidence.files) < 100,
+      head_contents: head_contents,
+      missing_paths: missing_paths,
+    },
+  )
+}
+
+/** Read and classify one prerequisite PR through the typed GitHub connector wrapper. */
+pub fn load_prerequisite_pr(
+  harness: Harness,
+  repo: string,
+  number: int,
+  expected_head_oid: string = "",
+  projection: PrerequisiteProjectionLease? = nil,
+  options: GithubClientOptions = github_connector_options(),
+) -> PrerequisitePrDecision {
+  const pr = github_pr_view(harness, repo, number, options)
+  if is_err(pr) {
+    return github_error_decision(
+      repo,
+      number,
+      expected_head_oid,
+      "GitHub PR view failed",
+      unwrap_err(pr),
+    )
+  }
+  const observed = unwrap(pr)
+  let equivalent_head = false
+  if expected_head_oid != "" && pr_head_oid(observed) != expected_head_oid && projection != nil {
+    const verification = load_projection_head_verification(
+      harness,
+      repo,
+      number,
+      observed,
+      expected_head_oid,
+      projection ?? {head_ref: "", base_ref: "", files: []},
+      options,
+    )
+    if !verification.ok {
+      if verification.github_error != nil {
+        return github_error_decision(
+          repo,
+          number,
+          expected_head_oid,
+          "GitHub projection equivalence proof failed",
+          verification.github_error
+            ?? {code: "invalid_response", category: "schema_drift", message: verification.detail},
+        )
+      }
+      return decision(
+        repo,
+        number,
+        observed,
+        false,
+        "unexpected_head",
+        verification.detail,
+        expected_head_oid,
+        "unexpected",
+      )
+    }
+    equivalent_head = true
+  }
+  if pr_is_merged(observed) {
+    return classify_prerequisite_pr(repo, number, observed, expected_head_oid, equivalent_head)
+  }
+  const lifecycle = classify_prerequisite_pr(
+    repo,
+    number,
+    observed,
+    expected_head_oid,
+    equivalent_head,
+  )
+  if lifecycle.status != "missing_check_evidence" {
+    return lifecycle
+  }
+  const checks = github_pr_checks(harness, repo, number, pr_head_oid(observed), options)
+  if is_err(checks) {
+    return github_error_decision(
+      repo,
+      number,
+      expected_head_oid,
+      "GitHub exact-head check read failed",
+      unwrap_err(checks),
+    )
+  }
+  const check_evidence = prerequisite_check_evidence(unwrap(checks))
+  return classify_prerequisite_pr(
+    repo,
+    number,
+    observed,
+    expected_head_oid,
+    equivalent_head,
+    check_evidence,
+  )
+}

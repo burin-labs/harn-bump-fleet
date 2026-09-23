@@ -1,0 +1,1 @@
+Fleet bump arming now treats `bump_enable_auto_merge = false` as a hold at the controller, not only at the generated adapter. Held repositories report `held_by_manifest` and never send an enable-auto-merge mutation; ordinary repositories still arm the exact signed head.
