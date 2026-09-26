@@ -11,9 +11,7 @@ The entry points are:
   `.github/workflows/bump-harn.yml`, dispatches Harn runtime bump workflows,
   polls them, and enables auto-merge on the resulting PRs.
 - `release_harn.harn`: mirrors the human `/release-harn` flow for
-  `~/projects/harn`. The launcher dispatches its default read-only audit to the
-  same hosted workflow as a live release. `--local-audit` is diagnosis only.
-  Live prepare/ship-pr requires `--yes-live-release`.
+  `~/projects/harn`. Live prepare/ship-pr requires `--yes-live-release`.
 - `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
   written after certification by `release_harn`. It signs and pushes the
   immutable candidate tag, arms the release pull request under its exact head
@@ -23,12 +21,6 @@ The entry points are:
   for a bump that merged and must not be published.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
-- `reap_chain_refs.harn`: clears `harn-update-chain/<chain id>` leases whose
-  every owning run reached a terminal conclusion, so a round that died before it
-  could release its own lease does not force the next release to start a fresh
-  chain around the dead one. Dry-run-first. It refuses a chain with a live run,
-  an unreadable run list, or no resolvable run, and its receipt distinguishes
-  reading zero refs from failing to read.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
   `release-attempt/vX.Y.Z/` refs by renaming each unclaimed attempt into
   `release-failed/vX.Y.Z/<oid>-abandoned`. Dry-run-first, and it refuses when a
@@ -36,27 +28,6 @@ The entry points are:
   hold the `release-owner` lease and refuse while a live release owns it.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
-- `report_failed_hosted_release.harn`: the terminal finalizer for a failed
-  hosted release. It reads the run's failing step and the inputs the run
-  recorded when it started, then writes one typed receipt naming the
-  precondition that failed and the exact re-dispatch that would retry it. It
-  never dispatches anything. `lib/hosted_release_failure.harn` owns the step
-  registry that decides what each failure means and whether a re-dispatch is a
-  sane repair at all; a step the registry does not name escalates rather than
-  defaulting to a retry, and `check_hosted_release_failure_coverage.harn` keeps
-  the registry and the workflow in step in both directions. Whether a step runs
-  before or after the release is irreversible is never registered by hand: it is
-  read from the step's position relative to `Run release harness`, and a failure
-  on the far side of that boundary is routed to recovery rather than to any
-  dispatch of the release workflow.
-- `lib/release_chain_driver.harn`: the one thing that moves a release chain and
-  the only thing that applies an effect. Every side effect goes through its
-  adapter's `apply_effect`, called from the planned-repair arm alone, and
-  control events are read before a stage is observed so a stand-down abandons
-  the remaining stages instead of only stopping the reporting. Its run receipt
-  names the proven, pending, and abandoned stages rather than reporting a
-  count. `release_chain.harn --plan` drives a journal read-only: its effect door
-  refuses, so a chain needing a repair says so instead of taking it.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that
@@ -166,9 +137,9 @@ Common harness runs:
 ```sh
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
-scripts/run_harn_release.sh
-scripts/run_harn_release.sh --mock --agent --mode ship-pr
-scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
@@ -180,9 +151,8 @@ scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --c
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
 are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
-Release and watch runs use `scripts/run_harn_release.sh` and
-`scripts/watch_harn_release.sh`. Those launchers retain Harn's worktree sandbox
-and grant the selected Harn checkout, its dedicated sibling release-workspace
+Watch runs use `scripts/watch_harn_release.sh`. That launcher retains Harn's
+worktree sandbox and grants the selected Harn checkout, its dedicated sibling release-workspace
 root, shared leases, toolchain caches, network, and the existing `gh` login at
 one audited boundary. Other fleet operations
 still need `--no-sandbox` until they have an equivalent typed root inventory.
@@ -295,17 +265,6 @@ retry that ran can be told from one that did not, and an exhausted bound reports
 unreadable. Whether a failure is transient is decided by
 `fleet_observation_class`, which owns that question for every connector error
 here, so the two answers cannot drift apart.
-A failed stage repairs itself only through `lib/release_chain_effect_door.harn`,
-the single place where a planned effect becomes an action. Its allowlist names
-every effect a repair may perform, and no entry dispatches the release workflow,
-so a repair can never produce a second cut of a published version. A repair runs
-at most once: the caller supplies the idempotency keys the chain has already
-spent and a repeat is refused, so a replayed chain refuses for the same reason a
-live one does. An effect counts as done only on evidence it read back; an empty,
-missing, or unattributed read-back escalates, because a door that accepted
-silence would report every unreachable dispatch as a successful repair. An
-unmapped cause, an unmapped effect kind, and an exhausted bound all stop with a
-typed reason rather than falling through to a retry.
 
 A release whose bump merged without a tag is recovered by
 `recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
