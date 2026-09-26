@@ -19,6 +19,12 @@ per-language review invariants.
    `open-pull-requests-limit` are identical in every block in every repo.
 3. **Group so the fleet does not drown in PRs.** See the grouping rule below.
 4. **Add a block, never a second file.** One `.github/dependabot.yml` per repo.
+5. **Start with the organization template, byte for byte.** Every file begins
+   with `burin-labs/.github` `templates/dependabot.yml`, which owns the
+   `github-actions` block. The repo's own blocks, ignores, and comments follow
+   it. Fleet projection convergence updates the template prefix in place and
+   keeps the rest; a file that does not start with the template fails that run
+   and is named in its annotations.
 
 ## Shared fields
 
@@ -72,26 +78,11 @@ groups:
 
 ## Full template
 
+The first block is `burin-labs/.github` `templates/dependabot.yml`, copied
+exactly (rule 5); read it there rather than from this page. Package blocks
+follow it:
+
 ```yaml
-version: 2
-
-# Cooldown defers freshly-published versions so a compromised release has time
-# to be yanked or flagged before Dependabot proposes it.
-updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Los_Angeles"
-    cooldown:
-      default-days: 7
-    groups:
-      actions:
-        patterns:
-          - "*"
-
   # Repeat per package ecosystem the repo actually has. `directory` points at
   # the manifest; use `directories` for several copies of one ecosystem.
   - package-ecosystem: "npm"
@@ -154,9 +145,7 @@ Shipping a manifest is not by itself a reason for a block. `tree-sitter-harn-spm
 has a `Package.swift` with an empty `dependencies` list — the grammar is
 vendored and updated by hand under supply-chain review — so a `swift` block
 there would monitor nothing. Rule 1 says cover every ecosystem the repo *has*;
-an ecosystem with no external dependencies is not one. Its config also drops
-`day`/`time`/`timezone` and adds a `ci` commit prefix; that is grandfathered,
-not a third permitted deviation.
+an ecosystem with no external dependencies is not one.
 
 ## Enforcement ownership
 
