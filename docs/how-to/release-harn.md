@@ -1,6 +1,6 @@
 # Release Harn
 
-Drive a Harn release through the harness, locally or on hosted runners.
+Drive a Harn release through the harness.
 
 `release_harn.harn` is the matching Harn-native harness for the
 `~/projects/harn` `/release-harn` skill workflow. It does not publish
@@ -16,106 +16,18 @@ verifies its signature locally before pushing. A merge-identity, ancestry,
 signing, or verification failure stops publication before the tag reaches the
 remote. Existing tags are never moved.
 
-## Preconditions are asked first
-
-Every mode runs `preflight_release_launch.harn` before anything is leased,
-dispatched, or built. It validates the dispatch inputs through the release's
-own validator, mints an installation token through the reviewed profile and
-asserts the grants the cut will exercise, compares that mint's lifetime against
-the declared phase wall budgets, and, for `ship-pr`, runs the consumer contract
-gate against live consumer mains. It takes under two minutes and writes
-nothing.
-
-Each precondition reports `pass`, `fail`, or `not asked`. A context without
-release App credentials -- an operator laptop, a fork pull request -- reports
-the credentialed half as not asked rather than as passing, so a partial read
-never looks like a clean one. On consumer drift the receipt names
-`fleet-projection-convergence.yml` as the repair to dispatch, and names the
-drifted repositories as its `only` targets, so the remedy can be run as
-written. A drift whose failure lines name no repository asks for the
-whole-fleet dispatch instead of a narrower one.
-
-`at_sha` takes seven to forty hex digits. A short one is resolved against the
-release repository and widened before the dispatch, so what reaches the receipt,
-the certification branch, and the tag is always one exact commit. A prefix that
-names no commit, or that GitHub resolves to something which does not extend it,
-is refused with the reason rather than adopted. A branch or tag name is not a
-commit prefix and is refused: `--at-sha main` would pin whatever main happened
-to be at that instant, which is the binding the input exists to remove.
-
-## What has to be true before anything is tagged
-
-Four assertions read the tree the release will act on rather than a workflow
-run's conclusion. A conclusion says a job finished; these say what the system
-decided.
-
-- the default branch carries the exact next `X.Y.Z-dev` version, which only the
-  post-release cutover produces
-- the release contract's own verdict is green on that commit
-- the tree that will carry the tag holds no unfolded `changelog.d/` fragment
-- every consumer's current pin is known by value, with any pin that could not
-  be read named rather than dropped from the count
-
-The fragment count is asked about the commit being tagged, not the base. At
-launch the fold has not run yet, so the base legitimately holds fragments and
-the question is reported not asked until a commit is named:
-
-```sh
-scripts/preflight_release_launch.sh --mode ship-pr --bump patch \
-  --checkpoint-commit <commit>
-```
-
-Ask the same questions without starting a release:
-
-```sh
-scripts/preflight_release_launch.sh --mode ship-pr --bump patch
-```
-
-To widen a commit prefix without asking anything else, `--resolve-only` prints
-the exact commit on stdout and everything a person reads on stderr.
-
-Two of these preconditions are facts about another repository: whether the
-release repository's default branch carries the last release's fold, and
-whether the consumers' adapters match what the renderer produces. No commit
-here repairs either. A pull request is therefore asked with a narrower scope:
-every precondition is still asked and still appears in the receipt, and a
-release-state refusal is announced as a warning instead of failing the check. A
-push to the default branch, the hourly run, and the release itself keep
-refusing on all of them.
-
-The same job runs on every pull request to this repository and hourly on main,
-so a change to a renderer, the fleet manifest, or the token profiles fails its
-own pull request instead of a release attempt.
-
-Default mode dispatches a read-only audit through the hosted release workflow:
-
-```sh
-scripts/run_harn_release.sh
-```
-
-The hosted route gives the audit the same runner, checkout, credential, and
-confinement setup as a live release. Use `--local-audit` only to diagnose local
-source lanes; a local result does not certify hosted release readiness.
-
-The dispatcher preserves `--agent` explicitly. Omit it for deterministic
-preparation with model calls disabled, or select `agent: false` in the hosted
-workflow. This choice is retained in dispatch and failure-recovery receipts;
-older receipts without the field retain their original agent-enabled behavior.
-Deterministic preparation requires valid release notes or changelog fragments
-and still runs the normal certification gates.
-
 Useful mock runs:
 
 ```sh
 # Fully mocked vX.Y.Z -> vX.Y.(Z+1) audit. No repo/GitHub writes.
-scripts/run_harn_release.sh --mock
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock
 
 # Mocked agent/tool loop using Harn's mock LLM provider.
-scripts/run_harn_release.sh --mock --agent
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent
 
 # Mock the full command sequence: prepare, commit, immutable publication, PR,
 # and auto-merge. Still no repo/GitHub writes.
-scripts/run_harn_release.sh --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
 ```
 
 The mock release path runs on every pull request as the required
@@ -146,10 +58,10 @@ titles.
 ```sh
 # The source checkout may be on any branch or dirty; release work is isolated.
 # If needed, the harness drafts CHANGELOG.md for vX.Y.Z before prepare.
-scripts/run_harn_release.sh --mode prepare --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode prepare --yes-live-release
 
 # Same, then commit/rebase/push/open-or-reuse the PR and enable squash auto-merge.
-scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 
 # Resume the post-PR handoff through certified-candidate tagging and publication.
 # Safe to stop and rerun.
@@ -158,144 +70,6 @@ scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
 # Import one hosted release run's receipt, then watch it through the same path.
 scripts/watch_harn_release.sh --tag vX.Y.Z --hosted-run RUN_ID --yes-live-release
 ```
-
-## Running the release on hosted runners
-
-If publication succeeded but the remaining work stopped, see
-[Resume a published release](resume-a-published-release.md).
-That path selects an exact tag and retains the original release-chain journal.
-
-`.github/workflows/hosted-release.yml` runs the same harness on hosted Linux
-capacity, normally an eight-CPU Blacksmith runner. If that provider cannot
-assign a runner, set the repository variable
-`HARN_CI_DISABLE_BLACKSMITH_LINUX=true` and replay the dispatch receipt. The
-replacement uses `ubuntu-latest` and declares the matching Harn runner tier;
-unset or set the variable to `false` after Blacksmith recovers. Both this
-repository and `burin-labs/harn` are public, so GitHub-hosted fallback minutes
-cost nothing. The Rust compilation that dominates a local release moves off
-the operator machine. On a measured v0.10.53 run,
-`prepare` and `release-cli-aot` accounted for 17 of the 24 minutes before the
-certification gate; the model agent accounted for 0.3 minutes, so the LLM is
-not the expensive part of a release.
-
-The canonical launcher dispatches every non-mock audit to this workflow. On
-macOS it also dispatches an authorized live `prepare` or `ship-pr` invocation
-before compilation.
-Candidate certification intentionally exercises nested OS sandboxes, which
-Seatbelt cannot apply beneath Harn's default-deny outer sandbox. Read-only
-`--local-audit` diagnosis and mocks remain local. The handoff accepts only the
-workflow's typed inputs and fails before dispatch when a local-only release
-flag cannot be represented. It writes an atomic
-`.harn-runs/hosted-release-dispatch-<run-id>.json` receipt containing the full
-non-secret input tuple and exact Actions run identity.
-
-Dispatch it from the Actions tab or through the typed launcher:
-
-```sh
-scripts/dispatch_hosted_release.sh --bump patch --mode ship-pr \
-  --at-sha <40-character-origin-main-sha> --expect-pr <number>
-```
-
-Recovery needs no archive selector. Once a candidate is certified, the harness
-reads its signed, write-once candidate record and reuses only the archive run
-that record names. If the selected archive expired, moved, or no longer matches
-the archive policy, recovery refuses or rebuilds according to the gate's normal
-policy; an operator cannot substitute another run.
-
-If a queued or environment-waiting run must be replaced, replay its receipt.
-The replacement command does not accept release input flags: it dispatches the
-recorded tuple, rechecks the old run, and records both run IDs. If the old run
-started or changed identity, the command cancels the new run and refuses the
-replacement.
-
-```sh
-scripts/dispatch_hosted_release.sh \
-  --replace-receipt .harn-runs/hosted-release-dispatch-<run-id>.json
-```
-
-`mode: audit` is read-only. `mode: prepare` builds and certifies the candidate.
-`mode: ship-pr` opens the release PR and hands its receipt to the watcher. The
-watcher tags the immutable certified candidate, arms the release PR, and monitors
-publication, even when `converge_fleet` is false. The watcher checks every three
-minutes and refreshes its credentials between segments of at most 45 minutes.
-A release needs no local step.
-
-With `converge_fleet: true`, the hosted run also follows the complete bounded
-repository-update chain, not just its first Actions run. Each continuation has
-the same release run ID in its display name. The first incomplete round leases
-an exact-OID `harn-update-chain/<release-run-id>` branch; later rounds dispatch
-only from that immutable controller, and the terminal round releases it under
-the same lease. Installing the requested Harn release remains a separate,
-explicit startup step. A round that dies before it can run that release leaves
-the lease held; the scheduled `Reap held convergence chain leases` workflow runs
-`reap_chain_refs.harn` and clears only the leases whose every owning run reached
-a terminal conclusion more than an hour ago. A chain with a live run, an
-unreadable run list, or no resolvable run is reported and left held, and the
-receipt distinguishes reading zero leases from failing to read the remote.
-Success means every repository proves the target pin on
-`main` with green checks; an independently opened PR is accepted when its
-merged commit supplies that same immutable proof. The terminal artifact
-`hosted-release-and-update-cost-receipt.json` combines the release and every
-update round. It reports a numeric model cost only when every contributing Harn
-receipt is exact and fully priced; missing or unpriced usage fails closed.
-
-Tags are signed by a dedicated release bot key that exists only in the
-workflow's `release` environment. The maintainer's personal signing key is
-deliberately not reachable from any runner. Harn owns the public trust root at
-`.github/release-bot-allowed-signers`, so signing and artifact publication use
-one contract. From a directory containing the Harn checkout:
-
-```sh
-git -c gpg.ssh.allowedSignersFile=harn/.github/release-bot-allowed-signers \
-  verify-tag v0.10.53
-```
-
-The tagger is a GitHub App bot, and an App bot cannot hold SSH signing keys on
-GitHub, so the web UI marks these tags unverified even though the signature is
-valid. Restoring that badge would mean signing as a machine user account rather
-than the App bot.
-
-The release commit is a different problem, and the bot key is the wrong answer
-to it. `burin-labs/harn`'s `main` ruleset requires signatures, and GitHub counts
-only a signature it can attribute to the committer's account — so a release
-commit signed with the bot key is real, checkable, and still refused, leaving
-the release PR blocked with every check green. The hosted workflow therefore
-passes `--github-signed-commit`, which has the harness create that commit
-through `createCommitOnBranch` under the App token it already holds. GitHub
-signs it server-side, so it needs no key at all, and the gate that follows asks
-GitHub for its verdict on the exact commit rather than asking whether this
-machine can check a signature — the same question the ruleset asks.
-
-The commit lands on a scratch `release-candidate/vX.Y.Z` branch first, because
-the immutable attempt ref is named for the object id GitHub is about to choose.
-The local branch is reset onto that commit before any gate reads it, and the
-scratch branch is deleted, so every proof below — parent, size, certification,
-tag — sees the exact commit that will be published.
-
-A release run from a machine whose signing key GitHub already accepts does not
-pass the flag and is unchanged. That route adds failure modes the local one does
-not have: `createCommitOnBranch` cannot carry a new executable file or a file
-mode change, and fails closed rather than publishing a different tree. It should
-become the only route once a hosted release has shipped through it.
-
-Both repositories are public, so the workflow assumes any secret it can read is
-worth attacking, and layers the controls accordingly:
-
-- `workflow_dispatch` is the only trigger. GitHub restricts manual dispatch to
-  actors with write access, so no fork or pull request can start the run.
-- The job binds to the `release` environment, whose protection rules require a
-  reviewer and allow only protected branches. The job pauses before any secret
-  is materialized until that reviewer approves, so even a collaborator with
-  write access cannot spend the API key unattended.
-- Top-level `permissions` is read-only. Write access to `burin-labs/harn` comes
-  from a short-lived GitHub App token scoped to that one repository.
-- Free-text inputs reach `run:` blocks through the environment rather than
-  string interpolation, and `at_sha` is rejected unless it is a full 40-hex SHA.
-- Every third-party action is pinned by commit SHA.
-
-The `release` environment holds `OPENROUTER_API_KEY` and `CEREBRAS_API_KEY`.
-The planner model is already well under a $2/Mtok budget — see
-`lib/llm_defaults` — so a release costs cents of inference rather than dollars.
 
 `ship-pr` returns as soon as the tag, branch, PR, auto-merge handoff, and typed
 watch receipt are durable. It does not hold the operator process open while
