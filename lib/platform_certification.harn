@@ -66,6 +66,21 @@ pub type PlatformCertificationSpec = {
   platform: "windows" | "macos",
   workflow_path: string,
   required_job: string,
+  /**
+   * An advisory platform is dispatched and awaited like any other, but a lane
+   * that does not prove it never fails certification or aborts a sibling. The
+   * decision records it as a named advisory instead.
+   */
+  advisory: bool,
+}
+
+/** A platform that did not prove the candidate, recorded without failing it. */
+pub type PlatformCertificationAdvisory = {
+  platform: string,
+  state: "failure" | "missing" | "abandoned",
+  code: string,
+  message: string,
+  run_url: string?,
 }
 
 pub type PlatformCertificationPlatform = "windows" | "macos"
@@ -115,6 +130,7 @@ pub type PlatformCertificationDecision = {
   reason: string,
   cause?: PlatformCertificationCause,
   receipt?: dict,
+  advisories?: list<PlatformCertificationAdvisory>,
   cancellations: list<dict>,
 }
 
@@ -199,15 +215,20 @@ pub type PlatformCertificationAdapter = {
 }
 
 const PLATFORM_SPECS: list<PlatformCertificationSpec> = [
+  // Windows builds and runs with no OS sandbox confinement, and its CI is
+  // advisory: its nightly is still dispatched at the candidate, but it never
+  // blocks a release.
   {
     platform: "windows",
     workflow_path: ".github/workflows/windows-nightly.yml",
     required_job: "Workspace nextest (windows-latest)",
+    advisory: true,
   },
   {
     platform: "macos",
     workflow_path: ".github/workflows/macos-nightly.yml",
     required_job: "Workspace nextest (macos-latest)",
+    advisory: false,
   },
 ]
 
@@ -720,6 +741,9 @@ fn platform_lane(
   if spec == nil || dispatch == nil || started == nil {
     return Err({code: "lane_identity_missing", message: "platform lane index was invalid"})
   }
+  if dispatch.missing ?? false {
+    return Err({code: "dispatch_missing", message: "${spec.platform}: ${dispatch.reason ?? ""}"})
+  }
   const proof = await_lane_verdict(
     runtime,
     cfg,
@@ -731,10 +755,11 @@ fn platform_lane(
     outer_abort,
     registry,
   )
-  // Only a lane that reached its own verdict may doom the run. Republishing an
-  // abandonment would let the first abandoned lane abort the lane that is still
-  // the only one able to report a real cause.
-  if is_err(proof) && !is_abandoned(proof) {
+  // Only a required lane that reached its own verdict may doom the run.
+  // Republishing an abandonment would let the first abandoned lane abort the
+  // lane that is still the only one able to report a real cause, and an
+  // advisory lane cannot fail the run at all.
+  if is_err(proof) && !is_abandoned(proof) && !spec.advisory {
     runtime.shared_set(abort, to_string(unwrap_err(proof)))
   }
   return proof
@@ -1053,6 +1078,9 @@ fn contract_source_lanes(fs: HarnessFs, path: string) -> list<string>? {
 fn cleanup_runs(adapter: PlatformCertificationAdapter, dispatches: list<dict>) -> list<dict> {
   let receipts: list<dict> = []
   for dispatch in dispatches {
+    if dispatch.missing ?? false {
+      continue
+    }
     const cancelled = adapter.cancel(dispatch.run_id)
     receipts = receipts
       + [
@@ -1131,6 +1159,21 @@ pub fn begin_platform_certification(
   for spec in PLATFORM_SPECS {
     const started = adapter.now_ms()
     const result = adapter.acquire(spec)
+    // An advisory platform that cannot be dispatched keeps its slot as a
+    // placeholder, so the lanes stay aligned with the specs and the decision
+    // records it as missing instead of failing acquisition.
+    if spec.advisory
+      && (is_err(result) || !exact_dispatch_identity(cfg, spec, unwrap(result))
+        || dispatches.any({ prior -> prior.run_id == unwrap(result).run_id })) {
+      const reason = if is_err(result) {
+        "dispatch failed: " + to_string(unwrap_err(result))
+      } else {
+        "dispatch returned a malformed exact identity"
+      }
+      dispatches = dispatches + [{platform: spec.platform, missing: true, reason: reason}]
+      starts = starts + [started]
+      continue
+    }
     if is_err(result) {
       const cancellations = cleanup_runs(adapter, dispatches)
       return {
@@ -1169,7 +1212,7 @@ pub fn begin_platform_certification(
   return {
     success: true,
     code: "acquired",
-    reason: "acquired exact Windows and macOS runs for ${cfg.pin_sha}",
+    reason: "acquired exact platform runs for ${cfg.pin_sha}",
     dispatches: dispatches,
     starts: starts,
     cancellations: [],
@@ -1269,7 +1312,45 @@ pub fn finish_platform_certification(
     { value, _index -> value },
     { message, _index -> Err({code: "lane_panicked", message: message}) },
   )
-  const failures = results.filter({ result -> is_err(result) }).to_list()
+  // Tasks 0 and 1 are the platform specs in order; task 2 is local source.
+  let failures = []
+  let advisories: list<PlatformCertificationAdvisory> = []
+  let platforms = []
+  for {index, value: result} in results.enumerate() {
+    const spec = if index < len(PLATFORM_SPECS) {
+      PLATFORM_SPECS[index]
+    } else {
+      nil
+    }
+    if !is_err(result) {
+      if spec != nil {
+        platforms = platforms + [unwrap(result)]
+      }
+      continue
+    }
+    if spec?.advisory ?? false {
+      const failure = unwrap_err(result)
+      const code = to_string(failure?.code ?? "unknown")
+      advisories = advisories
+        + [
+          {
+            platform: spec.platform,
+            state: if code == "dispatch_missing" {
+              "missing"
+            } else if code == "lane_abandoned" {
+              "abandoned"
+            } else {
+              "failure"
+            },
+            code: code,
+            message: to_string(failure?.message ?? failure),
+            run_url: dispatches[index]?.url,
+          },
+        ]
+      continue
+    }
+    failures = failures + [result]
+  }
   if len(failures) > 0 {
     const cause = unwrap_err(decisive_failure(failures))
     const cause_code = to_string(cause?.code ?? "unknown")
@@ -1285,7 +1366,6 @@ pub fn finish_platform_certification(
       cancellations: cleanup_runs(adapter, dispatches),
     }
   }
-  const platforms = [unwrap(results[0]), unwrap(results[1])]
   const local_timing = unwrap(results[2])
   const queried_lanes = adapter.source_lanes()
   if is_err(queried_lanes) {
@@ -1320,7 +1400,13 @@ pub fn finish_platform_certification(
     }
   }
   const join = platform_certification_join(platforms, local_timing)
-  const receipt = {
+  for advisory in advisories {
+    harness.stdio.println(
+      "PLATFORM_CERTIFICATION_ADVISORY platform=${advisory.platform} state=${advisory.state} "
+        + "code=${advisory.code} run=${advisory.run_url ?? "none"}",
+    )
+  }
+  const base_receipt = {
     schema_version: "harn.release_audit_receipt.v2",
     proof_kind: "hosted_platform",
     source: {
@@ -1346,11 +1432,25 @@ pub fn finish_platform_certification(
       status: "success",
     },
   }
+  // The key is present only when a platform went unproven, so a fully proven
+  // receipt keeps its established shape.
+  const receipt = if len(advisories) > 0 {
+    base_receipt + {advisories: advisories}
+  } else {
+    base_receipt
+  }
+  const proven = platforms.map({ proof -> proof.platform }).to_list().join(", ")
   return {
     success: true,
     code: "certified",
-    reason: "certified exact Windows, macOS, and local source evidence for ${cfg.pin_sha}",
+    reason: "certified exact ${proven} and local source evidence for ${cfg.pin_sha}"
+      + if len(advisories) > 0 {
+        "; advisory: " + advisories.map({ a -> "${a.platform} ${a.state}" }).to_list().join(", ")
+      } else {
+        ""
+      },
     receipt: receipt,
+    advisories: advisories,
     cancellations: [],
   }
 }
