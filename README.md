@@ -41,14 +41,6 @@ runs. The wrapper verifies the repo-pinned runtime before Harn parses the
 program and loads the configured provider environment. Mock release runs can
 stay sandboxed.
 
-To recover a completed consumer rehearsal, pass its exact workflow run ID to
-`rehearse_consumers.harn` with `--consumer-proof-runs-json '{"owner/repository":123}'`
-and `--only owner/repository` through the supported `scripts/with_env.sh harn run
---no-sandbox` launcher. The existing certification gate verifies the selected run's
-candidate, workflow, source commit, and result before recording proof. A selected
-run does not bypass a failed or missing check, and recovery does not dispatch a
-replacement for that consumer.
-
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It
@@ -65,13 +57,11 @@ Start with the job you need to do.
 - [Bump the fleet](docs/how-to/bump-the-fleet.md). Every orchestrator command,
   from a discover-only rehearsal to a live parallel bump.
 - [Release Harn](docs/how-to/release-harn.md). Drive a release through the
-  harness, locally or on hosted runners.
+  harness.
 - [Free a wedged release](docs/how-to/free-a-wedged-release.md). Recover a
   stalled version, resume a certified candidate, apply a post-publish fixup.
 - [Reserve the release queue](docs/how-to/reserve-the-release-queue.md). Take
   and hold the single release slot.
-- [Resume a published release](docs/how-to/resume-a-published-release.md). Pick
-  a release back up after publication.
 - [Sign blocked bot pull requests](docs/how-to/sign-blocked-bot-pull-requests.md).
   Get an unsigned dependency bot head past a signature-required branch.
 - [Review a run in chat](docs/how-to/review-a-run-in-chat.md). Open an
@@ -84,9 +74,6 @@ Start with the job you need to do.
   to find.
 - [Continuous integration](docs/reference/continuous-integration.md). What this
   repository's own CI runs, and what each job proves.
-- [Harn updates](docs/harn-updates.md) and
-  [update operations](docs/harn-update-operations.md). The update vocabulary
-  and the operator surface behind it.
 - [Dependabot fleet template](docs/dependabot-fleet-template.md). The projected
   dependency configuration every fleet repository receives.
 
@@ -96,7 +83,5 @@ Start with the job you need to do.
   run executes in, why a rerun is safe, and what it leaves behind.
 - [Candidate record](docs/explanation/candidate-record.md). How one signed
   certification identity selects the exact archives used after certification.
-- [Fleet convergence](docs/fleet-convergence.md). What convergence means, and
-  what it does not.
 - [Update benchmark](docs/harn-update-benchmark.md). How repair performance is
   measured.

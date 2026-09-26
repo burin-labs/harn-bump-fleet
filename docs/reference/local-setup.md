@@ -16,11 +16,11 @@ appears first on the ambient `PATH`:
 # Sources ~/projects/burin-code/.env (override with HARN_EXT_BUMP_FLEET_ENV_FILE),
 # then ./.env and ./.env.local from the repo root, then runs the harness.
 scripts/install_harn.sh
-scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --agent --yes-live-release
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
 
 # Verbose mode prints which files were sourced.
-HARN_EXT_ENV_VERBOSE=1 scripts/run_harn_release.sh
+HARN_EXT_ENV_VERBOSE=1 scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
 
 Discovery order (later entries override earlier ones):
@@ -87,7 +87,7 @@ The default release Cargo target is
 `$HOME/.cache/harn-bump-fleet/release-harn-target` when `XDG_CACHE_HOME` is
 unset. Override it only when a release lane needs an isolated cache.
 
-`scripts/run_harn_release.sh` prints a `planner` + `binder` line
+`release_harn.harn` prints a `planner` + `binder` line
 at the top of every run summarizing the resolved route.
 
 ## AMFI-shielded launcher (macOS)
@@ -105,7 +105,6 @@ changes, so warm runs cost ~50ms.
 
 ```sh
 scripts/with_env.sh scripts/harn_shielded.sh run --no-sandbox bump_fleet.harn -- --dry-run
-scripts/run_harn_release.sh --mode ship-pr
 ```
 
 Drop-in for any `harn ...` invocation. CI environments don't need it
@@ -131,5 +130,5 @@ auto-selected), set `HARN_PLANNER_PROVIDER=ollama` and pull the model:
 
 ```sh
 ollama pull qwen3.6:35b-a3b-coding-nvfp4
-HARN_PLANNER_PROVIDER=ollama scripts/run_harn_release.sh
+HARN_PLANNER_PROVIDER=ollama scripts/with_env.sh harn run --no-sandbox release_harn.harn
 ```
