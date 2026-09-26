@@ -21,8 +21,10 @@ import {
   unwatched_repositories,
 } from "lib/fleet_manifest"
 import {
+  ConvergenceDeadline,
   FleetStalenessSnapshot,
   PinStalenessRow,
+  convergence_survey_due,
   pin_staleness_verdict,
   releases_behind,
   stale_rows,
@@ -40,6 +42,7 @@ import {
   github_open_issues_with_label,
   github_pr_list,
   github_published_release_tags,
+  github_release_at_tag,
 } from "lib/github"
 import { development_cutover_verdict, workspace_version_from_manifest } from "lib/release_analysis"
 
@@ -54,6 +57,8 @@ pub type PinStalenessOptions = {
   target?: string,
   only?: string,
   max_releases_behind: string,
+  max_minutes_behind?: string,
+  survey_window_minutes?: string,
   dry_run: bool,
   run_url?: string,
 }
@@ -64,6 +69,8 @@ const ARG_SPEC: ParserSpec = {
     {kind: "positional", name: "target", required: false},
     {kind: "flag", name: "only", long: "--only"},
     {kind: "flag", name: "max_releases_behind", long: "--max-releases-behind", default: "1"},
+    {kind: "flag", name: "max_minutes_behind", long: "--max-minutes-behind"},
+    {kind: "flag", name: "survey_window_minutes", long: "--survey-window-minutes"},
     {kind: "switch", name: "dry_run", long: "--dry-run"},
     {kind: "flag", name: "run_url", long: "--run-url"},
   ],
@@ -81,11 +88,42 @@ pub fn parse_pin_staleness_args(args: list<string>) -> PinStalenessOptions {
  * alarm silently disarmed by a typo is worse than no alarm at all.
  */
 pub fn resolve_max_releases_behind(raw: string) -> int {
+  return resolve_count("--max-releases-behind", raw)
+}
+
+/** A count flag as a number, refusing anything that is not one, for the same reason. */
+pub fn resolve_count(flag: string, raw: string) -> int {
   const parsed = to_int(trim(raw))
   if parsed == nil || parsed < 0 {
-    throw "--max-releases-behind must be a non-negative integer, got '${raw}'"
+    throw "${flag} must be a non-negative integer, got '${raw}'"
   }
   return parsed
+}
+
+/**
+ * Minutes since `target` was published. An unreadable publication time throws:
+ * a deadline measured from nothing would read every consumer as on time.
+ */
+fn minutes_since_published(harness: Harness, target: string) -> int {
+  const lookup = github_release_at_tag(harness, HARN_REPO, target)
+  if is_err(lookup) {
+    throw "could not read the ${target} release: ${to_string(unwrap_err(lookup))}"
+  }
+  const release = unwrap(lookup)
+  const published_at = if release.found {
+    release.release?.published_at
+  } else {
+    nil
+  }
+  const published_s = if published_at == nil {
+    nil
+  } else {
+    to_int(date_parse(published_at))
+  }
+  if published_s == nil {
+    throw "${target} has no readable publication time"
+  }
+  return (harness.clock.now_ms() / 1000 - published_s) / 60
 }
 
 /**
@@ -174,6 +212,35 @@ pipeline main(harness: Harness) {
     harness.stdio.eprintln("error: target must be an exact Harn tag, got '${target}'")
     return 2
   }
+  const convergence: ConvergenceDeadline? = if options.max_minutes_behind == nil {
+    nil
+  } else {
+    {
+      minutes_since_publish: minutes_since_published(harness, target),
+      max_minutes_behind: resolve_count("--max-minutes-behind", options.max_minutes_behind),
+    }
+  }
+  if options.survey_window_minutes != nil {
+    if convergence == nil {
+      harness.stdio.eprintln("error: --survey-window-minutes needs --max-minutes-behind")
+      return 2
+    }
+    const window = resolve_count("--survey-window-minutes", options.survey_window_minutes)
+    if !convergence_survey_due(convergence, window) {
+      harness.stdio.println(
+        json_stringify_pretty(
+          {
+            schema_version: "harn_bump_fleet.pin_staleness.v1",
+            target: target,
+            convergence_deadline: convergence,
+            surveyed: false,
+            detail: "outside the survey window after the deadline; the daily run covers the rest",
+          },
+        ),
+      )
+      return 0
+    }
+  }
   const tags = github_published_release_tags(harness, HARN_REPO)
   if is_err(tags) {
     harness.stdio.eprintln("error: could not list Harn releases: ${to_string(unwrap_err(tags))}")
@@ -215,7 +282,14 @@ pipeline main(harness: Harness) {
     const pin = remote_pin(harness, update)
     const behind = releases_behind(pin, release_tags)
     const budget = repo.bump_max_releases_behind ?? max_behind
-    const verdict = pin_staleness_verdict(pin, target, behind, budget)
+    // A repository with its own lag budget trails on purpose; the deadline
+    // holds every other consumer to the newest release.
+    const repo_deadline = if repo.bump_max_releases_behind == nil {
+      convergence
+    } else {
+      nil
+    }
+    const verdict = pin_staleness_verdict(pin, target, behind, budget, repo_deadline)
     const row: PinStalenessRow = verdict
       + {
         slug: repo.slug,
@@ -257,6 +331,7 @@ pipeline main(harness: Harness) {
     schema_version: "harn_bump_fleet.pin_staleness.v1",
     target: target,
     max_releases_behind: max_behind,
+    convergence_deadline: convergence,
     stale_count: len(stale),
     development_cutover: development_cutover,
     repositories: rows,
