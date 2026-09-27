@@ -1,0 +1,254 @@
+#!/usr/bin/env harn
+//
+// Refuse an organization `uses: ...@<sha>` pin whose commit is not on the pinned
+// repository's default branch. Local mode reads this checkout's workflows and
+// actions, so a pull request fails before the pin reaches main. `--fleet` reads
+// every fleet.toml repository's default branch, which catches a pin that went
+// stale after merge.
+//
+// Both modes refuse an empty inventory and any pin whose reachability could not
+// be read: either would otherwise report a clean fleet that measured nothing.
+import { ParserSpec } from "std/cli/argparse"
+import { git_run } from "std/git"
+import { api_call } from "harn-github-connector/default"
+import { cli_options } from "lib/cli_options"
+import { read_fleet_manifest } from "lib/fleet_manifest"
+import {
+  github_commit_reachable_from_branch,
+  github_connector_options,
+  github_file_text_at_ref,
+} from "lib/github"
+import {
+  OrgCommitPin,
+  distinct_pin_keys,
+  org_commit_pins,
+  pin_ancestry_violation_line,
+  pin_ancestry_violations,
+} from "lib/pin_ancestry"
+
+const OWNER = "burin-labs"
+
+type Options = {fleet: bool, default_branch?: string}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-pin-ancestry",
+  args: [
+    {kind: "switch", name: "fleet", long: "--fleet"},
+    {kind: "flag", name: "default_branch", long: "--default-branch"},
+  ],
+}
+
+fn is_workflow_source(path: string) -> bool {
+  if starts_with(path, ".github/workflows/") {
+    return ends_with(path, ".yml") || ends_with(path, ".yaml")
+  }
+  return starts_with(path, ".github/actions/")
+    && (ends_with(path, "/action.yml") || ends_with(path, "/action.yaml"))
+}
+
+fn local_sources(
+  caps: {fs: HarnessFs, process: HarnessProcess},
+) -> list<{path: string, text: string}> {
+  const inventory = git_run(caps.process, ["ls-files", "-z", ".github"])
+  if !inventory.ok {
+    throw "could not inventory .github: ${inventory.combined}"
+  }
+  let sources = []
+  for entry in split(inventory.stdout, "\0") {
+    const path = trim(entry)
+    if path != "" && is_workflow_source(path) {
+      sources = sources.push({path: path, text: caps.fs.read_text(path)})
+    }
+  }
+  return sources
+}
+
+fn tree_entries(harness: Harness, slug: string, tree_ref: string) -> list<dict> {
+  const listed = api_call(
+    harness,
+    {path: "/repos/${slug}/git/trees/${url_encode(tree_ref)}", options: github_connector_options()},
+  )
+  if is_err(listed) {
+    throw "${slug}: could not list tree ${tree_ref}: " + to_string(unwrap_err(listed))
+  }
+  const tree = unwrap(listed)
+  if tree?.truncated ?? false {
+    throw "${slug}: tree ${tree_ref} was truncated"
+  }
+  return tree?.tree ?? []
+}
+
+fn child_tree(entries: list<dict>, name: string) -> string? {
+  for entry in entries {
+    if (entry?.path ?? "") == name && (entry?.type ?? "") == "tree" {
+      return to_string(entry.sha)
+    }
+  }
+  return nil
+}
+
+/**
+ * Workflow and action files on `branch`, found by walking `.github` one tree at
+ * a time. A recursive listing of a large repository outgrows the connector's
+ * response ceiling, and a contents 404 cannot tell absence from a masked
+ * permission failure; a tree walk has neither problem.
+ */
+fn remote_sources(
+  harness: Harness,
+  slug: string,
+  branch: string,
+) -> list<{path: string, text: string}> {
+  let paths = []
+  const dot_github = child_tree(tree_entries(harness, slug, branch), ".github")
+  if dot_github != nil {
+    const github_entries = tree_entries(harness, slug, dot_github)
+    const workflows = child_tree(github_entries, "workflows")
+    if workflows != nil {
+      for entry in tree_entries(harness, slug, workflows) {
+        if (entry?.type ?? "") == "blob" {
+          paths = paths.push(".github/workflows/" + to_string(entry.path))
+        }
+      }
+    }
+    const actions = child_tree(github_entries, "actions")
+    if actions != nil {
+      for action in tree_entries(harness, slug, actions) {
+        if (action?.type ?? "") != "tree" {
+          continue
+        }
+        for entry in tree_entries(harness, slug, to_string(action.sha)) {
+          if (entry?.type ?? "") == "blob" {
+            paths = paths.push(".github/actions/${action.path}/${entry.path}")
+          }
+        }
+      }
+    }
+  }
+  let sources = []
+  for path in paths.filter({ path -> is_workflow_source(path) }).to_list() {
+    const text = github_file_text_at_ref(harness, slug, path, branch)
+    if text == nil {
+      throw "${slug}: ${path} is listed on ${branch} but could not be read"
+    }
+    sources = sources.push({path: slug + ":" + path, text: text})
+  }
+  return sources
+}
+
+/**
+ * Every commit a tag of `slug` names, peeled. Release tags are cut from a
+ * release commit that is not on the default branch, and they are never deleted,
+ * so a pin to one is as durable as a pin on main. The API returns annotated tag
+ * objects unpeeled, so one `git ls-remote` reads them all instead of one call
+ * per tag.
+ */
+fn tagged_commits(harness: Harness, slug: string) -> list<string>? {
+  let env = {GIT_TERMINAL_PROMPT: "0"}
+  const token = harness.env.get("GH_TOKEN") ?? harness.env.get("GITHUB_TOKEN") ?? ""
+  if token != "" {
+    env = env
+      + {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
+      }
+  }
+  const listed = harness.process.run(
+    {
+      program: "git",
+      args: ["ls-remote", "--tags", "https://github.com/${slug}.git"],
+      env: env,
+      timeout_ms: 60000,
+    },
+  )
+  if is_err(listed) || (unwrap_or(listed, {exit_code: 1}).exit_code ?? 1) != 0 {
+    return nil
+  }
+  let commits = []
+  for row in split(to_string(unwrap(listed).stdout ?? ""), "\n") {
+    const fields = split(trim(row), "\t")
+    if len(fields) == 2 {
+      commits = commits.push(lowercase(fields[0]))
+    }
+  }
+  return commits
+}
+
+fn reachability(harness: Harness, pins: list<OrgCommitPin>, branch: string) -> dict {
+  let observed = {}
+  for key in distinct_pin_keys(pins) {
+    const at = key.last_index_of("@")
+    const result = github_commit_reachable_from_branch(
+      harness,
+      key.substring(0, at),
+      key.substring(at + 1),
+      branch,
+    )
+    observed[key] = if is_err(result) {
+      {error: to_string(unwrap_err(result)?.message ?? unwrap_err(result))}
+    } else {
+      unwrap(result)
+    }
+  }
+  let tags_by_slug = {}
+  for key in observed.keys() {
+    if observed[key]?.reachable ?? false {
+      continue
+    }
+    const at = key.last_index_of("@")
+    const slug = key.substring(0, at)
+    if !tags_by_slug.has(slug) {
+      tags_by_slug[slug] = tagged_commits(harness, slug)
+    }
+    const tagged = tags_by_slug[slug]
+    if tagged != nil && tagged.contains(key.substring(at + 1)) {
+      observed[key] = {reachable: true, status: "tagged"}
+    }
+  }
+  return observed
+}
+
+pipeline main(harness: Harness) {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const manifest = read_fleet_manifest(harness.fs)
+  const branch = options.default_branch ?? manifest.fleet.default_branch
+  let sources = []
+  if options.fleet {
+    for repo in manifest.repositories {
+      sources = sources + remote_sources(harness, repo.slug, branch)
+    }
+  } else {
+    sources = local_sources(pick(harness, ["fs", "process"]))
+  }
+  if len(sources) == 0 {
+    harness.stdio.eprintln(
+      "pin ancestry: no workflow or action files were found; nothing was measured",
+    )
+    return 1
+  }
+  let pins = []
+  for source in sources {
+    pins = pins + org_commit_pins(source.path, source.text, OWNER)
+  }
+  const violations = pin_ancestry_violations(pins, reachability(harness, pins, branch))
+  harness.stdio.println(
+    json_stringify_pretty(
+      {
+        schema_version: "harn.pin-ancestry.v1",
+        ok: len(violations) == 0,
+        files: len(sources),
+        pins: len(pins),
+        commits: len(distinct_pin_keys(pins)),
+        violations: violations,
+      },
+    ),
+  )
+  for violation in violations {
+    harness.stdio.eprintln("pin ancestry: " + pin_ancestry_violation_line(violation))
+  }
+  return if len(violations) == 0 {
+    0
+  } else {
+    1
+  }
+}
