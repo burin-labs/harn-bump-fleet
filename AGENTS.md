@@ -366,5 +366,8 @@ sub-asks and the pull request resolves it completely.
 - Match evidence to the claim: exercise the canonical user path, state the
   falsifier, verify liveness and recovery, and record residual blind spots.
 - "Ship" means landed on main with required deploy and post-merge checks complete.
+- Land PRs through the merge queue with `gh pr merge --squash --auto`; never
+  `gh pr merge --admin`. Incidents use the org override labels `bypass-ci`,
+  `bypass-merge-queue`, or `force-merge`.
 
 <!-- END HARN SHARED AGENT CONTRACT -->
