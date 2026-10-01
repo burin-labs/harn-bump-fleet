@@ -33,9 +33,17 @@ import {
   github_claim_ref,
   github_connector_options,
   github_file_text_at_ref,
+  github_file_text_at_ref_result,
   github_release_ref,
 } from "lib/github"
 import { github_path_head } from "lib/github_source_head"
+import {
+  OVERRIDE_DISPATCHER_PATH,
+  OVERRIDE_IMPLEMENTATION_PATH,
+  OVERRIDE_SOURCE_SLUG,
+  OVERRIDE_TEMPLATE_PATH,
+  resolve_merge_override_targets,
+} from "lib/merge_override_projection"
 import {
   PROJECTION_SOURCE_PREFIX,
   clean_source_record_writes,
@@ -133,7 +141,7 @@ pipeline main(harness: Harness) -> int {
     }
   }
   const dependabot_resolution = if len(selected_dependabot_repositories) == 0 {
-    {targets: [], errors: []}
+    {targets: [], errors: [], failed_by: []}
   } else {
     const templates = dependabot_template_revisions(
       harness,
@@ -156,6 +164,76 @@ pipeline main(harness: Harness) -> int {
       )
     }
   }
+  const override_repositories = if convergence_path_matches(
+    OVERRIDE_DISPATCHER_PATH,
+    converge_options.only_paths,
+  ) {
+    selected_repositories
+  } else {
+    []
+  }
+  let override_sources: dict<string, string?> = {}
+  let override_read_errors: list<string> = []
+  let override_read_failed: list<string> = []
+  let override_implementation_revision: string? = nil
+  for repo in override_repositories {
+    const source = github_file_text_at_ref_result(
+      harness,
+      repo.slug,
+      OVERRIDE_DISPATCHER_PATH,
+      default_branch,
+    )
+    if is_err(source) {
+      override_read_errors = override_read_errors
+        + [repo.slug + ": merge override caller read failed: " + to_string(unwrap_err(source))]
+      override_read_failed = override_read_failed + [repo.slug]
+    } else {
+      override_sources[projection_source_key(repo.slug, OVERRIDE_DISPATCHER_PATH)] = unwrap(source)
+    }
+  }
+  const override_resolution = if len(override_repositories) == 0 {
+    {targets: [], errors: [], failed_by: [], absent_by: []}
+  } else {
+    const revision = github_path_head(
+      harness,
+      OVERRIDE_SOURCE_SLUG,
+      OVERRIDE_IMPLEMENTATION_PATH,
+      default_branch,
+    )
+    if is_err(revision) {
+      {
+        targets: [],
+        errors: ["canonical merge override implementation: " + to_string(unwrap_err(revision))],
+        failed_by: override_repositories.map({ repo -> repo.slug }).to_list(),
+        absent_by: [],
+      }
+    } else {
+      override_implementation_revision = unwrap(revision)
+      const template = github_file_text_at_ref_result(
+        harness,
+        OVERRIDE_SOURCE_SLUG,
+        OVERRIDE_TEMPLATE_PATH,
+        unwrap(revision),
+      )
+      if is_err(template) || unwrap(template) == nil {
+        {
+          targets: [],
+          errors: [
+            "canonical merge override template was not measured at its implementation revision",
+          ],
+          failed_by: override_repositories.map({ repo -> repo.slug }).to_list(),
+          absent_by: [],
+        }
+      } else {
+        resolve_merge_override_targets(
+          override_repositories,
+          override_sources,
+          unwrap(template) ?? "",
+          unwrap(revision),
+        )
+      }
+    }
+  }
   // `--only` names a repository the way the local syncs accept it, by slug or
   // by checkout directory. Targets carry only a slug, so admission is decided
   // against the manifest and then applied to them.
@@ -168,11 +246,17 @@ pipeline main(harness: Harness) -> int {
     .to_list()
     + pin_resolution.targets
     + dependabot_resolution.targets
+    + override_resolution.targets
   const missing_paths = missing_convergence_paths(
     converge_options.only_paths,
     repository_targets.map({ target -> target.path }).to_list(),
   )
-  if len(missing_paths) > 0 {
+  // Source and shape failures must reach the named receipt instead of being
+  // mislabeled as an undeclared requested path when no target could be built.
+  if len(missing_paths) > 0 && len(pin_resolution.errors) == 0
+    && len(dependabot_resolution.errors) == 0
+    && len(override_resolution.errors) == 0
+    && len(override_read_errors) == 0 {
     throw "--only-path does not name a manifest-owned target admitted by --only: "
       + join(missing_paths, ", ")
   }
@@ -185,6 +269,8 @@ pipeline main(harness: Harness) -> int {
     || len(pin_resolution.errors) > 0
     || len(dependabot_resolution.errors) > 0
     || len(consumer_resolution.errors) > 0
+    || len(override_resolution.errors) > 0
+    || len(override_read_errors) > 0
   for group in group_projection_targets_by_repository(targets) {
     const result = converge_remote_repository(
       harness,
@@ -213,6 +299,9 @@ pipeline main(harness: Harness) -> int {
   }
   for error in consumer_resolution.errors {
     harness.stdio.eprintln("error ${error}")
+  }
+  for error in override_resolution.errors + override_read_errors {
+    harness.stdio.eprintln("error " + error)
   }
   // Counted at the top level so a receipt reader sees a fleet that stopped
   // arming without diffing twenty-seven per-repository records to notice.
@@ -339,8 +428,21 @@ pipeline main(harness: Harness) -> int {
         default_branch: default_branch,
         checked_repository_count: len(results),
         unresolved_sources: unresolved,
-        target_errors: pin_resolution.errors + dependabot_resolution.errors,
-        target_failed_by: (pin_resolution.failed_by + dependabot_resolution.failed_by).to_set()
+        merge_override_census: {
+          implementation_revision: override_implementation_revision,
+          measured: len(override_sources),
+          existing: len(override_resolution.targets),
+          absent_by: override_resolution.absent_by,
+          read_failed_by: override_read_failed,
+        },
+        unresolved_target_paths: missing_paths,
+        target_errors: pin_resolution.errors + dependabot_resolution.errors
+          + override_resolution.errors
+          + override_read_errors,
+        target_failed_by: (pin_resolution.failed_by + dependabot_resolution.failed_by
+          + override_resolution.failed_by
+          + override_read_failed)
+          .to_set()
           .to_list()
           .sort(),
         consumer_manifest_errors: consumer_resolution.errors,
