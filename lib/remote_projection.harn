@@ -14,7 +14,7 @@ import {
 } from "./github"
 import { pr_title_for_consumer } from "./pr_title_convention"
 import { github_enable_auto_merge_with_release_lease } from "./release_merge_lease"
-import { GithubClientOptions } from "harn-github-connector/default"
+import { GithubClientOptions, github_pr_file_census } from "harn-github-connector/default"
 
 /**
  * Prefix for repository projection proposal branches.
@@ -107,7 +107,21 @@ pub type SweptProposal = {
  * thing: not "this proposal resisted closing" but "this run cannot say whether
  * any superseded proposal is open." Silence would read like a clean fleet.
  */
-pub type ProposalSweep = {superseded: list<SweptProposal>, error?: string}
+pub type RetainedProposal = {
+  pull_request: int,
+  branch: string,
+  reason: "outside_scope" | "unmeasured" | "empty",
+  head_sha?: string,
+  total_files?: int,
+  paths?: list<string>,
+  error?: string,
+}
+
+pub type ProposalSweep = {
+  superseded: list<SweptProposal>,
+  retained?: list<RetainedProposal>,
+  error?: string,
+}
 
 /**
  * What arming asked GitHub for, and what GitHub said.
@@ -241,13 +255,24 @@ pub const PROJECTION_CONVERGENCE_RECEIPT_NAME: string = "fleet-projection-conver
 
 /** Name what the sweep did to this repository, or say nothing when it did nothing. */
 fn swept_summary(result: RemoteConvergenceResult) -> string {
+  const retained = result.sweep?.retained ?? []
+  const preserved = if len(retained) == 0 {
+    ""
+  } else {
+    " [retained: "
+      + join(
+        retained.map({ proposal -> "#${proposal.pull_request} ${proposal.reason}" }).to_list(),
+        ", ",
+      )
+      + "]"
+  }
   const failure = result.sweep?.error
   if failure != nil {
-    return " [sweep failed: ${failure ?? "unknown"}]"
+    return " [sweep failed: ${failure ?? "unknown"}]" + preserved
   }
   const superseded = result.sweep?.superseded ?? []
   if len(superseded) == 0 {
-    return ""
+    return preserved
   }
   // Each proposal carries its own outcome rather than one verb for the group: a
   // run that closed two and was refused a third must not read as three closes.
@@ -255,7 +280,7 @@ fn swept_summary(result: RemoteConvergenceResult) -> string {
     { proposal -> "#${to_string(proposal.pull_request)} ${proposal.state}" },
   )
     .to_list()
-  return " [superseded: ${join(rendered, ", ")}]"
+  return " [superseded: ${join(rendered, ", ")}]" + preserved
 }
 
 /** One human status line. Goes to stderr so stdout can stay a JSON document. */
@@ -553,20 +578,10 @@ fn superseded_comment(
 /**
  * Retire the projection proposals this run has already moved past.
  *
- * Every proposal lives on a branch named for the exact bytes it carries, so one
- * whose branch is not the branch this run renders is proposing bytes the
- * manifest no longer says. Nothing else in this loop ever looks at it again —
- * the next render opens its own branch, and the only lookup here is scoped to
- * that branch. What it leaves behind is not idle: a superseded proposal keeps an
- * armed auto-merge that can never fire once its pull request conflicts, so it
- * reads like active work forever.
- *
- * Two guards keep this to the automation's own leavings. The branch must carry
- * the projection prefix, which also reaches proposals left on the single stable
- * branch this loop used before each render got its own. The title must still be
- * the one this loop writes: a proposal someone renamed is a proposal someone is
- * holding, and closing it would be the same overreach as reopening one they
- * closed.
+ * Branch and title identify automation-owned proposals. A complete file census
+ * then proves every changed destination and rename source belongs to this run's
+ * selected targets. Partial convergence cannot retire proposals for other
+ * projections, and unreadable or empty evidence never authorizes a close.
  */
 fn sweep_superseded_proposals(
   harness: Harness,
@@ -576,6 +591,7 @@ fn sweep_superseded_proposals(
   apply: bool,
   options: GithubClientOptions,
   pr_title_area: string,
+  targets: list<FleetProjectionTarget>,
 ) -> ProposalSweep {
   const listed = github_pr_list(
     harness,
@@ -587,6 +603,10 @@ fn sweep_superseded_proposals(
     return {superseded: [], error: to_string(unwrap_err(listed))}
   }
   let superseded = []
+  let retained: list<RetainedProposal> = []
+  let errors: list<string> = []
+  const scope = targets.map({ target -> target.path }).to_list()
+  const parts = split(slug, "/")
   for pull in unwrap(listed) {
     const ref = to_string(pull?.head?.ref ?? "")
     const title = to_string(pull?.title ?? "")
@@ -603,6 +623,57 @@ fn sweep_superseded_proposals(
     }
     const number = to_int(pull?.number) ?? 0
     const url = to_string(pull?.url ?? "")
+    const expected_head = to_string(pull?.head?.sha ?? "")
+    if trim(expected_head) == "" {
+      const error = "listed proposal omitted its head identity"
+      retained = retained
+        + [{pull_request: number, branch: ref, reason: "unmeasured", error: error}]
+      errors = errors + ["#${number}: " + error]
+      continue
+    }
+    const measured = github_pr_file_census(
+      harness,
+      {
+        owner: parts[0],
+        repo: parts[1],
+        pull_number: number,
+        expected_head_oid: expected_head,
+        options: options,
+      },
+    )
+    if is_err(measured) {
+      const error = to_string(unwrap_err(measured))
+      retained = retained
+        + [{pull_request: number, branch: ref, reason: "unmeasured", error: error}]
+      errors = errors + ["#${number}: " + error]
+      continue
+    }
+    const census = unwrap(measured)
+    let changed: list<string> = []
+    for file in census.files {
+      changed = changed + [file.filename]
+      if file.status == "renamed" {
+        changed = changed + [file.previous_filename ?? ""]
+      }
+    }
+    if len(changed) == 0 || changed.any({ path -> !scope.contains(path) }) {
+      retained = retained
+        + [
+          {
+            pull_request: number,
+            branch: ref,
+            reason: if len(changed) == 0 {
+              "empty"
+            } else {
+              "outside_scope"
+            },
+            head_sha: census.head_sha,
+            total_files: census.total_files,
+            paths: changed,
+          },
+        ]
+      continue
+    }
     if !apply {
       superseded = superseded
         + [{pull_request: number, branch: ref, url: url, state: "would_close"}]
@@ -630,7 +701,12 @@ fn sweep_superseded_proposals(
         },
       ]
   }
-  return {superseded: superseded}
+  const outcome: ProposalSweep = {superseded: superseded, retained: retained}
+  return if len(errors) == 0 {
+    outcome
+  } else {
+    outcome + {error: join(errors, "; ")}
+  }
 }
 
 fn converge_repository(
@@ -646,29 +722,17 @@ fn converge_repository(
 ) -> RemoteConvergenceResult {
   const drifted = drifted_targets(harness, slug, default_branch, targets, options)
   const paths = drifted.map({ target -> target.path }).to_list()
-  // Empty when nothing drifted: there is no branch for this run to render, so
-  // every open proposal is superseded by the default branch itself.
+  // No replacement branch is needed when all selected targets match main.
   const branch = if len(drifted) == 0 {
     ""
   } else {
     remote_projection_branch(drifted)
   }
-  // The sweep runs before the repair and for every repository, drifting or not.
-  // A repository whose projections are already correct is exactly the one whose
-  // open proposal has nothing left to propose, so gating this on drift would
-  // miss the case that produces the most debris. The retry below re-enters this
-  // function from fresh remote facts and inherits this result: a second listing
-  // would only re-report what the first already closed.
-  const sweep = if retry_stale_pull {
-    sweep_superseded_proposals(harness, slug, default_branch, branch, apply, options, pr_title_area)
-  } else {
-    {superseded: []}
-  }
   if len(drifted) == 0 {
-    return {slug: slug, status: "clean", drifted: [], sweep: sweep}
+    return {slug: slug, status: "clean", drifted: []}
   }
   if !apply {
-    return {slug: slug, status: "drift", drifted: paths, sweep: sweep}
+    return {slug: slug, status: "drift", drifted: paths, branch: branch}
   }
   const head = unwrap_or_throw(
     github_branch_head(harness, slug, default_branch, options),
@@ -702,7 +766,6 @@ fn converge_repository(
         branch: branch,
         commit: branch_oid,
         auto_merge: {state: "held"},
-        sweep: sweep,
       }
     }
     const listed = github_pr_list(
@@ -719,14 +782,7 @@ fn converge_repository(
     // but reopening the pull request nightly would overrule a human decision
     // with a cron job. The next byte change proposes again on its own.
     if len(open) == 0 {
-      return {
-        slug: slug,
-        status: "pending",
-        drifted: paths,
-        branch: branch,
-        commit: branch_oid,
-        sweep: sweep,
-      }
+      return {slug: slug, status: "pending", drifted: paths, branch: branch, commit: branch_oid}
     }
     const open_number = to_int(open[0]?.number) ?? 0
     return {
@@ -737,7 +793,6 @@ fn converge_repository(
       commit: branch_oid,
       pull_request: open_number,
       auto_merge: arm_or_hold(harness, slug, open_number, branch_oid, arm, options),
-      sweep: sweep,
     }
   }
   if !(claim?.claimed ?? false) {
@@ -790,7 +845,6 @@ fn converge_repository(
       false,
       pr_title_area,
     )
-      + {sweep: sweep}
   }
   const pull = unwrap_or_throw(pull_attempt, "projection pull request failed")
   const pull_number = to_int(pull?.number) ?? 0
@@ -803,7 +857,6 @@ fn converge_repository(
     pull_request: pull_number,
     url: to_string(pull?.url ?? ""),
     auto_merge: arm_or_hold(harness, slug, pull_number, head_oid, arm, options),
-    sweep: sweep,
   }
 }
 
@@ -855,7 +908,29 @@ pub fn converge_remote_repository(
   if is_err(attempt) {
     return {slug: slug, status: "error", drifted: [], error: to_string(unwrap_err(attempt))}
   }
-  return observe_projection_pr_age(harness, unwrap(attempt), options, now, age_budget_days)
+  const prepared = unwrap(attempt)
+  // A failed repair or a human-closed identity branch cannot replace prior work.
+  // Dry runs only report potential closes and never perform them.
+  const can_replace = prepared.status == "clean" || !apply
+    || ((prepared.pull_request ?? 0) > 0 && ["applied", "pending"].contains(prepared.status))
+  const result = if can_replace {
+    prepared
+      + {
+        sweep: sweep_superseded_proposals(
+          harness,
+          slug,
+          default_branch,
+          prepared.branch ?? "",
+          apply,
+          options,
+          pr_title_area,
+          targets,
+        ),
+      }
+  } else {
+    prepared + {sweep: {superseded: []}}
+  }
+  return observe_projection_pr_age(harness, result, options, now, age_budget_days)
 }
 
 /**

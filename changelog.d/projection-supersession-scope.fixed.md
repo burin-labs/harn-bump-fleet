@@ -1,0 +1,1 @@
+Partial projection convergence retains proposals that change files outside its selected targets, including rename source paths. Retirement requires complete changed-file evidence on a stable pull-request revision and a valid replacement proposal or matching main projections. Missing evidence is reported as a failed census instead of authorizing a close.
