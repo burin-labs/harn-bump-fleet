@@ -27,6 +27,18 @@ scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --only har
 
 ## Repository scope
 
+`lib/first_party_actions.harn` owns this repository's reviewed Harn Action
+revision. After reviewing the Action sources and their bootstrap dependencies,
+update that contract and regenerate the local workflow references:
+
+```sh
+.harn/bin/harn run --no-sandbox sync_first_party_actions.harn -- --apply
+.harn/bin/harn run --no-sandbox sync_first_party_actions.harn -- --check
+```
+
+The check measures every workflow and requires both registered Actions. Runtime
+versions and reusable workflow policy remain separately owned by `fleet.toml`.
+
 This repo is public for transparency and cheap GitHub Actions coverage, but
 the tools are written for my own Burin Labs/Harn release operations. Keep
 audits, logs, prompts, and examples suitable for a public repo: do not commit
