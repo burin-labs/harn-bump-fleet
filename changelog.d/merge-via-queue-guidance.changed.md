@@ -1,0 +1,1 @@
+The shared agent contract now tells agents to land pull requests through the merge queue with `gh pr merge --squash --auto`, never `gh pr merge --admin`, and to use the org override labels for incidents.

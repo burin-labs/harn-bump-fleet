@@ -1,0 +1,1 @@
+Replace fleet-local SemVer, shell quoting, and argv-label compatibility helpers with pinned Harn primitives, remove unused text/path helpers, and batch downstream public-surface searches once per repository.

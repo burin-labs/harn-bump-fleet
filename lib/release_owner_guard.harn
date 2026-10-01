@@ -1,0 +1,251 @@
+import {
+  HostLeaseAcquireReceipt,
+  HostLeaseHandle,
+  HostLeaseOptions,
+  host_lease_acquire,
+  host_lease_release,
+  host_lease_update_metadata,
+} from "std/host_lease"
+import { BumpKind } from "std/semver"
+
+const RELEASE_OWNER_DOMAIN = "release-owner"
+
+pub type ReleaseOwnerConfig = {
+  mode: "audit" | "prepare" | "ship-pr" | "abandon",
+  yes_live_release: bool,
+  mock?: bool,
+  repo?: string,
+  base?: string,
+  bump?: BumpKind,
+  pin_sha?: string,
+  owner_guard_domain?: string,
+}
+
+pub type ReleaseOwnerAnalysis = {current_version?: string, next_version?: string}
+
+pub type ReleaseOwnerIdentity = {
+  run_id: string,
+  repo: string,
+  base: string,
+  mode: string,
+  bump: string,
+  current_version: string,
+  next_version: string,
+  tag: string,
+  pin_sha: string,
+  owner: string,
+  host: string,
+  owner_pid: int,
+  lease_id: string,
+  domain: string,
+}
+
+pub type ReleaseOwnerRecord = {reclaimed_prior: ReleaseOwnerIdentity?, ...ReleaseOwnerIdentity}
+
+pub type ReleaseOwnerDecision = {action: "acquired" | "recovered_dead_owner", reason: string}
+
+pub type ReleaseOwnerGuard = {state: "disabled"} \
+  | {
+  state: "owned",
+  acquire: HostLeaseAcquireReceipt,
+  handle: HostLeaseHandle,
+  record: ReleaseOwnerRecord,
+  decision: ReleaseOwnerDecision,
+}
+
+pub type ReleaseOwnerFinish = {
+  status: "finished" | "failed",
+  outcome: string,
+  success: bool,
+  released: bool,
+  ...ReleaseOwnerIdentity,
+}
+
+/** True when a run may mutate shared release refs, tags, or branches. */
+pub fn release_owner_guard_required(cfg: ReleaseOwnerConfig) -> bool {
+  if cfg.mock ?? false {
+    return false
+  }
+  // Abandoning reads and rewrites the same `release-attempt/` refs a live
+  // release is actively pushing, so it serializes on the lane in *both* modes
+  // rather than only when `--yes-live-release` is set. A dry run that samples
+  // refs mid-cut reports a torn view, and that report is what an operator
+  // reads before choosing to apply: classifying an in-flight candidate as
+  // unclaimed is what makes the destructive run look safe. Holding the lane
+  // for the inspection is what makes the plan mean anything by the time it is
+  // acted on.
+  if cfg.mode == "abandon" {
+    return true
+  }
+  if !cfg.yes_live_release {
+    return false
+  }
+  return cfg.mode == "prepare" || cfg.mode == "ship-pr"
+}
+
+fn owner_metadata(
+  cfg: ReleaseOwnerConfig,
+  analysis: ReleaseOwnerAnalysis,
+  run_id: string,
+) -> dict<string, string> {
+  const next = trim(analysis.next_version ?? "")
+  return {
+    run_id: trim(run_id),
+    repo: trim(cfg.repo ?? ""),
+    base: trim(cfg.base ?? ""),
+    mode: cfg.mode,
+    bump: cfg.bump ?? "",
+    current_version: trim(analysis.current_version ?? ""),
+    next_version: next,
+    tag: if next == "" {
+      ""
+    } else {
+      "v" + next
+    },
+    pin_sha: trim(cfg.pin_sha ?? ""),
+  }
+}
+
+pub fn release_owner_lease_options(
+  cfg: ReleaseOwnerConfig,
+  analysis: ReleaseOwnerAnalysis,
+  run_id: string,
+) -> HostLeaseOptions {
+  return {
+    owner: "release-harn.${run_id}",
+    resource_class: "whole-machine",
+    domain: trim(cfg.owner_guard_domain ?? RELEASE_OWNER_DOMAIN),
+    priority_class: "interactive",
+    wait_timeout_ms: 0,
+    reason: "serialize live release ownership",
+    metadata: owner_metadata(cfg, analysis, run_id),
+  }
+}
+
+fn identity_from_handle(handle: HostLeaseHandle) -> ReleaseOwnerIdentity {
+  const metadata = handle.metadata ?? {}
+  return {
+    run_id: metadata.run_id ?? "",
+    repo: metadata.repo ?? "",
+    base: metadata.base ?? "",
+    mode: metadata.mode ?? "",
+    bump: metadata.bump ?? "",
+    current_version: metadata.current_version ?? "",
+    next_version: metadata.next_version ?? "",
+    tag: metadata.tag ?? "",
+    pin_sha: metadata.pin_sha ?? "",
+    owner: handle.owner,
+    host: handle.host,
+    owner_pid: handle.owner_pid ?? 0,
+    lease_id: handle.lease_id,
+    domain: handle.domain,
+  }
+}
+
+fn record_from_handle(
+  handle: HostLeaseHandle,
+  reclaimed_prior: ReleaseOwnerIdentity? = nil,
+) -> ReleaseOwnerRecord {
+  return {...identity_from_handle(handle), reclaimed_prior: reclaimed_prior}
+}
+
+fn reclaimed_record(handle: HostLeaseHandle?) -> ReleaseOwnerIdentity? {
+  if handle == nil {
+    return nil
+  }
+  return identity_from_handle(handle)
+}
+
+/** Acquire one process-owned, cancellation-safe live-release lease. */
+pub fn release_owner_guard_acquire(
+  host_lease: HarnessHostLease,
+  cfg: ReleaseOwnerConfig,
+  analysis: ReleaseOwnerAnalysis,
+  run_id: string,
+) -> ReleaseOwnerGuard {
+  if !release_owner_guard_required(cfg) {
+    return {state: "disabled"}
+  }
+  const acquire = host_lease_acquire(host_lease, release_owner_lease_options(cfg, analysis, run_id))
+  if acquire.status == "deferred" {
+    const active = acquire.defer?.active
+    const owner = active?.owner ?? "another process"
+    const run = active?.metadata?.run_id ?? "unknown"
+    throw "error: another live Harn release owns ${active?.domain ?? RELEASE_OWNER_DOMAIN}: ${owner} (run ${run})"
+  }
+  const handle = acquire.handle
+  if handle == nil || acquire.guard == nil {
+    throw "release owner lease acquired without authority"
+  }
+  const reclaimed_prior = reclaimed_record(acquire.recovered)
+  const action = if reclaimed_prior == nil {
+    "acquired"
+  } else {
+    "recovered_dead_owner"
+  }
+  return {
+    state: "owned",
+    acquire: acquire,
+    handle: handle,
+    record: record_from_handle(handle, reclaimed_prior),
+    decision: {action: action, reason: "host lease ${action}"},
+  }
+}
+
+/** Persist discovery-derived labels without releasing or reacquiring ownership. */
+pub fn release_owner_guard_update(
+  host_lease: HarnessHostLease,
+  owner: ReleaseOwnerGuard,
+  cfg: ReleaseOwnerConfig,
+  analysis: ReleaseOwnerAnalysis,
+) -> ReleaseOwnerGuard {
+  if owner.state == "disabled" {
+    return owner
+  }
+  const update = host_lease_update_metadata(
+    host_lease,
+    owner.handle,
+    owner_metadata(cfg, analysis, owner.record.run_id),
+  )
+  if !update.updated || update.handle == nil {
+    throw "release owner lease was replaced before its metadata update"
+  }
+  let out = owner
+  out["handle"] = update.handle
+  out["record"] = record_from_handle(update.handle, owner.record.reclaimed_prior)
+  return out
+}
+
+/** Release ownership. The acquire receipt retains the opaque cleanup guard. */
+pub fn release_owner_guard_finish(
+  host_lease: HarnessHostLease,
+  owner: ReleaseOwnerGuard,
+  outcome: string,
+  success: bool,
+) -> ReleaseOwnerFinish? {
+  if owner.state == "disabled" {
+    return nil
+  }
+  const release = host_lease_release(host_lease, owner.acquire)
+  return {
+    ...owner.record,
+    status: if success {
+      "finished"
+    } else {
+      "failed"
+    },
+    outcome: outcome,
+    success: success,
+    released: release.released,
+  }
+}
+
+/** A non-expiring lease is recovered only after its recorded process dies. */
+pub fn owner_reclaimed_dead_for_version(owner: ReleaseOwnerGuard, version: string) -> bool {
+  if owner.state == "disabled" {
+    return false
+  }
+  const prior = owner.record.reclaimed_prior
+  const want = trim(version)
+  return want != "" && trim(prior?.next_version ?? "") == want
+}

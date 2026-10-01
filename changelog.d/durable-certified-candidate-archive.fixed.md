@@ -1,0 +1,1 @@
+Candidate certification now preserves its exact archive workflow run in a signed write-once remote record, so a fresh unattended run can reuse that receipt after the certifying Actions artifact expires without guessing between rebuilds.

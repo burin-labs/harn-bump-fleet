@@ -1,0 +1,1 @@
+A new check refuses an organization `uses: ...@<sha>` pin whose commit is on neither the pinned repository's default branch nor a tag. It runs on pull requests here and daily across every fleet repository, so a squash-merged feature-branch head is named before its branch is deleted.

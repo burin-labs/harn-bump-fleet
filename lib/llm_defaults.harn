@@ -1,0 +1,927 @@
+// lib/llm_defaults.harn
+//
+// Shared default model/provider/binder configuration for every agent call
+// in this repo. Reads `~/projects/burin-code/.env` (sourced upstream via
+// `scripts/with_env.sh` since harn does not auto-load `.env` files) and
+// picks the OpenRouter `qwen/qwen3.6-35b-a3b` planner paired with the
+// Cerebras GPT-OSS-120B natural-language tool binder from
+// burin-labs/harn#1814.
+//
+// The cloud cell is the UNCONDITIONAL default — local Ollama is never
+// auto-selected, because it kept returning HTTP 500s and silently became
+// the fallback whenever `OPENROUTER_API_KEY` was missing from the
+// process env (e.g. runs that forgot `scripts/with_env.sh`). To run
+// against local Ollama you now have to ask for it explicitly via
+// `HARN_PLANNER_PROVIDER=ollama` (or the per-role `HARN_<ROLE>_PROVIDER`).
+// Every default is overridable via env, and the binder is OFF by default
+// unless `CEREBRAS_API_KEY` is set (auto) or `HARN_EXT_BINDER=1` is
+// explicitly requested.
+import { agent_sanitize_model_options } from "std/agent/options"
+import { env_str } from "std/config"
+import { default_llm_caller } from "std/llm/caller"
+import { with_retry } from "std/llm/handlers"
+import { safe_call } from "std/llm/safe"
+import { with_natural_language_executor } from "std/llm/tool_binder"
+import {
+  compose_tool_callers,
+  default_tool_caller,
+  tool_inject_param,
+  tools_use_middleware,
+} from "std/llm/tool_middleware"
+
+// Planner uses the same Qwen 3.6 35B A3B family the repo ran locally
+// before, so behavior stays consistent now that the cloud cell is the
+// default. OpenRouter price: $0.15/$1.00 per Mtok (well under the
+// $2/Mtok value ceiling). Binder is the burin-labs/harn#1814 best cell:
+// Cerebras GPT-OSS-120B (sub-100ms hops, +18pp lift on PEAR-style
+// tool-call accuracy). Both are configurable via env — e.g. point the
+// planner at Together.ai with HARN_PLANNER_PROVIDER=together_ai /
+// HARN_PLANNER_MODEL=Qwen/Qwen3-... if OpenRouter ever gets flaky.
+const CLOUD_PLANNER_PROVIDER = "openrouter"
+
+const CLOUD_PLANNER_MODEL = "qwen/qwen3.6-35b-a3b"
+
+const CLOUD_BINDER_PROVIDER = "cerebras"
+
+const CLOUD_BINDER_MODEL = "gpt-oss-120b"
+
+// Only consulted when an operator explicitly overrides the provider to
+// ollama without naming a model — the default model is no longer
+// auto-selected. (No LOCAL_PROVIDER constant: ollama is opt-in via env.)
+const LOCAL_MODEL = "qwen3.6:35b-a3b-coding-nvfp4"
+
+// Binder middleware knobs. `max_tokens` follows burin-labs/harn#1814
+// finding 3 (256 tokens was consumed by reasoning-preamble before the
+// JSON payload landed on GPT-OSS-120B; 1024 over-provisions safely).
+// `timeout_ms` is the wall-clock budget for one binder hop, including
+// HTTP and generation. 100ms was Cerebras hop-latency marketing, not a
+// deadline any provider round trip can meet; 5s covers a Cerebras JSON
+// bind under load and still bounds a hung hop. Override with
+// HARN_EXT_BINDER_TIMEOUT_MS.
+const BINDER_DEFAULT_TIMEOUT_MS = 5000
+
+const BINDER_DEFAULT_MAX_TOKENS = 1024
+
+pub type PlannerDefaults = {provider: string, model: string, source: string}
+
+pub type PlannerCandidate = {provider: string, model: string, options: dict}
+
+pub type PlannerPreflightDecision = {
+  healthy: bool,
+  selected: PlannerCandidate?,
+  attempts: list<dict>,
+  changed: bool,
+  disable_binder: bool,
+}
+
+pub type BinderDefaults = {
+  enabled: bool,
+  provider: string,
+  model: string,
+  timeout_ms: int,
+  max_tokens: int,
+  switch: string,
+  reason: string,
+}
+
+pub type LlmCaller = fn(dict) -> dict
+
+pub type ToolCaller = fn(dict, fn(dict) -> dict) -> dict
+
+pub type BinderInstallation = {tools: dict, tool_caller: ToolCaller, audit: BinderDefaults}
+
+pub type ReleaseAgentInfraDefaults = {
+  provider: string,
+  model: string,
+  timeout_ms: int,
+  idle_timeout_ms: int,
+  policy: dict,
+  fallback_chain: list<string>,
+  equivalent_failover?: bool | dict,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Env reader plumbing (pure functions take an env dict; live callers wrap env_str)
+// -------------------------------------------------------------------------------------------------
+
+fn __nonempty(value: any) {
+  if type_of(value) != "string" {
+    return nil
+  }
+  const trimmed = trim(value)
+  if trimmed == "" {
+    return nil
+  }
+  return value
+}
+
+fn __lookup_to_int(lookup: any, key: any, default_value: any) {
+  const raw = lookup(key)
+  if raw == nil {
+    return default_value
+  }
+  const parsed = to_int(trim(raw))
+  if parsed == nil {
+    return default_value
+  }
+  return parsed
+}
+
+fn __coerce_switch(value: any) {
+  if value == nil {
+    return "auto"
+  }
+  const normalized = trim(value).to_lower()
+  if normalized == "" {
+    return "auto"
+  }
+  if normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off" {
+    return "off"
+  }
+  if normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on" {
+    return "on"
+  }
+  return "auto"
+}
+
+// -------------------------------------------------------------------------------------------------
+// Planner resolution
+// -------------------------------------------------------------------------------------------------
+
+fn __planner_with(lookup: any, role_env_prefix: any) {
+  // Priority: per-role HARN_<ROLE>_{PROVIDER,MODEL} (existing knobs in
+  // release_harn / harness_self_review / bump_fleet) > shared
+  // HARN_PLANNER_{PROVIDER,MODEL} > the cloud cell. The cloud cell is the
+  // unconditional default; local Ollama is opt-in only (set
+  // HARN_<ROLE>_PROVIDER=ollama or HARN_PLANNER_PROVIDER=ollama).
+  const role_provider = if role_env_prefix != "" {
+    lookup(role_env_prefix + "_PROVIDER")
+  } else {
+    nil
+  }
+  const role_model = if role_env_prefix != "" {
+    lookup(role_env_prefix + "_MODEL")
+  } else {
+    nil
+  }
+  const shared_provider = lookup("HARN_PLANNER_PROVIDER")
+  const shared_model = lookup("HARN_PLANNER_MODEL")
+  // The cloud cell is the unconditional default. Ollama is reachable only
+  // by explicitly setting a provider override above — it is never
+  // auto-selected, so a missing OPENROUTER_API_KEY surfaces as a loud
+  // auth error (run `scripts/with_env.sh`) instead of silently falling
+  // back to a local model that keeps 500ing.
+  const provider = role_provider ?? shared_provider ?? CLOUD_PLANNER_PROVIDER
+  const default_model = if provider == CLOUD_PLANNER_PROVIDER {
+    CLOUD_PLANNER_MODEL
+  } else {
+    LOCAL_MODEL
+  }
+  const model = role_model ?? shared_model ?? default_model
+  return {
+    provider: provider,
+    model: model,
+    source: planner_source_label(role_provider, role_model, shared_provider, shared_model),
+  }
+}
+
+fn planner_source_label(
+  role_provider: any,
+  role_model: any,
+  shared_provider: any,
+  shared_model: any,
+) {
+  if role_provider != nil || role_model != nil {
+    return "env_role_override"
+  }
+  if shared_provider != nil || shared_model != nil {
+    return "env_planner_override"
+  }
+  return "cloud_default"
+}
+
+/**
+ * planner_defaults_with(env, role_env_prefix) -> {provider, model, source}
+ *
+ * Pure overload of planner_defaults for tests: pass a dict of env vars
+ * (string -> string), no real env access. `role_env_prefix` is an
+ * uppercase prefix like "HARN_RELEASE" (resolves HARN_RELEASE_PROVIDER /
+ * HARN_RELEASE_MODEL); pass "" for the shared default.
+ */
+pub fn planner_defaults_with(env: dict, role_env_prefix: string) -> PlannerDefaults {
+  return __planner_with({ key -> return __nonempty(env[key]) }, role_env_prefix)
+}
+
+/**
+ * planner_defaults(role_env_prefix) -> {provider, model, source}
+ *
+ * Resolve the default planner provider/model for a given role. The
+ * `source` field is one of `env_role_override`, `env_planner_override`,
+ * `cloud_default`, `local_default` and is meant for audit/logging.
+ */
+pub fn planner_defaults(env: HarnessEnv, role_env_prefix: string) -> PlannerDefaults {
+  return __planner_with({ key -> return __nonempty(env_str(env, key)) }, role_env_prefix)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Planner preflight
+// -------------------------------------------------------------------------------------------------
+
+fn __candidate_key(candidate: any) {
+  const provider = candidate?.provider ?? ""
+  const model = candidate?.model ?? ""
+  return provider + "/" + model
+}
+
+fn __same_candidate(a: any, b: any) {
+  return __candidate_key(a) == __candidate_key(b)
+}
+
+fn __drop_keys(d: any, keys: any) {
+  let out = {}
+  for key in (d ?? {}).keys() {
+    if !(keys ?? []).contains(key) {
+      out = out + {[key]: d[key]}
+    }
+  }
+  return out
+}
+
+fn __redact_provider_text(text: any) {
+  let out = to_string(text ?? "")
+  out = regex_replace("sk-[A-Za-z0-9_./+=:-]+", "[redacted]", out)
+  out = regex_replace("csk-[A-Za-z0-9_./+=:-]+", "[redacted]", out)
+  out = regex_replace("Bearer[ ]+[^ ]+", "Bearer [redacted]", out)
+  return out
+}
+
+fn __append_unique_candidate(candidates: any, candidate: any) {
+  if trim(candidate?.provider ?? "") == "" || trim(candidate?.model ?? "") == "" {
+    return candidates
+  }
+  for existing in candidates ?? [] {
+    if __same_candidate(existing, candidate) {
+      return candidates
+    }
+  }
+  return (candidates ?? []) + [candidate]
+}
+
+/**
+ * Return the ordered release-planner candidates: requested, cloud default,
+ * local fallback. This boundary deliberately requires provider/model records;
+ * the general stdlib model ladder also accepts string shorthand that cannot
+ * carry the provenance needed by release audits.
+ */
+pub fn planner_preflight_candidates(requested: dict) -> list<PlannerCandidate> {
+  let candidates: list<PlannerCandidate> = []
+  const requested_step: PlannerCandidate = {
+    provider: requested?.provider ?? CLOUD_PLANNER_PROVIDER,
+    model: requested?.model ?? CLOUD_PLANNER_MODEL,
+    options: {source: requested?.source ?? "requested", fallback_tier: "requested"},
+  }
+  candidates = __append_unique_candidate(candidates, requested_step)
+  const cloud_step: PlannerCandidate = {
+    provider: CLOUD_PLANNER_PROVIDER,
+    model: CLOUD_PLANNER_MODEL,
+    options: {source: "cloud_default", fallback_tier: "configured_cloud"},
+  }
+  candidates = __append_unique_candidate(candidates, cloud_step)
+  const local_step: PlannerCandidate = {
+    provider: "ollama",
+    model: LOCAL_MODEL,
+    options: {source: "local_fallback", fallback_tier: "installed_local"},
+  }
+  candidates = __append_unique_candidate(candidates, local_step)
+  return candidates
+}
+
+/**
+ * Strip provider-unsupported and healthcheck-hostile option fields from a
+ * planner preflight call.
+ *
+ * The core sanitizer's healthcheck mode keeps deliberate-reasoning knobs out
+ * of one-token readiness probes even when the route supports them for normal
+ * generation.
+ */
+fn planner_provider_signature_options(
+  llm: HarnessLlm,
+  provider: any,
+  model: any,
+  options: any = {},
+) {
+  const base = options ?? {}
+  const had_provider = (base.keys() ?? []).contains("provider")
+  const had_model = (base.keys() ?? []).contains("model")
+  let candidate = base
+  if !had_provider {
+    candidate = candidate + {provider: provider}
+  }
+  if !had_model {
+    candidate = candidate + {model: model}
+  }
+  let sanitized = agent_sanitize_model_options(llm, candidate, {mode: "healthcheck"})
+  if !had_provider {
+    sanitized = __drop_keys(sanitized, ["provider"])
+  }
+  if !had_model {
+    sanitized = __drop_keys(sanitized, ["model"])
+  }
+  return sanitized
+}
+
+/** Build the low-cost healthcheck options for a release planner candidate. */
+pub fn planner_healthcheck_options(llm: HarnessLlm, provider: string, model: string) -> dict {
+  return planner_provider_signature_options(
+    llm,
+    provider,
+    model,
+    {model: model, temperature: 0.0, max_tokens: 1},
+  )
+}
+
+/** Build the tiny generation probe options for a release planner candidate. */
+pub fn planner_generation_probe_options(llm: HarnessLlm, provider: string, model: string) -> dict {
+  return planner_provider_signature_options(
+    llm,
+    provider,
+    model,
+    {provider: provider, model: model, temperature: 0.0, max_tokens: 1},
+  )
+}
+
+fn __planner_health_valid(health: any) {
+  if (health ?? {}).keys().contains("valid") {
+    return health.valid
+  }
+  const status = lowercase(trim(to_string(health?.status ?? "")))
+  if status == "ok" || status == "ready" || status == "healthy" || status == "success" {
+    return true
+  }
+  const metadata = health?.metadata ?? {}
+  const metadata_status = lowercase(trim(to_string(metadata?.status ?? metadata?.category ?? "")))
+  return metadata_status == "ok" || metadata_status == "ready" || metadata_status == "healthy"
+    || metadata_status
+      == "success"
+}
+
+/** Classify an unhealthy planner healthcheck into a deterministic failure class. */
+pub fn planner_preflight_failure_class(provider: string, _model: string, health: dict) -> string {
+  if __planner_health_valid(health) {
+    return ""
+  }
+  const status = lowercase(to_string(health?.status ?? ""))
+  const message = lowercase(to_string(health?.message ?? health?.error ?? ""))
+  const combined = status + " " + message
+  if provider == "ollama" {
+    return "local_server_unavailable"
+  }
+  if contains(combined, "reasoning_effort") || contains(combined, "reasoning effort")
+    || contains(combined, "reasoning option") {
+    return "wrong_api_option_shape"
+  }
+  if provider == "together_ai"
+    && (contains(combined, "dedicated") || contains(combined, "endpoint")) {
+    return "dedicated_endpoint_unavailable"
+  }
+  if contains(combined, "quota") || contains(combined, "unauthorized")
+    || contains(combined, "forbidden")
+    || contains(combined, "auth")
+    || contains(combined, "api key") {
+    return "auth_or_quota"
+  }
+  if provider == "minimax" || contains(combined, "unsupported")
+    || contains(combined, "not supported")
+    || contains(combined, "plan does not support")
+    || contains(combined, "model not found") {
+    return "unsupported_model"
+  }
+  if contains(combined, "timeout") || contains(combined, "transport")
+    || contains(combined, "connection")
+    || contains(combined, "temporar")
+    || contains(combined, "rate limit") {
+    return "transient_transport"
+  }
+  return "provider_unhealthy"
+}
+
+fn __planner_probe_error_text(probe: any) {
+  const error = probe?.error ?? probe
+  if type_of(error) == "dict" {
+    return error?.message ?? error?.error ?? error?.reason ?? to_string(error)
+  }
+  return to_string(error)
+}
+
+fn __planner_probe_status(probe: any) {
+  const error = probe?.error ?? {}
+  const status = probe?.status ?? error?.status ?? error?.category ?? "generation_failed"
+  return "generation_" + lowercase(trim(to_string(status)))
+}
+
+/**
+ * Fold a tiny generation probe into a reachability healthcheck.
+ *
+ * `llm_healthcheck` proves only that a provider endpoint/catalog route is
+ * reachable. It does not prove the API key can spend or that the generation
+ * path accepts the final provider/model options. Live release audits require
+ * the latter, so a healthy candidate must also complete a one-token call.
+ */
+pub fn planner_generation_probe_health(health: dict, probe: dict) -> dict {
+  if !__planner_health_valid(health) {
+    return health
+  }
+  if probe?.ok ?? false {
+    return {
+      valid: true,
+      status: "ok",
+      message: "generation probe completed",
+      reachability_status: health?.status ?? "",
+      reachability_message: __redact_provider_text(health?.message ?? health?.error ?? ""),
+    }
+  }
+  const message = __redact_provider_text(__planner_probe_error_text(probe))
+  return {
+    valid: false,
+    status: __planner_probe_status(probe),
+    message: "generation probe failed: " + message,
+    reachability_status: health?.status ?? "",
+    reachability_message: __redact_provider_text(health?.message ?? health?.error ?? ""),
+  }
+}
+
+fn __planner_preflight_attempt(candidate: any, health: any) {
+  const valid = __planner_health_valid(health)
+  return candidate
+    + {
+      valid: valid,
+      health_status: health?.status ?? "",
+      classification: planner_preflight_failure_class(candidate.provider, candidate.model, health),
+      message: __redact_provider_text(health?.message ?? health?.error ?? ""),
+    }
+}
+
+/** Pure selector used by tests and by the live preflight runner. */
+pub fn planner_preflight_select_from_results(
+  candidates: list<PlannerCandidate>,
+  health_by_key: dict,
+) -> PlannerPreflightDecision {
+  let attempts = []
+  for candidate in candidates ?? [] {
+    const health = health_by_key[__candidate_key(candidate)]
+      ?? {valid: false, status: "not_checked", message: "provider was not checked"}
+    const attempt = __planner_preflight_attempt(candidate, health)
+    attempts = attempts + [attempt]
+    if attempt.valid {
+      const primary = if len(candidates ?? []) > 0 {
+        candidates[0]
+      } else {
+        candidate
+      }
+      return {
+        healthy: true,
+        selected: candidate,
+        attempts: attempts,
+        changed: !__same_candidate(primary, candidate),
+        disable_binder: false,
+      }
+    }
+  }
+  return {healthy: false, selected: nil, attempts: attempts, changed: false, disable_binder: false}
+}
+
+/**
+ * Return true when a healthy fallback would otherwise keep a known-bad binder provider in the loop.
+ */
+pub fn planner_preflight_should_disable_binder(decision: dict, binder: dict) -> bool {
+  if !(binder?.enabled ?? false) {
+    return false
+  }
+  for attempt in decision?.attempts ?? [] {
+    if attempt.provider == binder.provider && !(attempt.valid ?? false) {
+      return true
+    }
+  }
+  return false
+}
+
+/** Render one concise, redacted planner preflight audit line. */
+pub fn planner_preflight_audit_line(decision: dict) -> string {
+  let attempts = len(decision?.attempts ?? [])
+  if decision?.healthy ?? false {
+    const selected = decision.selected
+    const suffix = if decision.changed ?? false {
+      " after fallback"
+    } else {
+      ""
+    }
+    return "planner check : ${selected.provider}/${selected.model} healthy (${attempts} attempt(s)${suffix})"
+  }
+  return "planner check : no healthy provider (${attempts} attempt(s))"
+}
+
+/** Run the live release planner preflight, stopping at the first healthy candidate. */
+pub fn run_planner_preflight(
+  harness: {env: HarnessEnv, llm: HarnessLlm},
+  requested: dict,
+) -> PlannerPreflightDecision {
+  let candidates = planner_preflight_candidates(requested)
+  let attempts = []
+  for candidate in candidates {
+    const health = if candidate.provider == "mock" {
+      {valid: true, status: "ok", message: "mock provider"}
+    } else {
+      try {
+        harness.llm.healthcheck(
+          candidate.provider,
+          planner_healthcheck_options(harness.llm, candidate.provider, candidate.model),
+        )
+      } catch (e) {
+        {valid: false, status: "exception", message: to_string(e)}
+      }
+    }
+    const probed = if __planner_health_valid(health) && candidate.provider != "mock" {
+      planner_generation_probe_health(
+        health,
+        safe_call(
+          harness.llm,
+          "Reply with ok.",
+          nil,
+          planner_generation_probe_options(harness.llm, candidate.provider, candidate.model),
+        ),
+      )
+    } else {
+      health
+    }
+    const attempt = __planner_preflight_attempt(candidate, probed)
+    attempts = attempts + [attempt]
+    if attempt.valid {
+      const base = {
+        healthy: true,
+        selected: candidate,
+        attempts: attempts,
+        changed: !__same_candidate(candidates[0], candidate),
+      }
+      return base
+        + {
+          disable_binder: planner_preflight_should_disable_binder(
+            base,
+            binder_defaults(harness.env),
+          ),
+        }
+    }
+  }
+  const failed = {healthy: false, selected: nil, attempts: attempts, changed: false}
+  return failed
+    + {
+      disable_binder: planner_preflight_should_disable_binder(failed, binder_defaults(harness.env)),
+    }
+}
+
+/** install_binder variant that honors a release planner preflight decision. */
+pub fn install_binder_after_preflight(
+  _harness: Harness,
+  clock: HarnessClock,
+  tools: dict,
+  preflight: PlannerPreflightDecision?,
+) -> BinderInstallation {
+  if preflight?.disable_binder ?? false {
+    const audit = binder_defaults(_harness.env)
+      + {
+        enabled: false,
+        reason:
+          "disabled by release planner preflight after the binder provider failed healthcheck",
+      }
+    return {tools: tools, tool_caller: default_tool_caller(), audit: audit}
+  }
+  return install_binder(_harness, clock, tools)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Binder resolution
+// -------------------------------------------------------------------------------------------------
+
+fn __binder_with(lookup: any) {
+  const switch = __coerce_switch(lookup("HARN_EXT_BINDER"))
+  const provider_override = lookup("HARN_BINDER_PROVIDER")
+  const model_override = lookup("HARN_BINDER_MODEL")
+  const cerebras_key = lookup("CEREBRAS_API_KEY")
+  const provider = provider_override ?? CLOUD_BINDER_PROVIDER
+  const model = model_override ?? CLOUD_BINDER_MODEL
+  const auto_eligible = if provider == CLOUD_BINDER_PROVIDER {
+    cerebras_key != nil
+  } else {
+    true
+  }
+  const enabled = if switch == "off" {
+    false
+  } else if switch == "on" {
+    true
+  } else {
+    auto_eligible
+  }
+  const reason = if !enabled {
+    if switch == "off" {
+      "HARN_EXT_BINDER explicitly disabled"
+    } else if !auto_eligible {
+      "no CEREBRAS_API_KEY for default Cerebras binder"
+    } else {
+      "binder disabled"
+    }
+  } else {
+    ""
+  }
+  return {
+    enabled: enabled,
+    provider: provider,
+    model: model,
+    timeout_ms: __lookup_to_int(lookup, "HARN_EXT_BINDER_TIMEOUT_MS", BINDER_DEFAULT_TIMEOUT_MS),
+    max_tokens: __lookup_to_int(lookup, "HARN_EXT_BINDER_MAX_TOKENS", BINDER_DEFAULT_MAX_TOKENS),
+    switch: switch,
+    reason: reason,
+  }
+}
+
+// For non-default binder providers the user opted into, trust them
+// to have configured the corresponding API key — they wouldn't have
+// set HARN_BINDER_PROVIDER otherwise.
+/**
+ * binder_defaults_with(env) -> {enabled, provider, model, timeout_ms, max_tokens, switch, reason}
+ *
+ * Pure overload for tests.
+ */
+pub fn binder_defaults_with(env: dict) -> BinderDefaults {
+  return __binder_with({ key -> return __nonempty(env[key]) })
+}
+
+/** binder_defaults() -> {enabled, provider, model, timeout_ms, max_tokens, switch, reason} */
+fn binder_defaults(env: HarnessEnv) {
+  return __binder_with({ key -> return __nonempty(env_str(env, key)) })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Tool-caller composition
+// -------------------------------------------------------------------------------------------------
+
+const NL_INTENT_FIELD = "_nl_intent"
+
+const NL_INTENT_SCHEMA = {
+  type: "string",
+  description:
+    "Optional one-sentence natural-language description of what you're trying to do with this tool. A fast binder LLM uses it to canonicalize the rest of the arguments; safe to omit when args are already exact.",
+  required: false,
+}
+
+fn __inject_nl_intent(tools: any) {
+  return tools_use_middleware(
+    tools,
+    { entry -> tool_inject_param(entry, NL_INTENT_FIELD, NL_INTENT_SCHEMA, {required: false}) },
+  )
+}
+
+fn __install_binder_with_cfg(_harness: Harness, clock: HarnessClock, tools: any, cfg: any) {
+  if !cfg.enabled {
+    return {tools: tools, tool_caller: default_tool_caller(), audit: cfg}
+  }
+  const augmented = __inject_nl_intent(tools)
+  const binder_layer = with_natural_language_executor(
+    _harness,
+    {
+      provider: cfg.provider,
+      model: cfg.model,
+      timeout_ms: cfg.timeout_ms,
+      max_tokens: cfg.max_tokens,
+      max_retries: 0,
+      on_failure: "passthrough",
+    },
+  )
+  return {
+    tools: augmented,
+    tool_caller: compose_tool_callers(clock, [binder_layer, default_tool_caller()]),
+    audit: cfg,
+  }
+}
+
+/**
+ * install_binder_with_env(tools, env) -> {tools, tool_caller, audit}
+ *
+ * Pure test seam for `install_binder`: resolve binder defaults from `env`
+ * instead of the live process environment.
+ */
+pub fn install_binder_with_env(
+  _harness: Harness,
+  clock: HarnessClock,
+  tools: dict,
+  env: dict,
+) -> BinderInstallation {
+  return __install_binder_with_cfg(_harness, clock, tools, binder_defaults_with(env))
+}
+
+/**
+ * install_binder(tools) -> {tools, tool_caller, audit}
+ *
+ * Returns a `{tools, tool_caller}` pair to spread into `agent_preset(...)`
+ * options. When the binder is disabled (env says off, or no Cerebras
+ * key), `tools` and `tool_caller` are still returned so callers always
+ * spread the same shape — `tool_caller` is then a passthrough that
+ * agent_loop treats as no middleware.
+ *
+ * `audit` carries the binder_defaults() dict so the calling harness can
+ * log which provider/model the binder chose (or why it was skipped).
+ */
+pub fn install_binder(_harness: Harness, clock: HarnessClock, tools: dict) -> BinderInstallation {
+  return __install_binder_with_cfg(_harness, clock, tools, binder_defaults(_harness.env))
+}
+
+/**
+ * binder_audit_line(audit) -> string
+ *
+ * One-line human-readable summary of an `install_binder` audit dict, for
+ * console logging at the top of an agent run.
+ */
+pub fn binder_audit_line(audit: dict) -> string {
+  if audit?.enabled ?? false {
+    return "binder        : ${audit.provider}/${audit.model} (timeout=${audit.timeout_ms}ms, max_tokens=${audit.max_tokens})"
+  }
+  const reason = audit?.reason ?? "disabled"
+  return "binder        : off (${reason})"
+}
+
+/**
+ * Shared retrying caller for low-risk summary/classifier/chat side calls.
+ *
+ * Harn core owns the caller middleware composition; this repo only chooses the
+ * attempt count for its harness roles. `max_attempts` is the total attempt
+ * count (a value of 2 means one retry), matching `with_retry`'s semantics.
+ */
+pub fn retrying_llm_caller(harness: Harness, max_attempts: int = 2) -> LlmCaller {
+  return with_retry(
+    harness,
+    default_llm_caller(harness.agent, harness.llm),
+    {max_attempts: max_attempts},
+  )
+}
+
+/**
+ * planner_audit_line(planner) -> string
+ *
+ * One-line human-readable summary of a `planner_defaults` dict.
+ */
+pub fn planner_audit_line(planner: dict) -> string {
+  return "planner       : ${planner.provider}/${planner.model} (${planner.source})"
+}
+
+// -------------------------------------------------------------------------------------------------
+// Per-run LLM cost ceiling
+// -------------------------------------------------------------------------------------------------
+
+// Default per-run LLM spend ceiling in USD. A safety guard so a runaway
+// agent loop (stuck retrying, over-long recovery, prompt blow-up) cannot
+// burn unbounded spend. Enforced by Harn's native `llm_budget` preflight:
+// any call whose projected session cost would cross the ceiling is
+// refused BEFORE it reaches the provider, surfacing as a
+// `budget_exhausted` status. Override per harness via env; set to 0 (or
+// any non-positive value) to disable the cap entirely.
+const DEFAULT_COST_LIMIT_USD = 1.0
+
+/**
+ * Resolve and install the per-run LLM cost ceiling.
+ *
+ * Reads `env_var` (e.g. `HARN_EXT_RELEASE_COST_LIMIT_USD`) as a USD float,
+ * falling back to `DEFAULT_COST_LIMIT_USD` ($1.00) when unset or
+ * unparseable. A resolved value `<= 0` disables the cap. Returns the
+ * resolved limit so the caller can surface it in the run header
+ * (`0.0` means uncapped).
+ */
+pub fn install_cost_budget(harness: {env: HarnessEnv, llm: HarnessLlm}, env_var: string) -> float {
+  const raw = env_str(harness.env, env_var)
+  const limit = if raw != nil {
+    to_float(raw) ?? DEFAULT_COST_LIMIT_USD
+  } else {
+    DEFAULT_COST_LIMIT_USD
+  }
+  if limit > 0.0 {
+    harness.llm.budget(limit)
+  }
+  return limit
+}
+
+/** Render the resolved cost ceiling for the run header. */
+pub fn cost_budget_audit_line(limit_usd: float) -> string {
+  if limit_usd > 0.0 {
+    return "cost limit    : ${llm_format_usd(limit_usd, {precision: 2})} per run (Harn llm_budget preflight)"
+  }
+  return "cost limit    : uncapped"
+}
+
+// -------------------------------------------------------------------------------------------------
+// Release-agent infra defaults
+// -------------------------------------------------------------------------------------------------
+
+// Wall-clock and idle ceilings shared by every release-DOMAIN agent loop (audit,
+// summary, recovery/repair). These are release-domain infra, not generic stdlib
+// defaults, so they live in this repo rather than in an `agent_preset` pack:
+// `agent_preset_register`'s pack schema only carries
+// provider/timeout_ms/budget/*_policy/model_ladder rows over a generic|captain
+// base family, which cannot reproduce the audit/summary/repair behavior
+// templates (profile, reasoning_task, iteration_budget, diagnostics) these loops
+// depend on. Centralizing them here removes the duplicated literals while the
+// call sites keep their exact stdlib preset kind, so the resolved `agent_loop`
+// options stay byte-identical.
+const RELEASE_AGENT_TIMEOUT_MS = 900000
+
+const RELEASE_AGENT_IDLE_TIMEOUT_MS = 180000
+
+/**
+ * Resolve the release agent's provider from `cfg`.
+ *
+ * `--mock` forces the `mock` provider; `--provider auto` keeps the literal
+ * `auto` route (resolved downstream by preflight); otherwise the configured
+ * provider is used verbatim.
+ */
+fn release_agent_provider(cfg: any) {
+  if cfg.mock {
+    return "mock"
+  }
+  if cfg.provider == "auto" {
+    return "auto"
+  }
+  return cfg.provider
+}
+
+/** Resolve the release agent's model from `cfg` (mock swaps in `mock_model`). */
+fn release_agent_model(cfg: any, mock_model: any) {
+  if cfg.mock {
+    return mock_model
+  }
+  return cfg.model
+}
+
+/**
+ * Provider ids to try when the pinned planner route fails availability.
+ *
+ * These loops set `provider`/`model` directly, so `agent_preset_register`
+ * ladders never apply. Harn's supported lever for that shape is
+ * `fallback_chain`: other providers, same model id. The order is the
+ * preflight candidate list minus the primary, so the two seams cannot drift.
+ *
+ * `--mock` has nothing to fail over to. Local Ollama is still never the
+ * *default* planner; it appears here only as a last-resort transport
+ * fallback after the requested and cloud providers.
+ */
+pub fn release_agent_fallback_chain(cfg: dict) -> list<string> {
+  if cfg.mock {
+    return []
+  }
+  const provider = release_agent_provider(cfg)
+  let chain: list<string> = []
+  for candidate in planner_preflight_candidates(
+    {provider: provider, model: release_agent_model(cfg, ""), source: "requested"},
+  ) {
+    if candidate.provider != provider && !chain.contains(candidate.provider) {
+      chain = chain + [candidate.provider]
+    }
+  }
+  return chain
+}
+
+/**
+ * Shared infra defaults for the release audit/summary/repair agent loops:
+ * resolved provider + model and the common timeout/idle ceilings. Spread this
+ * first into an `agent_preset(kind, ...)` options dict and layer the per-call
+ * keys (tools, iteration budget, compaction, session id, ...) on top; any key
+ * the caller sets explicitly still wins.
+ *
+ * `policy.workspace_roots` must include `cfg.repo`. A top-level `agent_loop`
+ * under `--no-sandbox` installs an OsHardened carrier with empty roots, which
+ * falls back to the fleet checkout; tool dispatch intersects this requested
+ * policy so release tools can read and run under the release worktree (which
+ * sits outside that fallback). Hosted prepare run 31063625486 died after the
+ * agent thrashed on sandbox rejections for every worktree path.
+ */
+pub fn release_agent_infra_defaults(cfg: dict, mock_model: string) -> ReleaseAgentInfraDefaults {
+  const defaults = {
+    provider: release_agent_provider(cfg),
+    model: release_agent_model(cfg, mock_model),
+    timeout_ms: RELEASE_AGENT_TIMEOUT_MS,
+    idle_timeout_ms: RELEASE_AGENT_IDLE_TIMEOUT_MS,
+    policy: release_agent_execution_policy(cfg),
+    fallback_chain: release_agent_fallback_chain(cfg),
+  }
+  // fallback_chain is the live route owner. Harn rejects a second explicit
+  // equivalent_failover owner, while mock runs stay pinned deliberately.
+  return if cfg.mock {
+    defaults + {equivalent_failover: false}
+  } else {
+    defaults
+  }
+}
+
+/** Execution policy for release agent tools rooted at `cfg.repo`. */
+pub fn release_agent_execution_policy(cfg: dict) -> dict {
+  const repo = cfg?.repo
+  if type_of(repo) != "string" || trim(repo) == "" {
+    throw "release_agent_execution_policy: cfg.repo must be a non-empty string"
+  }
+  return {workspace_roots: [repo]}
+}

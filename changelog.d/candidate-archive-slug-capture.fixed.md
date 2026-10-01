@@ -1,0 +1,1 @@
+Read `regex_captures` as the list of match objects it returns, so the candidate archive artifact lookup accepts a well-formed `owner/name` slug instead of refusing every one of them with `invalid_artifact_query`.
