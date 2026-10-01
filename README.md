@@ -74,6 +74,8 @@ Start with the job you need to do.
   to find.
 - [Continuous integration](docs/reference/continuous-integration.md). What this
   repository's own CI runs, and what each job proves.
+- [Consumer refresh finalization](docs/reference/consumer-refresh-finalization.md).
+  The optional contract for regenerating artifacts after runtime migrations.
 - [Dependabot fleet template](docs/dependabot-fleet-template.md). The projected
   dependency configuration every fleet repository receives.
 
