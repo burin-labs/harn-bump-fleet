@@ -1,0 +1,1 @@
+- A Harn release now promotes the bump orchestration pin itself: `promote-released-orchestration.yml` moves `fleet.toml` to the released commit, and each consumer's generated adapter runs its bump when the converged adapter lands, so no release reaches a consumer through an older orchestration contract.
