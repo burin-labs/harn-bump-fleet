@@ -1,0 +1,1 @@
+Rendered bump adapters and package CI now select `ubuntu-24.04` instead of `ubuntu-latest`, so consumers stay on the image their checks were measured on when GitHub moves the floating label, and the hosted-runner-labels check in consumer repositories accepts the rendered files.
