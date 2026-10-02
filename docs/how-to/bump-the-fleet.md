@@ -137,3 +137,20 @@ a fleet with nothing to converge.
 
 The scheduled `Converge Fleet Projections` workflow is the only place `--apply`
 runs by default; the harness itself reports and exits unless asked to write.
+
+## After a Harn release
+
+You don't need to run anything. The release's `repin` job starts
+`promote-released-orchestration.yml` here with the released tag. That run moves
+`fleet.toml`'s bump orchestration pin to the released commit and lands it.
+The `fleet.toml` push starts fleet projection convergence, which proposes each
+consumer's adapter at the new pin. Each adapter's landing on its default
+branch then starts that consumer's bump. A consumer never bumps to a release
+through an older orchestration commit.
+
+To promote by hand, for example after a failed run, dispatch the same
+workflow with the tag:
+
+```sh
+gh workflow run promote-released-orchestration.yml -R burin-labs/harn-bump-fleet -f version=vX.Y.Z
+```

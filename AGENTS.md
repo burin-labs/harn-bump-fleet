@@ -41,6 +41,12 @@ The entry points are:
   `[providers.setup].required_secrets` projection for every first-party
   connector. `policy.connector_secret_schema` keeps the output compatible with
   the released Harn manifest schema until the fleet can move as one.
+- `promote-released-orchestration.yml`: started by a Harn release's `repin`
+  job. It promotes `fleet.toml`'s orchestration pin to the released commit
+  with `promote_bump_workflow.harn --repositories-json
+  '["burin-labs/harn-bump-fleet"]'`. Convergence and each consumer adapter's
+  push-triggered bump do the rest, so a release never dispatches consumer
+  bumps through an older orchestration contract.
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
