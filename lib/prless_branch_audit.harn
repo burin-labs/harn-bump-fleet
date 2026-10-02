@@ -18,6 +18,24 @@ const PULL_REQUEST_MAX_PAGES = 34
 
 const ISSUE_PREVIEW_LIMIT = 100
 
+// GitHub lists at most 300 changed files in one compare response, with no
+// field saying it stopped. A list that reaches the cap may be truncated.
+const COMPARE_FILE_LIMIT = 300
+
+// Blob lookups per GraphQL request. Each path costs two aliased `object` reads,
+// and the answer is an OID or null, so a batch stays a few kilobytes.
+const BLOB_LOOKUP_BATCH = 50
+
+/**
+ * The prefix GitHub reserves for merge-queue branches.
+ *
+ * GitHub creates `gh-readonly-queue/<base>/pr-<N>-<sha>` for each queue entry
+ * and removes it itself, so such a branch is never abandoned work. Only this
+ * exact leading prefix identifies one; a name that merely contains it is an
+ * ordinary branch and stays in the audit.
+ */
+pub const MERGE_QUEUE_REF_PREFIX: string = "gh-readonly-queue/"
+
 pub const PRLESS_BRANCH_ISSUE_MARKER_PREFIX: string = "<!-- harn-bump-fleet:prless-branches:"
 
 pub const PRLESS_BRANCH_LABEL: string = "fleet/prless-branch-audit"
@@ -36,26 +54,52 @@ pub type RepositoryBranch = {name: string, head_oid: string, protected: bool}
  * Whether a branch with no open pull request still holds work.
  *
  * `merged` means the tip is reachable from the default branch, so deleting the
- * branch loses nothing. `unmerged` means it is not, so the branch is the only
- * copy of whatever is on it. `unknown` means the audit could not establish
- * either, and is deliberately its own value: an unreadable answer must not
- * collapse into the one that reads as safe to delete.
+ * branch loses nothing. `content_merged` means the tip is not reachable, but
+ * every file the branch changed already has the same content on the default
+ * branch, which is what a squash merge leaves behind; deleting it loses no
+ * file content. `unmerged` means at least one changed file differs, so the
+ * branch is the only copy of that work. `unknown` means the audit could not
+ * establish any of these, and is deliberately its own value: an unreadable
+ * answer must not collapse into one that reads as safe to delete.
  */
-pub type PrlessBranchDisposition = "merged" | "unmerged" | "unknown"
+pub type PrlessBranchDisposition = "merged" | "content_merged" | "unmerged" | "unknown"
 
 pub type PrlessBranchFinding = RepositoryBranch \
   & {disposition: PrlessBranchDisposition, disposition_detail: string}
+
+/**
+ * One path the branch changed relative to its merge base, with the blob the
+ * path holds at the branch tip and at the default-branch tip. `nil` means the
+ * path is absent on that side.
+ */
+pub type PrlessPathBlobs = {path: string, branch_blob: string?, default_blob: string?}
+
+/**
+ * What the content comparison established for one unreachable tip.
+ *
+ * `landed`: every changed path matches the default branch. `differs`: at
+ * least one does not. `unknown`: a read failed, was malformed, or may have
+ * been truncated, so the comparison makes no claim.
+ */
+pub type PrlessContentCheck = {
+  verdict: "landed" | "differs" | "unknown",
+  path_count: int?,
+  differing_path_count: int?,
+  detail: string,
+}
 
 pub type RepositoryBranchAudit = {
   slug: string,
   default_branch: string,
   state: BranchAuditState,
   branch_count: int?,
+  merge_queue_ref_count: int?,
   open_pr_head_count: int?,
   prless_branch_count: int?,
   prless_branches: list<RepositoryBranch>,
   prless_findings: list<PrlessBranchFinding>,
   merged_branch_count: int?,
+  content_merged_branch_count: int?,
   unmerged_branch_count: int?,
   undetermined_branch_count: int?,
   error_code?: string,
@@ -68,6 +112,7 @@ pub type FleetBranchAuditReceipt = {
   scanned_repository_count: int,
   failed_repository_count: int,
   branch_count: int,
+  merge_queue_ref_count: int,
   open_pr_head_count: int,
   prless_branch_count: int,
   repositories: list<RepositoryBranchAudit>,
@@ -76,6 +121,20 @@ pub type FleetBranchAuditReceipt = {
 type GithubBranchRow = {name: string, commit: {sha: string}, protected?: bool, ...rest}
 
 type GithubBranchRows = list<GithubBranchRow>
+
+type GithubCompareFile = {filename: string, status: string, previous_filename?: string, ...rest}
+
+type GithubContentCompare = {
+  status: string,
+  base_commit: {sha: string},
+  files: list<GithubCompareFile>,
+  ...rest,
+}
+
+/** Whether GitHub owns this branch as a merge-queue entry. */
+pub fn is_merge_queue_ref(name: string) -> bool {
+  return starts_with(name, MERGE_QUEUE_REF_PREFIX)
+}
 
 fn slug_parts(slug: string) -> {owner: string, repo: string} {
   const parts = split(slug, "/")
@@ -174,7 +233,11 @@ fn all_open_pr_head_names(
 }
 
 fn branch_snapshot_fingerprint(branches: list<RepositoryBranch>) -> list<string> {
-  return branches.map({ branch -> "${branch.name}@${branch.head_oid}" }).to_list().sort()
+  return branches.filter({ branch -> !is_merge_queue_ref(branch.name) }).map(
+    { branch -> "${branch.name}@${branch.head_oid}" },
+  )
+    .to_list()
+    .sort()
 }
 
 fn name_snapshot_fingerprint(names: list<string>) -> list<string> {
@@ -192,11 +255,13 @@ fn measurement_failure(
     default_branch: default_branch,
     state: "measurement_failed",
     branch_count: nil,
+    merge_queue_ref_count: nil,
     open_pr_head_count: nil,
     prless_branch_count: nil,
     prless_branches: [],
     prless_findings: [],
     merged_branch_count: nil,
+    content_merged_branch_count: nil,
     unmerged_branch_count: nil,
     undetermined_branch_count: nil,
     error_code: trim(pieces[0]),
@@ -205,18 +270,59 @@ fn measurement_failure(
 }
 
 /**
- * Classify one PR-less branch from a compare read that either succeeded or did
- * not.
+ * Decide whether a branch's changed files already hold the same content on the
+ * default branch.
  *
- * The read is passed in rather than performed here so the decision is testable
- * on its own, and so the failure case is a value instead of an exception. A
- * `nil` read is `unknown`: the audit reports what it established, and a branch
- * it could not compare is not evidence that the branch is disposable.
+ * Every burin-labs repository merges by squash, so a branch whose work landed
+ * keeps a tip the default branch cannot reach. Content is the evidence that
+ * survives a squash: if each path the branch changed has the same blob on the
+ * default branch, or is absent on both, merging the branch would change
+ * nothing. A single differing path makes the branch the only copy of that
+ * change. An empty list means the branch changes no file relative to its
+ * merge base, which also merges as a no-op.
+ *
+ * @effects: []
+ * @errors: []
+ */
+pub fn prless_content_verdict(paths: list<PrlessPathBlobs>) -> PrlessContentCheck {
+  const differing = len(
+    paths.filter({ entry -> entry.branch_blob != entry.default_blob }).to_list(),
+  )
+  if differing > 0 {
+    return {
+      verdict: "differs",
+      path_count: len(paths),
+      differing_path_count: differing,
+      detail: "${to_string(differing)} of ${to_string(len(paths))} changed path(s) differ",
+    }
+  }
+  return {
+    verdict: "landed",
+    path_count: len(paths),
+    differing_path_count: 0,
+    detail: "all ${to_string(len(paths))} changed path(s) match",
+  }
+}
+
+fn content_unknown(detail: string) -> PrlessContentCheck {
+  return {verdict: "unknown", path_count: nil, differing_path_count: nil, detail: detail}
+}
+
+/**
+ * Classify one PR-less branch from the reads that either succeeded or did not.
+ *
+ * The reads are passed in rather than performed here so the decision is
+ * testable on its own, and so a failure is a value instead of an exception.
+ * A `nil` reachability read is `unknown`. An unreachable tip is then decided
+ * by its content check, and a missing or `unknown` content check is `unknown`
+ * too: a branch the audit could not compare is not evidence that the branch
+ * is disposable, and not evidence that it is the only copy of anything.
  */
 pub fn prless_branch_disposition(
   branch: RepositoryBranch,
   default_branch: string,
   reachable: bool?,
+  content: PrlessContentCheck?,
 ) -> PrlessBranchFinding {
   if reachable == nil {
     return branch
@@ -234,11 +340,29 @@ pub fn prless_branch_disposition(
           "the tip is reachable from ${default_branch}, so deleting the branch loses nothing",
       }
   }
+  const verdict = content?.verdict ?? "unknown"
+  if verdict == "landed" {
+    return branch
+      + {
+        disposition: "content_merged",
+        disposition_detail: "the tip is not reachable from ${default_branch}, but ${content?.detail ?? ""} "
+          + "${default_branch}, so the work already landed there (for example by squash merge) "
+          + "and deleting the branch loses no file content",
+      }
+  }
+  if verdict == "differs" {
+    return branch
+      + {
+        disposition: "unmerged",
+        disposition_detail: "the tip is not reachable from ${default_branch} and ${content?.detail ?? ""} from "
+          + "${default_branch}, so this branch is the only copy of that work",
+      }
+  }
   return branch
     + {
-      disposition: "unmerged",
-      disposition_detail:
-        "the tip is not reachable from ${default_branch}, so this branch is the only copy of the work on it",
+      disposition: "unknown",
+      disposition_detail: "the tip is not reachable from ${default_branch} and the audit could not compare its file "
+        + "content (${content?.detail ?? "no content check ran"}), so it makes no claim about it",
     }
 }
 
@@ -248,6 +372,185 @@ pub fn prless_disposition_count(
   disposition: PrlessBranchDisposition,
 ) -> int {
   return len(findings.filter({ finding -> finding.disposition == disposition }).to_list())
+}
+
+/** A path the branch changed, and whether the compare says the tip holds it. */
+type ChangedPath = {path: string, on_branch: bool?}
+
+/**
+ * Read the paths the branch changed since its merge base, and the exact
+ * default-branch commit the compare measured against.
+ *
+ * `per_page=1` keeps the commit list to one entry; GitHub still returns the
+ * whole file list on the first page. A response over the connector's 1 MiB
+ * ceiling fails the read, which the caller reports as `unknown`.
+ */
+fn changed_paths(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  tip: string,
+  client: GithubClientOptions,
+) -> {base_oid: string, paths: list<ChangedPath>} {
+  const parts = slug_parts(slug)
+  const response = api_call(
+    harness,
+    {
+      path:
+        "/repos/${parts.owner}/${parts.repo}/compare/${url_encode(default_branch)}...${tip}?per_page=1",
+      options: client,
+    },
+  )
+  if is_err(response) {
+    throw "content_compare_failed: " + to_string(unwrap_err(response))
+  }
+  const raw = unwrap(response)
+  if !schema_is(raw, GithubContentCompare) {
+    throw "content_compare_malformed: GitHub did not return a typed compare with a file list"
+  }
+  const base_oid = lowercase(trim(raw.base_commit.sha))
+  if len(regex_captures("^[0-9a-f]{40}$", base_oid)) == 0 {
+    throw "content_compare_malformed: the compare named no exact default-branch commit"
+  }
+  if len(raw.files) >= COMPARE_FILE_LIMIT {
+    throw "content_compare_truncated: GitHub listed ${to_string(len(raw.files))} changed files, "
+      + "its cap, so the list may be incomplete"
+  }
+  let paths: list<ChangedPath> = []
+  for file in raw.files {
+    const path = file.filename
+    if trim(path) == "" {
+      throw "content_compare_malformed: a changed file had no path"
+    }
+    paths = paths + [{path: path, on_branch: file.status != "removed"}]
+    // A rename removed the old path on the branch. Whether the default branch
+    // still has it is part of the comparison too.
+    if file.status == "renamed" && trim(file.previous_filename ?? "") != "" {
+      paths = paths + [{path: file.previous_filename ?? "", on_branch: nil}]
+    }
+  }
+  return {base_oid: base_oid, paths: paths}
+}
+
+fn blob_lookup_query(count: int) -> string {
+  let declarations = ["$owner: String!", "$name: String!"]
+  let fields: list<string> = []
+  for index in range(0, count) {
+    const suffix = to_string(index)
+    declarations = declarations + ["$b${suffix}: String!", "$d${suffix}: String!"]
+    fields = fields
+      + [
+        "b${suffix}: object(expression: $b${suffix}) { oid }",
+        "d${suffix}: object(expression: $d${suffix}) { oid }",
+      ]
+  }
+  return "query(" + declarations.join(", ") + ") { repository(owner: $owner, name: $name) { "
+    + fields.join(" ")
+    + " } }"
+}
+
+/** One aliased `object` answer: an exact OID, or `nil` when the path is absent. */
+fn alias_blob(repository: dict, alias: string) -> string? {
+  if !contains(repository.keys().to_list(), alias) {
+    throw "blob_lookup_malformed: GraphQL omitted ${alias}"
+  }
+  const value = repository[alias]
+  if value == nil {
+    return nil
+  }
+  const oid = lowercase(trim(to_string(value?.oid ?? "")))
+  if len(regex_captures("^[0-9a-f]{40}$", oid)) == 0 {
+    throw "blob_lookup_malformed: ${alias} carried no exact object id"
+  }
+  return oid
+}
+
+/** Look up each path's object on both exact commits, in bounded batches. */
+fn path_blobs(
+  harness: Harness,
+  slug: string,
+  tip: string,
+  base_oid: string,
+  paths: list<ChangedPath>,
+  client: GithubClientOptions,
+) -> list<PrlessPathBlobs> {
+  const parts = slug_parts(slug)
+  let rows: list<PrlessPathBlobs> = []
+  let start = 0
+  while start < len(paths) {
+    const batch = paths.slice(start, min(start + BLOB_LOOKUP_BATCH, len(paths)))
+    let variables: dict<string, string> = {owner: parts.owner, name: parts.repo}
+    for index in range(0, len(batch)) {
+      const suffix = to_string(index)
+      variables["b${suffix}"] = "${tip}:${batch[index].path}"
+      variables["d${suffix}"] = "${base_oid}:${batch[index].path}"
+    }
+    const response = api_call(
+      harness,
+      {
+        path: "/graphql",
+        method: "POST",
+        body: {query: blob_lookup_query(len(batch)), variables: variables},
+        options: client,
+      },
+    )
+    if is_err(response) {
+      throw "blob_lookup_failed: " + to_string(unwrap_err(response))
+    }
+    const answer = unwrap(response)
+    if len(answer?.errors ?? []) > 0 {
+      throw "blob_lookup_failed: GraphQL reported " + to_string(len(answer?.errors ?? []))
+        + " error(s)"
+    }
+    const repository = answer?.data?.repository
+    if type_of(repository) != "dict" {
+      throw "blob_lookup_malformed: GraphQL returned no repository object"
+    }
+    for index in range(0, len(batch)) {
+      const suffix = to_string(index)
+      const entry = batch[index]
+      const branch_blob = alias_blob(repository, "b${suffix}")
+      // The compare said whether the tip holds this path. A lookup that
+      // disagrees, such as a submodule GraphQL cannot resolve, is a read the
+      // audit cannot trust rather than an absence.
+      if entry.on_branch != nil && branch_blob != nil != (entry.on_branch ?? false) {
+        throw "blob_lookup_inconsistent: the branch-side lookup disagreed with the compare"
+      }
+      rows = rows
+        + [
+          {
+            path: entry.path,
+            branch_blob: branch_blob,
+            default_blob: alias_blob(repository, "d${suffix}"),
+          },
+        ]
+    }
+    start = start + BLOB_LOOKUP_BATCH
+  }
+  return rows
+}
+
+/**
+ * Compare an unreachable tip's changed files with the default branch.
+ *
+ * Every failure becomes `unknown` with its reason. The verdict is reached only
+ * from a complete, consistent read.
+ */
+fn branch_content_check(
+  harness: Harness,
+  slug: string,
+  default_branch: string,
+  tip: string,
+  client: GithubClientOptions,
+) -> PrlessContentCheck {
+  const observed = try {
+    const changed = changed_paths(harness, slug, default_branch, tip, client)
+    prless_content_verdict(path_blobs(harness, slug, tip, changed.base_oid, changed.paths, client))
+  }
+  if is_err(observed) {
+    return content_unknown(split(to_string(unwrap_err(observed)), ":")[0])
+  }
+  return unwrap(observed)
 }
 
 fn classify_findings(
@@ -271,7 +574,12 @@ fn classify_findings(
     } else {
       unwrap(read).reachable
     }
-    rows = rows + [prless_branch_disposition(branch, default_branch, reachable)]
+    const content = if reachable == false {
+      branch_content_check(harness, slug, default_branch, branch.head_oid, client)
+    } else {
+      nil
+    }
+    rows = rows + [prless_branch_disposition(branch, default_branch, reachable, content)]
   }
   return rows
 }
@@ -308,6 +616,9 @@ pub fn survey_repository_branches(
     const open_heads = all_open_pr_head_names(harness, slug, client)
     // REST pages are not a snapshot. Read both inventories twice and refuse a
     // moving answer so a branch inserted between pages cannot hide another.
+    // Merge-queue refs come and go within seconds while a queue is busy and are
+    // never findings, so they are left out of the comparison. A page shift they
+    // cause still moves an audited branch, which the comparison does see.
     const confirmed_branches = all_branches(harness, slug, client)
     const confirmed_open_heads = all_open_pr_head_names(harness, slug, client)
     if branch_snapshot_fingerprint(branches) != branch_snapshot_fingerprint(confirmed_branches) {
@@ -316,8 +627,14 @@ pub fn survey_repository_branches(
     if name_snapshot_fingerprint(open_heads) != name_snapshot_fingerprint(confirmed_open_heads) {
       throw "pull_request_snapshot_moved: open same-repository pull-request heads changed during the audit"
     }
+    const queue_refs = confirmed_branches.filter({ branch -> is_merge_queue_ref(branch.name) })
+      .to_list()
     const findings = confirmed_branches.filter(
-      { branch -> branch.name != default_branch && !contains(open_heads, branch.name) },
+      { branch ->
+        branch.name != default_branch
+          && !contains(open_heads, branch.name)
+          && !is_merge_queue_ref(branch.name)
+      },
     )
       .to_list()
     const state: BranchAuditState = if len(findings) == 0 {
@@ -330,17 +647,19 @@ pub fn survey_repository_branches(
       slug: slug,
       default_branch: default_branch,
       state: state,
-      branch_count: len(branches),
+      branch_count: len(confirmed_branches),
+      merge_queue_ref_count: len(queue_refs),
       open_pr_head_count: len(open_heads),
       prless_branch_count: len(findings),
       prless_branches: findings,
       prless_findings: classified,
       merged_branch_count: prless_disposition_count(classified, "merged"),
+      content_merged_branch_count: prless_disposition_count(classified, "content_merged"),
       unmerged_branch_count: prless_disposition_count(classified, "unmerged"),
       undetermined_branch_count: prless_disposition_count(classified, "unknown"),
       error_code: nil,
       detail: if len(findings) == 0 {
-        "every non-default branch is the head of an open pull request"
+        "every non-default branch is the head of an open pull request or a merge-queue ref"
       } else {
         "${to_string(len(findings))} non-default branch(es) have no open pull request"
       },
@@ -392,6 +711,7 @@ pub fn fleet_branch_audit_receipt(rows: list<RepositoryBranchAudit>) -> FleetBra
   let scanned = 0
   let failed = 0
   let branch_count = 0
+  let merge_queue_ref_count = 0
   let open_pr_head_count = 0
   let prless_branch_count = 0
   for row in rows {
@@ -401,15 +721,17 @@ pub fn fleet_branch_audit_receipt(rows: list<RepositoryBranchAudit>) -> FleetBra
     }
     scanned = scanned + 1
     branch_count = branch_count + (row.branch_count ?? 0)
+    merge_queue_ref_count = merge_queue_ref_count + (row.merge_queue_ref_count ?? 0)
     open_pr_head_count = open_pr_head_count + (row.open_pr_head_count ?? 0)
     prless_branch_count = prless_branch_count + (row.prless_branch_count ?? 0)
   }
   return {
-    schema_version: "harn_bump_fleet.prless_branch_audit.v1",
+    schema_version: "harn_bump_fleet.prless_branch_audit.v2",
     requested_repository_count: len(rows),
     scanned_repository_count: scanned,
     failed_repository_count: failed,
     branch_count: branch_count,
+    merge_queue_ref_count: merge_queue_ref_count,
     open_pr_head_count: open_pr_head_count,
     prless_branch_count: prless_branch_count,
     repositories: rows,
@@ -535,17 +857,21 @@ pub fn prless_branch_issue_body(row: RepositoryBranchAudit, run_url: string?) ->
     + "\n\nThe daily fleet branch audit found **${to_string(row.prless_branch_count ?? 0)}** "
     + "non-default branch(es) that are not the head of an open pull request."
     + "\n\nThe audit measured ${to_string(row.branch_count ?? 0)} branch(es) and "
-    + "${to_string(row.open_pr_head_count ?? 0)} unique same-repository open pull-request head(s)."
+    + "${to_string(row.open_pr_head_count ?? 0)} unique same-repository open pull-request head(s). "
+    + "It left out ${to_string(row.merge_queue_ref_count ?? 0)} merge-queue ref(s) under "
+    + "`${MERGE_QUEUE_REF_PREFIX}`, which GitHub creates and removes itself."
     + "\n\n```json\n"
     + json_stringify_pretty(preview)
     + "\n```"
     + omitted_text
     + "\n\nOf those, **${to_string(row.merged_branch_count ?? 0)}** have a tip already reachable "
     + "from `${row.default_branch}` and can be deleted without losing anything, "
-    + "**${to_string(row.unmerged_branch_count ?? 0)}** hold work that exists nowhere else, and "
-    + "**${to_string(row.undetermined_branch_count ?? 0)}** could not be compared at all. Each "
-    + "branch above carries its own `disposition`. Delete only the merged ones. A branch the "
-    + "audit could not compare is not a branch it found safe."
+    + "**${to_string(row.content_merged_branch_count ?? 0)}** have every changed file already "
+    + "matching `${row.default_branch}` (a squash merge leaves this) and can be deleted without "
+    + "losing file content, **${to_string(row.unmerged_branch_count ?? 0)}** hold work that exists "
+    + "nowhere else, and **${to_string(row.undetermined_branch_count ?? 0)}** could not be compared "
+    + "at all. Each branch above carries its own `disposition`. Delete only the `merged` and "
+    + "`content_merged` ones. A branch the audit could not compare is not a branch it found safe."
     + "\n\nReview, finish, or archive the work deliberately. This audit never deletes branches."
     + " It refreshes this issue while findings remain and closes it when none remain."
     + trailer
