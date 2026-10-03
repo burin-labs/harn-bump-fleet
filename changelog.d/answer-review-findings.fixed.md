@@ -1,0 +1,1 @@
+Answer every automated-reviewer finding on a fleet pull request: the repair agent now receives the finding text and fixes it, and each thread gets a fleet reply naming the head that addressed it or the typed reason it could not, so a reviewed update is escalated instead of blocking silently.

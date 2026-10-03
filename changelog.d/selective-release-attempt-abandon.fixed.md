@@ -1,0 +1,1 @@
+Allow release recovery to archive one exact unclaimed attempt while preserving siblings claimed by an active release pull request. Archive creation is now create-only, exact-identity adoption is explicit, and source races leave a recoverable partial receipt instead of risking ref loss.

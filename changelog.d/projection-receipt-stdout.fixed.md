@@ -1,0 +1,1 @@
+- Keep fleet projection-convergence human status on stderr and write the JSON receipt to its own artifact name, so `jq` can parse the teed document.

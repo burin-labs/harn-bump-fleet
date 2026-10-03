@@ -1,0 +1,1 @@
+- Let long-lived release and fleet operations wait through bounded GitHub core API reset windows instead of abandoning healthy work.

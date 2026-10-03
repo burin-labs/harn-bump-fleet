@@ -1,0 +1,1 @@
+The resumable Harn release watcher now waits for the release PR to merge, records the default-branch source SHA returned by GitHub, and follows that exact cache-warm run through all five matrix jobs. It retries all-skipped suppression after overlapping release work clears and persists completed or failed warming instead of treating dispatch acceptance as success.

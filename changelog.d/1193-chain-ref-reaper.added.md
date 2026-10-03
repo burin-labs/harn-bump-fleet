@@ -1,0 +1,1 @@
+A scheduled reaper clears held convergence chain leases. `reap_chain_refs.harn` deletes a `harn-update-chain/` ref only when every run owning that chain reached a terminal conclusion more than an hour ago, and reports the refs it examined and the refs it left with counts. Reading zero leases is reported distinguishably from failing to read the remote.

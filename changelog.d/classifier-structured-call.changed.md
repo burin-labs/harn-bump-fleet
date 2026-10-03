@@ -1,0 +1,1 @@
+The release-triviality classifier now issues a single `llm_call_structured_result` schema-validated request instead of a one-shot `agent_loop` followed by hand-rolled JSON extraction, matching the Harn layering doctrine (one classification = one `llm_call`). Fail-open-to-manual-review behavior is unchanged.

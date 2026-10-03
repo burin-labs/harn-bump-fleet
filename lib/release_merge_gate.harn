@@ -1,0 +1,431 @@
+/**
+ * When the release pull request is allowed to merge, and what to do about a
+ * default branch that moved while the release was certifying.
+ *
+ * The release candidate is parented at the commit the release pinned, so a
+ * squash onto main carries main's tree plus the release's own paperwork. Main
+ * moves at a median of one merge every twenty-one minutes and a two-hour
+ * certification sees a still branch on fewer than one cut in ten, so demanding
+ * that the merged tree equal the certified tree exactly is demanding a freeze,
+ * and a freeze held by a person is not a mechanism.
+ *
+ * The contract is therefore not identity. The shipped tree is the certified
+ * tree plus commits that passed main's own required checks, verified at merge
+ * time and recorded in the receipt. Drift that carries a red or unreported
+ * required check stops the release with nothing merged. Drift that is green
+ * merges, whatever it touched.
+ *
+ * The lanes only a release runs are deliberately not consulted here. They take
+ * about thirty-four minutes at the median against a main that moves every
+ * nineteen, so gating the merge on them would mean chasing a branch that moves
+ * faster than the proof, which converges to the same freeze by a slower route.
+ * They run once on the merged main commit instead, before the tag, because the
+ * tag is the publication act and an unpublished bump on main is recoverable by
+ * reverting it. That gate lives in `release_main_delta.harn`.
+ *
+ * Nothing in the harness used to check any of this before the merge: the ship
+ * phase armed GitHub's auto-merge at pull-request open, and GitHub merged
+ * whenever the checks went green, up to a full certification later. The tree
+ * gate that refuses the tag then reported the loss after the merge had already
+ * happened, leaving main carrying a bumped version with no tag.
+ *
+ * Everything here is pure, so the same rules decide a live cut, a rehearsal,
+ * and a recovery.
+ */
+import { ReleaseDriftEvidence } from "./release_drift_evidence"
+
+/** Paths no release-only lane depends on, so drift confined to them ships as is. */
+const NON_BEARING_PATH_PREFIXES = ["changelog.d/"]
+
+const NON_BEARING_PATHS = ["CHANGELOG.md"]
+
+/** Pull-request states in which GitHub would merge the release right now. */
+const MERGEABLE_NOW_STATES = ["clean", "unstable"]
+
+/** Pull-request states that no amount of waiting repairs. */
+const UNRECOVERABLE_MERGE_STATES = ["dirty"]
+
+pub type ReleaseMergeGateAction = "hold" | "merge" | "defer" | "abort"
+
+pub type ReleaseDriftPathObservationState = "measured" | "unreadable"
+
+/** One exact Git comparison, including why it could not be measured. */
+pub type ReleaseDriftPathObservation = {
+  state: ReleaseDriftPathObservationState,
+  paths: list<string>,
+  failed_operation: "" | "fetch" | "diff",
+  exit_code: int?,
+  detail: string,
+}
+
+pub type ReleaseMergeGateState = {
+  certified_base: string,
+  observed_main: string,
+  mergeable_state: string,
+  mergeable_resolved: bool,
+  drifted_paths: list<string>,
+  /** The owning observation behind `drifted_paths`; nil only for legacy callers. */
+  path_observation?: ReleaseDriftPathObservation,
+  /** Nil until the drift has been read. Absent evidence never means clean. */
+  evidence: ReleaseDriftEvidence?,
+  /**
+   * Names of the lanes only a release runs, computed from workflow triggers.
+   * Recorded so the receipt says which proof the merged tree still owes, not
+   * consulted to decide the merge.
+   */
+  release_only_checks: list<string>,
+}
+
+pub type ReleaseMergeGateDecision = {
+  action: ReleaseMergeGateAction,
+  reason: string,
+  terminal_reason: string,
+  bearing_paths: list<string>,
+}
+
+pub type ReleaseStrandedRecoveryAction = "tag" | "already_published" | "refuse"
+
+pub type ReleaseStrandedRecoveryState = {
+  tag: string,
+  tag_exists: bool,
+  tag_target: string,
+  /** The stranded release commit on the default branch, the one to tag. */
+  target_commit: string,
+  /** The release commit's first parent: the main snapshot it merged onto. */
+  target_base_commit: string,
+  target_version: string,
+  certified_tree: string,
+  target_tree: string,
+  drifted_paths: list<string>,
+}
+
+pub type ReleaseStrandedRecoveryDecision = {
+  action: ReleaseStrandedRecoveryAction,
+  reason: string,
+  terminal_reason: string,
+  merge_oid: string,
+  bearing_paths: list<string>,
+}
+
+fn oid(value: string?) -> string {
+  return lowercase(trim(to_string(value ?? "")))
+}
+
+fn exact_commit(value: string?) -> bool {
+  return regex_match("^[0-9a-f]{40}$", oid(value)) != nil
+}
+
+fn named(paths: list<string>) -> string {
+  if len(paths) == 0 {
+    return "no paths reported"
+  }
+  return paths.join(", ")
+}
+
+fn non_bearing(path: string) -> bool {
+  const normalized = trim(path)
+  if NON_BEARING_PATHS.contains(normalized) {
+    return true
+  }
+  for prefix in NON_BEARING_PATH_PREFIXES {
+    if starts_with(normalized, prefix) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * The subset of changed paths that invalidates a certification.
+ *
+ * Fails closed. A path is non-bearing only by naming it here, so a file type
+ * nobody classified re-certifies rather than riding along inside a version.
+ */
+pub fn release_certification_bearing_paths(paths: list<string>) -> list<string> {
+  return paths.filter({ path -> trim(path) != "" && !non_bearing(path) }).to_list()
+}
+
+fn gate_decision(
+  action: ReleaseMergeGateAction,
+  reason: string,
+  terminal_reason: string = "",
+  bearing_paths: list<string> = [],
+) -> ReleaseMergeGateDecision {
+  return {
+    action: action,
+    reason: reason,
+    terminal_reason: terminal_reason,
+    bearing_paths: bearing_paths,
+  }
+}
+
+/**
+ * Decide the drift case: main moved while the release was certifying.
+ *
+ * Order matters and every step fails closed. The evidence must exist and must
+ * describe these exact two heads, or a stale read from an earlier poll would
+ * decide a merge it never saw. Every drifted commit must carry a green required
+ * check, and one that does not stops the release with nothing merged.
+ *
+ * The bearing paths are computed and carried on the decision so the receipt can
+ * record what the merged tree still owes a proof for. They do not change the
+ * verdict.
+ */
+fn drift_decision(state: ReleaseMergeGateState) -> ReleaseMergeGateDecision {
+  const drifted = state.drifted_paths.filter({ path -> trim(path) != "" }).to_list()
+  const observation = state.path_observation
+  if observation != nil && observation.state == "unreadable" {
+    return gate_decision("abort", observation.detail, "drift_paths_unreadable")
+  }
+  if observation != nil {
+    const observed_paths = observation.paths.filter({ path -> trim(path) != "" }).to_list()
+    if observed_paths != drifted {
+      return gate_decision(
+        "abort",
+        "the recorded drift paths do not match the Git comparison that produced them;"
+          + " refusing to act on inconsistent evidence",
+        "drift_path_observation_mismatch",
+      )
+    }
+  }
+  if len(drifted) == 0 {
+    if observation != nil && observation.state == "measured" {
+      return gate_decision(
+        "abort",
+        "Git successfully compared ${oid(state.certified_base)}..${oid(state.observed_main)}"
+          + " and measured zero changed paths even though the heads differ;"
+          + " refusing to act on the inconsistent comparison",
+        "drift_paths_measured_empty",
+      )
+    }
+    return gate_decision(
+      "abort",
+      "main is at ${oid(state.observed_main)} rather than the certified base ${oid(state.certified_base)},"
+        + " but no changed path was reported; refusing to act on an unproved comparison",
+      "drift_paths_not_observed",
+    )
+  }
+  const evidence = state.evidence
+  if evidence == nil {
+    return gate_decision(
+      "abort",
+      "main moved to ${oid(state.observed_main)} and the drift was never read;"
+        + " refusing to release the merge without that evidence",
+      "drift_evidence_not_observed",
+    )
+  }
+  if oid(evidence.certified_base) != oid(state.certified_base)
+    || oid(evidence.observed_main) != oid(state.observed_main) {
+    return gate_decision(
+      "abort",
+      "the drift evidence describes ${oid(evidence.certified_base)}..${oid(evidence.observed_main)},"
+        + " not the ${oid(state.certified_base)}..${oid(state.observed_main)} being decided",
+      "drift_evidence_is_stale",
+    )
+  }
+  if !evidence.green {
+    const terminal = if len(evidence.required_contexts) == 0 {
+      "required_contexts_not_observed"
+    } else {
+      "drifted_commit_not_green"
+    }
+    return gate_decision(
+      "defer",
+      "${evidence.reason}. Nothing was merged and main is untouched."
+        + " The release may not carry a commit the branch itself did not pass.",
+      terminal,
+    )
+  }
+  return mergeability_decision(
+    state,
+    "main moved to ${oid(state.observed_main)} and every drifted commit passed"
+      + " ${evidence.required_contexts.join(", ")}",
+    release_certification_bearing_paths(drifted),
+  )
+}
+
+/**
+ * Release the merge only when GitHub would take it now.
+ *
+ * Arming or merging while the checks are still running reopens the whole
+ * window, because the merge would then land at a base nobody re-observed.
+ */
+fn mergeability_decision(
+  state: ReleaseMergeGateState,
+  because: string,
+  bearing_paths: list<string> = [],
+) -> ReleaseMergeGateDecision {
+  const merge_state = lowercase(trim(state.mergeable_state))
+  if UNRECOVERABLE_MERGE_STATES.contains(merge_state) {
+    return gate_decision(
+      "abort",
+      "the release pull request is ${merge_state} and cannot merge as certified",
+      "release_pr_unmergeable",
+      bearing_paths,
+    )
+  }
+  if !state.mergeable_resolved {
+    return gate_decision(
+      "hold",
+      "GitHub has not resolved the release pull request's mergeability",
+      "",
+      bearing_paths,
+    )
+  }
+  if !MERGEABLE_NOW_STATES.contains(merge_state) {
+    return gate_decision(
+      "hold",
+      "GitHub reports the release pull request as ${merge_state}; it would not merge now",
+      "",
+      bearing_paths,
+    )
+  }
+  return gate_decision("merge", "${because}, and GitHub would merge now", "", bearing_paths)
+}
+
+/**
+ * Decide whether the release pull request may be merged.
+ *
+ * Both heads must be exact. An unobserved head is not agreement: two empty
+ * strings compare equal, which is precisely how a probe that answered nothing
+ * would release the merge it was supposed to guard.
+ */
+pub fn release_merge_gate_decision(state: ReleaseMergeGateState) -> ReleaseMergeGateDecision {
+  if !exact_commit(state.certified_base) {
+    return gate_decision(
+      "abort",
+      "the release receipt carries no exact certified base commit",
+      "certified_base_not_observed",
+    )
+  }
+  if !exact_commit(state.observed_main) {
+    return gate_decision(
+      "abort",
+      "could not observe an exact origin/main head; refusing to release the merge without it",
+      "main_head_not_observed",
+    )
+  }
+  if oid(state.observed_main) != oid(state.certified_base) {
+    return drift_decision(state)
+  }
+  return mergeability_decision(
+    state,
+    "main still sits at the certified base ${oid(state.certified_base)}",
+  )
+}
+
+/** How an operator recovers a release whose bump landed without a tag. */
+pub fn release_stranded_recovery_advice(tag: string, merge_oid: string) -> string {
+  return "Recover with the Recover release publication workflow, mode tag-stranded-main,"
+    + " tag ${tag} and merge_oid ${oid(merge_oid)}."
+    + " Do not re-dispatch a release: main already carries the bumped version, so the"
+    + " release preflight refuses it"
+}
+
+fn recovery_decision(
+  action: ReleaseStrandedRecoveryAction,
+  reason: string,
+  terminal_reason: string = "",
+  merge_oid: string = "",
+  bearing_paths: list<string> = [],
+) -> ReleaseStrandedRecoveryDecision {
+  return {
+    action: action,
+    reason: reason,
+    terminal_reason: terminal_reason,
+    merge_oid: merge_oid,
+    bearing_paths: bearing_paths,
+  }
+}
+
+/**
+ * Decide whether a release whose version bump merged without a tag may be
+ * tagged where it stands.
+ *
+ * This is the state no other entry point admits. The release preflight refuses
+ * a fresh cut because main is no longer a development version, and resuming the
+ * original receipt re-enters the same tree refusal that stopped it. Recovery is
+ * legitimate exactly when main's tree is the certified one, or differs from it
+ * only in paths certification does not depend on.
+ */
+pub fn release_stranded_recovery_decision(
+  state: ReleaseStrandedRecoveryState,
+) -> ReleaseStrandedRecoveryDecision {
+  if !exact_commit(state.target_commit) {
+    return recovery_decision(
+      "refuse",
+      "recovery needs an exact release commit to tag",
+      "target_commit_not_observed",
+    )
+  }
+  if state.tag_exists {
+    if oid(state.tag_target) == oid(state.target_commit) {
+      return recovery_decision(
+        "already_published",
+        "${state.tag} already names ${oid(state.target_commit)}; nothing to recover",
+        "",
+        oid(state.target_commit),
+      )
+    }
+    return recovery_decision(
+      "refuse",
+      "${state.tag} already names ${oid(state.tag_target)}, not ${oid(state.target_commit)};"
+        + " a published tag is never moved",
+      "tag_names_another_commit",
+    )
+  }
+  const expected_version = trim(state.tag).substring(1)
+  if trim(state.target_version) != expected_version {
+    return recovery_decision(
+      "refuse",
+      "the release commit carries version ${trim(state.target_version)}, not the stranded"
+        + " ${expected_version};"
+        + " this release did not merge, so there is nothing stranded to tag",
+      "main_is_not_stranded",
+    )
+  }
+  if !exact_commit(state.certified_tree) || !exact_commit(state.target_tree) {
+    return recovery_decision(
+      "refuse",
+      "could not resolve both the certified tree and the release commit's tree;"
+        + " refusing to tag without that proof",
+      "certified_tree_not_observed",
+    )
+  }
+  if oid(state.certified_tree) == oid(state.target_tree) {
+    return recovery_decision(
+      "tag",
+      "${oid(state.target_commit)} carries the exact certified tree",
+      "",
+      oid(state.target_commit),
+    )
+  }
+  const drifted = state.drifted_paths.filter({ path -> trim(path) != "" }).to_list()
+  if len(drifted) == 0 {
+    return recovery_decision(
+      "refuse",
+      "the release commit's tree differs from the certified tree but no changed path was reported;"
+        + " refusing to tag on an unproved comparison",
+      "drift_paths_not_observed",
+    )
+  }
+  const bearing = release_certification_bearing_paths(drifted)
+  if len(bearing) > 0 {
+    return recovery_decision(
+      "refuse",
+      "${oid(state.target_commit)} carries uncertified changes to paths this release"
+        + " certified, so the certification does not transfer. Revert the version bump on main"
+        + " and cut the release again. Certification-bearing paths: ${named(bearing)}",
+      "certification_does_not_transfer",
+      "",
+      bearing,
+    )
+  }
+  return recovery_decision(
+    "tag",
+    "main at ${oid(state.target_commit)} differs from the certified tree only in release paperwork"
+      + " (${named(drifted)}), which certification does not depend on",
+    "",
+    oid(state.target_commit),
+  )
+}

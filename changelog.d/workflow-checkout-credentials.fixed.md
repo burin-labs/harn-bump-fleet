@@ -1,0 +1,1 @@
+Stop persisting checkout credentials in the bump, pin-staleness, heartbeat, projection-convergence, and hosted-release convergence workflows, and add a census that refuses any future checkout that keeps one.
