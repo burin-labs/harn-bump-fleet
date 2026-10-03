@@ -318,9 +318,11 @@ Documentation should read plainly: no emoji, no title-case section headings, no
 marketing phrasing, no vague claims, and no filler endings. Use bullets only
 where they make scanning easier.
 
-Before opening a PR, rebase on the latest `origin/main` and run the checks
-above. Review your own diff for stale comments and duplicated abstractions.
-Then push a branch, and enable auto-merge when CI is green.
+Before opening a PR, check the current integration base and review your diff
+for stale comments and duplicated abstractions. Update the branch when a
+conflict, dependency, or relevant intervening change requires it; rerun only
+affected verification and preserve evidence whose inputs are unchanged.
+Then push a branch, and enable auto-merge when required checks and review pass.
 
 ## Pull requests
 
@@ -369,9 +371,16 @@ sub-asks and the pull request resolves it completely.
 - Work autonomously inside approved scope. Pause for destructive, production,
   high-spend, ambiguous, or authority-expanding actions—not routine reversible work.
 - Treat stop, wait, stand down, and pivot as control events for long-lived work.
-- Match evidence to the claim: exercise the canonical user path, state the
-  falsifier, verify liveness and recovery, and record residual blind spots.
-- "Ship" means landed on main with required deploy and post-merge checks complete.
+- Match evidence to the claim. Use the smallest owning product-path check;
+  add a falsifier for contested, load-bearing, or potentially vacuous claims.
+  Record relevant controls, recovery, and blind spots without repeating proof.
+- Evidence follows source and artifact identity, not the branch name. Reuse
+  verified branch or merge-candidate evidence after landing when relevant code,
+  build inputs, and dependencies are unchanged. Repeat affected checks only
+  for a relevant change, observed failure, deployment, or packaging difference.
+- "Ship" means integrated on owning main with terminal integration checks and
+  applicable release or deployment checks complete. Confirm the landed change
+  and merge result; do not rebuild or recapture screenshots solely for main.
 - Land PRs through the merge queue with `gh pr merge --squash --auto`; never
   `gh pr merge --admin`. Incidents use the org override labels `bypass-ci`,
   `bypass-merge-queue`, or `force-merge`.
