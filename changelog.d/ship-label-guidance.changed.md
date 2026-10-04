@@ -1,0 +1,1 @@
+The shared agent contract now tells agents to ship a ready pull request by adding the `ship` label when the repository has a Smart Ship caller, and to fall back to the merge queue with `gh pr merge --squash --auto` otherwise.
