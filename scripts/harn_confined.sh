@@ -185,7 +185,7 @@ if [ "$artifact_import_egress" -ne 0 ]; then
     --minimal-artifact-env \
     "${script_dir}/harn_shielded.sh" \
     run \
-    "${run_args[@]}" \
+    ${run_args[@]+"${run_args[@]}"} \
     "${sandbox_args[@]}" \
     "${script_args[@]}"
 fi
@@ -195,6 +195,6 @@ exec "${script_dir}/with_env.sh" \
   --private-config-root "$github_config_root" \
   "${script_dir}/harn_shielded.sh" \
   run \
-  "${run_args[@]}" \
+  ${run_args[@]+"${run_args[@]}"} \
   "${sandbox_args[@]}" \
   "${script_args[@]}"
