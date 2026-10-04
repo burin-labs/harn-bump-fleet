@@ -68,8 +68,8 @@ Start with the job you need to do.
 
 - [Bump the fleet](docs/how-to/bump-the-fleet.md). Every orchestrator command,
   from a discover-only rehearsal to a live parallel bump.
-- [Release Harn](docs/how-to/release-harn.md). Drive a release through the
-  harness.
+- [Release Harn](docs/how-to/release-harn.md). Open Harn's workflow-owned
+  release and observe its certified public files.
 - [Free a wedged release](docs/how-to/free-a-wedged-release.md). Recover a
   stalled version, resume a certified candidate, apply a post-publish fixup.
 - [Reserve the release queue](docs/how-to/reserve-the-release-queue.md). Take

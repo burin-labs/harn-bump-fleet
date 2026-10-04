@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One supported boundary for the long-running live watcher. Terminal cleanup
-# deletes only exact, observed refs under an OID lease, but that still crosses
-# Harn's protected git.push boundary and therefore needs explicit operator
-# authority. Keep the grant beside the live launcher so a watcher cannot run
-# for hours and discover the missing authority only after hosted proof lands.
+# Supported boundary for read-only live release observation. Historical mock
+# recovery retains its separate authority below; live watches never receive it.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 target_repo="${HARN_EXT_RELEASE_REPO:-${HOME}/projects/harn}"
+
+# Live watches only observe the canonical workflow. Keep provider/signing
+# credentials, checkout writes, and git.push grants out of that process.
+rehearsal=0
+for arg in "$@"; do
+  if [ "$arg" = "--mock" ]; then rehearsal=1; fi
+done
+if [ "$rehearsal" -eq 0 ]; then
+  exec "${script_dir}/harn_confined.sh" \
+    "$target_repo" \
+    --workflow-watch-egress \
+    -- \
+    "${repo_root}/watch_harn_release.harn" \
+    -- \
+    "$@"
+fi
 
 hosted_run=0
 import_only=0
