@@ -1,3 +1,8 @@
+import { read_json_result, write_json } from "std/fs"
+import {
+  ReleaseArchiveProducer,
+  decode_release_archive_manifest,
+} from "./release_archive_observation"
 import { release_redact_secrets } from "./release_step_output"
 import {
   ReleaseWatchReceipt,
@@ -5,10 +10,139 @@ import {
   release_watch_receipt_read,
   release_watch_receipt_write,
 } from "./release_watch_state"
+import { GithubWorkflowDispatchReceipt } from "harn-github-connector/default"
 
 pub type HostedReleaseWatchDownload = {success: bool, message: string}
 
 pub type HostedReleaseWatchAdapter = {download: fn(int, string) -> HostedReleaseWatchDownload}
+
+/** The workflow owner prepares the PR; this receipt only remembers its handoff. */
+pub type ReleaseWorkflowHandoff = {
+  schema: "harn.release_workflow_handoff.v1",
+  repository: "burin-labs/harn",
+  opener_run_id: int,
+  opener_run_attempt: int,
+  opener_source: string,
+  merged_source: string,
+  producer: ReleaseArchiveProducer?,
+}
+
+fn exact_source(source: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", source)) == 1
+}
+
+fn validate_workflow_handoff(receipt: ReleaseWorkflowHandoff) -> ReleaseWorkflowHandoff {
+  if receipt.opener_run_id <= 0 || receipt.opener_run_attempt <= 0
+    || !exact_source(receipt.opener_source) {
+    throw "release opener handoff has no exact workflow attempt"
+  }
+  if receipt.merged_source != "" && !exact_source(receipt.merged_source) {
+    throw "release handoff merged source is not an exact commit"
+  }
+  const producer = receipt.producer
+  if producer != nil {
+    if receipt.merged_source == "" || producer.repository != receipt.repository
+      || producer.workflow != "build-release-binaries.yml"
+      || producer.source != receipt.merged_source || producer.run_id <= 0
+      || producer.run_attempt <= 0 || producer.status != "completed"
+      || producer.conclusion != "success" {
+      throw "release handoff producer is not successful certification of the merged source"
+    }
+  }
+  return receipt
+}
+
+/** An accepted dispatch is pending work, never a completed release. */
+pub fn release_workflow_handoff(dispatch: GithubWorkflowDispatchReceipt) -> ReleaseWorkflowHandoff {
+  if !dispatch.accepted || dispatch.repo != "burin-labs/harn"
+    || dispatch.workflow_path != ".github/workflows/bump-release.yml"
+    || dispatch.ref != "main" || dispatch.head_branch != "main"
+    || dispatch.event != "workflow_dispatch" {
+    throw "release handoff requires the no-input Harn main workflow opener"
+  }
+  return validate_workflow_handoff(
+    {
+      schema: "harn.release_workflow_handoff.v1",
+      repository: "burin-labs/harn",
+      opener_run_id: dispatch.run_id,
+      opener_run_attempt: dispatch.run_attempt ?? 0,
+      opener_source: dispatch.head_sha,
+      merged_source: "",
+      producer: nil,
+    },
+  )
+}
+
+/** Bind the producer once, using its actual manifest, not a promoter's head. */
+pub fn release_workflow_handoff_bind_producer(
+  receipt: ReleaseWorkflowHandoff,
+  merged_source: string,
+  producer: ReleaseArchiveProducer,
+  manifest_text: string,
+) -> ReleaseWorkflowHandoff {
+  validate_workflow_handoff(receipt)
+  const decoded = decode_release_archive_manifest(manifest_text)
+  if is_err(decoded) {
+    throw unwrap_err(decoded)
+  }
+  const manifest = unwrap(decoded)
+  if manifest.repository != receipt.repository || manifest.sourceCommit != merged_source
+    || to_int(manifest.runId) != producer.run_id
+    || to_int(manifest.runAttempt) != producer.run_attempt {
+    throw "release handoff producer differs from the exact candidate manifest"
+  }
+  if receipt.merged_source != "" && receipt.merged_source != merged_source {
+    throw "release handoff cannot replace its merged source"
+  }
+  if receipt.producer != nil && receipt.producer != producer {
+    throw "release handoff cannot replace its bound producer attempt"
+  }
+  return validate_workflow_handoff(receipt + {merged_source: merged_source, producer: producer})
+}
+
+/** Malformed, missing, and legacy custody records refuse canonical observation. */
+pub fn release_workflow_handoff_read(fs: HarnessFs, path: string) -> Result<ReleaseWorkflowHandoff, string> {
+  const loaded = read_json_result(fs, path)
+  if is_err(loaded) {
+    return Err("release workflow handoff is missing or unreadable")
+  }
+  const checked = schema_check(unwrap(loaded), schema_of(ReleaseWorkflowHandoff))
+  if is_err(checked) {
+    return Err("release workflow handoff does not match its contract")
+  }
+  return try {
+    Ok(validate_workflow_handoff(unwrap(checked)))
+  } catch (error) {
+    Err(to_string(error))
+  }
+}
+
+/** Persist before observing; resumption cannot silently select another producer. */
+pub fn release_workflow_handoff_write(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  path: string,
+  receipt: ReleaseWorkflowHandoff,
+) -> string {
+  validate_workflow_handoff(receipt)
+  if harness.fs.exists(path) {
+    const existing = release_workflow_handoff_read(harness.fs, path)
+    if is_err(existing) {
+      throw unwrap_err(existing)
+    }
+    const prior = unwrap(existing)
+    if prior.opener_run_id != receipt.opener_run_id
+      || prior.opener_run_attempt != receipt.opener_run_attempt
+      || prior.opener_source != receipt.opener_source
+      || (prior.merged_source != "" && prior.merged_source != receipt.merged_source)
+      || (prior.producer != nil && prior.producer != receipt.producer) {
+      throw "release workflow handoff cannot overwrite its recorded identity"
+    }
+  }
+  const temporary = path + ".tmp-" + harness.random.uuid_v7()
+  write_json(harness.fs, temporary, receipt, {pretty: true})
+  harness.fs.rename(temporary, path)
+  return path
+}
 
 const HOSTED_RELEASE_WATCH_DOWNLOAD_ATTEMPTS = 3
 
