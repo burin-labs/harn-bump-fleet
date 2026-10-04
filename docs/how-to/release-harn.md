@@ -52,7 +52,8 @@ publication and consumer checks before declaring the release finished.
 The live watcher receives GitHub authentication and the permitted artifact/file
 destinations. It receives no provider environment, signing roots, checkout write
 roots, or git.push grant. It never dispatches recovery, creates a tag, arms a PR,
-or chooses a replacement release. Live local preparation, hosted legacy imports,
+or chooses a replacement release. You do not need a local Harn source checkout
+to observe the handoff. Live local preparation, hosted legacy imports,
 tag recovery, and cache warming refuse instead of falling back to the old flow.
 
 ## Diagnose a failure
