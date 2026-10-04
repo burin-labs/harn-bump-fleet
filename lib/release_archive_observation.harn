@@ -1,0 +1,223 @@
+import { harn_release_artifacts } from "./release_readiness"
+
+/** The organization-owned producer manifest, consumed without a fleet certification tag. */
+pub type ReleaseArchiveManifestFile = {
+  kind: "archive" | "checksums" | "asset-index" | "notes",
+  target?: string,
+  artifact: string,
+  file: string,
+  sha256: string,
+  attestationPredicateType: string,
+  signingStatus: string,
+  notarizationStatus: string,
+}
+
+pub type ReleaseArchiveManifest = {
+  schemaVersion: "burin-labs.candidate_manifest.v1",
+  repository: string,
+  sourceCommit: string,
+  runId: string,
+  runAttempt: string,
+  artifacts: list<ReleaseArchiveManifestFile>,
+}
+
+pub type ReleaseArchiveProducer = {
+  repository: string,
+  workflow: string,
+  source: string,
+  run_id: int,
+  run_attempt: int,
+  status: string,
+  conclusion: string,
+}
+
+/** A digest of downloaded bytes, never a digest copied from a release listing. */
+pub type ReleaseArchiveReadback = {file: string, sha256: string}
+
+pub type ReleaseArchiveObservation = {
+  state: "pending" | "failed" | "verified",
+  source: string,
+  producer_run_id: int,
+  producer_run_attempt: int,
+  expected_files: int,
+  measured_files: int,
+  pending_names: list<string>,
+  failing_names: list<string>,
+}
+
+/** Decode once at the manifest boundary; malformed or partial records cannot become absence. */
+pub fn decode_release_archive_manifest(text: string) -> Result<ReleaseArchiveManifest, string> {
+  const document = try {
+    json_parse(text)
+  } catch (_) {
+    nil
+  }
+  if document == nil {
+    return Err("candidate manifest is not JSON")
+  }
+  const decoded = schema_check(document, schema_of(ReleaseArchiveManifest))
+  if is_err(decoded) {
+    return Err("candidate manifest does not match its producer schema")
+  }
+  const manifest = unwrap(decoded)
+  if len(regex_captures("^[0-9a-f]{40}$", manifest.sourceCommit)) != 1 {
+    return Err("candidate manifest source is not an exact commit")
+  }
+  if (to_int(manifest.runId) ?? 0) <= 0 || (to_int(manifest.runAttempt) ?? 0) <= 0 {
+    return Err("candidate manifest has no exact producer attempt")
+  }
+  const required_files = harn_release_artifacts().map({ entry -> entry.archive }).to_list()
+    + ["SHA256SUMS", "release-assets.json", "release-notes.md"]
+  let seen: list<string> = []
+  for entry in manifest.artifacts {
+    if seen.contains(entry.file) || !required_files.contains(entry.file) {
+      return Err("candidate manifest has a duplicate or unexpected file: ${entry.file}")
+    }
+    if len(regex_captures("^[0-9a-f]{64}$", entry.sha256)) != 1 {
+      return Err("candidate manifest has an invalid digest: ${entry.file}")
+    }
+    const archive = harn_release_artifacts().find({ item -> item.archive == entry.file })
+    if archive != nil {
+      if entry.kind != "archive" || entry.target != archive.target {
+        return Err("candidate manifest archive kind or target differs: ${entry.file}")
+      }
+    } else {
+      const kind = if entry.file == "SHA256SUMS" {
+        "checksums"
+      } else if entry.file == "release-assets.json" {
+        "asset-index"
+      } else {
+        "notes"
+      }
+      if entry.kind != kind {
+        return Err("candidate manifest sidecar kind differs: ${entry.file}")
+      }
+    }
+    seen = seen + [entry.file]
+  }
+  if len(seen) != len(required_files) {
+    return Err("candidate manifest is incomplete")
+  }
+  return Ok(manifest)
+}
+
+/**
+ * Compare the actual combined-source producer and downloaded public archives.
+ * Prepared PR head and promoter workflow head are not archive identities.
+ * Notes become the release body. Public metadata has its own consumer contract.
+ * This proves archive identity only;
+ * queue, promotion, metadata and package verdicts
+ * remain observations of their owning workflows.
+ */
+pub fn observe_release_archives(
+  repository: string,
+  merged_source: string,
+  manifest_text: string?,
+  producer: ReleaseArchiveProducer?,
+  readbacks: list<ReleaseArchiveReadback>,
+) -> ReleaseArchiveObservation {
+  let pending: list<string> = []
+  let failing: list<string> = []
+  let manifest: ReleaseArchiveManifest? = nil
+  if manifest_text != nil {
+    const decoded = decode_release_archive_manifest(manifest_text)
+    if is_err(decoded) {
+      failing = failing + ["candidate_manifest_invalid"]
+    } else {
+      manifest = unwrap(decoded)
+    }
+  }
+  if len(regex_captures("^[0-9a-f]{40}$", merged_source)) != 1 {
+    pending = pending + ["merged_source"]
+  }
+  if manifest == nil {
+    pending = pending + ["candidate_manifest"]
+  } else if manifest.repository != repository || manifest.sourceCommit != merged_source {
+    failing = failing + ["candidate_manifest_source"]
+  }
+  if producer == nil {
+    pending = pending + ["archive_producer"]
+  } else {
+    if producer.repository != repository || producer.workflow != "build-release-binaries.yml"
+      || producer.source != merged_source
+      || producer.run_id <= 0
+      || producer.run_attempt <= 0 {
+      failing = failing + ["archive_producer_identity"]
+    }
+    if manifest != nil
+      && (to_string(producer.run_id) != manifest.runId
+        || to_string(producer.run_attempt) != manifest.runAttempt) {
+      failing = failing + ["archive_producer_attempt"]
+    }
+    if producer.status != "completed" {
+      pending = pending + ["archive_producer_verdict"]
+    } else if producer.conclusion != "success" {
+      failing = failing + ["archive_producer_verdict"]
+    }
+  }
+  const files = observe_public_files(manifest, readbacks)
+  pending = pending + files.pending_names
+  failing = failing + files.failing_names
+  return {
+    state: if len(failing) > 0 {
+      "failed"
+    } else if len(pending) > 0 {
+      "pending"
+    } else {
+      "verified"
+    },
+    source: merged_source,
+    producer_run_id: producer?.run_id ?? 0,
+    producer_run_attempt: producer?.run_attempt ?? 0,
+    expected_files: files.expected_files,
+    measured_files: files.measured_files,
+    pending_names: pending,
+    failing_names: failing,
+  }
+}
+
+type PublicFilesObservation = {
+  expected_files: int,
+  measured_files: int,
+  pending_names: list<string>,
+  failing_names: list<string>,
+}
+
+fn observe_public_files(
+  manifest: ReleaseArchiveManifest?,
+  readbacks: list<ReleaseArchiveReadback>,
+) -> PublicFilesObservation {
+  let pending: list<string> = []
+  let failing: list<string> = []
+  let measured = 0
+  if manifest != nil {
+    const archives = manifest.artifacts.filter({ entry -> entry.kind == "archive" }).to_list()
+    for entry in archives {
+      const observed = readbacks.filter({ item -> item.file == entry.file }).to_list()
+      if len(observed) == 0 {
+        pending = pending + [entry.file]
+      } else if len(observed) != 1 || observed[0]?.sha256 != entry.sha256 {
+        failing = failing + [entry.file]
+      } else {
+        measured = measured + 1
+      }
+    }
+    for observed in readbacks {
+      if !archives.any({ entry -> entry.file == observed.file }) {
+        failing = failing + [observed.file]
+      }
+    }
+  } else if len(readbacks) > 0 {
+    failing = failing + ["unbound_public_files"]
+  }
+  return {
+    expected_files: if manifest == nil {
+      0
+    } else {
+      len(manifest.artifacts.filter({ entry -> entry.kind == "archive" }).to_list())
+    },
+    measured_files: measured,
+    pending_names: pending,
+    failing_names: failing,
+  }
+}
