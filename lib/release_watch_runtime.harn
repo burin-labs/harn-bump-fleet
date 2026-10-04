@@ -1,5 +1,5 @@
 import { env_bool } from "std/config"
-import { GithubConnectorError, github_actions_run, github_commit_reachable_from_branch, github_connector_options, github_pr_view } from "./github"
+import { GithubConnectorError, github_actions_run, github_commit_reachable_from_branch, github_connector_options, github_pr_view, github_release_at_tag } from "./github"
 import { ReleaseArchiveManifest, ReleaseArchiveObservation, ReleaseArchiveReadback, decode_release_archive_manifest, observe_release_archives, release_manifest_public_files } from "./release_archive_observation"
 import { newest_run_for_workflow } from "./release_health"
 import {
@@ -39,7 +39,7 @@ import {
   release_watch_warm_cache_overlap,
   release_watch_warm_cache_transition,
 } from "./release_watch_state"
-import { GithubPullRequestSummary, GithubWorkflowRun, actions_workflow_run_json_artifact } from "harn-github-connector/default"
+import { GithubPullRequestSummary, GithubWorkflowRun, GithubReleaseLookup, actions_workflow_run_json_artifact } from "harn-github-connector/default"
 
 const WARM_CACHE_WORKFLOW = "build-release-binaries.yml"
 
@@ -50,6 +50,7 @@ pub type ReleaseWorkflowWatchAdapter = {
   source_on_main: fn(string) -> Result<bool, string>,
   manifest: fn(GithubWorkflowRun) -> Result<string, string>,
   archives: fn(string, string) -> Result<list<ReleaseArchiveReadback>, string>,
+  release: fn(string) -> Result<GithubReleaseLookup, string>,
 }
 
 pub type ReleaseWorkflowWatchSelection = {release_pr: int, producer_run: int}
@@ -115,6 +116,10 @@ fn canonical_watch_adapter(harness: Harness) -> ReleaseWorkflowWatchAdapter {
       return if is_err(read) { Err(unwrap_err(read).code) } else { Ok(unwrap(read).reachable) }
     },
     manifest: fn(run) { return read_release_candidate_manifest(harness, run) },
+    release: fn(tag) {
+      const read = github_release_at_tag(harness, "burin-labs/harn", tag)
+      return if is_err(read) { Err(unwrap_err(read).code) } else { Ok(unwrap(read)) }
+    },
     archives: fn(tag, manifest_text) {
       const decoded = decode_release_archive_manifest(manifest_text)
       if is_err(decoded) { return Err(unwrap_err(decoded)) }
@@ -145,6 +150,55 @@ fn canonical_watch_adapter(harness: Harness) -> ReleaseWorkflowWatchAdapter {
       }
       return Ok(measured)
     },
+  }
+}
+
+pub type ReleasePromotionObservation = {
+  state: "pending" | "failed" | "verified",
+  pending_names: list<string>, failing_names: list<string>,
+}
+
+/** Same-file promotion is a public tag/source and measured-byte claim, not a promoter-head claim. */
+pub fn observe_release_promotion(
+  lookup: GithubReleaseLookup,
+  tag: string,
+  source: string,
+  files: ReleaseArchiveObservation? = nil,
+) -> ReleasePromotionObservation {
+  let pending: list<string> = []
+  let failing: list<string> = []
+  if lookup.repo != "burin-labs/harn" || lookup.tag != tag {
+    failing = ["public_release_identity"]
+  } else if lookup.state == "absent" {
+    pending = ["public_release"]
+  } else {
+    const release = lookup.release
+    const lease = lookup.lease
+    if release.id <= 0 || lease.release_id != release.id || release.tag_name != tag {
+      failing = failing + ["public_release_identity"]
+    }
+    if lease.tag_target_type != "commit" || lease.tag_target_oid != source {
+      failing = failing + ["public_tag_source"]
+    }
+    if release.draft || release.prerelease || trim(release.published_at ?? "") == "" {
+      pending = pending + ["public_release_publication"]
+    }
+    for name in required_harn_release_assets() {
+      const assets = release.assets.filter({ asset -> asset.name == name }).to_list()
+      if len(assets) == 0 { pending = pending + ["public_asset:${name}"] }
+      else if len(assets) != 1 || assets[0]?.state != "uploaded" || (assets[0]?.size ?? 0) <= 0 {
+        failing = failing + ["public_asset:${name}"]
+      }
+    }
+  }
+  if files == nil || files.state != "verified" || files.source != source
+    || files.expected_files != len(required_harn_release_assets())
+    || files.measured_files != files.expected_files {
+    pending = pending + ["public_asset_bytes"]
+  }
+  return {
+    state: if len(failing) > 0 { "failed" } else if len(pending) > 0 { "pending" } else { "verified" },
+    pending_names: pending, failing_names: failing,
   }
 }
 
@@ -196,15 +250,26 @@ pub fn observe_release_workflow(
   if is_err(certified) { return workflow_observation(receipt, [], ["candidate_manifest_identity"]) }
   receipt = unwrap(certified)
   release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  const public_read = adapter.release(receipt.release_tag)
+  if is_err(public_read) { return workflow_observation(receipt, ["public_release_unreadable"]) }
+  const public_release = unwrap(public_read)
+  const metadata = observe_release_promotion(public_release, receipt.release_tag, receipt.merged_source)
+  if len(metadata.failing_names) > 0 {
+    return workflow_observation(receipt, metadata.pending_names, metadata.failing_names)
+  }
+  if metadata.pending_names.any({ name -> name != "public_asset_bytes" }) {
+    return workflow_observation(receipt, metadata.pending_names)
+  }
   const readbacks = adapter.archives(receipt.release_tag, unwrap(manifest))
   if is_err(readbacks) { return workflow_observation(receipt, ["public_archives_unreadable"]) }
   const archives = observe_release_archives(
     receipt.repository, receipt.merged_source, unwrap(manifest), producer, unwrap(readbacks), "public_assets",
   )
+  const promotion = observe_release_promotion(public_release, receipt.release_tag, receipt.merged_source, archives)
   return workflow_observation(
     receipt,
-    archives.pending_names + ["promotion", "crate_publication", "versioned_container", "development_bump", "downstream_convergence"],
-    archives.failing_names,
+    archives.pending_names + promotion.pending_names + ["crate_publication", "versioned_container", "development_bump", "downstream_convergence"],
+    archives.failing_names + promotion.failing_names,
     archives,
   )
 }
