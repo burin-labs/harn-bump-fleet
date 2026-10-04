@@ -1,5 +1,6 @@
 import { env_bool } from "std/config"
-import { GithubConnectorError } from "./github"
+import { GithubConnectorError, github_actions_run, github_commit_reachable_from_branch, github_connector_options, github_pr_view } from "./github"
+import { ReleaseArchiveManifest, ReleaseArchiveObservation, ReleaseArchiveReadback, decode_release_archive_manifest, observe_release_archives } from "./release_archive_observation"
 import { newest_run_for_workflow } from "./release_health"
 import {
   ReleaseLandingReceipt,
@@ -7,8 +8,10 @@ import {
   release_landing_admission,
   release_merge_method,
 } from "./release_merge_lease"
+import { release_run_root } from "./release_paths"
 import { release_pr_watchdog_decision } from "./release_pr_watchdog"
 import { required_harn_release_assets } from "./release_readiness"
+import { ReleaseWorkflowHandoff, release_workflow_handoff_bind_pr, release_workflow_handoff_bind_producer, release_workflow_handoff_select_producer, release_workflow_handoff_write } from "./release_watch_handoff"
 import {
   ReleaseWatchRuntimeProgress,
   ReleaseWatchRuntimeReadiness,
@@ -35,8 +38,175 @@ import {
   release_watch_warm_cache_overlap,
   release_watch_warm_cache_transition,
 } from "./release_watch_state"
+import { GithubPullRequestSummary, GithubWorkflowRun, actions_workflow_run_json_artifact } from "harn-github-connector/default"
 
 const WARM_CACHE_WORKFLOW = "build-release-binaries.yml"
+
+/** Read-only capabilities; this adapter has no dispatch, tag, merge, or recovery operation. */
+pub type ReleaseWorkflowWatchAdapter = {
+  pull_request: fn(int) -> Result<GithubPullRequestSummary, string>,
+  producer_run: fn(int) -> Result<GithubWorkflowRun, string>,
+  source_on_main: fn(string) -> Result<bool, string>,
+  manifest: fn(GithubWorkflowRun) -> Result<string, string>,
+  archives: fn(string, string) -> Result<list<ReleaseArchiveReadback>, string>,
+}
+
+pub type ReleaseWorkflowWatchSelection = {release_pr: int, producer_run: int}
+
+pub type ReleaseWorkflowWatchResult = {
+  state: "pending" | "failed",
+  receipt: ReleaseWorkflowHandoff,
+  archive_observation: ReleaseArchiveObservation?,
+  pending_names: list<string>,
+  failing_names: list<string>,
+}
+
+fn workflow_observation(
+  receipt: ReleaseWorkflowHandoff,
+  pending: list<string>,
+  failing: list<string> = [],
+  archives: ReleaseArchiveObservation? = nil,
+) -> ReleaseWorkflowWatchResult {
+  return {
+    state: if len(failing) > 0 { "failed" } else { "pending" },
+    receipt: receipt,
+    archive_observation: archives,
+    pending_names: pending,
+    failing_names: failing,
+  }
+}
+
+/** Fetch the manifest through the connector's bounded, exact-run artifact reader. */
+pub fn read_release_candidate_manifest(harness: Harness, run: GithubWorkflowRun) -> Result<string, string> {
+  if run.repo != "burin-labs/harn" || run.workflow_path != ".github/workflows/build-release-binaries.yml"
+    || run.status != "completed" || run.conclusion != "success" {
+    return Err("candidate_manifest_producer_not_certified")
+  }
+  const read = actions_workflow_run_json_artifact(
+    harness,
+    {
+      owner: "burin-labs", repo: "harn", run_id: run.id, run_name: run.name,
+      options: github_connector_options(),
+      artifact_name: "candidate-manifest-${run.head_sha}", member_name: "candidate-manifest.json",
+    },
+    schema_of(ReleaseArchiveManifest),
+  )
+  if is_err(read) { return Err(unwrap_err(read).code) }
+  const artifact = unwrap(read)
+  if artifact.run_head_sha != run.head_sha || artifact.run_attempt != run.run_attempt {
+    return Err("candidate_manifest_run_changed")
+  }
+  return Ok(json_stringify(artifact.data))
+}
+
+fn canonical_watch_adapter(harness: Harness) -> ReleaseWorkflowWatchAdapter {
+  return {
+    pull_request: fn(number) {
+      const read = github_pr_view(harness, "burin-labs/harn", number)
+      return if is_err(read) { Err(unwrap_err(read).code) } else { Ok(unwrap(read)) }
+    },
+    producer_run: fn(id) {
+      const read = github_actions_run(harness, "burin-labs/harn", id)
+      return if is_err(read) { Err(unwrap_err(read).code) } else { Ok(unwrap(read)) }
+    },
+    source_on_main: fn(source) {
+      const read = github_commit_reachable_from_branch(harness, "burin-labs/harn", source, "main")
+      return if is_err(read) { Err(unwrap_err(read).code) } else { Ok(unwrap(read).reachable) }
+    },
+    manifest: fn(run) { return read_release_candidate_manifest(harness, run) },
+    archives: fn(tag, manifest_text) {
+      const decoded = decode_release_archive_manifest(manifest_text)
+      if is_err(decoded) { return Err(unwrap_err(decoded)) }
+      const manifest = unwrap(decoded)
+      const root = path_join(release_run_root(harness.fs), "archive-readbacks", manifest.sourceCommit,
+        "${manifest.runId}-${manifest.runAttempt}",)
+      harness.fs.mkdir(root, true)
+      let measured: list<ReleaseArchiveReadback> = []
+      for artifact in manifest.artifacts.filter({ entry -> entry.kind == "archive" }) {
+        const path = path_join(root, artifact.file)
+        if !harness.fs.exists(path) {
+          const temporary = path + ".download-" + harness.random.uuid_v7()
+          const downloaded = try {
+            harness.net.download(
+              "https://github.com/burin-labs/harn/releases/download/${tag}/${artifact.file}",
+              temporary,
+              {max_response_bytes: 536870912, retry: {max: 1, backoff_ms: 0}},
+            )
+          }
+          if is_err(downloaded) || !unwrap(downloaded).ok {
+            return Err("public_archive_download:${artifact.file}")
+          }
+          harness.fs.rename(temporary, path)
+        }
+        const bytes = try { harness.fs.read_bytes(path) }
+        if is_err(bytes) { return Err("public_archive_read:${artifact.file}") }
+        measured = measured + [{file: artifact.file, sha256: sha256(unwrap(bytes))}]
+      }
+      return Ok(measured)
+    },
+  }
+}
+
+/** Observe one canonical handoff and retain identities before any repeated read. */
+pub fn observe_release_workflow(
+  harness: Harness,
+  initial: ReleaseWorkflowHandoff,
+  path: string,
+  selection: ReleaseWorkflowWatchSelection,
+  injected_adapter: ReleaseWorkflowWatchAdapter? = nil,
+) -> ReleaseWorkflowWatchResult {
+  const adapter = injected_adapter ?? canonical_watch_adapter(harness)
+  let receipt = initial
+  const number = if selection.release_pr > 0 { selection.release_pr } else { receipt.release_pr_number }
+  if number <= 0 { return workflow_observation(receipt, ["release_pull_request"]) }
+  const pr = adapter.pull_request(number)
+  if is_err(pr) { return workflow_observation(receipt, ["release_pull_request_unreadable"]) }
+  if unwrap(pr).number != number { return workflow_observation(receipt, [], ["release_pull_request_identity"]) }
+  const bound_pr = try { release_workflow_handoff_bind_pr(receipt, unwrap(pr)) }
+  if is_err(bound_pr) { return workflow_observation(receipt, [], ["release_pull_request_identity"]) }
+  receipt = unwrap(bound_pr)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  if receipt.merged_source == "" { return workflow_observation(receipt, ["release_pull_request_merge"]) }
+  const on_main = adapter.source_on_main(receipt.merged_source)
+  if is_err(on_main) { return workflow_observation(receipt, ["merged_source_reachability"]) }
+  if !unwrap(on_main) { return workflow_observation(receipt, [], ["merged_source_not_on_main"]) }
+  const id = if selection.producer_run > 0 { selection.producer_run } else { receipt.producer_run_id }
+  if id <= 0 { return workflow_observation(receipt, ["archive_producer"]) }
+  const run_read = adapter.producer_run(id)
+  if is_err(run_read) { return workflow_observation(receipt, ["archive_producer_unreadable"]) }
+  const run = unwrap(run_read)
+  if run.id != id { return workflow_observation(receipt, [], ["archive_producer_identity"]) }
+  const selected = try { release_workflow_handoff_select_producer(receipt, run) }
+  if is_err(selected) { return workflow_observation(receipt, [], ["archive_producer_identity"]) }
+  receipt = unwrap(selected)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  if run.status != "completed" { return workflow_observation(receipt, ["archive_producer"]) }
+  if run.conclusion == nil { return workflow_observation(receipt, ["archive_producer_conclusion"]) }
+  if run.conclusion != "success" { return workflow_observation(receipt, [], ["archive_producer_failed"]) }
+  const manifest = adapter.manifest(run)
+  if is_err(manifest) { return workflow_observation(receipt, [], ["candidate_manifest_unreadable"]) }
+  const producer = {
+    repository: run.repo, workflow: "build-release-binaries.yml", source: run.head_sha,
+    run_id: run.id, run_attempt: run.run_attempt ?? 0, status: run.status, conclusion: run.conclusion ?? "",
+  }
+  const certified = try {
+    release_workflow_handoff_bind_producer(receipt, receipt.merged_source, producer, unwrap(manifest))
+  }
+  if is_err(certified) { return workflow_observation(receipt, [], ["candidate_manifest_identity"]) }
+  receipt = unwrap(certified)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  const readbacks = adapter.archives(receipt.release_tag, unwrap(manifest))
+  if is_err(readbacks) { return workflow_observation(receipt, ["public_archives_unreadable"]) }
+  const archives = observe_release_archives(
+    receipt.repository, receipt.merged_source, unwrap(manifest), producer, unwrap(readbacks),
+  )
+  return workflow_observation(
+    receipt,
+    archives.pending_names + ["promotion", "crate_publication", "versioned_container", "development_bump", "downstream_convergence"],
+    archives.failing_names,
+    archives,
+  )
+}
 
 pub type ReleaseWatchProgressSink = fn(ReleaseWatchRuntimeProgress, string, int) -> nil
 
