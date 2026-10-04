@@ -1,27 +1,14 @@
 import { env_bool } from "std/config"
-import { git_run } from "std/git"
-import {
-  GithubConnectorError,
-  github_actions_run,
-  github_actions_run_jobs,
-  github_pr_list,
-  github_pr_view,
-  github_workflow_dispatch,
-  github_workflow_runs,
-} from "./github"
-import { verify_tagged_fixup_handoff } from "./release_fixup_handoff"
+import { GithubConnectorError } from "./github"
 import { newest_run_for_workflow } from "./release_health"
 import {
   ReleaseLandingReceipt,
-  ReleaseMergeLease,
-  github_enable_auto_merge_with_release_lease,
-  observe_release_landing,
   record_release_landing,
   release_landing_admission,
   release_merge_method,
 } from "./release_merge_lease"
 import { release_pr_watchdog_decision } from "./release_pr_watchdog"
-import { harn_release_readiness, required_harn_release_assets } from "./release_readiness"
+import { required_harn_release_assets } from "./release_readiness"
 import {
   ReleaseWatchRuntimeProgress,
   ReleaseWatchRuntimeReadiness,
@@ -82,6 +69,13 @@ pub type ReleaseWatchRuntimeAdapter = {
   landing_on_main?: fn(string) -> bool,
 }
 
+fn rehearsal_watch_adapter(adapter: ReleaseWatchRuntimeAdapter?) -> ReleaseWatchRuntimeAdapter {
+  if adapter == nil {
+    throw "legacy release controller is retired; use the canonical read-only workflow handoff"
+  }
+  return adapter
+}
+
 pub type ReleaseWatchRuntimeResult = {
   status: int,
   state: ReleaseWatchState,
@@ -131,125 +125,6 @@ fn dispatch_binary_recovery(
       to_string(unwrap_err(dispatched))
     } else {
       updated.message
-    },
-  }
-}
-
-fn github_adapter_result(result: any) {
-  return if is_err(result) {
-    result
-  } else {
-    unwrap(result)
-  }
-}
-
-fn default_watch_adapter(harness: Harness, repo: string) -> ReleaseWatchRuntimeAdapter {
-  return {
-    now: fn(_poll) { return harness.clock.date_iso() },
-    workflow_runs: fn(slug, workflow, _poll) {
-      const result = github_workflow_runs(harness, slug, workflow, {}, 20)
-      if is_err(result) {
-        throw unwrap_err(result)
-      }
-      return unwrap(result).runs
-    },
-    workflow_jobs: fn(slug, run_id, _poll) { return github_adapter_result(
-      github_actions_run_jobs(harness, slug, run_id, "latest"),
-    ) },
-    readiness: fn(tag, _poll) { return harn_release_readiness(harness, tag) },
-    dispatch: fn(slug, workflow, fields) { return github_adapter_result(
-      github_workflow_dispatch(harness, slug, workflow, fields),
-    ) },
-    warm_dispatch: fn(slug, workflow, fields, _poll) { return github_adapter_result(
-      github_workflow_dispatch(harness, slug, workflow, fields),
-    ) },
-    warm_run: fn(slug, run_id, _poll) { return github_adapter_result(
-      github_actions_run(harness, slug, run_id),
-    ) },
-    warm_jobs: fn(slug, run_id, _poll) { return github_adapter_result(
-      github_actions_run_jobs(harness, slug, run_id, "latest"),
-    ) },
-    pr_probe:
-      fn(slug, pr_url) { return github_adapter_result(github_pr_view(harness, slug, pr_url)) },
-    enable_auto_merge: fn(slug, pr) { return github_adapter_result(
-      github_enable_auto_merge_with_release_lease(harness, slug, pr.number, pr.head.sha, "squash"),
-    ) },
-    replacement_prs: fn(slug, _tag, _poll) {
-      // Superseding a frozen release creates a new immutable attempt ref, so
-      // it necessarily has a different head from the receipt. GitHub also
-      // cannot head-filter a deleted source ref reliably after merge. Scan a
-      // bounded active/merged history in small pages: the REST list response
-      // includes PR bodies, so one 100-entry request can exceed Harn's network
-      // response ceiling even though only typed identity fields are retained.
-      let pull_requests: list<dict> = []
-      for state in ["open", "merged"] {
-        let page = 1
-        while page <= 10 {
-          const listed = github_pr_list(
-            harness,
-            slug,
-            {base: "main", state: state, limit: 10, page: page},
-          )
-          if is_err(listed) {
-            return Err(unwrap_err(listed))
-          }
-          const current = unwrap(listed)
-          pull_requests = pull_requests + current
-          if len(current) < 10 {
-            break
-          }
-          page = page + 1
-        }
-      }
-      return {pull_requests: pull_requests}
-    },
-    verify_replacement: fn(receipt, pr) {
-      if repo == "" {
-        return false
-      }
-      const verified = try {
-        verify_tagged_fixup_handoff(
-          pick(harness, ["env", "process"]),
-          {repo: repo, mock: false},
-          receipt.publication,
-          {number: pr.number, url: pr.url, head: pr.head},
-        )
-      }
-      return is_ok(verified)
-    },
-    landing: fn(receipt, pr) {
-      const merge_method = release_merge_method(receipt.merge_lease_method)
-      if repo == "" || merge_method == nil {
-        return nil
-      }
-      const lease: ReleaseMergeLease = {
-        repo: receipt.slug,
-        base_branch: "main",
-        base_oid: receipt.pin_sha,
-        candidate_pr: receipt.merge_lease_candidate_pr,
-        candidate_head: receipt.publication.head_oid,
-        generation: receipt.merge_lease_generation,
-        tag: receipt.tag,
-        merge_method: merge_method,
-      }
-      return observe_release_landing(harness.process, repo, lease, pr)
-    },
-    landing_on_main: fn(oid) {
-      if repo == "" {
-        return false
-      }
-      const fetched = git_run(
-        harness.process,
-        ["fetch", "--no-tags", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
-        {repo: repo},
-      )
-      return fetched.success
-        && git_run(
-          harness.process,
-          ["merge-base", "--is-ancestor", oid, "origin/main"],
-          {repo: repo},
-        ).exit_code
-          == 0
     },
   }
 }
@@ -790,7 +665,7 @@ pub fn run_release_watch(
     ?? !env_bool(harness.env, "HARN_EXT_RELEASE_DISABLE_POST_PUBLISH_WARM_CACHE", false)
   const keep_pr_armed = opts.keep_pr_armed ?? true
   const on_progress = opts.on_progress
-  const adapter = injected_adapter ?? default_watch_adapter(harness, opts.repo ?? "")
+  const adapter = rehearsal_watch_adapter(injected_adapter)
   let receipt = initial_receipt
   let poll = 0
   let last_watchdog: dict = {action: "skip", reason: "not_polled"}
