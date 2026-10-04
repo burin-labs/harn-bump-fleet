@@ -18,10 +18,17 @@ profile="release"
 if [ "${1:-}" = "--github-artifact-import" ]; then
   profile="github-artifact-import"
   shift
+elif [ "${1:-}" = "--workflow-watch" ]; then
+  profile="workflow-watch"
+  shift
 fi
 
 if [ "$profile" = "github-artifact-import" ]; then
   export HARN_EGRESS_ALLOW="api.github.com:443,*.blob.core.windows.net:443"
+elif [ "$profile" = "workflow-watch" ]; then
+  # Exact-run certification artifacts and public release files only. This
+  # process receives GitHub auth, never signing identity or provider keys.
+  export HARN_EGRESS_ALLOW="api.github.com:443,*.blob.core.windows.net:443,github.com:443,release-assets.githubusercontent.com:443"
 else
   # GitHub's API owns workflow/release state, while its Git transport owns the
   # immutable refs the watcher verifies and cleans up. crates.io owns publication

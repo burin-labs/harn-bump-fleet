@@ -18,6 +18,9 @@ artifact_import_egress=0
 if [ "${1:-}" = "--github-artifact-import-egress" ]; then
   artifact_import_egress=1
   shift
+elif [ "${1:-}" = "--workflow-watch-egress" ]; then
+  artifact_import_egress=2
+  shift
 fi
 
 run_args=()
@@ -59,7 +62,7 @@ if [ ! -d "$target_repo" ]; then
   exit 2
 fi
 target_repo="$(cd -- "$target_repo" && pwd -P)"
-if [ "$repo_arg_seen" -eq 0 ]; then
+if [ "$repo_arg_seen" -eq 0 ] && [ "$artifact_import_egress" -ne 2 ]; then
   script_args+=(--repo "$target_repo")
 fi
 
@@ -167,12 +170,16 @@ case "$github_config_root" in
     exit 2
     ;;
 esac
-if [ "$artifact_import_egress" -eq 1 ]; then
+if [ "$artifact_import_egress" -ne 0 ]; then
+  egress_profile="--github-artifact-import"
+  if [ "$artifact_import_egress" -eq 2 ]; then
+    egress_profile="--workflow-watch"
+  fi
   # Do not source the release environment here: this phase needs GitHub auth,
   # not provider tokens or signing identity. `with_github_auth.sh` resolves the
   # operator login before recursive process confinement starts.
   exec "${script_dir}/with_release_egress.sh" \
-    --github-artifact-import \
+    "$egress_profile" \
     "${script_dir}/with_github_auth.sh" \
     --private-config-root "$github_config_root" \
     --minimal-artifact-env \
