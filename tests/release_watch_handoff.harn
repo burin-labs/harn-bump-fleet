@@ -1,5 +1,9 @@
-import { ReleaseArchiveProducer } from "../lib/release_archive_observation"
+import {
+  ReleaseArchiveProducer,
+  decode_release_archive_manifest,
+} from "../lib/release_archive_observation"
 import { release_harness_root } from "../lib/release_paths"
+import { read_public_release_archives } from "../lib/release_public_archive_readback"
 import { required_harn_release_assets } from "../lib/release_readiness"
 import { parse_release_args } from "../lib/release_runtime"
 import { release_workflow_open } from "../lib/release_ship_pr"
@@ -65,13 +69,158 @@ fn public_release() -> GithubReleaseLookup {
             download_count: 0,
             url: "https://github.com/burin-labs/harn/releases/download/v0.10.157/${name}",
             created_at: nil,
-            updated_at: nil,
+            updated_at: "2026-10-04T02:05:11Z",
           }
         },
       )
         .to_list(),
     },
   }
+}
+
+fn small_archive_manifest(fs: HarnessFs) -> string {
+  const manifest = unwrap(
+    decode_release_archive_manifest(
+      fs.read_text(
+        path_join(release_harness_root(fs), "tests/fixtures/release-controller-157-manifest.json"),
+      ),
+    ),
+  )
+  return json_stringify(
+    manifest
+      + {
+        artifacts: manifest.artifacts.map({ entry -> entry + {sha256: sha256(entry.file)} })
+          .to_list(),
+      },
+  )
+}
+
+pipeline test_public_archive_missing_update_identity_does_not_reuse_cache(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("archive-unknown-")
+  const manifest = small_archive_manifest(harness.fs)
+  const original = public_release()
+  const release = original.release!
+  const unknown = original
+    + {
+      release: release
+        + {assets: release.assets.map({ asset -> asset + {updated_at: nil} }).to_list()},
+    }
+  let downloads = 0
+  const downloader = fn(url, destination) {
+    downloads += 1
+    harness.fs.write_text(destination, basename(url))
+    return true
+  }
+  assert_eq(
+    len(unwrap(read_public_release_archives(harness.fs, root, unknown, manifest, downloader))),
+    7,
+  )
+  assert_eq(downloads, 7)
+  assert_eq(
+    len(unwrap(read_public_release_archives(harness.fs, root, unknown, manifest, downloader))),
+    7,
+  )
+  assert_eq(downloads, 14)
+}
+
+pipeline test_public_archive_resume_refetches_replaced_asset(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("archive-resume-")
+  const manifest = small_archive_manifest(harness.fs)
+  const original = public_release()
+  const release = original.release!
+  let downloads = 0
+  const downloader = fn(url, destination) {
+    downloads += 1
+    harness.fs.write_text(destination, basename(url))
+    return true
+  }
+  const first = unwrap(
+    read_public_release_archives(harness.fs, root, original, manifest, downloader),
+  )
+  assert_eq(len(first), 7)
+  assert_eq(downloads, 7)
+  unwrap(read_public_release_archives(harness.fs, root, original, manifest, downloader))
+  assert_eq(downloads, 7)
+  const replaced = original
+    + {
+      release: release
+        + {
+          assets: release.assets.map(
+            { asset ->
+              if asset.name == "SHA256SUMS" {
+                asset + {id: 99, updated_at: "2026-10-04T16:00:00Z"}
+              } else {
+                asset
+              }
+            },
+          )
+            .to_list(),
+        },
+    }
+  const changed = unwrap(
+    read_public_release_archives(
+      harness.fs,
+      root,
+      replaced,
+      manifest,
+      fn(url, destination) {
+        downloads += 1
+        assert_eq(basename(url), "SHA256SUMS")
+        harness.fs.write_text(destination, "replaced-public-bytes")
+        return true
+      },
+    ),
+  )
+  assert_eq(downloads, 8)
+  assert_eq(
+    changed.find({ row -> row.file == "SHA256SUMS" })!.sha256,
+    sha256("replaced-public-bytes"),
+  )
+  assert(changed.find({ row -> row.file == "SHA256SUMS" })!.sha256 != sha256("SHA256SUMS"))
+}
+
+pipeline test_public_archive_resume_recovers_after_corrupt_download(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("archive-repair-")
+  const manifest = small_archive_manifest(harness.fs)
+  let downloads = 0
+  const corrupt = unwrap(
+    read_public_release_archives(
+      harness.fs,
+      root,
+      public_release(),
+      manifest,
+      fn(url, destination) {
+        downloads += 1
+        harness.fs.write_text(
+          destination,
+          if basename(url) == "SHA256SUMS" {
+            "corrupt"
+          } else {
+            basename(url)
+          },
+        )
+        return true
+      },
+    ),
+  )
+  assert_eq(downloads, 7)
+  assert_eq(corrupt.find({ row -> row.file == "SHA256SUMS" })!.sha256, sha256("corrupt"))
+  const repaired = unwrap(
+    read_public_release_archives(
+      harness.fs,
+      root,
+      public_release(),
+      manifest,
+      fn(url, destination) {
+        downloads += 1
+        assert_eq(basename(url), "SHA256SUMS")
+        harness.fs.write_text(destination, basename(url))
+        return true
+      },
+    ),
+  )
+  assert_eq(downloads, 8)
+  assert_eq(repaired.find({ row -> row.file == "SHA256SUMS" })!.sha256, sha256("SHA256SUMS"))
 }
 
 fn workflow_dispatch() -> GithubWorkflowDispatchReceipt {
@@ -194,7 +343,7 @@ fn canonical_watch_fixture(
       assert_eq(tag, "v0.10.157")
       return Ok(public_release())
     },
-    archives: fn(tag, manifest) {
+    archives: fn(tag, manifest, _lookup) {
       assert_eq(tag, "v0.10.157")
       assert(manifest.contains(archive_producer().source))
       return Ok(release_public_readbacks(fs) + release_public_readbacks(fs, true))
@@ -318,7 +467,7 @@ pipeline test_public_promotion_requires_exact_tag_source_listing_and_bytes(harne
       base
         + {
           release: fn(tag) { return Ok(changed) },
-          archives: fn(tag, manifest) {
+          archives: fn(tag, manifest, _lookup) {
             downloads = downloads + 1
             return base.archives(tag, manifest)
           },
@@ -418,7 +567,9 @@ pipeline test_read_only_workflow_watch_missing_and_corrupt_public_bytes_cannot_v
   harness: Harness,
 ) {
   const base = canonical_watch_fixture(harness.fs)
-  const measured = unwrap(base.archives("v0.10.157", unwrap(base.manifest(producer_run()))))
+  const measured = unwrap(
+    base.archives("v0.10.157", unwrap(base.manifest(producer_run())), public_release()),
+  )
   for rows in [
     [],
     measured.slice(0, 4),
@@ -433,7 +584,7 @@ pipeline test_read_only_workflow_watch_missing_and_corrupt_public_bytes_cannot_v
       release_workflow_handoff(workflow_dispatch()),
       path,
       {release_pr: 9326, producer_run: 37167101058},
-      base + {archives: fn(tag, manifest) { return Ok(rows) }},
+      base + {archives: fn(tag, manifest, _lookup) { return Ok(rows) }},
     )
     assert(result.archive_observation != nil)
     assert(result.archive_observation.state != "verified")
