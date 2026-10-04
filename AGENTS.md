@@ -381,8 +381,10 @@ sub-asks and the pull request resolves it completely.
 - "Ship" means integrated on owning main with terminal integration checks and
   applicable release or deployment checks complete. Confirm the landed change
   and merge result; do not rebuild or recapture screenshots solely for main.
-- Land PRs through the merge queue with `gh pr merge --squash --auto`; never
-  `gh pr merge --admin`. Incidents use the org override labels `bypass-ci`,
-  `bypass-merge-queue`, or `force-merge`.
+- Ship a ready PR by adding the `ship` label when the repo has a Smart Ship
+  caller (`.github/workflows/smart-ship.yml`); otherwise land through the merge
+  queue with `gh pr merge --squash --auto`. Never `gh pr merge --admin`.
+  Incidents use the org override labels `bypass-ci`, `bypass-merge-queue`, or
+  `force-merge`.
 
 <!-- END HARN SHARED AGENT CONTRACT -->
