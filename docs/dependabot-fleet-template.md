@@ -30,13 +30,16 @@ per-language review invariants.
 
 ```yaml
 schedule:
-  interval: "weekly"
-  day: "monday"
+  interval: "monthly"
   time: "09:00"
   timezone: "America/Los_Angeles"
 cooldown:
   default-days: 7
 ```
+
+Version updates run monthly: one grouped pull request per ecosystem per month
+keeps routine bumps from drowning review and CI. Security updates ignore the
+schedule and still arrive immediately.
 
 `cooldown` defers freshly-published versions so a compromised release has time
 to be yanked or flagged before Dependabot ever proposes it.
@@ -88,8 +91,7 @@ follow it:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "09:00"
       timezone: "America/Los_Angeles"
     cooldown:
@@ -197,5 +199,5 @@ scripts/with_env.sh harn run --no-sandbox sign_bot_prs.harn -- --repo burin-labs
 ```
 
 Budget for this when adding coverage to a repo: more ecosystems means more bot
-PRs to re-sign each Monday. It is the main reason the grouping rule above is
+PRs to re-sign each month. It is the main reason the grouping rule above is
 aggressive.
