@@ -1,0 +1,1 @@
+- Explicitly pinned releases now supersede an older bare pre-tag checkpoint with a new immutable attempt instead of requiring deletion of the audit ref or failing every retry.

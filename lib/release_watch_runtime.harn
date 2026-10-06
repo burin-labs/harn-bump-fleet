@@ -1,0 +1,1469 @@
+import { env_bool } from "std/config"
+import {
+  GithubConnectorError,
+  github_actions_run,
+  github_commit_reachable_from_branch,
+  github_connector_options,
+  github_pr_view,
+  github_release_at_tag,
+} from "./github"
+import {
+  ReleaseArchiveManifest,
+  ReleaseArchiveObservation,
+  ReleaseArchiveReadback,
+  observe_release_archives,
+} from "./release_archive_observation"
+import { newest_run_for_workflow } from "./release_health"
+import {
+  ReleaseLandingReceipt,
+  record_release_landing,
+  release_landing_admission,
+  release_merge_method,
+} from "./release_merge_lease"
+import { release_run_root } from "./release_paths"
+import { release_pr_watchdog_decision } from "./release_pr_watchdog"
+import { read_public_release_archives } from "./release_public_archive_readback"
+import { required_harn_release_assets } from "./release_readiness"
+import {
+  release_watch_guard_acquire,
+  release_watch_guard_cleanup_warning,
+  release_watch_guard_finish,
+} from "./release_watch_guard"
+import {
+  ReleaseWorkflowHandoff,
+  release_workflow_handoff_bind_pr,
+  release_workflow_handoff_bind_producer,
+  release_workflow_handoff_read,
+  release_workflow_handoff_select_producer,
+  release_workflow_handoff_write,
+} from "./release_watch_handoff"
+import {
+  ReleaseWatchRuntimeProgress,
+  ReleaseWatchRuntimeReadiness,
+  release_watch_progress_for_receipt,
+  release_watch_progress_with_warm_cache,
+} from "./release_watch_progress"
+import {
+  ReleaseWatchObservation,
+  ReleaseWatchReceipt,
+  ReleaseWatchState,
+  ReleaseWatchTransition,
+  ReleaseWatchWarmCache,
+  ReleaseWatchWarmCacheJob,
+  ReleaseWatchWarmCacheObservation,
+  ReleaseWatchWarmCacheRun,
+  release_watch_apply_warm_cache_transition,
+  release_watch_receipt_retarget_pr,
+  release_watch_receipt_write,
+  release_watch_record_recovery_dispatch,
+  release_watch_record_warm_cache_dispatch,
+  release_watch_transition,
+  release_watch_warm_cache_matrix_identity,
+  release_watch_warm_cache_matrix_succeeded,
+  release_watch_warm_cache_overlap,
+  release_watch_warm_cache_transition,
+} from "./release_watch_state"
+import {
+  GithubPullRequestSummary,
+  GithubReleaseLookup,
+  GithubWorkflowRun,
+  actions_workflow_run_json_artifact,
+} from "harn-github-connector/default"
+
+const WARM_CACHE_WORKFLOW = "build-release-binaries.yml"
+
+type PublicArchiveDownload = {ok: bool}
+
+/** Read-only capabilities; this adapter has no dispatch, tag, merge, or recovery operation. */
+pub type ReleaseWorkflowWatchAdapter = {
+  pull_request: fn(int) -> Result<GithubPullRequestSummary, string>,
+  producer_run: fn(int) -> Result<GithubWorkflowRun, string>,
+  source_on_main: fn(string) -> Result<bool, string>,
+  manifest: fn(GithubWorkflowRun) -> Result<string, string>,
+  archives: fn(string, string, GithubReleaseLookup) -> Result<list<ReleaseArchiveReadback>, string>,
+  release: fn(string) -> Result<GithubReleaseLookup, string>,
+}
+
+pub type ReleaseWorkflowWatchSelection = {release_pr: int, producer_run: int}
+
+pub type ReleaseWorkflowWatchResult = {
+  state: "pending" | "failed",
+  receipt: ReleaseWorkflowHandoff,
+  archive_observation: ReleaseArchiveObservation?,
+  pending_names: list<string>,
+  failing_names: list<string>,
+}
+
+fn workflow_observation(
+  receipt: ReleaseWorkflowHandoff,
+  pending: list<string>,
+  failing: list<string> = [],
+  archives: ReleaseArchiveObservation? = nil,
+) -> ReleaseWorkflowWatchResult {
+  return {
+    state: if len(failing) > 0 {
+      "failed"
+    } else {
+      "pending"
+    },
+    receipt: receipt,
+    archive_observation: archives,
+    pending_names: pending,
+    failing_names: failing,
+  }
+}
+
+/** Fetch the manifest through the connector's bounded, exact-run artifact reader. */
+pub fn read_release_candidate_manifest(
+  harness: Harness,
+  run: GithubWorkflowRun,
+) -> Result<string, string> {
+  if run.repo != "burin-labs/harn"
+    || run.workflow_path != ".github/workflows/build-release-binaries.yml"
+    || run.status != "completed"
+    || run.conclusion != "success" {
+    return Err("candidate_manifest_producer_not_certified")
+  }
+  const read = actions_workflow_run_json_artifact(
+    harness,
+    {
+      owner: "burin-labs",
+      repo: "harn",
+      run_id: run.id,
+      run_name: run.name,
+      options: github_connector_options(),
+      artifact_name: "candidate-manifest-${run.head_sha}",
+      member_name: "candidate-manifest.json",
+    },
+    schema_of(ReleaseArchiveManifest),
+  )
+  if is_err(read) {
+    return Err(unwrap_err(read).code)
+  }
+  const artifact = unwrap(read)
+  if artifact.run_head_sha != run.head_sha || artifact.run_attempt != run.run_attempt {
+    return Err("candidate_manifest_run_changed")
+  }
+  return Ok(json_stringify(artifact.data))
+}
+
+fn canonical_watch_adapter(harness: Harness) -> ReleaseWorkflowWatchAdapter {
+  return {
+    pull_request: fn(number) {
+      const read = github_pr_view(harness, "burin-labs/harn", number)
+      return if is_err(read) {
+        Err(unwrap_err(read).code)
+      } else {
+        Ok(unwrap(read))
+      }
+    },
+    producer_run: fn(id) {
+      const read = github_actions_run(harness, "burin-labs/harn", id)
+      return if is_err(read) {
+        Err(unwrap_err(read).code)
+      } else {
+        Ok(unwrap(read))
+      }
+    },
+    source_on_main: fn(source) {
+      const read = github_commit_reachable_from_branch(harness, "burin-labs/harn", source, "main")
+      return if is_err(read) {
+        Err(unwrap_err(read).code)
+      } else {
+        Ok(unwrap(read).reachable)
+      }
+    },
+    manifest: fn(run) { return read_release_candidate_manifest(harness, run) },
+    release: fn(tag) {
+      const read = github_release_at_tag(harness, "burin-labs/harn", tag)
+      return if is_err(read) {
+        Err(unwrap_err(read).code)
+      } else {
+        Ok(unwrap(read))
+      }
+    },
+    archives: fn(_tag, manifest_text, lookup) { return read_public_release_archives(
+      harness.fs,
+      path_join(release_run_root(harness.fs), "archive-readbacks"),
+      lookup,
+      manifest_text,
+      fn(url, destination) {
+        const downloaded = harness.net.download(
+          url,
+          destination,
+          {max_response_bytes: 536870912, retry: {max: 1, backoff_ms: 0}},
+        )
+        const checked = schema_check(downloaded, schema_of(PublicArchiveDownload))
+        return is_ok(checked) && unwrap(checked).ok
+      },
+    ) },
+  }
+}
+
+pub type ReleasePromotionObservation = {
+  state: "pending" | "failed" | "verified",
+  pending_names: list<string>,
+  failing_names: list<string>,
+}
+
+/**
+ * Same-file promotion is a public tag/source and measured-byte claim, not a promoter-head claim.
+ */
+pub fn observe_release_promotion(
+  lookup: GithubReleaseLookup,
+  tag: string,
+  source: string,
+  files: ReleaseArchiveObservation? = nil,
+) -> ReleasePromotionObservation {
+  let pending: list<string> = []
+  let failing: list<string> = []
+  if lookup.repo != "burin-labs/harn" || lookup.tag != tag {
+    failing = ["public_release_identity"]
+  } else if lookup.state == "absent" {
+    pending = ["public_release"]
+  } else {
+    const release = lookup.release
+    const lease = lookup.lease
+    if release.id <= 0 || lease.release_id != release.id || release.tag_name != tag {
+      failing = failing + ["public_release_identity"]
+    }
+    if lease.tag_target_type != "commit" || lease.tag_target_oid != source {
+      failing = failing + ["public_tag_source"]
+    }
+    if release.draft || release.prerelease || trim(release.published_at ?? "") == "" {
+      pending = pending + ["public_release_publication"]
+    }
+    for name in required_harn_release_assets() {
+      const assets = release.assets.filter({ asset -> asset.name == name }).to_list()
+      if len(assets) == 0 {
+        pending = pending + ["public_asset:${name}"]
+      } else if len(assets) != 1 || assets[0]?.state != "uploaded" || (assets[0]?.size ?? 0) <= 0 {
+        failing = failing + ["public_asset:${name}"]
+      }
+    }
+  }
+  if files == nil || files.state != "verified" || files.source != source
+    || files.expected_files != len(required_harn_release_assets())
+    || files.measured_files != files.expected_files {
+    pending = pending + ["public_asset_bytes"]
+  }
+  return {
+    state: if len(failing) > 0 {
+      "failed"
+    } else if len(pending) > 0 {
+      "pending"
+    } else {
+      "verified"
+    },
+    pending_names: pending,
+    failing_names: failing,
+  }
+}
+
+/** Observe one canonical handoff and retain identities before any repeated read. */
+pub fn observe_release_workflow(
+  harness: Harness,
+  initial: ReleaseWorkflowHandoff,
+  path: string,
+  selection: ReleaseWorkflowWatchSelection,
+  injected_adapter: ReleaseWorkflowWatchAdapter? = nil,
+) -> ReleaseWorkflowWatchResult {
+  const adapter = injected_adapter ?? canonical_watch_adapter(harness)
+  let receipt = initial
+  const number = if selection.release_pr > 0 {
+    selection.release_pr
+  } else {
+    receipt.release_pr_number
+  }
+  if number <= 0 {
+    return workflow_observation(receipt, ["release_pull_request"])
+  }
+  const pr = adapter.pull_request(number)
+  if is_err(pr) {
+    return workflow_observation(receipt, ["release_pull_request_unreadable"])
+  }
+  if unwrap(pr).number != number {
+    return workflow_observation(receipt, [], ["release_pull_request_identity"])
+  }
+  const bound_pr = try {
+    release_workflow_handoff_bind_pr(receipt, unwrap(pr))
+  }
+  if is_err(bound_pr) {
+    return workflow_observation(receipt, [], ["release_pull_request_identity"])
+  }
+  receipt = unwrap(bound_pr)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  if receipt.merged_source == "" {
+    return workflow_observation(receipt, ["release_pull_request_merge"])
+  }
+  const on_main = adapter.source_on_main(receipt.merged_source)
+  if is_err(on_main) {
+    return workflow_observation(receipt, ["merged_source_reachability"])
+  }
+  if !unwrap(on_main) {
+    return workflow_observation(receipt, [], ["merged_source_not_on_main"])
+  }
+  const id = if selection.producer_run > 0 {
+    selection.producer_run
+  } else {
+    receipt.producer_run_id
+  }
+  if id <= 0 {
+    return workflow_observation(receipt, ["archive_producer"])
+  }
+  const run_read = adapter.producer_run(id)
+  if is_err(run_read) {
+    return workflow_observation(receipt, ["archive_producer_unreadable"])
+  }
+  const run = unwrap(run_read)
+  if run.id != id {
+    return workflow_observation(receipt, [], ["archive_producer_identity"])
+  }
+  const selected = try {
+    release_workflow_handoff_select_producer(receipt, run)
+  }
+  if is_err(selected) {
+    return workflow_observation(receipt, [], ["archive_producer_identity"])
+  }
+  receipt = unwrap(selected)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  if run.status != "completed" {
+    return workflow_observation(receipt, ["archive_producer"])
+  }
+  if run.conclusion == nil {
+    return workflow_observation(receipt, ["archive_producer_conclusion"])
+  }
+  if run.conclusion != "success" {
+    return workflow_observation(receipt, [], ["archive_producer_failed"])
+  }
+  const manifest = adapter.manifest(run)
+  if is_err(manifest) {
+    return workflow_observation(receipt, [], ["candidate_manifest_unreadable"])
+  }
+  const producer = {
+    repository: run.repo,
+    workflow: "build-release-binaries.yml",
+    source: run.head_sha,
+    run_id: run.id,
+    run_attempt: run.run_attempt ?? 0,
+    status: run.status,
+    conclusion: run.conclusion ?? "",
+  }
+  const certified = try {
+    release_workflow_handoff_bind_producer(
+      receipt,
+      receipt.merged_source,
+      producer,
+      unwrap(manifest),
+    )
+  }
+  if is_err(certified) {
+    return workflow_observation(receipt, [], ["candidate_manifest_identity"])
+  }
+  receipt = unwrap(certified)
+  release_workflow_handoff_write(pick(harness, ["fs", "random"]), path, receipt)
+  const public_read = adapter.release(receipt.release_tag)
+  if is_err(public_read) {
+    return workflow_observation(receipt, ["public_release_unreadable"])
+  }
+  const public_release = unwrap(public_read)
+  const metadata = observe_release_promotion(
+    public_release,
+    receipt.release_tag,
+    receipt.merged_source,
+  )
+  if len(metadata.failing_names) > 0 {
+    return workflow_observation(receipt, metadata.pending_names, metadata.failing_names)
+  }
+  if metadata.pending_names.any({ name -> name != "public_asset_bytes" }) {
+    return workflow_observation(receipt, metadata.pending_names)
+  }
+  const readbacks = adapter.archives(receipt.release_tag, unwrap(manifest), public_release)
+  if is_err(readbacks) {
+    return workflow_observation(receipt, ["public_archives_unreadable"])
+  }
+  const archives = observe_release_archives(
+    receipt.repository,
+    receipt.merged_source,
+    unwrap(manifest),
+    producer,
+    unwrap(readbacks),
+    "public_assets",
+  )
+  const promotion = observe_release_promotion(
+    public_release,
+    receipt.release_tag,
+    receipt.merged_source,
+    archives,
+  )
+  return workflow_observation(
+    receipt,
+    archives.pending_names + promotion.pending_names
+      + ["crate_publication", "versioned_container", "development_bump", "downstream_convergence"],
+    archives.failing_names + promotion.failing_names,
+    archives,
+  )
+}
+
+pub type ReleaseWatchProgressSink = fn(ReleaseWatchRuntimeProgress, string, int) -> nil
+
+pub type ReleaseWorkflowWatchOptions = {
+  tag: string,
+  release_pr: int,
+  producer_run: int,
+  max_polls: int,
+  interval_seconds: int,
+  json: bool,
+}
+
+/** Resume the read-only observer under the existing receipt writer lease. */
+pub fn run_release_workflow_watch(
+  harness: Harness,
+  path: string,
+  options: ReleaseWorkflowWatchOptions,
+) -> int {
+  const loaded = release_workflow_handoff_read(harness.fs, path)
+  if is_err(loaded) {
+    throw unwrap_err(loaded)
+  }
+  let receipt = unwrap(loaded)
+  if trim(options.tag) != "" && options.tag != receipt.release_tag {
+    throw "--tag does not match the recorded workflow handoff"
+  }
+  const watch_guard = release_watch_guard_acquire(
+    harness.host_lease,
+    {tag: "workflow-${receipt.opener_run_id}", receipt_path: path},
+  )
+  let observed = false
+  return try {
+    let status = 3
+    for poll in range(options.max_polls) {
+      const result = observe_release_workflow(
+        harness,
+        receipt,
+        path,
+        pick(options, ["release_pr", "producer_run"]),
+      )
+      receipt = result.receipt
+      status = if result.state == "failed" {
+        2
+      } else {
+        3
+      }
+      observed = true
+      if options.json {
+        harness.stdio.println(
+          json_stringify(result + {status: status, polls: poll + 1, receipt_path: path}),
+        )
+      } else {
+        harness.stdio.println(
+          "== ${result.state}: ${len(result.pending_names)} pending, ${len(result.failing_names)} failing",
+        )
+        harness.stdio.println("   pending: " + join(result.pending_names, ", "))
+        harness.stdio.println("   failing: " + join(result.failing_names, ", "))
+        harness.stdio.println("   receipt: " + path)
+      }
+      // Missing selections need an operator's exact identity. After archives
+      // are measured, the remaining publication owners stay named pending.
+      if result.state == "failed" || result.archive_observation != nil
+        || (receipt.release_pr_number == 0 && options.release_pr == 0)
+        || (receipt.merged_source != "" && receipt.producer_run_id == 0 && options.producer_run == 0) {
+        break
+      }
+      if poll + 1 < options.max_polls && options.interval_seconds > 0 {
+        harness.clock.sleep_ms(options.interval_seconds * 1000)
+      }
+    }
+    status
+  } finally {
+    const warning = release_watch_guard_cleanup_warning(
+      release_watch_guard_finish(harness.host_lease, watch_guard)?.error,
+      observed,
+    )
+    if warning != nil {
+      harness.stdio.eprintln(warning ?? "")
+    }
+  }
+}
+
+pub type ReleaseWatchRuntimeOptions = {
+  repo?: string,
+  max_polls?: int,
+  interval_ms?: int,
+  dispatch_recovery?: bool,
+  dispatch_warm_cache?: bool,
+  keep_pr_armed?: bool,
+  on_progress?: ReleaseWatchProgressSink,
+}
+
+pub type ReleaseWatchConnectorResult = dict | Result<dict, GithubConnectorError>
+
+pub type ReleaseWatchRuntimeAdapter = {
+  now: fn(int) -> string,
+  workflow_runs: fn(string, string, int) -> list<dict>,
+  workflow_jobs?: fn(string, int, int) -> ReleaseWatchConnectorResult,
+  readiness: fn(string, int) -> ReleaseWatchRuntimeReadiness,
+  dispatch: fn(string, string, dict) -> ReleaseWatchConnectorResult,
+  warm_dispatch: fn(string, string, dict, int) -> ReleaseWatchConnectorResult,
+  warm_run: fn(string, int, int) -> ReleaseWatchConnectorResult,
+  warm_jobs: fn(string, int, int) -> ReleaseWatchConnectorResult,
+  pr_probe: fn(string, string) -> ReleaseWatchConnectorResult,
+  replacement_prs?: fn(string, string, int) -> ReleaseWatchConnectorResult,
+  verify_replacement?: fn(ReleaseWatchReceipt, dict) -> bool,
+  enable_auto_merge?: fn(string, dict) -> ReleaseWatchConnectorResult,
+  landing?: fn(ReleaseWatchReceipt, dict) -> ReleaseLandingReceipt?,
+  landing_on_main?: fn(string) -> bool,
+}
+
+fn rehearsal_watch_adapter(adapter: ReleaseWatchRuntimeAdapter?) -> ReleaseWatchRuntimeAdapter {
+  if adapter == nil {
+    throw "legacy release controller is retired; use the canonical read-only workflow handoff"
+  }
+  return adapter
+}
+
+pub type ReleaseWatchRuntimeResult = {
+  status: int,
+  state: ReleaseWatchState,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  polls: int,
+  watchdog: dict,
+  warm_cache?: ReleaseWatchWarmCache,
+  reason: string,
+  progress: ReleaseWatchRuntimeProgress,
+}
+
+type ReleaseWatchRuntimeWarmSnapshot = {
+  run: ReleaseWatchWarmCacheRun?,
+  jobs: list<ReleaseWatchWarmCacheJob>,
+  jobs_observed: bool,
+}
+
+type ReleaseWatchRecoveryDispatchResult = {receipt: ReleaseWatchReceipt, error: string?}
+
+fn dispatch_binary_recovery(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  transition: ReleaseWatchTransition,
+  observed_at: string,
+) -> ReleaseWatchRecoveryDispatchResult {
+  const fields = transition.recovery_fields ?? {tag: receipt.tag}
+  const dispatched = adapter.dispatch(receipt.slug, transition.recovery_workflow ?? "", fields)
+  const updated = release_watch_record_recovery_dispatch(
+    receipt,
+    observed_at,
+    fields,
+    if is_err(dispatched) {
+      nil
+    } else {
+      dispatched
+    },
+  )
+  release_watch_receipt_write(harness, receipt_path, updated)
+  return {
+    receipt: updated,
+    error: if updated.recovery.dispatch_status == "succeeded" {
+      nil
+    } else if is_err(dispatched) {
+      to_string(unwrap_err(dispatched))
+    } else {
+      updated.message
+    },
+  }
+}
+
+fn attach_judged_publish_jobs(
+  adapter: any,
+  receipt: ReleaseWatchReceipt,
+  poll: int,
+  runs: list<dict>,
+) -> list<dict> {
+  const jobs_reader = adapter.workflow_jobs
+  if jobs_reader == nil {
+    return runs
+  }
+  const scoped = runs.filter(
+    { run ->
+      trim(to_string(run?.workflow ?? "")) == "publish-release.yml"
+        && trim(to_string(run?.head_branch ?? "")) == receipt.tag
+    },
+  )
+    .to_list()
+  const judged = newest_run_for_workflow(scoped, "publish-release.yml")
+  if judged == nil
+    || lowercase(trim(judged.status ?? "")) != "completed"
+    || lowercase(trim(judged.conclusion ?? "")) != "failure" {
+    return runs
+  }
+  const judged_id = to_int(judged.id ?? 0) ?? 0
+  let attached: list<dict> = []
+  for run in runs {
+    const same_judged_run = (to_int(run?.id ?? 0) ?? 0) == judged_id
+      && trim(to_string(run?.workflow ?? "")) == "publish-release.yml"
+    if !same_judged_run {
+      attached = attached + [run]
+    } else if judged_id <= 0 {
+      attached = attached + [{...run, jobs_observed: false, jobs: []}]
+    } else {
+      const jobs = jobs_reader(receipt.slug, judged_id, poll)
+      if is_err(jobs) {
+        attached = attached + [{...run, jobs_observed: false, jobs: []}]
+      } else {
+        attached = attached + [{...run, jobs_observed: true, jobs: jobs.jobs ?? []}]
+      }
+    }
+  }
+  return attached
+}
+
+fn collect_runs(adapter: any, receipt: ReleaseWatchReceipt, poll: int) -> list<dict> {
+  let runs: list<dict> = []
+  for workflow in receipt.required_workflows {
+    for run in adapter.workflow_runs(receipt.slug, workflow, poll) {
+      runs = runs + [{...run, workflow: workflow, conclusion: run.conclusion ?? ""}]
+    }
+  }
+  return attach_judged_publish_jobs(adapter, receipt, poll, runs)
+}
+
+fn observe_release_pr_authority(adapter: any, receipt: ReleaseWatchReceipt) {
+  if receipt.pr_url == "" {
+    return {watchdog: {action: "skip", reason: "missing_pull_request"}, landing: receipt.landing}
+  }
+  const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if is_err(probe) {
+    return {
+      watchdog: {action: "skip", reason: "pull_request_probe_failed", error: unwrap_err(probe)},
+      landing: receipt.landing,
+    }
+  }
+  let landing = receipt.landing
+  const merged = (probe?.merged ?? false)
+    || lowercase(trim(to_string(probe?.github_state ?? ""))) == "merged"
+  if merged && receipt.merge_lease_generation != "" && landing == nil && adapter.landing != nil {
+    landing = adapter.landing(receipt, probe)
+  }
+  const landing_admission = if merged && receipt.merge_lease_generation == "" {
+    {valid: true, reason: "legacy watch receipt predates release merge leasing"}
+  } else if merged && adapter.landing_on_main != nil {
+    release_landing_admission(landing, receipt.pin_sha, adapter.landing_on_main)
+  } else {
+    nil
+  }
+  const decision = release_pr_watchdog_decision(probe, landing_admission)
+  if decision.action != "skip" && receipt.release_commit_oid != ""
+    && probe?.head?.sha != receipt.publication.head_oid {
+    if adapter.verify_replacement == nil || !adapter.verify_replacement(receipt, probe) {
+      return {
+        watchdog: {action: "blocked", reason: "replacement_release_pr_unverified"},
+        landing: landing,
+      }
+    }
+  }
+  return {watchdog: decision, landing: landing}
+}
+
+fn persist_release_pr_authority(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  observed_at: string,
+  enabled: bool,
+) -> dict {
+  const authority = if enabled {
+    observe_release_pr_authority(adapter, receipt)
+  } else {
+    {watchdog: {action: "skip", reason: "pull_request_watchdog_disabled"}, landing: receipt.landing}
+  }
+  let persisted = receipt
+  if receipt.initial_merge_request == "attempted"
+    && (authority.watchdog.action == "ok" || authority.watchdog.action == "done") {
+    persisted = persisted + {initial_merge_request: "observed", updated_at: observed_at}
+  }
+  if authority.landing != nil && authority.landing != receipt.landing {
+    persisted = record_release_landing(persisted, authority.landing, observed_at)
+  }
+  if persisted != receipt {
+    release_watch_receipt_write(harness, receipt_path, persisted)
+  }
+  return {receipt: persisted, watchdog: authority.watchdog}
+}
+
+/** Consume the certified handoff once; an uncertain request is never sent again. */
+fn request_initial_release_merge(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  observed_at: string,
+) -> ReleaseWatchReceipt {
+  if receipt.initial_merge_request != "authorized" {
+    return receipt
+  }
+  if receipt.release_commit_oid != receipt.publication.head_oid
+    || receipt.merge_lease_generation == ""
+    || receipt.merge_lease_method != "squash" {
+    throw "initial merge request requires the tagged candidate and its squash merge lease"
+  }
+  const probe = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if is_err(probe) {
+    throw "initial release merge identity could not be read"
+  }
+  if probe?.head?.sha != receipt.publication.head_oid
+    || probe?.number != receipt.merge_lease_candidate_pr
+    || probe?.base?.ref != "main" {
+    throw "initial release merge identity does not match the certified handoff"
+  }
+  const already_armed = (probe?.auto_merge_armed ?? false)
+    || (probe?.in_merge_queue ?? false)
+    || (probe?.merged ?? false)
+  if already_armed {
+    const adopted = receipt + {initial_merge_request: "observed", updated_at: observed_at}
+    release_watch_receipt_write(harness, receipt_path, adopted)
+    return adopted
+  }
+  if probe?.github_state != "open" || probe?.mergeable_state == "dirty" {
+    return receipt
+  }
+  const arm = adapter.enable_auto_merge
+  if arm == nil {
+    throw "initial release merge adapter is unavailable"
+  }
+  const attempted = receipt + {initial_merge_request: "attempted", updated_at: observed_at}
+  release_watch_receipt_write(harness, receipt_path, attempted)
+  // Persist before the network effect. A lost response leaves attempted state,
+  // and the observer below may adopt success but can never repeat the request.
+  const sent = arm(receipt.slug, probe)
+  if is_err(sent) {
+    return attempted
+  }
+  const observed = adapter.pr_probe(receipt.slug, receipt.pr_url)
+  if !is_err(observed) && observed?.head?.sha == receipt.publication.head_oid
+    && ((observed?.auto_merge_armed ?? false) || (observed?.in_merge_queue ?? false)
+      || (observed?.merged ?? false)) {
+    const confirmed = attempted + {initial_merge_request: "observed"}
+    release_watch_receipt_write(harness, receipt_path, confirmed)
+    return confirmed
+  }
+  return attempted
+}
+
+/** Select one exact-version immutable replacement without trusting connector-side filtering. */
+pub fn release_watch_replacement_pr(
+  receipt: ReleaseWatchReceipt,
+  pull_requests: list<dict>,
+) -> dict {
+  const prefix = "https://github.com/${receipt.slug}/pull/"
+  const expected_title = "Release ${receipt.tag}"
+  const attempt_prefix = "release-attempt/${receipt.tag}/"
+  let candidates: list<dict> = []
+  for pull_request in pull_requests {
+    const url = trim(to_string(pull_request?.url ?? ""))
+    const head_ref = trim(to_string(pull_request?.head?.ref ?? ""))
+    const head_sha = trim(to_string(pull_request?.head?.sha ?? ""))
+    const active = (pull_request?.merged ?? false)
+      || lowercase(trim(to_string(pull_request?.github_state ?? "")))
+        == "open"
+    // The pre-tag certifier and the post-tag immutable attempt are two
+    // write-once refs for the same candidate OID. A release-specific merge
+    // override can land the certifier PR before the watcher observes the
+    // attempt PR. GitHub then auto-closes the zero-diff attempt PR. Accept the
+    // merged certifier only when its head is the receipt's exact candidate;
+    // open or superseding replacements must retain the canonical attempt ref.
+    const exact_merged_candidate = (pull_request?.merged ?? false)
+      && head_sha
+        == receipt.publication.head_oid
+      && head_ref
+        == "release-certify/${head_sha}"
+    const canonical_attempt = head_ref == attempt_prefix + head_sha
+    const tagged_paperwork = receipt.release_commit_oid != ""
+      && head_ref == "release/${receipt.tag}"
+    if url != receipt.pr_url
+      && url.starts_with(prefix)
+      && trim(to_string(pull_request?.base?.ref ?? "")) == "main"
+      && trim(to_string(pull_request?.title ?? ""))
+        == expected_title
+      && (canonical_attempt || exact_merged_candidate || tagged_paperwork)
+      && active {
+      candidates = candidates + [pull_request]
+    }
+  }
+  if len(candidates) == 0 {
+    return {action: "wait", reason: "replacement_release_pr_not_found"}
+  }
+  if len(candidates) > 1 {
+    return {
+      action: "fail",
+      reason: "multiple replacement release PRs match ${receipt.tag}",
+      urls: candidates.map({ candidate -> candidate.url }).to_list().sorted(),
+    }
+  }
+  return {action: "retarget", reason: "replacement_release_pr_found", pull_request: candidates[0]}
+}
+
+fn reconcile_replacement_release_pr(
+  harness: {fs: HarnessFs, random: HarnessRandom},
+  adapter: ReleaseWatchRuntimeAdapter,
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  watchdog: dict,
+  observed_at: string,
+  poll: int,
+  enabled: bool,
+) -> dict {
+  if !enabled
+    || watchdog.action != "skip"
+    || watchdog.reason != "release_pr_not_open"
+    || adapter.replacement_prs == nil {
+    return {receipt: receipt, watchdog: watchdog}
+  }
+  const replacements = adapter.replacement_prs(receipt.slug, receipt.tag, poll)
+  if is_err(replacements) {
+    return {
+      receipt: receipt,
+      watchdog: {
+        action: "skip",
+        reason: "replacement_release_pr_probe_failed",
+        error: unwrap_err(replacements),
+      },
+    }
+  }
+  const replacement = release_watch_replacement_pr(receipt, replacements?.pull_requests ?? [])
+  if replacement.action == "fail" {
+    throw replacement.reason
+  }
+  if replacement.action != "retarget" {
+    return {receipt: receipt, watchdog: watchdog}
+  }
+  const selected = replacement.pull_request
+  if selected.head.sha != receipt.publication.head_oid {
+    if receipt.release_commit_oid == "" || adapter.verify_replacement == nil
+      || !adapter.verify_replacement(receipt, selected) {
+      return {
+        receipt: receipt,
+        watchdog: {action: "blocked", reason: "replacement_release_pr_unverified"},
+      }
+    }
+  }
+  const retargeted = release_watch_receipt_retarget_pr(
+    receipt,
+    replacement.pull_request.url,
+    observed_at,
+  )
+  const authority = observe_release_pr_authority(adapter, retargeted)
+  const persisted = if authority.landing != nil && authority.landing != retargeted.landing {
+    record_release_landing(retargeted, authority.landing, observed_at)
+  } else {
+    retargeted
+  }
+  release_watch_receipt_write(pick(harness, ["fs", "random"]), receipt_path, persisted)
+  return {receipt: persisted, watchdog: authority.watchdog}
+}
+
+fn readiness_observation(readiness: any, runs: any, observed_at: any) -> ReleaseWatchObservation {
+  return {
+    runs: runs,
+    assets_ready: readiness.ready ?? false,
+    missing_assets: readiness.missing_assets ?? [],
+    observed_at: observed_at,
+  }
+}
+
+fn progress_runs(receipt: ReleaseWatchReceipt, runs: list<dict>) -> list<dict> {
+  const relevant = runs.filter(
+    { run ->
+      const run_id = to_int(run?.id ?? 0) ?? 0
+      return trim(to_string(run?.head_branch ?? "")) == receipt.tag
+        || run_id == receipt.recovery.workflow_run_id
+        || receipt.observed_run_ids.any({ observed -> observed == run_id })
+    },
+  )
+    .to_list()
+  if len(relevant) > 0 {
+    return relevant
+  }
+  return runs
+}
+
+fn warm_cache_run(run: any) -> ReleaseWatchWarmCacheRun {
+  return {
+    workflow_run_id: run.id,
+    workflow_run_url: run.url,
+    source_sha: run.head_sha,
+    event: run.event,
+    head_branch: run.head_branch,
+    status: run.status,
+    conclusion: run.conclusion ?? "",
+    started_at: run.run_started_at ?? run.created_at ?? "",
+    completed_at: run.updated_at ?? "",
+  }
+}
+
+type WarmCacheAdoption = {kind: "adopt", run: dict} | {kind: "wait"} | {kind: "dispatch"}
+
+type WarmCacheRunDisposition = {kind: "candidate", run: dict, terminal_success: bool} \
+  | {kind: "pending"} \
+  | {kind: "ignore"}
+
+fn warm_cache_run_disposition(
+  adapter: ReleaseWatchRuntimeAdapter,
+  slug: string,
+  run: dict,
+  main_sha: string,
+  poll: int,
+) -> WarmCacheRunDisposition {
+  const status = lowercase(trim(to_string(run?.status ?? "")))
+  const active = status == "queued" || status == "in_progress"
+  if run?.workflow != WARM_CACHE_WORKFLOW
+    || trim(to_string(run?.head_branch ?? ""))
+      != "main" {
+    return {kind: "ignore"}
+  }
+  const same_current_source = lowercase(trim(to_string(run?.head_sha ?? ""))) == main_sha
+  const dispatched = lowercase(trim(to_string(run?.event ?? ""))) == "workflow_dispatch"
+  if !same_current_source || !dispatched {
+    return if active {
+      {kind: "pending"}
+    } else {
+      {kind: "ignore"}
+    }
+  }
+  const completed_success = status == "completed"
+    && lowercase(trim(to_string(run?.conclusion ?? ""))) == "success"
+  if !active && !completed_success {
+    return {kind: "ignore"}
+  }
+  const run_id = to_int(run?.id ?? 0) ?? 0
+  if run_id <= 0 {
+    return {kind: "pending"}
+  }
+  const jobs = adapter.warm_jobs(slug, run_id, poll)
+  if is_err(jobs) {
+    return {kind: "pending"}
+  }
+  const identity = release_watch_warm_cache_matrix_identity(jobs.jobs)
+  if identity == "exact" && active {
+    return {kind: "candidate", run: run, terminal_success: false}
+  }
+  if identity == "exact" && release_watch_warm_cache_matrix_succeeded(jobs.jobs) {
+    return {kind: "candidate", run: run, terminal_success: true}
+  }
+  return if active {
+    {kind: "pending"}
+  } else {
+    {kind: "ignore"}
+  }
+}
+
+fn adoptable_warm_cache_run(
+  adapter: ReleaseWatchRuntimeAdapter,
+  slug: string,
+  runs: list<dict>,
+  poll: int,
+) -> WarmCacheAdoption {
+  let main_run_id = 0
+  let main_sha = ""
+  for run in runs {
+    const run_id = to_int(run?.id ?? 0) ?? 0
+    if run?.workflow == WARM_CACHE_WORKFLOW
+      && lowercase(trim(to_string(run?.event ?? ""))) == "push"
+      && trim(to_string(run?.head_branch ?? ""))
+        == "main"
+      && run_id > main_run_id {
+      main_run_id = run_id
+      main_sha = lowercase(trim(to_string(run?.head_sha ?? "")))
+    }
+  }
+  if main_sha == "" {
+    return {kind: "dispatch"}
+  }
+  let candidate: dict? = nil
+  let candidate_id = 0
+  let terminal_candidates = 0
+  let pending = false
+  for run in runs {
+    const run_id = to_int(run?.id ?? 0) ?? 0
+    const disposition = warm_cache_run_disposition(adapter, slug, run, main_sha, poll)
+    if disposition.kind == "pending" {
+      pending = true
+    } else if disposition.kind == "candidate" {
+      if disposition.terminal_success {
+        terminal_candidates = terminal_candidates + 1
+      }
+      if run_id > candidate_id {
+        candidate = disposition.run
+        candidate_id = run_id
+      }
+    }
+  }
+  if terminal_candidates > 1 {
+    return {kind: "wait"}
+  }
+  if candidate != nil {
+    return {kind: "adopt", run: candidate}
+  }
+  if pending {
+    return {kind: "wait"}
+  }
+  return {kind: "dispatch"}
+}
+
+fn observe_warm_cache(
+  adapter: any,
+  receipt: ReleaseWatchReceipt,
+  poll: int,
+) -> ReleaseWatchRuntimeWarmSnapshot {
+  if receipt.warm_cache.state != "dispatch_accepted"
+    && receipt.warm_cache.state
+      != "running"
+    && receipt.warm_cache.state
+      != "failed" {
+    return {run: nil, jobs: [], jobs_observed: false}
+  }
+  const run_probe = adapter.warm_run(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
+  if is_err(run_probe) {
+    return {run: nil, jobs: [], jobs_observed: false}
+  }
+  const jobs_probe = adapter.warm_jobs(receipt.slug, receipt.warm_cache.workflow_run_id, poll)
+  if is_err(jobs_probe) {
+    return {run: warm_cache_run(run_probe), jobs: [], jobs_observed: false}
+  }
+  const jobs: list<ReleaseWatchWarmCacheJob> = jobs_probe.jobs.map(
+    { job ->
+      const active_step = job.steps?.find({ step -> step.status == "in_progress" })
+      return {
+        name: job.name,
+        status: job.status,
+        conclusion: job.conclusion ?? "",
+        active_step: active_step?.name ?? "",
+        started_at: job.started_at ?? "",
+        completed_at: job.completed_at ?? "",
+      }
+    },
+  )
+    .to_list()
+  return {run: warm_cache_run(run_probe), jobs: jobs, jobs_observed: true}
+}
+
+fn terminal_result(
+  receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  polls: int,
+  watchdog: any,
+  status: int,
+  progress: ReleaseWatchRuntimeProgress,
+) -> ReleaseWatchRuntimeResult {
+  return {
+    status: status,
+    state: receipt.state,
+    receipt: receipt,
+    receipt_path: receipt_path,
+    polls: polls,
+    watchdog: watchdog,
+    warm_cache: receipt.warm_cache,
+    reason: receipt.warm_cache.message,
+    progress: progress,
+  }
+}
+
+fn emit_progress(
+  sink: ReleaseWatchProgressSink?,
+  progress: ReleaseWatchRuntimeProgress,
+  receipt_path: string,
+  poll: int,
+) {
+  if sink != nil {
+    sink(progress, receipt_path, poll)
+  }
+}
+
+fn release_watch_blocked_message(reason: string) -> string {
+  return if reason == "release_pr_conflicted" {
+    "release PR conflicts with main; resume the canonical release command for post-publish fixup while preserving the published tag and immutable candidate"
+  } else if reason == "release_pr_merge_authority_revoked" {
+    "release PR has no observed merge request or queue membership; the watcher will not re-enable it"
+  } else {
+    "replacement release PR signature, release notes, or identity verification failed; the published tag and certified candidate remain unchanged"
+  }
+}
+
+/**
+ * Monitor release publication and continue autonomously through terminal warming.
+ * Tests inject immutable snapshots and virtual timestamps; only the production
+ * adapter reads the clock, GitHub, process state, or sleeps between polls.
+ */
+pub fn run_release_watch(
+  harness: Harness,
+  initial_receipt: ReleaseWatchReceipt,
+  receipt_path: string,
+  options: ReleaseWatchRuntimeOptions = {},
+  injected_adapter: ReleaseWatchRuntimeAdapter? = nil,
+) -> ReleaseWatchRuntimeResult {
+  const opts = options ?? {}
+  const max_polls = opts.max_polls ?? 240
+  const interval_ms = opts.interval_ms ?? 30000
+  const dispatch_recovery = opts.dispatch_recovery ?? true
+  const dispatch_warm = opts.dispatch_warm_cache
+    ?? !env_bool(harness.env, "HARN_EXT_RELEASE_DISABLE_POST_PUBLISH_WARM_CACHE", false)
+  const keep_pr_armed = opts.keep_pr_armed ?? true
+  const on_progress = opts.on_progress
+  const adapter = rehearsal_watch_adapter(injected_adapter)
+  let receipt = initial_receipt
+  let poll = 0
+  let last_watchdog: dict = {action: "skip", reason: "not_polled"}
+  let last_progress = release_watch_progress_for_receipt(
+    receipt,
+    {ready: receipt.state == "healthy", asset_names: [], missing_assets: []},
+    [],
+    receipt.updated_at,
+  )
+  while poll < max_polls {
+    const observed_at = adapter.now(poll)
+    if keep_pr_armed {
+      receipt = request_initial_release_merge(
+        pick(harness, ["fs", "random"]),
+        adapter,
+        receipt,
+        receipt_path,
+        observed_at,
+      )
+    }
+    const authority = persist_release_pr_authority(
+      pick(harness, ["fs", "random"]),
+      adapter,
+      receipt,
+      receipt_path,
+      observed_at,
+      keep_pr_armed,
+    )
+    receipt = authority.receipt
+    last_watchdog = authority.watchdog
+    const reconciliation = reconcile_replacement_release_pr(
+      pick(harness, ["fs", "random"]),
+      adapter,
+      receipt,
+      receipt_path,
+      last_watchdog,
+      observed_at,
+      poll,
+      keep_pr_armed,
+    )
+    receipt = reconciliation.receipt
+    last_watchdog = reconciliation.watchdog
+    if last_watchdog.action == "blocked" {
+      return {
+        status: 2,
+        state: receipt.state,
+        receipt: receipt,
+        receipt_path: receipt_path,
+        polls: poll + 1,
+        watchdog: last_watchdog,
+        progress: last_progress,
+        reason: release_watch_blocked_message(last_watchdog.reason),
+      }
+    }
+    const runs = collect_runs(adapter, receipt, poll)
+    last_progress = release_watch_progress_for_receipt(
+      receipt,
+      {
+        ready: receipt.state == "healthy",
+        asset_names: last_progress.observed_assets,
+        missing_assets: last_progress.missing_assets,
+      },
+      progress_runs(receipt, runs),
+      observed_at,
+    )
+    if receipt.state != "healthy" {
+      const readiness = adapter.readiness(receipt.tag, poll)
+      const transition = release_watch_transition(
+        receipt,
+        readiness_observation(readiness, runs, observed_at),
+      )
+      receipt = transition.receipt
+      last_progress = release_watch_progress_for_receipt(
+        receipt,
+        readiness,
+        progress_runs(receipt, runs),
+        observed_at,
+      )
+      release_watch_receipt_write(pick(harness, ["fs", "random"]), receipt_path, receipt)
+      if transition.action == "fail" {
+        return {
+          status: 2,
+          state: receipt.state,
+          receipt: receipt,
+          receipt_path: receipt_path,
+          polls: poll + 1,
+          watchdog: last_watchdog,
+          reason: receipt.message,
+          progress: last_progress,
+        }
+      }
+      if transition.action == "dispatch_binary_recovery" {
+        if !dispatch_recovery {
+          return {
+            status: 2,
+            state: "failed",
+            receipt: receipt,
+            receipt_path: receipt_path,
+            polls: poll + 1,
+            watchdog: last_watchdog,
+            reason: "binary recovery required but dispatch is disabled",
+            progress: last_progress,
+          }
+        }
+        const recovered = dispatch_binary_recovery(
+          pick(harness, ["fs", "random"]),
+          adapter,
+          receipt,
+          receipt_path,
+          transition,
+          observed_at,
+        )
+        receipt = recovered.receipt
+        if recovered.error != nil {
+          return {
+            status: 2,
+            state: receipt.state,
+            receipt: receipt,
+            receipt_path: receipt_path,
+            polls: poll + 1,
+            watchdog: last_watchdog,
+            reason: recovered.error ?? "binary recovery dispatch failed",
+            progress: last_progress,
+          }
+        }
+      }
+    }
+    if receipt.state == "healthy" {
+      const snapshot = observe_warm_cache(adapter, receipt, poll)
+      const warm_observation: ReleaseWatchWarmCacheObservation = {
+        observed_at: observed_at,
+        release_pr_merged: last_watchdog.action == "done",
+        overlap_active: release_watch_warm_cache_overlap(receipt, runs),
+        run: snapshot.run,
+        jobs: snapshot.jobs,
+        jobs_observed: snapshot.jobs_observed,
+      }
+      const warm_transition = release_watch_warm_cache_transition(
+        receipt.warm_cache,
+        dispatch_warm,
+        warm_observation,
+      )
+      receipt = release_watch_apply_warm_cache_transition(receipt, warm_transition)
+      last_progress = release_watch_progress_with_warm_cache(
+        last_progress,
+        receipt.warm_cache,
+        snapshot.run,
+        snapshot.jobs,
+      )
+      release_watch_receipt_write(pick(harness, ["fs", "random"]), receipt_path, receipt)
+      if warm_transition.action == "dispatch" {
+        const adoption = adoptable_warm_cache_run(adapter, receipt.slug, runs, poll)
+        if adoption.kind != "wait" {
+          const adopted = adoption.kind == "adopt"
+          const existing = adoption.run
+          const dispatch = if adopted {
+            {
+              run_id: to_int(existing?.id ?? 0) ?? 0,
+              url: to_string(existing?.url ?? ""),
+              head_sha: lowercase(trim(to_string(existing?.head_sha ?? ""))),
+            }
+          } else {
+            adapter.warm_dispatch(receipt.slug, WARM_CACHE_WORKFLOW, {warm_cache_only: true}, poll)
+          }
+          const accepted = !is_err(dispatch)
+          receipt = release_watch_record_warm_cache_dispatch(
+            receipt,
+            {
+              accepted: accepted,
+              observed_at: observed_at,
+              workflow_run_id: if accepted {
+                dispatch.run_id
+              } else {
+                0
+              },
+              workflow_run_url: if accepted {
+                dispatch.url
+              } else {
+                ""
+              },
+              source_sha: if accepted {
+                dispatch.head_sha
+              } else {
+                ""
+              },
+              message: if accepted {
+                if adopted {
+                  "adopted active warm-cache workflow run ${dispatch.run_id} at ${dispatch.head_sha}"
+                } else {
+                  "warm-cache dispatch accepted as workflow run ${dispatch.run_id} at ${dispatch.head_sha}"
+                }
+              } else {
+                to_string(unwrap_err(dispatch))
+              },
+            },
+          )
+          last_progress = release_watch_progress_with_warm_cache(
+            last_progress,
+            receipt.warm_cache,
+            snapshot.run,
+            snapshot.jobs,
+          )
+          release_watch_receipt_write(pick(harness, ["fs", "random"]), receipt_path, receipt)
+          if !accepted {
+            emit_progress(on_progress, last_progress, receipt_path, poll + 1)
+            return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 2, last_progress)
+          }
+        }
+      } else if warm_transition.action == "complete" {
+        emit_progress(on_progress, last_progress, receipt_path, poll + 1)
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 0, last_progress)
+      } else if warm_transition.action == "fail" {
+        emit_progress(on_progress, last_progress, receipt_path, poll + 1)
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 2, last_progress)
+      } else if warm_transition.action == "disabled" {
+        emit_progress(on_progress, last_progress, receipt_path, poll + 1)
+        return terminal_result(receipt, receipt_path, poll + 1, last_watchdog, 0, last_progress)
+      }
+    }
+    poll = poll + 1
+    emit_progress(on_progress, last_progress, receipt_path, poll)
+    if poll < max_polls && interval_ms > 0 {
+      harness.clock.sleep_ms(interval_ms)
+    }
+  }
+  const reason = if receipt.state == "healthy" {
+    "release is healthy but warm-cache state remains ${receipt.warm_cache.state} after ${poll} polls"
+  } else {
+    "release remains incomplete after ${poll} polls"
+  }
+  return {
+    status: 3,
+    state: receipt.state,
+    receipt: receipt,
+    receipt_path: receipt_path,
+    polls: poll,
+    warm_cache: receipt.warm_cache,
+    reason: reason,
+    watchdog: last_watchdog,
+    progress: last_progress,
+  }
+}
+
+/**
+ * Deterministic command rehearsal: publish succeeds, dispatch persists, then five matrix jobs pass.
+ */
+pub fn mock_release_watch_adapter(receipt: ReleaseWatchReceipt) -> ReleaseWatchRuntimeAdapter {
+  const run_id = 9001
+  const run_url = "https://github.com/burin-labs/harn/actions/runs/${run_id}"
+  const warm_source_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  const times = ["2026-07-13T00:00:00Z", "2026-07-13T00:01:00Z", "2026-07-13T00:02:00Z"]
+  return {
+    now: fn(poll) { return times[min(poll, len(times) - 1)] ?? "" },
+    workflow_runs: fn(_slug, workflow, _poll) { return [
+      {
+        id: if workflow == "publish-release.yml" {
+          8001
+        } else {
+          8002
+        },
+        created_at: "2026-07-12T23:00:00Z",
+        event: "push",
+        head_branch: receipt.tag,
+        head_sha: receipt.pin_sha,
+        status: "completed",
+        conclusion: "success",
+        url: "https://github.com/burin-labs/harn/actions/runs/8001",
+      },
+    ] },
+    readiness: fn(_tag, _poll) {
+      const assets = required_harn_release_assets()
+      return {ready: true, asset_names: assets, missing_assets: []}
+    },
+    dispatch: fn(_slug, _workflow, _fields) { return {
+      accepted: true,
+      run_id: 9001,
+      url: "https://github.test/run/9001",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      head_sha: receipt.pin_sha,
+    } },
+    warm_dispatch: fn(_slug, _workflow, _fields, _poll) { return {
+      accepted: true,
+      run_id: run_id,
+      url: run_url,
+      head_sha: warm_source_sha,
+      event: "workflow_dispatch",
+      head_branch: "main",
+    } },
+    warm_run: fn(_slug, _run_id, poll) { return {
+      id: run_id,
+      url: run_url,
+      head_sha: warm_source_sha,
+      event: "workflow_dispatch",
+      head_branch: "main",
+      status: if poll < 2 {
+        "in_progress"
+      } else {
+        "completed"
+      },
+      conclusion: if poll < 2 {
+        ""
+      } else {
+        "success"
+      },
+      created_at: "2026-07-13T00:00:00Z",
+      run_started_at: "2026-07-13T00:01:00Z",
+      updated_at: if poll < 2 {
+        ""
+      } else {
+        "2026-07-13T00:02:00Z"
+      },
+    } },
+    warm_jobs: fn(_slug, _run_id, _poll) { return {
+      jobs: [
+        {name: "Build aarch64-apple-darwin", status: "completed", conclusion: "success"},
+        {name: "Build aarch64-unknown-linux-gnu", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-apple-darwin", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-pc-windows-msvc", status: "completed", conclusion: "success"},
+        {name: "Build x86_64-unknown-linux-gnu", status: "completed", conclusion: "success"},
+      ],
+    } },
+    pr_probe: fn(_slug, _pr_url) { return {
+      number: 1,
+      merged: true,
+      github_state: "merged",
+      merged_at: "2026-07-12T23:59:00Z",
+      merge_commit_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      in_merge_queue: false,
+      auto_merge_armed: false,
+      mergeable_state: "unknown",
+      head: {sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      base: {ref: "main"},
+    } },
+    landing: fn(current, pr) {
+      const merge_method = release_merge_method(current.merge_lease_method) ?? "squash"
+      const landing: ReleaseLandingReceipt = {
+        schema_version: "harn_bump_fleet.release_landing.v1",
+        tag_oid: current.publication.head_oid,
+        release_pr: current.merge_lease_candidate_pr,
+        merge_method: merge_method,
+        merge_commit_oid: if current.release_commit_oid == "" {
+          pr.merge_commit_oid
+        } else {
+          current.release_commit_oid
+        },
+        merged_tree_oid: "cccccccccccccccccccccccccccccccccccccccc",
+        candidate_tree_oid: "cccccccccccccccccccccccccccccccccccccccc",
+      }
+      return landing
+    },
+    landing_on_main: fn(_oid) { return true },
+    enable_auto_merge: fn(_slug, _pr) { return {state: "enabled"} },
+  }
+}

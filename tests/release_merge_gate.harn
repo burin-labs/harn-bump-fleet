@@ -1,0 +1,447 @@
+import {
+  ReleaseDriftCommit,
+  release_drift_commit_evidence,
+  release_drift_evidence,
+} from "../lib/release_drift_evidence"
+import {
+  ReleaseMergeGateState,
+  ReleaseStrandedRecoveryState,
+  release_certification_bearing_paths,
+  release_merge_gate_decision,
+  release_stranded_recovery_decision,
+} from "../lib/release_merge_gate"
+
+const BASE = "1111111111111111111111111111111111111111"
+
+const MOVED = "2222222222222222222222222222222222222222"
+
+const CERTIFIED_TREE = "4444444444444444444444444444444444444444"
+
+const DRIFTED_TREE = "5555555555555555555555555555555555555555"
+
+// The two contexts burin-labs/harn requires on main, and the two lanes only a
+// release runs, both computed rather than chosen: the required set comes from
+// the branch's rulesets and the lane set from workflow triggers.
+const REQUIRED = ["CI status", "drift"]
+
+const RELEASE_ONLY = ["Workspace nextest (macos-latest)", "Workspace nextest (windows-latest)"]
+
+fn string_list(value: any) -> list<string> {
+  let out: list<string> = []
+  for item in value {
+    out = out + [to_string(item)]
+  }
+  return out
+}
+
+fn run(name: string, conclusion: string) {
+  return {name: name, status: "COMPLETED", conclusion: conclusion, __typename: "CheckRun"}
+}
+
+fn green_commit(sha: string) -> ReleaseDriftCommit {
+  return release_drift_commit_evidence(
+    sha,
+    7885,
+    REQUIRED,
+    [run("CI status", "SUCCESS"), run("drift", "SUCCESS")],
+    [],
+  )
+}
+
+fn red_commit(sha: string) -> ReleaseDriftCommit {
+  return release_drift_commit_evidence(
+    sha,
+    7897,
+    REQUIRED,
+    [run("CI status", "FAILURE"), run("drift", "SUCCESS")],
+    [],
+  )
+}
+
+fn gate(overrides: dict = {}) -> ReleaseMergeGateState {
+  const merged = {
+    certified_base: BASE,
+    observed_main: BASE,
+    mergeable_state: "clean",
+    mergeable_resolved: true,
+    drifted_paths: [],
+    path_observation: nil,
+    evidence: nil,
+    release_only_checks: RELEASE_ONLY,
+  }
+    + overrides
+  return {
+    certified_base: to_string(merged.certified_base),
+    observed_main: to_string(merged.observed_main),
+    mergeable_state: to_string(merged.mergeable_state),
+    mergeable_resolved: merged.mergeable_resolved == true,
+    drifted_paths: string_list(merged.drifted_paths),
+    path_observation: merged.path_observation,
+    evidence: merged.evidence,
+    release_only_checks: string_list(merged.release_only_checks),
+  }
+}
+
+fn drifted(paths: list<string>, overrides: dict = {}) -> ReleaseMergeGateState {
+  return gate(
+    {
+      observed_main: MOVED,
+      drifted_paths: paths,
+      evidence: release_drift_evidence(
+        BASE,
+        MOVED,
+        REQUIRED,
+        [green_commit(MOVED)],
+        "2026-09-03T03:00:00Z",
+      ),
+    }
+      + overrides,
+  )
+}
+
+/** Main did not move and GitHub would merge now, so the merge is released. */
+pipeline test_merge_gate_merges_on_a_stable_base(task: any) {
+  assert_eq(release_merge_gate_decision(gate()).action, "merge")
+}
+
+/** A failed Git read names its operation instead of looking like a clean diff. */
+pipeline test_merge_gate_distinguishes_an_unreadable_diff_from_measured_zero(task: any) {
+  const unreadable = release_merge_gate_decision(
+    gate(
+      {
+        observed_main: MOVED,
+        path_observation: {
+          state: "unreadable",
+          paths: [],
+          failed_operation: "diff",
+          exit_code: 128,
+          detail: "could not diff ${BASE}..${MOVED} (exit 128): missing object",
+        },
+      },
+    ),
+  )
+  const measured_zero = release_merge_gate_decision(
+    gate(
+      {
+        observed_main: MOVED,
+        path_observation: {
+          state: "measured",
+          paths: [],
+          failed_operation: "",
+          exit_code: 0,
+          detail: "Git measured zero changed paths",
+        },
+      },
+    ),
+  )
+  assert_eq(unreadable.action, "abort")
+  assert_eq(unreadable.terminal_reason, "drift_paths_unreadable")
+  assert(contains(unreadable.reason, "missing object"))
+  assert_eq(measured_zero.action, "abort")
+  assert_eq(measured_zero.terminal_reason, "drift_paths_measured_empty")
+  assert(contains(measured_zero.reason, "measured zero changed paths"))
+}
+
+/** The legacy path list cannot disagree with its owning measured observation. */
+pipeline test_merge_gate_refuses_a_mismatched_path_projection(task: any) {
+  const decision = release_merge_gate_decision(
+    gate(
+      {
+        observed_main: MOVED,
+        drifted_paths: ["Cargo.lock"],
+        path_observation: {
+          state: "measured",
+          paths: ["Cargo.toml"],
+          failed_operation: "",
+          exit_code: 0,
+          detail: "Git measured one changed path",
+        },
+      },
+    ),
+  )
+  assert_eq(decision.action, "abort")
+  assert_eq(decision.terminal_reason, "drift_path_observation_mismatch")
+}
+
+/**
+ * A stable base is not enough. Merging while the checks are still running would
+ * land at a base nobody re-observed, which is the window this gate closes.
+ */
+pipeline test_merge_gate_holds_until_github_would_merge_now(task: any) {
+  const blocked = release_merge_gate_decision(gate({mergeable_state: "blocked"}))
+  const unresolved = release_merge_gate_decision(
+    gate({mergeable_state: "clean", mergeable_resolved: false}),
+  )
+  const conflicted = release_merge_gate_decision(gate({mergeable_state: "dirty"}))
+  assert_eq([blocked.action, unresolved.action], ["hold", "hold"])
+  assert_eq(conflicted.action, "abort")
+}
+
+/**
+ * The contract. Main moved, but every commit that landed passed the branch's own
+ * required checks, and nothing it changed is a path the release-only lanes bear
+ * on, so the release merges instead of waiting for a freeze.
+ */
+pipeline test_merge_gate_merges_green_paperwork_drift(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(["changelog.d/7885.fixed.md", "CHANGELOG.md"]),
+  )
+  assert_eq(decision.action, "merge")
+  assert(contains(decision.reason, "passed CI status, drift"))
+}
+
+/**
+ * The v0.10.128 shape under the new contract. Main moved by code and every
+ * drifted commit passed main's own required checks, so the release merges onto
+ * it. The lanes only a release runs are named on the decision, so the receipt
+ * can record what the merged tree still owes, but they do not gate the merge:
+ * they take about thirty-four minutes against a branch that moves every
+ * nineteen, so waiting for them here is the freeze by a slower route. They run
+ * once on the merged commit, before the tag, in `release_main_delta.harn`.
+ */
+pipeline test_merge_gate_merges_green_code_drift_and_names_what_it_still_owes(task: any) {
+  const decision = release_merge_gate_decision(drifted(["crates/harn-core/src/lib.rs"]))
+  assert_eq([decision.action, decision.bearing_paths], ["merge", ["crates/harn-core/src/lib.rs"]])
+  assert(contains(decision.reason, "passed CI status, drift"))
+}
+
+/**
+ * A drifted commit that did not pass the branch's own required checks stops the
+ * release. This is the v0.10.128 merge commit's real shape: `CI status=failure`.
+ */
+pipeline test_merge_gate_defers_a_drifted_commit_that_is_not_green(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {
+        evidence: release_drift_evidence(
+          BASE,
+          MOVED,
+          REQUIRED,
+          [green_commit(BASE), red_commit(MOVED)],
+          "2026-09-03T03:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq([decision.action, decision.terminal_reason], ["defer", "drifted_commit_not_green"])
+  assert(contains(decision.reason, "did not pass CI status"))
+  assert(contains(decision.reason, "Nothing was merged and main is untouched"))
+}
+
+/**
+ * Evidence that was never gathered is not clean drift, and evidence describing
+ * other heads is not evidence about these ones. Both are the shape where a
+ * missing observation would release the merge it was meant to guard.
+ */
+pipeline test_merge_gate_refuses_absent_or_stale_evidence(task: any) {
+  const absent = release_merge_gate_decision(
+    gate({observed_main: MOVED, drifted_paths: ["crates/harn-core/src/lib.rs"]}),
+  )
+  const stale = release_merge_gate_decision(
+    gate(
+      {
+        observed_main: MOVED,
+        drifted_paths: ["crates/harn-core/src/lib.rs"],
+        evidence: release_drift_evidence(
+          BASE,
+          BASE,
+          REQUIRED,
+          [green_commit(BASE)],
+          "2026-09-03T02:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq(
+    [absent.terminal_reason, stale.terminal_reason],
+    ["drift_evidence_not_observed", "drift_evidence_is_stale"],
+  )
+}
+
+/** An unreadable required set defers rather than merging on an unproved drift. */
+pipeline test_merge_gate_defers_when_the_required_set_is_unreadable(task: any) {
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {
+        evidence: release_drift_evidence(
+          BASE,
+          MOVED,
+          [],
+          [green_commit(MOVED)],
+          "2026-09-03T03:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq(
+    [decision.action, decision.terminal_reason],
+    ["defer", "required_contexts_not_observed"],
+  )
+}
+
+/**
+ * A probe that answered nothing must not read as a stable base. Two unresolved
+ * heads compare equal, which is exactly how a missing observation would release
+ * the merge.
+ */
+pipeline test_merge_gate_refuses_an_unobserved_base(task: any) {
+  const unobserved = release_merge_gate_decision(gate({certified_base: "", observed_main: ""}))
+  const partial = release_merge_gate_decision(gate({observed_main: ""}))
+  const malformed = release_merge_gate_decision(gate({observed_main: "not-a-sha"}))
+  assert_eq([unobserved.action, partial.action, malformed.action], ["abort", "abort", "abort"])
+}
+
+/** A moved head that reports no paths is an unproved probe, not a clean drift. */
+pipeline test_merge_gate_refuses_a_drift_with_no_reported_paths(task: any) {
+  assert_eq(release_merge_gate_decision(gate({observed_main: MOVED})).action, "abort")
+}
+
+fn stranded(overrides: dict = {}) -> ReleaseStrandedRecoveryState {
+  const merged = {
+    tag: "v1.2.3",
+    tag_exists: false,
+    tag_target: "",
+    target_commit: MOVED,
+    target_base_commit: BASE,
+    target_version: "1.2.3",
+    certified_tree: CERTIFIED_TREE,
+    target_tree: CERTIFIED_TREE,
+    drifted_paths: [],
+  }
+    + overrides
+  return {
+    tag: to_string(merged.tag),
+    tag_exists: merged.tag_exists == true,
+    tag_target: to_string(merged.tag_target),
+    target_commit: to_string(merged.target_commit),
+    target_base_commit: to_string(merged.target_base_commit),
+    target_version: to_string(merged.target_version),
+    certified_tree: to_string(merged.certified_tree),
+    target_tree: to_string(merged.target_tree),
+    drifted_paths: string_list(merged.drifted_paths),
+  }
+}
+
+/** The classifier fails closed: anything not named non-bearing is bearing. */
+pipeline test_certification_bearing_classifier_fails_closed(task: any) {
+  assert_eq(release_certification_bearing_paths(["changelog.d/1.md", "CHANGELOG.md"]), [])
+  assert_eq(
+    release_certification_bearing_paths(["docs/guide.md", "changelog.d/1.md", "Cargo.lock"]),
+    ["docs/guide.md", "Cargo.lock"],
+  )
+  assert_eq(release_certification_bearing_paths(["changelog.d.rs"]), ["changelog.d.rs"])
+}
+
+/**
+ * Falsifier 4: tonight's stranded state. Main carries the bumped version with no
+ * tag. Recovery tags it when the tree is the certified one, and refuses with an
+ * executable remediation when uncertified code reached it.
+ */
+pipeline test_stranded_recovery_tags_a_clean_strand(task: any) {
+  const decision = release_stranded_recovery_decision(stranded())
+  assert_eq(decision.action, "tag")
+  assert_eq(decision.merge_oid, MOVED)
+}
+
+pipeline test_stranded_recovery_tags_a_non_bearing_strand(task: any) {
+  const decision = release_stranded_recovery_decision(
+    stranded({target_tree: DRIFTED_TREE, drifted_paths: ["changelog.d/7885.fixed.md"]}),
+  )
+  assert_eq(decision.action, "tag")
+}
+
+pipeline test_stranded_recovery_refuses_a_bearing_strand(task: any) {
+  const decision = release_stranded_recovery_decision(
+    stranded(
+      {
+        target_tree: DRIFTED_TREE,
+        drifted_paths: ["crates/harn-core/src/lib.rs", "changelog.d/7885.fixed.md"],
+      },
+    ),
+  )
+  assert_eq(decision.action, "refuse")
+  assert_eq(decision.terminal_reason, "certification_does_not_transfer")
+  assert_eq(decision.bearing_paths, ["crates/harn-core/src/lib.rs"])
+}
+
+/** Recovery only ever applies to a version whose bump already landed. */
+pipeline test_stranded_recovery_refuses_a_development_main(task: any) {
+  const decision = release_stranded_recovery_decision(stranded({target_version: "1.2.3-dev"}))
+  assert_eq(decision.action, "refuse")
+  assert_eq(decision.terminal_reason, "main_is_not_stranded")
+}
+
+/** An already-correct tag is idempotent; a tag anywhere else is a refusal. */
+pipeline test_stranded_recovery_is_idempotent_and_never_moves_a_tag(task: any) {
+  const published = release_stranded_recovery_decision(
+    stranded({tag_exists: true, tag_target: MOVED}),
+  )
+  const elsewhere = release_stranded_recovery_decision(
+    stranded({tag_exists: true, tag_target: BASE}),
+  )
+  assert_eq(published.action, "already_published")
+  assert_eq(elsewhere.action, "refuse")
+  assert_eq(elsewhere.terminal_reason, "tag_names_another_commit")
+}
+
+/**
+ * A drifted commit whose release-only lane has not finished merges now.
+ *
+ * The gate no longer holds for such a lane. The branch does not require it, so
+ * nothing it goes on to report can make the commit inadmissible, and the hold
+ * bought delay rather than evidence: the .129 cut spent ten polls on this arm.
+ * The lane is named in the merge reason instead.
+ */
+pipeline test_merge_gate_merges_over_an_unfinished_lane(task: any) {
+  const unfinished = release_drift_commit_evidence(
+    MOVED,
+    7885,
+    REQUIRED,
+    [run("CI status", "SUCCESS"), run("drift", "SUCCESS")],
+    [],
+    RELEASE_ONLY,
+  )
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {
+        evidence: release_drift_evidence(
+          BASE,
+          MOVED,
+          REQUIRED,
+          [unfinished],
+          "2026-09-03T03:00:00Z",
+        ),
+      },
+    ),
+  )
+  assert_eq([decision.action, decision.terminal_reason], ["merge", ""])
+}
+
+/**
+ * A lane that ran green on the drifted commit's pull request head releases the
+ * merge with no release-only work of its own. This is what the pull-request
+ * trigger buys, and it is the common case once that lands.
+ */
+pipeline test_merge_gate_merges_when_the_lanes_passed_on_the_pr_head(task: any) {
+  const proved = release_drift_commit_evidence(
+    MOVED,
+    7885,
+    REQUIRED,
+    [run("CI status", "SUCCESS"), run("drift", "SUCCESS")],
+    [
+      run("Workspace nextest (windows-latest)", "SUCCESS"),
+      run("Workspace nextest (macos-latest)", "SUCCESS"),
+    ],
+    RELEASE_ONLY,
+  )
+  const decision = release_merge_gate_decision(
+    drifted(
+      ["crates/harn-core/src/lib.rs"],
+      {evidence: release_drift_evidence(BASE, MOVED, REQUIRED, [proved], "2026-09-03T03:00:00Z")},
+    ),
+  )
+  assert_eq(decision.action, "merge")
+}
