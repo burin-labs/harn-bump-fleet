@@ -10,25 +10,16 @@ The entry points are:
 - `bump_fleet.harn`: finds local `~/projects/{*harn*,*burin*}` repos with
   `.github/workflows/bump-harn.yml`, dispatches Harn runtime bump workflows,
   polls them, and enables auto-merge on the resulting PRs.
-- `release_harn.harn`: mirrors the human `/release-harn` flow for
-  `~/projects/harn`. The launcher dispatches its default read-only audit to the
-  same hosted workflow as a live release. `--local-audit` is diagnosis only.
-  Live prepare/ship-pr requires `--yes-live-release`.
-- `watch_harn_release.harn`: resumes the post-PR handoff from the typed receipt
-  written after certification by `release_harn`. It signs and pushes the
-  immutable candidate tag, arms the release pull request under its exact head
-  lease, then monitors publication and the independent PR merge
-  without repeating preparation. `--tag-stranded-main <sha>` recovers a release
-  whose bump merged without a tag; `--unfold-merged-bump <sha>` opens the revert
-  for a bump that merged and must not be published.
+- `release_harn.harn`: delegates live `ship-pr --yes-live-release` to Harn's
+  no-input workflow opener on main and records its typed handoff. Local live
+  preparation refuses; historical preparation remains an offline mock rehearsal.
+- `watch_harn_release.harn`: reads the recorded handoff, an explicitly selected
+  release PR, and its exact merge-group producer attempt. It verifies the public
+  tag target and seven public files against the certificate. Missing evidence
+  stays named pending. The live watcher has no tag, merge, dispatch, or recovery
+  capability.
 - `sweep_release_refs.harn`: inventories historical local and remote release
   refs. It is dry-run-first and applies only exact, tag-backed deletions.
-- `reap_chain_refs.harn`: clears `harn-update-chain/<chain id>` leases whose
-  every owning run reached a terminal conclusion, so a round that died before it
-  could release its own lease does not force the next release to start a fresh
-  chain around the dead one. Dry-run-first. It refuses a chain with a live run,
-  an unreadable run list, or no resolvable run, and its receipt distinguishes
-  reading zero refs from failing to read.
 - `abandon_release_attempts.harn`: frees a version wedged by leftover
   `release-attempt/vX.Y.Z/` refs by renaming each unclaimed attempt into
   `release-failed/vX.Y.Z/<oid>-abandoned`. Dry-run-first, and it refuses when a
@@ -36,27 +27,6 @@ The entry points are:
   hold the `release-owner` lease and refuse while a live release owns it.
 - `harness_self_review.harn`: a local meta-audit over recent `.harn-runs/`
   artifacts. It is not CI and should stay out of the main release/bump path.
-- `report_failed_hosted_release.harn`: the terminal finalizer for a failed
-  hosted release. It reads the run's failing step and the inputs the run
-  recorded when it started, then writes one typed receipt naming the
-  precondition that failed and the exact re-dispatch that would retry it. It
-  never dispatches anything. `lib/hosted_release_failure.harn` owns the step
-  registry that decides what each failure means and whether a re-dispatch is a
-  sane repair at all; a step the registry does not name escalates rather than
-  defaulting to a retry, and `check_hosted_release_failure_coverage.harn` keeps
-  the registry and the workflow in step in both directions. Whether a step runs
-  before or after the release is irreversible is never registered by hand: it is
-  read from the step's position relative to `Run release harness`, and a failure
-  on the far side of that boundary is routed to recovery rather than to any
-  dispatch of the release workflow.
-- `lib/release_chain_driver.harn`: the one thing that moves a release chain and
-  the only thing that applies an effect. Every side effect goes through its
-  adapter's `apply_effect`, called from the planned-repair arm alone, and
-  control events are read before a stage is observed so a stand-down abandons
-  the remaining stages instead of only stopping the reporting. Its run receipt
-  names the proven, pending, and abandoned stages rather than reporting a
-  count. `release_chain.harn --plan` drives a journal read-only: its effect door
-  refuses, so a chain needing a repair says so instead of taking it.
 - `sync_agent_guidance.harn`: checks or applies the manifest-owned shared
   agent contract and `CLAUDE.md` projection without replacing local rules.
 - `sync_package_ci.harn`: checks or applies package CI for repositories that
@@ -70,6 +40,12 @@ The entry points are:
   `[providers.setup].required_secrets` projection for every first-party
   connector. `policy.connector_secret_schema` keeps the output compatible with
   the released Harn manifest schema until the fleet can move as one.
+- `promote-released-orchestration.yml`: started by a Harn release's `repin`
+  job. It promotes `fleet.toml`'s orchestration pin to the released commit
+  with `promote_bump_workflow.harn --repositories-json
+  '["burin-labs/harn-bump-fleet"]'`. Convergence and each consumer adapter's
+  push-triggered bump do the rest, so a release never dispatches consumer
+  bumps through an older orchestration contract.
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
@@ -79,6 +55,19 @@ The entry points are:
   `--apply` also arms auto-merge, leased to the commit it published, so each
   repair lands once that repository's own checks pass. `--no-auto-merge` holds
   arming; it never merges anything itself.
+- `check_projection_source_drift.harn`: the trigger half of the same repair. A
+  projection has two inputs, the renderer here and the canonical source file in
+  another repository, and only the renderer had an event. This compares each
+  declared source's current head against the head it last converged from and
+  dispatches convergence for the consumers of the sources that moved. A head it
+  cannot resolve, a source with no record, and a source recorded twice all read
+  as unknown and converge; none of them may read as unchanged. Records live in
+  `refs/heads/projection-source-converged/`, one per source, read in a single
+  `git ls-remote`. This harness writes none of them:
+  `converge_fleet_projections.harn` records a source once every consumer that
+  projects it reports `clean`, because only that run knows whether the bytes
+  are in place. A proposed repair is not a converged one, so a run that opened
+  a pull request records nothing and the comparison asks again.
 
 Shared code belongs in `lib/*.harn`. Every shared module should have focused
 coverage in `tests/*.harn`.
@@ -102,7 +91,10 @@ Release implementation changes belong in the stage that owns the behavior:
 - `release_modes`: prepare execution, thin ship-phase composition, and cleanup
 - `release_ship_prepare`: prepared commit and immutable attempt publication
 - `release_ship_certify`: cutoff and exact-candidate certification gates
-- `release_ship_pr`: PR publication and watch-receipt handoff
+- `release_ship_pr`: canonical workflow opener and typed handoff; mock PR publication
+- `release_watch_handoff`: immutable PR, merged-source, and producer-attempt identities
+- `release_archive_observation`: certificate identity and measured public-file digests
+- `release_watch_runtime`: read-only canonical publication observation and mock control flow
 - `release_candidate_tag`: certified-candidate tagging and write-once receipt binding
 - `release_main_tag`: historical merged-main recovery and bump reversal
 - `release_main_drift`: the drift reading those recoveries decide on, and
@@ -153,10 +145,10 @@ Common harness runs:
 ```sh
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
-scripts/run_harn_release.sh
-scripts/run_harn_release.sh --mock --agent --mode ship-pr
-scripts/run_harn_release.sh --mode ship-pr --agent --yes-live-release
-scripts/watch_harn_release.sh --tag vX.Y.Z --yes-live-release
+scripts/with_env.sh harn run --no-sandbox release_harn.harn
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --yes-live-release
+scripts/watch_harn_release.sh --receipt PATH --release-pr NUMBER --producer-run RUN_ID
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 scripts/with_env.sh harn run --no-sandbox sync_bump_workflows.harn -- --check
@@ -167,11 +159,11 @@ scripts/with_env.sh harn run --no-sandbox converge_fleet_projections.harn -- --c
 Harn does not auto-load `.env`; use `scripts/with_env.sh` when provider keys
 are needed. On macOS, wrap long local runs with `scripts/harn_shielded.sh` if
 another session may replace the `harn` binary while the process is running.
-Release and watch runs use `scripts/run_harn_release.sh` and
-`scripts/watch_harn_release.sh`. Those launchers retain Harn's worktree sandbox
-and grant the selected Harn checkout, its dedicated sibling release-workspace
-root, shared leases, toolchain caches, network, and the existing `gh` login at
-one audited boundary. Other fleet operations
+Watch runs use `scripts/watch_harn_release.sh`. The live launcher retains Harn's
+worktree sandbox and grants its receipt/cache locations, shared leases, the
+minimal GitHub login environment, and the explicit artifact/public-file egress
+profile. It needs no local Harn checkout, signing roots, or git.push grant.
+Other fleet operations
 still need `--no-sandbox` until they have an equivalent typed root inventory.
 
 Run `scripts/install_harn.sh` after a `.harn-version` repin. By default it
@@ -183,13 +175,11 @@ Use the release/watch launchers for their entrypoints and
 `scripts/with_env.sh harn ...` for other documented harness invocations. They
 install and select the repo-pinned runtime before Harn parses the program and
 load the provider environment without putting secrets on the command line.
-Direct ambient `harn` invocations are not a supported release path. Hosted and
-local releases are alternative owners of the same lane, not parallel fallbacks:
-do not start one while the other is active. Run only one live release watcher;
+Direct ambient `harn` invocations are not a supported release path. Harn's
+workflows own live preparation, certification, and promotion. Run only one live release watcher;
 the watcher host lease refuses a second local receipt writer. Always start that
 watcher through `scripts/watch_harn_release.sh`; it selects and shields the
-repo-pinned runtime and supplies the exact `git.push` operator grant required by
-terminal leased-ref cleanup.
+repo-pinned runtime and gives the observer no release-mutation authority.
 
 ## Implementation rules
 
@@ -238,26 +228,24 @@ ignored and must not be committed.
 
 ## Release policy
 
-`release_harn.harn` pins each live release at startup from `--at-sha`,
-`HARN_EXT_RELEASE_PIN_SHA`, or `origin/<base>`. The local `release/vX.Y.Z` branch is
-parented at that pin and is never published. Canonical ship mode materializes
-and signs the versioned candidate, publishes one OID-qualified immutable
-`release-attempt/...` ref, then certifies that prepared OID rather than the
-pre-bump parent. Hosted Windows/macOS and local source proof runs concurrently
-with the Linux release-size gate; residual generated-content proof follows the
-join. A write-once `release-certify/<candidate-oid>` branch lets GitHub dispatch
-the exact commit while `main` keeps merging. Any missing, stale, moved, or red
-lane blocks the release PR. The startup pin identifies the candidate's parent
-and prevents preparation from silently advancing to newer main content.
-The release pull request opens unarmed after certification succeeds. The watcher
-verifies the candidate's pinned parent and immutable certification ref, signs
-`vX.Y.Z` at that exact candidate, and binds the receipt to it once. Main may
-continue changing throughout this process; those changes cannot enter the tag.
-After tagging, the watcher arms the release PR and independently monitors its
-merge, publication, assets, and cache warm. Publish/build workflows derive from
-the immutable tag; no candidate archive is promoted as the release artifact.
-If the release PR conflicts with main, the watcher stops with a conflict result
-and preserves its receipt and refs. Post-publish fixup owns that repair.
+Harn's `bump-release.yml` on main owns version selection, preparation, and the
+release PR. Its merge-group build owns certification; the promoter publishes
+the same certified files. Fleet delegates to that owner and observes its
+result. Never restore the retired candidate-only dispatch or manually tag an
+old prepared candidate.
+
+The watcher binds the selected PR, its actual merged source, and the successful
+`build-release-binaries.yml` merge-group run and attempt. A manifest must name
+that same repository, source, and producer. Public promotion requires the
+matching tag target and measured bytes for every file in the shared release
+catalog. Empty, partial, failed, or unreported evidence cannot verify it.
+Crate publication, the versioned container, the development bump, and downstream
+convergence remain separate named obligations before a release is finished.
+
+Use [the release procedure](docs/how-to/release-harn.md) for this interface and
+Harn's owning maintainer runbook for workflow recovery. Keep receipts and
+immutable source custody on failure. Historical prepare, tag, recovery, and
+warm-cache controllers are mock rehearsal paths and refuse live invocation.
 
 `preflight_package_test_compatibility.harn` runs package test discovery for
 every managed package under the candidate runtime before a cut, without
@@ -282,48 +270,6 @@ retry that ran can be told from one that did not, and an exhausted bound reports
 unreadable. Whether a failure is transient is decided by
 `fleet_observation_class`, which owns that question for every connector error
 here, so the two answers cannot drift apart.
-A failed stage repairs itself only through `lib/release_chain_effect_door.harn`,
-the single place where a planned effect becomes an action. Its allowlist names
-every effect a repair may perform, and no entry dispatches the release workflow,
-so a repair can never produce a second cut of a published version. A repair runs
-at most once: the caller supplies the idempotency keys the chain has already
-spent and a repeat is refused, so a replayed chain refuses for the same reason a
-live one does. An effect counts as done only on evidence it read back; an empty,
-missing, or unattributed read-back escalates, because a door that accepted
-silence would report every unreachable dispatch as a successful repair. An
-unmapped cause, an unmapped effect kind, and an exhausted bound all stop with a
-typed reason rather than falling through to a retry.
-
-A release whose bump merged without a tag is recovered by
-`recover-release-publication.yml` in `tag-stranded-main` mode, not by a fresh
-cut the release preflight refuses. That mode tags the stranded merge commit only
-after it re-proves admitted drift and runs any release-only lanes on the exact
-commit. Unreadable or stale proof refuses the tag, and a red lane unfolds the
-bump.
-
-The opposite recovery is `unfold-merged-bump`, for a bump that merged and must
-not be published. It opens the revert that returns main to its development
-version and restores the folded changelog fragments, and refuses once the tag is
-public, because reverting a commit a tag names does not unpublish the tag. The
-release opens that revert itself when the post-merge lanes fail; the mode exists
-for a watch that died between the merge and the verdict.
-
-A pre-tag checkpoint supersede is a new candidate, not paperwork. If recovery
-rebuilds that candidate on fresh base, the fresh base is part of the artifact.
-Fold its current `## Unreleased` body and every parseable fragment into the
-candidate release section before certification. Only an already-tagged fixup
-may preserve newer notes for the following release.
-
-If release assets already exist and an open `release/vX.Y.Z` PR remains,
-post-publish fixup mode is paperwork only. It does the following:
-
-- recreates the branch on fresh base;
-- preserves the shipped release body from the tag;
-- leaves post-publish `## Unreleased` entries in place;
-- skips retagging, and refreshes the PR.
-
-Changed prepared content creates a new immutable attempt ref and PR. A retry
-resumes only when the recorded ref still resolves to the exact prepared OID.
 
 ## Repo hygiene
 
@@ -340,9 +286,11 @@ Documentation should read plainly: no emoji, no title-case section headings, no
 marketing phrasing, no vague claims, and no filler endings. Use bullets only
 where they make scanning easier.
 
-Before opening a PR, rebase on the latest `origin/main` and run the checks
-above. Review your own diff for stale comments and duplicated abstractions.
-Then push a branch, and enable auto-merge when CI is green.
+Before opening a PR, check the current integration base and review your diff
+for stale comments and duplicated abstractions. Update the branch when a
+conflict, dependency, or relevant intervening change requires it; rerun only
+affected verification and preserve evidence whose inputs are unchanged.
+Then push a branch, and enable auto-merge when required checks and review pass.
 
 ## Pull requests
 
@@ -384,15 +332,19 @@ sub-asks and the pull request resolves it completely.
 
 ## Ecosystem working agreement
 
-- Pursue the ambitious product outcome; make the seams boring with small typed
-  interfaces, explicit invariants, and deterministic projections.
-- Give each behavior one semantic owner. Generate or parity-test other surfaces
-  instead of maintaining competing implementations.
-- Work autonomously inside approved scope. Pause for destructive, production,
-  high-spend, ambiguous, or authority-expanding actions—not routine reversible work.
-- Treat stop, wait, stand down, and pivot as control events for long-lived work.
-- Match evidence to the claim: exercise the canonical user path, state the
-  falsifier, verify liveness and recovery, and record residual blind spots.
-- "Ship" means landed on main with required deploy and post-merge checks complete.
+- Build ambitious outcomes behind small typed interfaces; give behavior one owner
+  and generate or parity-test projections instead of duplicating policy.
+- Work autonomously within approved scope. Pause for destructive or production effects,
+  exceptional spend, material ambiguity, or new authority.
+- Treat stop, wait, stand down, pivot, and steer as control events.
+- Use the smallest owning product-path check. Add a falsifier for contested, load-bearing,
+  or potentially vacuous claims; record controls, recovery, and blind spots.
+- Evidence follows source/artifact identity. Reuse proof when relevant code, build inputs,
+  and dependencies are unchanged. Repeat affected checks for relevant changes, failures,
+  deployment, or packaging differences. Do not rebuild or recapture solely for main.
+- Ship means owning-main integration with terminal merge and applicable release/deploy
+  checks. Confirm landed content and result; an open PR is incomplete.
+- Use `ship` with a deployed Smart Ship caller; otherwise use `gh pr merge --squash --auto`.
+  Never use `--admin`; incidents use `bypass-ci`, `bypass-merge-queue`, or `force-merge`.
 
 <!-- END HARN SHARED AGENT CONTRACT -->

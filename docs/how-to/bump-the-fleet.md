@@ -15,14 +15,6 @@ scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 # Run on one repo only.
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 
-# Repair only manifest-admitted failed bump PRs in an isolated fleet root.
-# The hosted workflow invokes this automatically after a terminal failure.
-# By default every admitted manifest consumer is considered; use
-# --max-repositories N for an explicitly narrower rehearsal. The Harn cost
-# budget remains the global live-spend ceiling.
-scripts/with_env.sh harn run --no-sandbox repair_fleet_convergence.harn -- \
-  --fleet-root /absolute/path/to/materialized-fleet vX.Y.Z
-
 # Check fleet-owned package CI adapters without writing them.
 scripts/with_env.sh harn run --no-sandbox sync_package_ci.harn -- --check
 
@@ -145,3 +137,20 @@ a fleet with nothing to converge.
 
 The scheduled `Converge Fleet Projections` workflow is the only place `--apply`
 runs by default; the harness itself reports and exits unless asked to write.
+
+## After a Harn release
+
+You don't need to run anything. The release's `repin` job starts
+`promote-released-orchestration.yml` here with the released tag. That run moves
+`fleet.toml`'s bump orchestration pin to the released commit and lands it.
+The `fleet.toml` push starts fleet projection convergence, which proposes each
+consumer's adapter at the new pin. Each adapter's landing on its default
+branch then starts that consumer's bump. A consumer never bumps to a release
+through an older orchestration commit.
+
+To promote by hand, for example after a failed run, dispatch the same
+workflow with the tag:
+
+```sh
+gh workflow run promote-released-orchestration.yml -R burin-labs/harn-bump-fleet -f version=vX.Y.Z
+```

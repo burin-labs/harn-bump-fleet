@@ -15,26 +15,6 @@ test("release profile is confined to Harn", () => {
   });
 });
 
-test("fleet profile is organization-wide but permission-minimal", () => {
-  assert.deepEqual(installationTokenRequest("fleet-orchestration"), {
-    permissions: {
-      actions: "write",
-      contents: "write",
-      pull_requests: "write",
-      workflows: "write",
-    },
-  });
-});
-
-test("consumer rehearsal profile can dispatch and record, but cannot edit pull requests", () => {
-  assert.deepEqual(installationTokenRequest("consumer-rehearsal"), {
-    permissions: {
-      actions: "write",
-      contents: "write",
-    },
-  });
-});
-
 test("unknown profiles fail closed", () => {
   assert.throws(() => installationTokenRequest("all-access"), /unknown RELEASE_APP_TOKEN_PROFILE/);
 });

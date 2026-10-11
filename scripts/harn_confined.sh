@@ -18,6 +18,9 @@ artifact_import_egress=0
 if [ "${1:-}" = "--github-artifact-import-egress" ]; then
   artifact_import_egress=1
   shift
+elif [ "${1:-}" = "--workflow-watch-egress" ]; then
+  artifact_import_egress=2
+  shift
 fi
 
 run_args=()
@@ -54,32 +57,32 @@ for ((index = 0; index < ${#script_args[@]}; index++)); do
   esac
 done
 
-if [ ! -d "$target_repo" ]; then
-  echo "harn_confined: target checkout does not exist: $target_repo" >&2
-  exit 2
-fi
-target_repo="$(cd -- "$target_repo" && pwd -P)"
-if [ "$repo_arg_seen" -eq 0 ]; then
-  script_args+=(--repo "$target_repo")
-fi
+if [ "$artifact_import_egress" -ne 2 ]; then
+  if [ ! -d "$target_repo" ]; then
+    echo "harn_confined: target checkout does not exist: $target_repo" >&2
+    exit 2
+  fi
+  target_repo="$(cd -- "$target_repo" && pwd -P)"
+  if [ "$repo_arg_seen" -eq 0 ]; then
+    script_args+=(--repo "$target_repo")
+  fi
 
-# Release worktrees live in one dedicated sibling root. Granting that root
-# keeps the source checkout immutable without authorizing unrelated worktrees
-# or the checkout's parent directory. This projection intentionally mirrors
-# lib/release_workspace.harn; the Harn contract test guards both spellings.
-git_common_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
-if [ "$(basename -- "$git_common_dir")" != ".git" ]; then
-  echo "harn_confined: target does not resolve to a non-bare Git checkout: $target_repo" >&2
-  exit 2
+  # Mutable release worktrees use one dedicated sibling root. The read-only
+  # workflow watcher needs neither a Harn checkout nor this write location.
+  git_common_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
+  if [ "$(basename -- "$git_common_dir")" != ".git" ]; then
+    echo "harn_confined: target does not resolve to a non-bare Git checkout: $target_repo" >&2
+    exit 2
+  fi
+  primary_checkout="$(dirname -- "$git_common_dir")"
+  release_workspace_root="$(dirname -- "$primary_checkout")/$(basename -- "$primary_checkout")-release-workspaces"
+  if [ -L "$release_workspace_root" ]; then
+    echo "harn_confined: release workspace root must not be a symlink: $release_workspace_root" >&2
+    exit 2
+  fi
+  mkdir -p -- "$release_workspace_root"
+  release_workspace_root="$(cd -- "$release_workspace_root" && pwd -P)"
 fi
-primary_checkout="$(dirname -- "$git_common_dir")"
-release_workspace_root="$(dirname -- "$primary_checkout")/$(basename -- "$primary_checkout")-release-workspaces"
-if [ -L "$release_workspace_root" ]; then
-  echo "harn_confined: release workspace root must not be a symlink: $release_workspace_root" >&2
-  exit 2
-fi
-mkdir -p -- "$release_workspace_root"
-release_workspace_root="$(cd -- "$release_workspace_root" && pwd -P)"
 
 sandbox_args=(--allow-process-network)
 if [ "$artifact_import_egress" -eq 0 ]; then
@@ -167,18 +170,22 @@ case "$github_config_root" in
     exit 2
     ;;
 esac
-if [ "$artifact_import_egress" -eq 1 ]; then
+if [ "$artifact_import_egress" -ne 0 ]; then
+  egress_profile="--github-artifact-import"
+  if [ "$artifact_import_egress" -eq 2 ]; then
+    egress_profile="--workflow-watch"
+  fi
   # Do not source the release environment here: this phase needs GitHub auth,
   # not provider tokens or signing identity. `with_github_auth.sh` resolves the
   # operator login before recursive process confinement starts.
   exec "${script_dir}/with_release_egress.sh" \
-    --github-artifact-import \
+    "$egress_profile" \
     "${script_dir}/with_github_auth.sh" \
     --private-config-root "$github_config_root" \
     --minimal-artifact-env \
     "${script_dir}/harn_shielded.sh" \
     run \
-    "${run_args[@]}" \
+    ${run_args[@]+"${run_args[@]}"} \
     "${sandbox_args[@]}" \
     "${script_args[@]}"
 fi
@@ -188,6 +195,6 @@ exec "${script_dir}/with_env.sh" \
   --private-config-root "$github_config_root" \
   "${script_dir}/harn_shielded.sh" \
   run \
-  "${run_args[@]}" \
+  ${run_args[@]+"${run_args[@]}"} \
   "${sandbox_args[@]}" \
   "${script_args[@]}"

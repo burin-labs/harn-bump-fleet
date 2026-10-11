@@ -10,11 +10,11 @@ apply a fix to the harness or release artifacts mid-debrief if you ask.
 
 ```sh
 # Disable chat even when at a TTY.
-scripts/run_harn_release.sh --no-chat        # or `HARN_EXT_CHAT=0`
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --no-chat        # or `HARN_EXT_CHAT=0`
 
 # Skip the pipeline; open the loop over a prior run.
-scripts/run_harn_release.sh --chat-only                       # carousel
-scripts/run_harn_release.sh --chat-only --chat-run <run-id>   # direct
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only                       # carousel
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --chat-only --chat-run <run-id>   # direct
 
 # Change the start-typing timeout (default 60s).
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --chat-timeout-s 120

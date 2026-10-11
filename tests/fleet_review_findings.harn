@@ -1,0 +1,283 @@
+import { fleet_chain_refusal } from "../lib/fleet_chain_stop"
+import { FleetConvergenceSnapshot } from "../lib/fleet_convergence"
+import { FleetRepository } from "../lib/fleet_manifest"
+import { FleetRepairPolicy, fleet_repair_plan, repair_fleet_plan } from "../lib/fleet_repair"
+import {
+  FleetReviewFinding,
+  fleet_answer_review_findings,
+  fleet_review_answer_marker,
+  fleet_review_findings,
+  fleet_review_findings_from_threads,
+  fleet_review_reply_body,
+  fleet_review_standing,
+} from "../lib/fleet_review_findings"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const API = "https://fleet-review-findings.test"
+
+const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const NEW_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+fn options() -> GithubClientOptions {
+  return {
+    api_base_url: API,
+    installation_token: "review-findings-fixture",
+    retry: {max_attempts: 1},
+  }
+}
+
+fn thread(
+  id: string,
+  author: string,
+  comment_id: int,
+  resolved: bool = false,
+  latest: string = "",
+) {
+  return {
+    id: id,
+    isResolved: resolved,
+    path: "src/lib.rs",
+    line: 12,
+    comments: {
+      nodes: [
+        {
+          databaseId: comment_id,
+          author: {login: author},
+          body: "**issue** · blocking: the update drops a field",
+          url: "https://github.com/owner/consumer/pull/7#discussion_r" + to_string(comment_id),
+        },
+      ],
+    },
+    latest: {nodes: [{body: latest}]},
+  }
+}
+
+fn finding(comment_id: int, answered: string? = nil) -> FleetReviewFinding {
+  const base: FleetReviewFinding = {
+    thread_id: "T" + to_string(comment_id),
+    comment_id: comment_id,
+    path: "src/lib.rs",
+    line: 12,
+    body: "**issue** · blocking: the update drops a field",
+    url: "https://github.com/owner/consumer/pull/7#discussion_r" + to_string(comment_id),
+  }
+  return if answered == nil {
+    base
+  } else {
+    base + {answered_head: answered ?? ""}
+  }
+}
+
+/** Only the reviewer's open threads are findings; a person's thread is theirs. */
+pipeline test_only_unresolved_reviewer_threads_are_findings() {
+  const found = fleet_review_findings_from_threads(
+    [
+      thread("T1", "github-actions", 101),
+      thread("T2", "github-actions", 102, true),
+      thread("T3", "someone", 103),
+      thread("T4", "github-actions", 0),
+      thread("T5", "github-actions", 105, false, "fixed " + fleet_review_answer_marker(HEAD)),
+    ],
+  )
+  assert_eq(found.map({ row -> row.comment_id }).to_list(), [101, 105])
+  assert_eq(found[0]?.answered_head, nil)
+  assert_eq(found[1]?.answered_head, HEAD)
+}
+
+/** A finding answered at the current head is escalated; any head change reopens it. */
+pipeline test_standing_separates_unanswered_from_escalated_at_this_head() {
+  assert_eq(fleet_review_standing([], HEAD).state, "none")
+  const mixed = fleet_review_standing([finding(1, HEAD), finding(2)], HEAD)
+  assert_eq(mixed.state, "unanswered")
+  assert_eq(mixed.findings.map({ row -> row.comment_id }).to_list(), [2])
+  assert_eq(fleet_review_standing([finding(1, HEAD), finding(2, HEAD)], HEAD).state, "escalated")
+  // The fleet answered at an older head and the branch moved since: answer again.
+  assert_eq(fleet_review_standing([finding(1, NEW_HEAD)], HEAD).state, "unanswered")
+}
+
+/** Every reply carries the head it answered at, which is what the next round reads. */
+pipeline test_reply_names_the_head_it_answered_at() {
+  const repaired = fleet_review_reply_body(
+    {status: "repaired", head_sha: NEW_HEAD, reason: "validated_published_and_auto_merge_armed"},
+    HEAD,
+  )
+  assert(contains(repaired, NEW_HEAD))
+  assert(contains(repaired, fleet_review_answer_marker(NEW_HEAD)))
+  const escalated = fleet_review_reply_body(
+    {status: "escalated", reason: "validation_attempts_exhausted"},
+    HEAD,
+  )
+  assert(contains(escalated, "validation_attempts_exhausted"))
+  assert(contains(escalated, fleet_review_answer_marker(HEAD)))
+  // The parse and the marker are one contract: a reply the fleet wrote reads back.
+  assert_eq(
+    fleet_review_findings_from_threads([thread("T", "github-actions", 9, false, escalated)])[0]
+      ?.answered_head,
+    HEAD,
+  )
+}
+
+pipeline test_the_thread_read_refuses_a_second_page(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    API + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: {hasNextPage: false},
+                  nodes: [thread("T1", "github-actions", 101)],
+                },
+              },
+            },
+          },
+        },
+      ),
+    },
+  )
+  const read = fleet_review_findings(harness, "owner/consumer", 7, options())
+  assert_eq(unwrap(read).map({ row -> row.comment_id }).to_list(), [101])
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    API + "/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            repository: {pullRequest: {reviewThreads: {pageInfo: {hasNextPage: true}, nodes: []}}},
+          },
+        },
+      ),
+    },
+  )
+  assert(is_err(fleet_review_findings(harness, "owner/consumer", 7, options())))
+}
+
+pipeline test_each_finding_gets_one_reply_and_a_failed_reply_is_reported(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    API + "/repos/owner/consumer/pulls/7/comments/101/replies",
+    {status: 201, body: json_stringify({id: 1})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    API + "/repos/owner/consumer/pulls/7/comments/102/replies",
+    {status: 422, body: json_stringify({message: "Validation Failed"})},
+  )
+  const replies = fleet_answer_review_findings(
+    harness,
+    "owner/consumer",
+    7,
+    [finding(101), finding(102)],
+    {status: "escalated", reason: "repair_disabled_by_update_contract"},
+    HEAD,
+    options(),
+  )
+  assert_eq(replies.map({ reply -> reply.posted }).to_list(), [true, false])
+}
+
+pipeline test_unanswered_findings_are_repairable_and_escalated_ones_are_final() {
+  const unanswered = fleet_chain_refusal(
+    {repo: "owner/consumer", state: "failed", reason: "review_findings_unanswered"},
+  )
+  assert_eq(unanswered?.kind, "repairable")
+  const escalated = fleet_chain_refusal(
+    {repo: "owner/consumer", state: "failed", reason: "review_findings_escalated"},
+  )
+  assert_eq(escalated?.kind, "final")
+}
+
+const POLICY: FleetRepairPolicy = {
+  max_repositories: 1,
+  max_rounds: 4,
+  max_attempts_per_repository: 2,
+  max_tokens_per_attempt: 4000,
+  max_cost_per_attempt_usd: 0.3,
+  max_cost_per_repository_usd: 0.6,
+  max_cost_per_run_usd: 4.0,
+  runtime_provenance: {
+    harn_version: "v0.10.96",
+    controller_revision: "test",
+    repair_contract_revision: "harn-update-repair-v10",
+  },
+  provider_secret_reference: "CEREBRAS_API_KEY",
+}
+
+fn consumer(enabled: bool = true) -> FleetRepository {
+  return {
+    slug: "owner/consumer",
+    directory: "consumer",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: "harn package verify .",
+    bump_repair_enabled: enabled,
+  }
+}
+
+fn reviewed_snapshot() -> FleetConvergenceSnapshot {
+  return {
+    target: "v0.10.78",
+    complete: false,
+    terminal: true,
+    total_count: 1,
+    pending_count: 0,
+    failing_count: 1,
+    repositories: [
+      {
+        repo: "owner/consumer",
+        state: "failed",
+        reason: "review_findings_unanswered",
+        pr_number: 7,
+        pr_url: "https://github.com/owner/consumer/pull/7",
+        head_sha: HEAD,
+        review_findings: [finding(101)],
+      },
+    ],
+  }
+}
+
+/** A finding is code the agent edits, so the plan hands it over with the finding text. */
+pipeline test_plan_hands_findings_to_the_repair_agent(task: any) {
+  const plan = fleet_repair_plan(reviewed_snapshot(), [consumer()], POLICY)
+  assert_eq(len(plan.candidates), 1)
+  assert_eq(
+    (plan.candidates[0]?.review_findings ?? []).map({ row -> row.comment_id }).to_list(),
+    [101],
+  )
+}
+
+/**
+ * The guarantee: a refused repository's reviewer still gets an answer.
+ *
+ * Repair is disabled for this consumer, so no agent runs and no checkout is
+ * made; the round still replies on the finding with the typed refusal, at the
+ * head it read, and the receipt records the reply.
+ */
+pipeline test_a_refused_repository_still_answers_its_findings(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    API + "/repos/owner/consumer/pulls/7/comments/101/replies",
+    {status: 201, body: json_stringify({id: 1})},
+  )
+  const plan = fleet_repair_plan(reviewed_snapshot(), [consumer(false)], POLICY)
+  assert_eq(len(plan.candidates), 0)
+  const receipt = repair_fleet_plan(harness, plan, POLICY, options())
+  const result = receipt.results.find({ row -> row.repo == "owner/consumer" })
+  assert_eq(result?.reason, "repair_disabled_by_update_contract")
+  assert_eq((result?.review_replies ?? []).map({ reply -> reply.posted }).to_list(), [true])
+  const posted = harness.testing.http_mock_calls().filter({ call -> call.method == "POST" })
+    .to_list()
+  assert_eq(len(posted), 1)
+  assert(contains(to_string(posted[0]?.body ?? ""), "repair_disabled_by_update_contract"))
+  assert(contains(to_string(posted[0]?.body ?? ""), fleet_review_answer_marker(HEAD)))
+}

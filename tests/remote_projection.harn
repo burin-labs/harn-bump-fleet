@@ -98,7 +98,7 @@ const PROJECTION_TITLE = "chore: restore fleet-owned projections"
 const LEGACY_BRANCH = REMOTE_PROJECTION_BRANCH_PREFIX
 
 fn pulls_url() -> string {
-  return BASE + "/repos/octo-org/octo-repo/pulls?state=open&base=main&per_page=100"
+  return BASE + "/repos/octo-org/octo-repo/pulls?state=open&base=main&per_page=10&page=1"
 }
 
 fn issue_url(number: int) -> string {
@@ -121,6 +121,7 @@ fn mock_open_proposals(testing: HarnessTesting, pulls: list<dict>) {
 }
 
 fn mock_closable(testing: HarnessTesting, number: int) {
+  mock_proposal_files(testing, number, [{filename: PATH, status: "modified"}], 1)
   testing.http_mock(
     "POST",
     issue_url(number) + "/comments",
@@ -130,6 +131,27 @@ fn mock_closable(testing: HarnessTesting, number: int) {
     "PATCH",
     issue_url(number),
     {status: 200, body: json_stringify({number: number, state: "closed"})},
+  )
+}
+
+fn mock_proposal_files(testing: HarnessTesting, number: int, files: list<dict>, count: any) {
+  const pull = open_pull(number, LEGACY_BRANCH, PROJECTION_TITLE)
+  const url = BASE + "/repos/octo-org/octo-repo/pulls/${number}"
+  testing.http_mock("GET", url, {status: 200, body: json_stringify(pull + {changed_files: count})})
+  testing.http_mock(
+    "GET",
+    url + "/files?per_page=100&page=1",
+    {
+      status: 200,
+      body: json_stringify(
+        files.map(
+          { file ->
+            {sha: BASE_OID, additions: 1, deletions: 1, changes: 2}
+              + file
+          },
+        ),
+      ),
+    },
   )
 }
 
@@ -819,6 +841,13 @@ pipeline test_a_closed_proposal_is_not_reopened_by_a_cron_job(harness: Harness, 
   // Closing the pull request is how a person says no. The drift is still
   // reported, but a nightly run must not overrule that decision.
   harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    BASE + "/repos/octo-org/octo-repo/pulls?state=closed&head="
+      + url_encode("octo-org:" + branch())
+      + "&base=main&per_page=100",
+    {status: 200, body: "[]"},
+  )
   mock_open_proposals(harness.testing, [])
   mock_file(harness.testing, "main", "name: stale\n")
   mock_file(harness.testing, branch(), EXPECTED)
@@ -1036,12 +1065,63 @@ pipeline test_a_sweep_that_cannot_list_fails_the_run(harness: Harness, task: any
   assert_eq(result.sweep?.superseded, [])
 }
 
+pipeline test_later_page_retirement_requires_complete_inventory(harness: Harness) {
+  for failure in [false, true] {
+    harness.testing.http_mock_clear()
+    mock_fresh_proposal(harness.testing)
+    let first = [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)]
+    let number = 1
+    while number < 10 {
+      first = first + [open_pull(number, "human-work", "Human proposal")]
+      number = number + 1
+    }
+    mock_open_proposals(harness.testing, first)
+    harness.testing.http_mock(
+      "GET",
+      replace(pulls_url(), "&page=1", "&page=2"),
+      if failure {
+        {status: 403, body: "denied"}
+      } else {
+        {status: 200, body: json_stringify([open_pull(60, LEGACY_BRANCH, PROJECTION_TITLE)])}
+      },
+    )
+    mock_closable(harness.testing, 59)
+    mock_closable(harness.testing, 60)
+    mock_pull_for_arming(harness.testing, COMMIT_OID)
+    const result = converge_remote_repository(
+      harness,
+      SLUG,
+      "main",
+      targets(),
+      true,
+      false,
+      options(),
+    )
+    assert_eq(remote_convergence_failed(result), failure, json_stringify(result))
+    assert_eq(
+      closed_numbers(result),
+      if failure {
+        []
+      } else {
+        [59, 60]
+      },
+    )
+    const calls = methods_called(harness.testing)
+    assert_eq(contains(calls, "PATCH " + issue_url(59)), !failure)
+    assert_eq(contains(calls, "PATCH " + issue_url(60)), !failure)
+    if failure {
+      assert(contains(result.sweep?.error ?? "", "page 2 after 10 pull requests"))
+    }
+  }
+}
+
 pipeline test_a_refused_close_is_reported_rather_than_raised(harness: Harness, task: any) {
   // One repository declining a close must not end the run that was repairing
   // twenty-six others.
   harness.testing.http_mock_clear()
   mock_file(harness.testing, "main", EXPECTED)
   mock_open_proposals(harness.testing, [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)])
+  mock_proposal_files(harness.testing, 59, [{filename: PATH, status: "modified"}], 1)
   harness.testing.http_mock(
     "POST",
     issue_url(59) + "/comments",
@@ -1070,6 +1150,109 @@ fn pending_result(created_at: string) -> RemoteConvergenceResult {
     pull_request: AUTO_MERGE_PR,
     created_at: created_at,
   }
+}
+
+pipeline test_partial_convergence_retains_unrelated_and_mixed_proposals(
+  harness: Harness,
+  task: any,
+) {
+  for files in [
+    [{filename: "dependabot.yml", status: "modified"}],
+    [{filename: PATH, status: "modified"}, {filename: "dependabot.yml", status: "modified"}],
+    [{filename: PATH, status: "renamed", previous_filename: "dependabot.yml"}],
+  ] {
+    harness.testing.http_mock_clear()
+    mock_file(harness.testing, "main", EXPECTED)
+    mock_open_proposals(harness.testing, [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)])
+    mock_closable(harness.testing, 59)
+    mock_proposal_files(harness.testing, 59, files, len(files))
+    const result = converge_remote_repository(
+      harness,
+      SLUG,
+      "main",
+      targets(),
+      true,
+      false,
+      options(),
+    )
+    assert_eq(closed_numbers(result), [])
+    assert_eq(result.sweep?.retained?.[0]?.reason, "outside_scope")
+    assert_eq(result.sweep?.retained?.[0]?.total_files, len(files))
+    assert_eq(
+      wrote_anything(harness.testing),
+      false,
+      "no comment or close may fire for unrelated work",
+    )
+    assert_eq(remote_convergence_failed(result), false)
+  }
+}
+
+pipeline test_unmeasured_proposals_are_retained_and_fail_the_census(harness: Harness, task: any) {
+  for count in [nil, 2, 3001] {
+    harness.testing.http_mock_clear()
+    mock_file(harness.testing, "main", EXPECTED)
+    mock_open_proposals(harness.testing, [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)])
+    mock_closable(harness.testing, 59)
+    mock_proposal_files(harness.testing, 59, [{filename: PATH, status: "modified"}], count)
+    const result = converge_remote_repository(
+      harness,
+      SLUG,
+      "main",
+      targets(),
+      true,
+      false,
+      options(),
+    )
+    assert_eq(closed_numbers(result), [])
+    assert_eq(result.sweep?.retained?.[0]?.reason, "unmeasured")
+    assert_eq(remote_convergence_failed(result), true)
+    assert_eq(wrote_anything(harness.testing), false)
+  }
+}
+
+pipeline test_a_measured_empty_proposal_is_retained(harness: Harness, task: any) {
+  harness.testing.http_mock_clear()
+  mock_file(harness.testing, "main", EXPECTED)
+  mock_open_proposals(harness.testing, [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)])
+  mock_closable(harness.testing, 59)
+  mock_proposal_files(harness.testing, 59, [], 0)
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
+  assert_eq(closed_numbers(result), [])
+  assert_eq(result.sweep?.retained?.[0]?.reason, "empty")
+  assert_eq(result.sweep?.retained?.[0]?.total_files, 0)
+  assert_eq(wrote_anything(harness.testing), false)
+}
+
+pipeline test_failed_replacement_does_not_close_prior_proposals(harness: Harness, task: any) {
+  mock_fresh_proposal(harness.testing)
+  mock_open_proposals(harness.testing, [open_pull(59, LEGACY_BRANCH, PROJECTION_TITLE)])
+  mock_closable(harness.testing, 59)
+  harness.testing.http_mock(
+    "POST",
+    refs_url(),
+    {status: 403, body: json_stringify({message: "denied"})},
+  )
+  const result = converge_remote_repository(
+    harness,
+    SLUG,
+    "main",
+    targets(),
+    true,
+    false,
+    options(),
+  )
+  assert_eq(result.status, "error")
+  assert_eq(closed_numbers(result), [])
+  assert_eq(contains(methods_called(harness.testing), "PATCH " + issue_url(59)), false)
+  assert_eq(close_comment(harness.testing, 59), "")
 }
 
 pipeline test_pull_request_age_is_measured_in_whole_days(task: any) {
@@ -1263,6 +1446,32 @@ pipeline test_an_overdue_proposal_is_named_on_the_status_line(task: any) {
     ),
     "pending octo-org/octo-repo: PROJECTION.yml [overdue: 8d]",
   )
+}
+
+pipeline test_retained_recovery_fails_but_an_open_proposal_remains_pending(task: any) {
+  const retained: RemoteConvergenceResult = {
+    slug: SLUG,
+    status: "pending",
+    drifted: [PATH],
+    recovery: {
+      state: "retained",
+      reason: "closure lacks exact release-App supersession provenance",
+    },
+  }
+  assert_eq(remote_convergence_failed(retained), true)
+  assert_eq(
+    projection_status_line(retained),
+    "pending octo-org/octo-repo: PROJECTION.yml [recovery retained: closure lacks exact release-App supersession provenance]",
+  )
+  const reopened: RemoteConvergenceResult = {
+    slug: SLUG,
+    status: "pending",
+    drifted: [PATH],
+    pull_request: 42,
+    recovery: {state: "reopened", reason: "verified bot supersession"},
+  }
+  assert_eq(remote_convergence_failed(reopened), false)
+  assert_eq(remote_convergence_failed(pending_result("")), false)
 }
 
 pipeline test_a_sweep_is_named_on_the_status_line(task: any) {

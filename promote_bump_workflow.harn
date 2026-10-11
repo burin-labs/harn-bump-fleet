@@ -19,10 +19,13 @@
 import { ParserSpec } from "std/cli/argparse"
 import { GithubClientOptions, api_call } from "harn-github-connector/default"
 import {
+  HARN_BUMP_WORKFLOW_SLUG,
   bump_workflow_promotion_targets,
   promote_bump_workflow_manifest,
   promote_bump_workflow_manifest_text,
+  promotion_history_commits,
   released_bump_workflow_reference,
+  released_pin_landing,
 } from "lib/bump_workflow_promotion"
 import { cli_options } from "lib/cli_options"
 import {
@@ -44,10 +47,12 @@ import {
   projection_source_key,
 } from "lib/fleet_projection_targets"
 import {
+  github_commit_reachable_from_branch,
   github_connector_options,
   github_file_text_at_ref,
   github_file_text_at_ref_result,
 } from "lib/github"
+import { github_commit_pull_requests } from "lib/github_commits"
 import { PrerequisiteProjectionLease } from "lib/prerequisite_prs"
 import {
   PrerequisiteWaitReceipt,
@@ -61,7 +66,9 @@ import {
   observe_remote_projection_effect,
 } from "lib/remote_projection"
 
-type Options = {commit_oid: string, timeout_s: int, interval_s: int}
+type Options = {commit_oid: string, timeout_s: int, interval_s: int, repositories_json: string}
+
+import { ReleaseLandingReceipt } from "lib/release_merge_lease"
 
 import {
   fleet_operation_scope,
@@ -79,6 +86,8 @@ pub type BumpWorkflowPromotionRequest = {
   interval_s: int,
   apply: bool,
   repositories_json?: string,
+  landing?: ReleaseLandingReceipt,
+  pin_sha?: string,
 }
 
 pub type BumpWorkflowPromotionReceipt = {
@@ -120,6 +129,10 @@ const ARG_SPEC: ParserSpec = {
     {kind: "positional", name: "commit_oid", required: true},
     {kind: "flag", name: "timeout_s", long: "--timeout-s", parse: "int", default: 10800},
     {kind: "flag", name: "interval_s", long: "--interval-s", parse: "int", default: 20},
+    // A release promotes only the controller policy here and lets each
+    // consumer's adapter converge and start its own bump; see
+    // .github/workflows/promote-released-orchestration.yml.
+    {kind: "flag", name: "repositories_json", long: "--repositories-json", default: ""},
   ],
 }
 
@@ -198,12 +211,16 @@ pub fn select_bump_workflow_commit(
       detail: "the current orchestration pin is a descendant of the requested release commit",
     }
   }
-  if relation == "behind" {
+  if relation == "behind" || relation == "identical" {
     return {
       state: "selected",
       effective_commit_oid: requested_commit_oid,
       preserved_advanced: false,
-      detail: "the current orchestration pin predates the requested release commit",
+      detail: if relation == "identical" {
+        "the orchestration pins resolve to the same certified landing"
+      } else {
+        "the current orchestration pin predates the requested release commit"
+      },
     }
   }
   return {
@@ -235,6 +252,58 @@ fn compare_bump_workflow_commits(
     return Err("GitHub compare omitted a recognized orchestration history relation")
   }
   return Ok(relation)
+}
+
+/** Whether a commit is an ancestor of main, through the one owner of that question. */
+fn bump_workflow_commit_on_main(harness: Harness, commit_oid: string) -> Result<bool, string> {
+  const reachable = github_commit_reachable_from_branch(
+    harness,
+    HARN_BUMP_WORKFLOW_SLUG,
+    commit_oid,
+    "main",
+    github_connector_options(),
+  )
+  if is_err(reachable) {
+    return Err("could not compare orchestration commits: " + to_string(unwrap_err(reachable)))
+  }
+  return Ok(unwrap(reachable).reachable)
+}
+
+/**
+ * Compare a pin by the commit it landed as on main, so a prior release's tag commit is comparable.
+ */
+fn landed_bump_workflow_commit(harness: Harness, commit_oid: string) -> Result<string, string> {
+  const on_main = bump_workflow_commit_on_main(harness, commit_oid)
+  if is_err(on_main) {
+    return Err(unwrap_err(on_main))
+  }
+  if unwrap(on_main) {
+    return Ok(commit_oid)
+  }
+  const pulls = github_commit_pull_requests(harness, "burin-labs/harn", commit_oid)
+  if is_err(pulls) {
+    return Err(
+      "could not read the release pull request for orchestration pin ${commit_oid}: "
+        + to_string(unwrap_err(pulls)),
+    )
+  }
+  const landing = released_pin_landing(commit_oid, unwrap(pulls))
+  if landing == nil {
+    // Not a landed release pin: compare it as-is and let history decide.
+    return Ok(commit_oid)
+  }
+  const landed = unwrap(landing)
+  const landed_on_main = bump_workflow_commit_on_main(harness, landed)
+  if is_err(landed_on_main) {
+    return Err(unwrap_err(landed_on_main))
+  }
+  return Ok(
+    if unwrap(landed_on_main) {
+      landed
+    } else {
+      commit_oid
+    },
+  )
 }
 
 fn remote_fleet_source(harness: Harness, options: GithubClientOptions) -> Result<string, string> {
@@ -379,10 +448,32 @@ pub fn run_bump_workflow_promotion(
     const source = unwrap(source_result)
     const current = parse_fleet_manifest(toml_parse(source))
     const current_commit = parse_workflow_policy_reference(current.policy.bump_workflow).ref
+    const history = promotion_history_commits(
+      current_commit,
+      request.commit_oid,
+      request.landing,
+      request.pin_sha ?? "",
+      fn(oid) {
+        const on_main = bump_workflow_commit_on_main(harness, oid)
+        return is_ok(on_main) && unwrap(on_main)
+      },
+    )
+    if is_err(history) {
+      return failed_promotion(request, unwrap_err(history))
+    }
+    const comparison = unwrap(history)
     const relation = if current_commit == request.commit_oid {
       "identical"
     } else {
-      const compared = compare_bump_workflow_commits(harness, request.commit_oid, current_commit)
+      const landed_current = landed_bump_workflow_commit(harness, comparison.current)
+      if is_err(landed_current) {
+        return failed_promotion(request, unwrap_err(landed_current))
+      }
+      const compared = compare_bump_workflow_commits(
+        harness,
+        comparison.requested,
+        unwrap(landed_current),
+      )
       if is_err(compared) {
         return failed_promotion(request, unwrap_err(compared))
       }
@@ -550,13 +641,18 @@ fn resolved_sources(
 
 pipeline main(harness: Harness) -> int {
   const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const request: BumpWorkflowPromotionRequest = {
+    commit_oid: options.commit_oid,
+    timeout_s: options.timeout_s,
+    interval_s: options.interval_s,
+    apply: true,
+  }
   const receipt = run_bump_workflow_promotion(
     harness,
-    {
-      commit_oid: options.commit_oid,
-      timeout_s: options.timeout_s,
-      interval_s: options.interval_s,
-      apply: true,
+    if options.repositories_json == "" {
+      request
+    } else {
+      request + {repositories_json: options.repositories_json}
     },
   )
   harness.stdio.println(
