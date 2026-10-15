@@ -7,6 +7,10 @@ harnesses themselves.
 
 The entry points are:
 
+- `check_prless_branches.harn`: reads the complete remote branch inventory and
+  publishes a workflow summary and JSON receipt. It has no issue-write or
+  branch-mutation authority. A missing PR does not establish abandonment;
+  cleanup tasks must name a bounded batch and its disposition.
 - `bump_fleet.harn`: finds local `~/projects/{*harn*,*burin*}` repos with
   `.github/workflows/bump-harn.yml`, dispatches Harn runtime bump workflows,
   polls them, and enables auto-merge on the resulting PRs.
