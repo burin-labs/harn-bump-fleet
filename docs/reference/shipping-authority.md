@@ -40,3 +40,11 @@ uses the same installation's verified shadow generation and writer enrollment.
 Declaring these records does not transfer controller authority. Live enrollment
 still requires release guards, exact source and protection snapshots, a complete
 authenticated drain census, and Harn's fenced generation transfer.
+
+## Shared file ownership
+
+Shipping enrollment does not delegate shared file updates. A repository with
+`shared_projection_ownership = "repository"` retains ownership of its agent
+guidance, Dependabot configuration, and merge override caller. Existing fleet
+consumers default to `"fleet"`. Package CI, runtime bumps, and consumer-declared
+file projections retain their separate explicit contracts.
