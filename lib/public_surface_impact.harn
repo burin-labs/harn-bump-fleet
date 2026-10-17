@@ -1,0 +1,576 @@
+import { command_run } from "std/command"
+import { RootEvidence, search_evidence } from "std/fs"
+
+pub type PublicSurfaceUsageMatch = {surface: string, evidence: string}
+
+pub type PublicSurfaceUsage = {
+  repo: string,
+  match_count: int,
+  matches: list<PublicSurfaceUsageMatch>,
+}
+
+pub type PublicSurfaceImpactReport = {
+  target: string,
+  source_status: string,
+  source_detail: string,
+  surfaces: list<string>,
+  surface_count: int,
+  affected_repos: list<PublicSurfaceUsage>,
+  affected_repo_count: int,
+}
+
+pub type PublicSurfaceReleaseDiff = {
+  known: bool,
+  status: string,
+  detail: string,
+  base_tag: string,
+  target_tag: string,
+  paths: list<string>,
+  patch: string,
+}
+
+pub type PublicSurfaceAnalysis = {
+  changelog_section?: string,
+  changelog_unreleased_section?: string,
+  diff_names?: string,
+  commit_file_changes_since_latest_tag?: string,
+  commit_stats_since_latest_tag?: string,
+  public_surface_diff?: string,
+  ...rest,
+}
+
+pub type PublicSurfaceCommand = {argv: list<string>, ...rest}
+
+pub type PublicSurfaceCommandResult = {success?: bool, stdout?: string, stderr?: string, ...rest}
+
+pub type PublicSurfaceRunner = fn(PublicSurfaceCommand) -> PublicSurfaceCommandResult
+
+pub type PublicSurfaceRepo = {slug?: string, repo?: string, dir: string, ...rest}
+
+const IMPACT_KEYWORDS = [
+  "breaking",
+  "removed",
+  "remove",
+  "renamed",
+  "rename",
+  "replaced",
+  "replace",
+  "deleted",
+  "delete",
+  "signature",
+  "no longer",
+]
+
+fn unique_push_text(values: any, value: any) {
+  const trimmed = trim(to_string(value ?? ""))
+  if trimmed == "" {
+    return values
+  }
+  for existing in values {
+    if existing == trimmed {
+      return values
+    }
+  }
+  return values + [trimmed]
+}
+
+fn line_is_surface_impact(line: any) {
+  const lower = lowercase(line ?? "")
+  for keyword in IMPACT_KEYWORDS {
+    if contains(lower, keyword) {
+      return true
+    }
+  }
+  return false
+}
+
+fn impact_surface_segment(line: any) {
+  const text = to_string(line ?? "")
+  const lower = lowercase(text)
+  if (contains(lower, "removed") || contains(lower, "delete")) && contains(text, ";") {
+    return split(text, ";")[0] ?? text
+  }
+  return text
+}
+
+fn normalize_public_surface_token(value: any) {
+  return regex_replace("[,.;:!?]+$", "", trim(to_string(value ?? "")))
+}
+
+fn looks_like_public_surface(value: any) {
+  const token = normalize_public_surface_token(value)
+  if token == "" {
+    return false
+  }
+  if contains(token, " ") || contains(token, "\n") || contains(token, "\t") {
+    return false
+  }
+  if starts_with(token, "v") && len(regex_captures("^v[0-9]+\\.[0-9]+\\.[0-9]+$", token)) > 0 {
+    return false
+  }
+  const has_public_shape = contains(token, "/")
+    || contains(token, "::")
+    || contains(token, ".")
+    || contains(token, "_")
+  if !has_public_shape {
+    return false
+  }
+  return len(regex_captures("[A-Za-z]", token)) > 0
+}
+
+fn normalize_release_tag(target: any) {
+  const value = trim(to_string(target ?? ""))
+  if starts_with(value, "v") {
+    return value
+  }
+  return "v" + value
+}
+
+fn is_public_surface_source_path(path: any) {
+  const value = trim(to_string(path ?? ""))
+  if starts_with(value, "crates/") && ends_with(value, ".rs") && !contains(value, "/tests/")
+    && !ends_with(value, "_tests.rs") {
+    return true
+  }
+  if (starts_with(value, "stdlib/") || starts_with(value, "scripts/"))
+    && !starts_with(value, "scripts/tests/")
+    && ends_with(value, ".harn") {
+    return true
+  }
+  return (starts_with(value, "spec/") || starts_with(value, "conformance/protocols/"))
+    && (ends_with(value, ".json")
+      || ends_with(value, ".toml")
+      || ends_with(value, ".harn"))
+}
+
+pub fn public_surface_diff_paths_from_text(text: string) -> list<string> {
+  let paths = []
+  for line in split(text ?? "", "\n") {
+    const path = trim(line)
+    if is_public_surface_source_path(path) {
+      paths = unique_push_text(paths, path)
+    }
+  }
+  return paths.sort()
+}
+
+fn release_diff_runner(tools: HarnessTools, harn_repo: any, runner: any) {
+  return if runner == nil {
+    { spec ->
+      command_run(
+        tools,
+        spec + {cwd: harn_repo, capture: {max_inline_bytes: 512000}},
+        {timeout_ms: 30000},
+      )
+    }
+  } else {
+    runner
+  }
+}
+
+/**
+ * Read a bounded, source-only release diff. Failure to resolve historical tags
+ * is evidence unavailable, never a release or downstream-bump blocker.
+ */
+pub fn public_surface_release_diff(
+  tools: HarnessTools,
+  target: string,
+  harn_repo: string,
+  runner: PublicSurfaceRunner? = nil,
+) -> PublicSurfaceReleaseDiff {
+  const run = release_diff_runner(tools, harn_repo, runner)
+  const target_tag = normalize_release_tag(target)
+  const previous = run({argv: ["git", "describe", "--tags", "--abbrev=0", target_tag + "^"]})
+  if !(previous?.success ?? false) || trim(previous?.stdout ?? "") == "" {
+    return {
+      known: false,
+      status: "previous_tag_unavailable",
+      detail: trim(previous?.stderr ?? "could not resolve previous release tag"),
+      base_tag: "",
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const base_tag = trim(previous.stdout)
+  const changed = run({argv: ["git", "diff", "--name-only", base_tag + ".." + target_tag]})
+  if !(changed?.success ?? false) {
+    return {
+      known: false,
+      status: "release_diff_paths_unavailable",
+      detail: trim(changed?.stderr ?? "could not list release diff paths"),
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const paths = public_surface_diff_paths_from_text(changed.stdout ?? "")
+  if len(paths) == 0 {
+    return {
+      known: true,
+      status: "git_release_diff",
+      detail: "no public-surface source files changed from ${base_tag} to ${target_tag}",
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: [],
+      patch: "",
+    }
+  }
+  const diff = run(
+    {
+      argv: ["git", "diff", "--unified=0", "--no-ext-diff", base_tag + ".." + target_tag, "--"]
+        + paths,
+    },
+  )
+  if !(diff?.success ?? false) {
+    return {
+      known: false,
+      status: "release_diff_unavailable",
+      detail: trim(diff?.stderr ?? "could not read public-surface release diff"),
+      base_tag: base_tag,
+      target_tag: target_tag,
+      paths: paths,
+      patch: "",
+    }
+  }
+  return {
+    known: true,
+    status: "git_release_diff",
+    detail:
+      "inspected ${len(paths)} public-surface source file(s) from ${base_tag} to ${target_tag}",
+    base_tag: base_tag,
+    target_tag: target_tag,
+    paths: paths,
+    patch: diff.stdout ?? "",
+  }
+}
+
+fn backtick_tokens(line: any) {
+  let values = []
+  for capture in regex_captures("`([^`]+)`", line ?? "") ?? [] {
+    const groups = capture?.groups ?? []
+    if len(groups) > 0 {
+      const token = normalize_public_surface_token(groups[0])
+      if looks_like_public_surface(token) {
+        values = unique_push_text(values, token)
+      }
+    }
+  }
+  return values
+}
+
+fn symbol_tokens(line: any) {
+  let values = []
+  for capture in regex_captures(
+    "[A-Za-z][A-Za-z0-9_/-]*(::|\\.|/|-|_)[A-Za-z0-9_./:-]*",
+    line ?? "",
+  )
+    ?? [] {
+    const groups = capture?.groups ?? []
+    const token = normalize_public_surface_token(capture?.match ?? groups[0])
+    if looks_like_public_surface(token) {
+      values = unique_push_text(values, token)
+    }
+  }
+  return values
+}
+
+fn capture_tokens(line: any, pattern: any) {
+  let values = []
+  for capture in regex_captures(pattern, line ?? "") ?? [] {
+    const groups = capture?.groups ?? []
+    const raw = if len(groups) > 0 {
+      groups[0]
+    } else {
+      capture?.match ?? ""
+    }
+    const token = normalize_public_surface_token(raw)
+    if token != "" {
+      values = unique_push_text(values, token)
+    }
+  }
+  return values
+}
+
+fn diff_line_is_content(line: any) {
+  return (starts_with(line, "+") && !starts_with(line, "+++"))
+    || (starts_with(line, "-")
+      && !starts_with(line, "---"))
+}
+
+fn public_surface_tokens_from_diff_line(line: any) {
+  const lower = lowercase(line ?? "")
+  let values = []
+  for capture in regex_captures(
+    "^[-+]\\s*pub\\s+(fn|type|struct|enum|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+    line ?? "",
+  )
+    ?? [] {
+    const groups = capture?.groups ?? []
+    if len(groups) > 1 {
+      values = unique_push_text(values, groups[1])
+    }
+  }
+  for field in capture_tokens(line, "^[-+]\\s*pub\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*:") {
+    if contains(field, "_") {
+      values = unique_push_text(values, field)
+    }
+  }
+  for constant in capture_tokens(line, "[A-Z0-9_]*SCHEMA_VERSION") {
+    values = unique_push_text(values, constant)
+  }
+  if contains(lower, "schema") || contains(lower, "protocol") || contains(lower, "event")
+    || contains(lower, "command(name") {
+    for token in capture_tokens(line, "\\\"([A-Za-z][A-Za-z0-9_.-]*)\\\"") {
+      const cli_subcommand = contains(lower, "command(name")
+        && len(regex_captures("^[A-Za-z][A-Za-z0-9-]*$", token))
+          > 0
+      if looks_like_public_surface(token) || cli_subcommand {
+        values = unique_push_text(values, token)
+      }
+    }
+  }
+  return values
+}
+
+/** Extract downstream-searchable symbols from changed public source lines. */
+pub fn public_surface_candidates_from_diff(diff: string) -> list<string> {
+  let surfaces = []
+  for line in split(diff ?? "", "\n") {
+    if !diff_line_is_content(line) {
+      continue
+    }
+    for token in public_surface_tokens_from_diff_line(line) {
+      surfaces = unique_push_text(surfaces, token)
+    }
+  }
+  return surfaces.sort()
+}
+
+/**
+ * Extract public Harn/stdlib/builtin/API surface tokens from release evidence.
+ *
+ * This is deliberately conservative: only lines that describe a breaking or
+ * removed/renamed/replaced/signature-changing surface contribute tokens.
+ */
+pub fn public_surface_candidates_from_text(text: string) -> list<string> {
+  let surfaces = []
+  for line in split(text ?? "", "\n") {
+    if !line_is_surface_impact(line) {
+      continue
+    }
+    const segment = impact_surface_segment(line)
+    for token in backtick_tokens(segment) + symbol_tokens(segment) {
+      surfaces = unique_push_text(surfaces, token)
+    }
+  }
+  return surfaces.sort()
+}
+
+pub fn public_surface_candidates_from_analysis(analysis: PublicSurfaceAnalysis) -> list<string> {
+  const evidence = join(
+    [
+      analysis?.changelog_section ?? "",
+      analysis?.changelog_unreleased_section ?? "",
+      analysis?.diff_names ?? "",
+      analysis?.commit_file_changes_since_latest_tag ?? "",
+      analysis?.commit_stats_since_latest_tag ?? "",
+    ],
+    "\n",
+  )
+  let surfaces = []
+  for token in public_surface_candidates_from_text(evidence)
+    + public_surface_candidates_from_diff(analysis?.public_surface_diff ?? "") {
+    surfaces = unique_push_text(surfaces, token)
+  }
+  return surfaces.sort()
+}
+
+pub fn public_surface_usage_from_text(
+  repo: string,
+  text: string,
+  surfaces: list<string>,
+) -> PublicSurfaceUsage {
+  let matches: list<PublicSurfaceUsageMatch> = []
+  const body = text ?? ""
+  for surface in surfaces ?? [] {
+    const token = trim(to_string(surface ?? ""))
+    if token != "" && contains(body, token) {
+      matches = matches + [{surface: token, evidence: "text"}]
+    }
+  }
+  return {repo: repo, match_count: len(matches), matches: matches}
+}
+
+fn usage_from_evidence(repo: any, root: RootEvidence?) -> PublicSurfaceUsage {
+  let matches: list<PublicSurfaceUsageMatch> = []
+  for pattern in root?.patterns ?? [] {
+    if pattern.count > 0 {
+      const evidence = pattern.hits.map(
+        { hit -> "${hit.path}:${hit.line}:${hit.column}:${hit.text}" },
+      )
+        .to_list()
+      matches = matches + [{surface: pattern.id, evidence: join(evidence, "\n")}]
+    }
+  }
+  return {repo: repo, match_count: len(matches), matches: matches}
+}
+
+fn public_surface_usages(fs: HarnessFs, checkouts: any, surfaces: any) -> list<PublicSurfaceUsage> {
+  let candidates = []
+  for surface in surfaces ?? [] {
+    candidates = unique_push_text(candidates, surface)
+  }
+  const patterns = candidates.map({ surface -> {id: surface, text: surface} }).to_list()
+  if len(patterns) == 0 || len(checkouts) == 0 {
+    return []
+  }
+  const receipt = search_evidence(
+    fs,
+    checkouts.map({ checkout -> {id: checkout.repo, path: checkout.path} }).to_list(),
+    patterns,
+    {preset: "source"},
+  )
+  let usages: list<PublicSurfaceUsage> = []
+  for checkout in checkouts {
+    const roots = receipt.roots.filter({ root -> root.id == checkout.repo }).to_list()
+    usages = usages + [usage_from_evidence(checkout.repo, roots[0])]
+  }
+  return usages
+}
+
+pub fn public_surface_usage_from_checkout(
+  fs: HarnessFs,
+  repo: string,
+  checkout_dir: string,
+  surfaces: list<string>,
+) -> PublicSurfaceUsage {
+  const usages = public_surface_usages(fs, [{repo: repo, path: checkout_dir}], surfaces)
+  return usages[0] ?? {repo: repo, match_count: 0, matches: []}
+}
+
+pub fn public_surface_usage_from_repo(
+  fs: HarnessFs,
+  repo: string,
+  surfaces: list<string>,
+) -> PublicSurfaceUsage {
+  return public_surface_usage_from_checkout(fs, repo, repo, surfaces)
+}
+
+pub fn public_surface_impact_report_from_surfaces(
+  target: string,
+  surfaces: list<string>,
+  downstream_usages: list<PublicSurfaceUsage>,
+  source_status: string = "analysis",
+  source_detail: string = "",
+) -> PublicSurfaceImpactReport {
+  let affected: list<PublicSurfaceUsage> = []
+  for usage in downstream_usages ?? [] {
+    if usage.match_count > 0 {
+      affected = affected + [usage]
+    }
+  }
+  return {
+    target: target,
+    source_status: source_status,
+    source_detail: source_detail,
+    surfaces: surfaces,
+    surface_count: len(surfaces),
+    affected_repos: affected,
+    affected_repo_count: len(affected),
+  }
+}
+
+pub fn public_surface_impact_report(
+  target: string,
+  analysis: PublicSurfaceAnalysis,
+  downstream_usages: list<PublicSurfaceUsage>,
+) -> PublicSurfaceImpactReport {
+  return public_surface_impact_report_from_surfaces(
+    target,
+    public_surface_candidates_from_analysis(analysis),
+    downstream_usages,
+  )
+}
+
+pub fn public_surface_impact_for_repos(
+  fs: HarnessFs,
+  target: string,
+  analysis: PublicSurfaceAnalysis,
+  repos: list<PublicSurfaceRepo>,
+) -> PublicSurfaceImpactReport {
+  const surfaces = public_surface_candidates_from_analysis(analysis)
+  let checkouts = []
+  for repo in repos ?? [] {
+    const label = trim(to_string(repo?.slug ?? repo?.repo ?? repo?.dir ?? ""))
+    const dir = trim(to_string(repo?.dir ?? ""))
+    if label == "" || dir == "" {
+      continue
+    }
+    checkouts = checkouts + [{repo: label, path: dir}]
+  }
+  return public_surface_impact_report_from_surfaces(
+    target,
+    surfaces,
+    public_surface_usages(fs, checkouts, surfaces),
+  )
+}
+
+pub fn public_surface_impact_for_repo(
+  report: PublicSurfaceImpactReport,
+  repo: string,
+) -> PublicSurfaceImpactReport {
+  const affected = report.affected_repos.filter({ usage -> usage.repo == repo }).to_list()
+  return {
+    target: report.target,
+    source_status: report.source_status,
+    source_detail: report.source_detail,
+    surfaces: report.surfaces,
+    surface_count: report.surface_count,
+    affected_repos: affected,
+    affected_repo_count: len(affected),
+  }
+}
+
+fn usage_line(usage: any) {
+  const repo = to_string(usage?.repo ?? "unknown")
+  const surfaces = (usage?.matches ?? []).map({ m -> to_string(m?.surface ?? "") }).to_list()
+  return "- `${repo}`: " + join(surfaces.sort(), ", ")
+}
+
+pub fn public_surface_impact_markdown(target: string, report: PublicSurfaceImpactReport) -> string {
+  const surfaces = report.surfaces
+  const affected = report.affected_repos
+  const surface_line = if len(surfaces) == 0 {
+    "none detected"
+  } else {
+    join(surfaces.map({ s -> "`" + to_string(s) + "`" }).to_list(), ", ")
+  }
+  let lines = [
+    "## Harn public-surface impact",
+    "",
+    "- Target Harn version: `${target}`.",
+    "- Evidence source: `${report.source_status}`"
+      + if trim(report.source_detail) == "" {
+        "."
+      } else {
+        " — " + report.source_detail + "."
+      },
+    "- Candidate changed or removed surfaces: " + surface_line + ".",
+  ]
+  if len(affected) == 0 {
+    lines = lines + ["- Downstream usage: none detected from the scanned repos."]
+  } else {
+    lines = lines + ["- Downstream usage:"]
+    for usage in affected {
+      lines = lines + [usage_line(usage)]
+    }
+  }
+  lines = lines
+    + [
+      "",
+      "This metadata is generated before downstream bump repair so the agent starts with release-owned migration facts instead of inferring the task only from red CI logs.",
+    ]
+  return join(lines, "\n")
+}
