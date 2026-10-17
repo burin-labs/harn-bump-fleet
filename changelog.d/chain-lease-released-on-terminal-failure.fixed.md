@@ -1,0 +1,1 @@
+A fleet update round that ends without dispatching a successor now releases its chain lease before exiting, including after a failing proof gate, so an aborted round no longer strands the controller ref and force a fresh chain.

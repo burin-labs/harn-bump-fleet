@@ -1,0 +1,905 @@
+import { shell_quote } from "std/runtime"
+import { with_temp_dir } from "std/testing"
+import { release_timed_phase } from "../lib/release_runtime"
+import { prompt_asset, release_harness_root, release_run_root } from "../release_harn.harn"
+
+fn pinned_test_binary(harness: {fs: HarnessFs, process: HarnessProcess}, root: string) -> string {
+  const local = path_join(root, ".harn/bin/harn")
+  const binary = if harness.fs.exists(local) {
+    local
+  } else {
+    "harn"
+  }
+  const version = harness.process.run({program: binary, args: ["--version"]})
+  assert_eq(version.exit_code, 0)
+  const expected = trim(harness.fs.read_text(path_join(root, ".harn-version")))
+  assert_eq(trim(version.stdout ?? ""), "harn ${expected}")
+  return binary
+}
+
+pipeline test_release_harness_paths_anchor_to_checkout(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  assert_eq(harness.fs.exists(path_join(root, "release_harn.harn")), true)
+  assert_eq(
+    prompt_asset(harness.fs, "release_report.harn.prompt"),
+    path_join(root, "prompts", "release_report.harn.prompt"),
+  )
+  assert_eq(release_run_root(harness.fs), path_join(root, ".harn-runs/release-harn"))
+}
+
+pipeline test_release_fixup_prompts_describe_immutable_recovery(harness: Harness, task: any) {
+  const prompts = [
+    harness.fs.read_text(prompt_asset(harness.fs, "release_fixup_system.harn.prompt")),
+    harness.fs.read_text(prompt_asset(harness.fs, "release_fixup_user.harn.prompt")),
+  ]
+  for prompt in prompts {
+    assert_eq(contains(prompt, "origin/release/v"), false)
+    assert_eq(contains(prompt, "Force-pushed"), false)
+    assert_eq(contains(lowercase(prompt), "immutable"), true)
+  }
+  assert_eq(contains(prompts[0] ?? "", "fresh candidate"), true)
+  assert_eq(contains(prompts[0] ?? "", "frozen artifact"), true)
+  assert_eq(contains(prompts[1] ?? "", "{{ recovery_oid }}..origin/{{ base_branch }}"), true)
+  assert_eq(contains(prompts[1] ?? "", "{{ fixup_tag }}..origin/{{ base_branch }}"), false)
+}
+
+pipeline test_release_watch_launcher_carries_cleanup_authority_and_exact_egress(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  const launcher = harness.fs.read_text(path_join(root, "scripts/watch_harn_release.sh"))
+  const confined = harness.fs.read_text(path_join(root, "scripts/harn_confined.sh"))
+  const release_egress = harness.fs.read_text(path_join(root, "scripts/with_release_egress.sh"))
+  assert(contains(launcher, "/harn_confined.sh"))
+  assert(contains(launcher, "--approve-risky git.push"))
+  assert_eq(contains(launcher, "--no-sandbox"), false)
+  assert(contains(launcher, "/watch_harn_release.harn"))
+  assert(contains(confined, "/with_env.sh"))
+  assert(contains(confined, "/with_release_egress.sh"))
+  const import_phase = index_of(confined, "if [ \"$artifact_import_egress\" -ne 0 ]")
+  const normal_env = index_of(confined, "/with_env.sh\"")
+  assert(import_phase >= 0)
+  assert(normal_env > import_phase)
+  const import_body = substring(confined, import_phase, normal_env)
+  assert(contains(import_body, "--github-artifact-import"))
+  assert_eq(contains(import_body, "/with_env.sh"), false)
+  assert(
+    contains(
+      release_egress,
+      "HARN_EGRESS_ALLOW=\"api.github.com:443,github.com:443,crates.io:443,static.crates.io:443\"",
+    ),
+  )
+  assert(contains(release_egress, "api.github.com:443,*.blob.core.windows.net:443"))
+  assert(contains(confined, "--github-artifact-import-egress"))
+  assert(contains(confined, "--private-config-root"))
+  assert(contains(confined, "--minimal-artifact-env"))
+  assert(contains(launcher, "--import-hosted-receipt-only"))
+  assert(contains(release_egress, "HARN_EGRESS_DEFAULT=\"deny\""))
+  assert(contains(release_egress, "HARN_EGRESS_BLOCK_PRIVATE=\"private\""))
+  assert(contains(release_egress, "HARN_EGRESS_ALLOW_LOOPBACK=\"0\""))
+  assert(contains(release_egress, "unset HARN_EGRESS_ALLOW"))
+  assert(contains(release_egress, "unset HARN_EGRESS_DENY"))
+  assert(contains(release_egress, "unset HARN_EGRESS_DEFAULT"))
+  assert(contains(release_egress, "unset HARN_EGRESS_BLOCK_PRIVATE"))
+  assert(contains(release_egress, "unset HARN_EGRESS_ALLOW_LOOPBACK"))
+  const guidance = [
+    "AGENTS.md",
+    "docs/how-to/release-harn.md",
+    "docs/how-to/reserve-the-release-queue.md",
+    "watch_harn_release.harn",
+  ]
+  for relative in guidance {
+    const contents = harness.fs.read_text(path_join(root, relative))
+    assert(contains(contents, "scripts/watch_harn_release.sh"))
+    assert_eq(
+      contains(contents, "scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn"),
+      false,
+    )
+  }
+  const recovery_workflow = harness.fs.read_text(
+    path_join(root, ".github/workflows/recover-release-publication.yml"),
+  )
+  assert(contains(recovery_workflow, "./scripts/watch_hosted_harn_release.sh"))
+  assert_eq(
+    contains(
+      recovery_workflow,
+      "scripts/with_env.sh harn run --no-sandbox watch_harn_release.harn",
+    ),
+    false,
+  )
+}
+
+/** Historical mock import stays isolated; live watches receive no mutation grant. */
+pipeline test_release_watch_launcher_splits_hosted_import_from_watch(harness: Harness, task: any) {
+  const source_root = release_harness_root(harness.fs)
+  const fixture = harness.fs.mkdtemp_in_workspace("release-watch-launcher-")
+  const scripts = path_join(fixture, "scripts")
+  const target = path_join(fixture, "harn")
+  const log = path_join(fixture, "calls")
+  harness.fs.mkdir(scripts, true)
+  harness.fs.mkdir(target, true)
+  harness.fs.write_text(
+    path_join(scripts, "watch_harn_release.sh"),
+    harness.fs.read_text(path_join(source_root, "scripts", "watch_harn_release.sh")),
+  )
+  harness.fs.write_text(
+    path_join(scripts, "harn_confined.sh"),
+    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HARN_TEST_WATCH_CALLS\"\ncase \"$*\" in *--import-hosted-receipt-only*) ;; *) printf '{\"phase\":\"watch\"}\\n' ;; esac\n",
+  )
+  const chmod = harness.process.shell(
+    "chmod +x "
+      + shell_quote(path_join(scripts, "watch_harn_release.sh"))
+      + " "
+      + shell_quote(path_join(scripts, "harn_confined.sh")),
+  )
+  assert(chmod.success, chmod.combined)
+  const cases = [
+    {
+      name: "normal watch",
+      args:
+        "--mock --tag v0.10.130 --hosted-run 42 --observe-only --max-polls 1 --yes-live-release --json",
+      recovery: "",
+      recovery_oid: "",
+    },
+    {
+      name: "tag stranded main",
+      args: "--mock --tag v0.10.130 --hosted-run 42 --repo /fixture/harn --github-app-signer"
+        + " --yes-live-release --tag-stranded-main 1111111111111111111111111111111111111111 --json",
+      recovery: "--tag-stranded-main",
+      recovery_oid: "1111111111111111111111111111111111111111",
+    },
+    {
+      name: "unfold merged bump",
+      args: "--mock --tag v0.10.130 --hosted-run=42 --repo /fixture/harn --github-app-signer"
+        + " --yes-live-release --unfold-merged-bump=2222222222222222222222222222222222222222 --json",
+      recovery: "--unfold-merged-bump",
+      recovery_oid: "2222222222222222222222222222222222222222",
+    },
+  ]
+  for fixture_case in cases {
+    if harness.fs.exists(log) {
+      harness.fs.delete(log)
+    }
+    const result = harness.process.shell(
+      "HARN_EXT_RELEASE_REPO="
+        + shell_quote(target)
+        + " HARN_TEST_WATCH_CALLS="
+        + shell_quote(log)
+        + " "
+        + shell_quote(path_join(scripts, "watch_harn_release.sh"))
+        + " "
+        + fixture_case.args,
+    )
+    assert(result.success, "${fixture_case.name}: ${result.combined}")
+    assert_eq(json_parse(trim(result.stdout ?? "")), {phase: "watch"})
+    const calls = harness.fs.read_lines(log)
+    assert_eq(len(calls), 2)
+    assert(contains(calls[0], "--github-artifact-import-egress"))
+    assert(contains(calls[0], "--import-hosted-receipt-only"))
+    assert_eq(contains(calls[0], "--approve-risky git.push"), false)
+    assert_eq(contains(calls[0], "--yes-live-release"), false)
+    assert_eq(contains(calls[0], "--github-app-signer"), false)
+    assert_eq(contains(calls[0], "--json"), false)
+    assert(contains(calls[0], "--tag v0.10.130"))
+    assert(contains(calls[0], "--hosted-run"))
+    assert_eq(contains(calls[1], "--github-artifact-import-egress"), false)
+    assert_eq(contains(calls[1], "--import-hosted-receipt-only"), false)
+    assert(contains(calls[1], "--approve-risky git.push"))
+    assert(ends_with(calls[1], fixture_case.args))
+    assert(contains(calls[1], "--yes-live-release"))
+    assert(contains(calls[1], "--json"))
+    if fixture_case.recovery != "" {
+      assert_eq(contains(calls[0], fixture_case.recovery), false)
+      assert_eq(contains(calls[0], fixture_case.recovery_oid), false)
+      assert(contains(calls[1], fixture_case.recovery))
+      assert(contains(calls[1], fixture_case.recovery_oid))
+      assert(contains(calls[1], "--github-app-signer"))
+    }
+  }
+  harness.fs.delete(log)
+  const live = harness.process.shell(
+    "HARN_EXT_RELEASE_REPO=" + shell_quote(target)
+      + " HARN_TEST_WATCH_CALLS="
+      + shell_quote(log)
+      + " "
+      + shell_quote(path_join(scripts, "watch_harn_release.sh"))
+      + " --receipt handoff.json --release-pr 9326 --producer-run 37167101058 --json",
+  )
+  assert(live.success, live.combined)
+  const live_calls = harness.fs.read_lines(log)
+  assert_eq(len(live_calls), 1)
+  assert(contains(live_calls[0], "--workflow-watch-egress"))
+  assert(
+    contains(live_calls[0], "--receipt handoff.json --release-pr 9326 --producer-run 37167101058"),
+  )
+  assert_eq(contains(live_calls[0], "--approve-risky"), false)
+  assert_eq(contains(live_calls[0], "--import-hosted-receipt-only"), false)
+}
+
+pipeline test_read_only_watch_boundary_needs_no_harn_checkout(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const fixture = harness.fs.mkdtemp_in_workspace("read-only-watch-boundary-")
+  const scripts = path_join(fixture, "scripts")
+  const missing = path_join(fixture, "absent-harn")
+  harness.fs.mkdir(scripts, true)
+  let executables: list<string> = []
+  for name in ["harn_confined.sh", "with_release_egress.sh", "with_github_auth.sh"] {
+    const path = path_join(scripts, name)
+    harness.fs.write_text(path, harness.fs.read_text(path_join(root, "scripts", name)))
+    executables = executables + [path]
+  }
+  const child = path_join(scripts, "harn_shielded.sh")
+  harness.fs.write_text(
+    child,
+    "#!/bin/sh\nprintf '%s\\n' \"\${CEREBRAS_API_KEY:-absent}\" \"$HARN_EGRESS_ALLOW\" \"$*\"\n",
+  )
+  const chmod = harness.process.run({program: "chmod", args: ["+x"] + executables + [child]})
+  assert(chmod.success, chmod.combined)
+  const result = harness.process.run(
+    {
+      program: path_join(scripts, "harn_confined.sh"),
+      args: [
+        missing,
+        "--workflow-watch-egress",
+        "--",
+        "watch_harn_release.harn",
+        "--",
+        "--receipt",
+        "handoff.json",
+      ],
+      env: {GH_TOKEN: "fixture-token", CEREBRAS_API_KEY: "must-not-reach-child"},
+    },
+  )
+  assert(result.success, result.combined)
+  const lines = trim(result.stdout ?? "").split("\n")
+  assert_eq(lines[0], "absent")
+  assert_eq(
+    lines[1],
+    "api.github.com:443,*.blob.core.windows.net:443,github.com:443,release-assets.githubusercontent.com:443",
+  )
+  assert(contains(lines[2] ?? "", "watch_harn_release.harn -- --receipt handoff.json"))
+  assert_eq(contains(lines[2] ?? "", "--repo"), false)
+  assert_eq(contains(lines[2] ?? "", missing), false)
+  assert_eq(harness.fs.exists(missing), false)
+  assert_eq(harness.fs.list_dir(path_join(fixture, ".harn-runs/github-config")), [])
+}
+
+/** Authentication resolves before the child is isolated from the operator config. */
+pipeline test_github_auth_uses_and_cleans_owned_private_config(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const fixture = harness.fs.mkdtemp_in_workspace("github-auth-private-config-")
+  const bin = path_join(fixture, "bin")
+  const private_root = path_join(fixture, "private")
+  const ambient = path_join(fixture, "ambient")
+  const log = path_join(fixture, "calls")
+  harness.fs.mkdir(bin, true)
+  harness.fs.mkdir(ambient, true)
+  harness.fs.write_text(
+    path_join(bin, "gh"),
+    "#!/bin/sh\nprintf 'auth:%s\\n' \"\${GH_CONFIG_DIR:-unset}\" >> \"$HARN_TEST_AUTH_LOG\"\nprintf 'fixture-token\\n'\n",
+  )
+  harness.fs.write_text(
+    path_join(bin, "child"),
+    "#!/bin/sh\nprintf 'child:%s:%s:%s\\n' \"$GH_CONFIG_DIR\" \"\${GH_TOKEN:+set}\" \"\${CEREBRAS_API_KEY:-absent}\"\ntouch \"$GH_CONFIG_DIR/probe\"\n",
+  )
+  const chmod = harness.process.shell(
+    "chmod +x " + shell_quote(path_join(bin, "gh")) + " " + shell_quote(path_join(bin, "child")),
+  )
+  assert(chmod.success, chmod.combined)
+  const command = "env -u GH_TOKEN -u GITHUB_TOKEN PATH="
+    + shell_quote(bin + ":" + (harness.env.get("PATH") ?? ""))
+    + " GH_CONFIG_DIR="
+    + shell_quote(ambient)
+    + " CEREBRAS_API_KEY=must-not-reach-child"
+    + " HARN_TEST_AUTH_LOG="
+    + shell_quote(log)
+    + " "
+    + shell_quote(path_join(root, "scripts/with_github_auth.sh"))
+    + " --private-config-root "
+    + shell_quote(private_root)
+    + " --minimal-artifact-env"
+    + " "
+    + shell_quote(path_join(bin, "child"))
+  const result = harness.process.shell(command)
+  assert(result.success, result.combined)
+  const calls = harness.fs.read_lines(log)
+  assert_eq(calls[0], "auth:" + ambient)
+  const child_call = trim(result.stdout ?? "")
+  assert(starts_with(child_call, "child:" + private_root + "/session."))
+  assert(ends_with(child_call, ":set:absent"))
+  assert_eq(harness.fs.list_dir(private_root), [])
+}
+
+/** Import mode enters the same single-writer guard before touching the receipt. */
+pipeline test_hosted_import_acquires_receipt_writer_guard_before_download(
+  harness: Harness,
+  task: any,
+) {
+  const source = harness.fs.read_text(
+    path_join(release_harness_root(harness.fs), "watch_harn_release.harn"),
+  )
+  const import_mode = substring(source, index_of(source, "if parsed.import_hosted_receipt_only"))
+  const guard_index = index_of(import_mode, "release_watch_guard_acquire(")
+  const download = index_of(import_mode, "import_hosted_release_watch_receipt(")
+  assert(guard_index >= 0)
+  assert(download >= 0)
+  assert(guard_index < download)
+  assert(index_of(import_mode, "release_watch_guard_finish(") > download)
+}
+
+/** Azure artifact authority is absent from the normal long-lived watcher profile. */
+pipeline test_release_egress_profiles_are_exact(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const fixture = harness.fs.mkdtemp_in_workspace("release-egress-profiles-")
+  const child = path_join(fixture, "capture")
+  const normal_log = path_join(fixture, "normal")
+  const import_log = path_join(fixture, "import")
+  const watch_log = path_join(fixture, "watch")
+  harness.fs.write_text(
+    child,
+    "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$HARN_EGRESS_ALLOW\" \"$HARN_EGRESS_DEFAULT\" \"$HARN_EGRESS_BLOCK_PRIVATE\" \"$HARN_EGRESS_ALLOW_LOOPBACK\" > \"$1\"\n",
+  )
+  const chmod = harness.process.shell("chmod +x " + shell_quote(child))
+  assert(chmod.success, chmod.combined)
+  const boundary = shell_quote(path_join(root, "scripts/with_release_egress.sh"))
+  const normal = harness.process.shell(
+    boundary + " " + shell_quote(child) + " " + shell_quote(normal_log),
+  )
+  assert(normal.success, normal.combined)
+  const artifact = harness.process.shell(
+    boundary + " --github-artifact-import " + shell_quote(child) + " " + shell_quote(import_log),
+  )
+  assert(artifact.success, artifact.combined)
+  const watch = harness.process.shell(
+    boundary + " --workflow-watch " + shell_quote(child) + " " + shell_quote(watch_log),
+  )
+  assert(watch.success, watch.combined)
+  assert_eq(
+    trim(harness.fs.read_text(normal_log)),
+    "api.github.com:443,github.com:443,crates.io:443,static.crates.io:443|deny|private|0",
+  )
+  assert_eq(
+    trim(harness.fs.read_text(import_log)),
+    "api.github.com:443,*.blob.core.windows.net:443|deny|private|0",
+  )
+  assert_eq(
+    trim(harness.fs.read_text(watch_log)),
+    "api.github.com:443,*.blob.core.windows.net:443,github.com:443,release-assets.githubusercontent.com:443|deny|private|0",
+  )
+}
+
+/** Signed redirect queries are removed before Harn records subprocess output. */
+pipeline test_artifact_downloader_redacts_before_process_boundary(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const fixture = harness.fs.mkdtemp_in_workspace("artifact-downloader-redaction-")
+  const bin = path_join(fixture, "bin")
+  const destination = path_join(fixture, "download")
+  harness.fs.mkdir(bin, true)
+  harness.fs.mkdir(destination, true)
+  harness.fs.write_text(
+    path_join(bin, "gh"),
+    "#!/bin/sh\nprintf '%s\\n' 'download failed: https://productionresultssa8.blob.core.windows.net/archive.zip?sig=SECRET-SAS&se=later' >&2\nexit 23\n",
+  )
+  const chmod = harness.process.shell("chmod +x " + shell_quote(path_join(bin, "gh")))
+  assert(chmod.success, chmod.combined)
+  const result = harness.process.run(
+    {
+      program: path_join(root, "scripts/download_github_artifact.sh"),
+      args: ["42", "release-run-42", destination],
+      env: {PATH: bin + ":" + (harness.env.get("PATH") ?? "")},
+    },
+  )
+  assert_eq(result.exit_code, 23)
+  assert(contains(result.stderr ?? "", "productionresultssa8.blob.core.windows.net"))
+  assert(contains(result.stderr ?? "", "?[redacted-query]"))
+  assert_eq(contains(result.stderr ?? "", "SECRET-SAS"), false)
+  assert_eq(harness.fs.list_dir(destination), [])
+}
+
+pipeline test_abandon_release_apply_guidance_carries_ref_mutation_authority(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  for relative in ["docs/how-to/free-a-wedged-release.md", "abandon_release_attempts.harn"] {
+    const contents = harness.fs.read_text(path_join(root, relative))
+    let apply_commands = 0
+    for line in contents.split("\n") {
+      if contains(line, "abandon_release_attempts.harn") && contains(line, "--apply") {
+        apply_commands = apply_commands + 1
+        assert(contains(line, "--approve-risky git.push"))
+      }
+    }
+    assert_eq(apply_commands, 1)
+  }
+}
+
+pipeline test_abandon_release_proves_repository_identity_before_any_lane_or_ref_mutation(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  const source = harness.fs.read_text(path_join(root, "abandon_release_attempts.harn"))
+  const main_source = source.split("pipeline main(harness: Harness) {")[1] ?? ""
+  const identity = main_source.index_of("const repository_identity = remote_mutation_slug_check(")
+  const local_lane = main_source.index_of("release_owner_guard_acquire(")
+  const fleet_lane = main_source.index_of("fleet_lane = claim_release_lane(")
+  const abandon = main_source.index_of("result = run_release_attempt_abandon(")
+  assert(identity >= 0, "abandon entrypoint must check checkout/repository identity")
+  assert(local_lane > identity, "local release lane must follow repository identity")
+  assert(fleet_lane > identity, "fleet lane mutation must follow repository identity")
+  assert(abandon > identity, "archive/delete runner must follow repository identity")
+  const refusal = main_source.index_of("if !repository_identity.ok {")
+  assert(refusal > identity)
+  assert(main_source.index_of("return 2", refusal) < local_lane)
+}
+
+@test
+pipeline test_abandon_release_repository_mismatch_makes_no_lane_or_ref_write(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const checkout = path_join(dir, "wrong-repository")
+      const lease_root = path_join(dir, "host-leases")
+      assert(
+        harness.process.shell(
+          "git init -q "
+            + shell_quote(checkout)
+            + " && git -C "
+            + shell_quote(checkout)
+            + " config user.email test@example.com && git -C "
+            + shell_quote(checkout)
+            + " config user.name test && git -C "
+            + shell_quote(checkout)
+            + " commit -q --allow-empty -m seed && git -C "
+            + shell_quote(checkout)
+            + " remote add origin https://github.com/another-owner/harn.git",
+        ).success,
+      )
+      const refs_before = harness.process.run({program: "git", args: ["-C", checkout, "show-ref"]})
+      assert_eq(refs_before.exit_code, 0)
+      assert(trim(refs_before.stdout ?? "") != "", "fixture must positively measure a local ref")
+      const result = harness.process.run(
+        {
+          program: pinned_test_binary(pick(harness, ["fs", "process"]), root),
+          args: [
+            "run",
+            "--no-sandbox",
+            "--approve-risky",
+            "git.push",
+            path_join(root, "abandon_release_attempts.harn"),
+            "--",
+            "--repo",
+            checkout,
+            "--slug",
+            "burin-labs/harn",
+            "--version",
+            "0.10.130",
+            "--attempt-oid",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--apply",
+            "--yes-live-release",
+          ],
+          env: {HARN_HOST_LEASE_ROOT: lease_root, GH_TOKEN: "invalid-test-token"},
+        },
+      )
+      assert_eq(result.exit_code, 2)
+      assert(contains(result.stdout ?? "", "checkout origin is another-owner/harn"))
+      assert_eq(
+        harness.fs.exists(lease_root),
+        false,
+        "repository mismatch must return before the local release lane is written",
+      )
+      const refs_after = harness.process.run({program: "git", args: ["-C", checkout, "show-ref"]})
+      assert_eq(refs_after.exit_code, 0)
+      assert_eq(
+        refs_after.stdout,
+        refs_before.stdout,
+        "repository mismatch must not create or delete a ref",
+      )
+    },
+  )
+}
+
+@test
+pipeline test_abandon_release_push_url_mismatch_makes_no_lane_or_ref_write(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const checkout = path_join(dir, "wrong-push-repository")
+      const lease_root = path_join(dir, "host-leases")
+      assert(
+        harness.process.shell(
+          "git init -q "
+            + shell_quote(checkout)
+            + " && git -C "
+            + shell_quote(checkout)
+            + " config user.email test@example.com && git -C "
+            + shell_quote(checkout)
+            + " config user.name test && git -C "
+            + shell_quote(checkout)
+            + " commit -q --allow-empty -m seed && git -C "
+            + shell_quote(checkout)
+            + " remote add origin https://github.com/burin-labs/harn.git"
+            + " && git -C "
+            + shell_quote(checkout)
+            + " remote set-url --push origin https://github.com/another-owner/harn.git",
+        ).success,
+      )
+      const refs_before = harness.process.run({program: "git", args: ["-C", checkout, "show-ref"]})
+      assert_eq(refs_before.exit_code, 0)
+      assert(trim(refs_before.stdout ?? "") != "", "fixture must positively measure a local ref")
+      const result = harness.process.run(
+        {
+          program: pinned_test_binary(pick(harness, ["fs", "process"]), root),
+          args: [
+            "run",
+            "--no-sandbox",
+            "--approve-risky",
+            "git.push",
+            path_join(root, "abandon_release_attempts.harn"),
+            "--",
+            "--repo",
+            checkout,
+            "--slug",
+            "burin-labs/harn",
+            "--version",
+            "0.10.130",
+            "--attempt-oid",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--apply",
+            "--yes-live-release",
+          ],
+          env: {HARN_HOST_LEASE_ROOT: lease_root, GH_TOKEN: "invalid-test-token"},
+        },
+      )
+      assert_eq(result.exit_code, 2)
+      assert(contains(result.stdout ?? "", "push URL does not match"))
+      assert_eq(harness.fs.exists(lease_root), false)
+      const refs_after = harness.process.run({program: "git", args: ["-C", checkout, "show-ref"]})
+      assert_eq(refs_after.exit_code, 0)
+      assert_eq(refs_after.stdout, refs_before.stdout)
+    },
+  )
+}
+
+pipeline test_release_fixup_system_prompt_renders_one_recovery_source(harness: Harness, task: any) {
+  const prompt = prompt_asset(harness.fs, "release_fixup_system.harn.prompt")
+  const from_pr = harness.fs.render_prompt(
+    prompt,
+    {
+      target_version: "1.2.3",
+      fixup_pr_url: "https://github.com/example/harn/pull/42",
+      fixup_tag: "v1.2.3",
+      base_branch: "main",
+      candidate_tree_notes: false,
+    },
+  )
+  assert(contains(from_pr, "open Release PR `https://github.com/example/harn/pull/42`"))
+  assert_eq(contains(from_pr, "durable recovery source is tag or immutable attempt"), false)
+  assert(contains(from_pr, "frozen artifact's release body"))
+  const from_tag = harness.fs.render_prompt(
+    prompt,
+    {
+      target_version: "1.2.3",
+      fixup_pr_url: "",
+      fixup_tag: "v1.2.3",
+      base_branch: "main",
+      candidate_tree_notes: true,
+    },
+  )
+  assert(contains(from_tag, "durable recovery source is tag or immutable attempt `v1.2.3`"))
+  assert_eq(contains(from_tag, "open Release PR"), false)
+  assert(contains(from_tag, "complete current note set"))
+  assert_eq(contains(from_tag, "frozen artifact's release body"), false)
+}
+
+pipeline test_prompt_assets_use_harn_control_syntax(harness: Harness, task: any) {
+  const prompts_dir = path_join(release_harness_root(harness.fs), "prompts")
+  for name in harness.fs.list_dir(prompts_dir).sort() {
+    if ends_with(name, ".harn.prompt") {
+      assert_eq(contains(harness.fs.read_text(path_join(prompts_dir, name)), "{%"), false)
+    }
+  }
+}
+
+pipeline test_release_pr_body_renders_local_branch_conditionally(harness: Harness, task: any) {
+  const prompt = prompt_asset(harness.fs, "release_pr_body.harn.prompt")
+  const base = {
+    next_version: "1.2.3",
+    current_version: "1.2.2",
+    branch: "release-attempt/v1.2.3/head",
+    base_branch: "main",
+    pin_sha: "abc123",
+    pin_sha_note: "",
+    tag_publish_note: "already published",
+    run_session_view_fixture_status: "passed",
+    run_session_view_summary: "fixtures stable",
+    run_session_view_release_note: "no contract-file change detected",
+    execution_step_count: 0,
+    execution_status_summary: "all ok",
+    execution_summary: "none",
+    latest_tag: "v1.2.2",
+    commits_since_latest_tag: "abc123 release",
+    run_id: "test-run",
+  }
+  const with_branch = harness.fs.render_prompt(prompt, {...base, local_branch: "release/v1.2.3"})
+  assert(contains(with_branch, "Local preparation branch:** `release/v1.2.3`"))
+  assert_eq(contains(with_branch, "{%"), false)
+  const without_branch = harness.fs.render_prompt(prompt, {...base, local_branch: ""})
+  assert_eq(contains(without_branch, "Local preparation branch"), false)
+  assert_eq(contains(without_branch, "{%"), false)
+}
+
+fn read_run_events(fs: HarnessFs, run_id: any) {
+  const path = path_join(release_run_root(fs), run_id, "run-events.jsonl")
+  return fs.read_text(path).split("\n").filter({ line -> trim(line) != "" }).map(
+    { line -> json_parse(line) },
+  )
+    .to_list()
+}
+
+pipeline test_release_timed_phase_emits_start_and_finish_events(harness: Harness, task: any) {
+  const run_id = "test-phase-" + harness.random.uuid_v7()
+  const result = release_timed_phase(
+    pick(harness, ["clock", "fs"]),
+    run_id,
+    "analysis",
+    "release.analysis",
+    {mode: "audit", mock: true},
+    { -> return "done" },
+  )
+  assert_eq(result, "done")
+  const events = read_run_events(harness.fs, run_id)
+  assert_eq(events.map({ event -> event.event_type }), ["phase_started", "phase_finished"])
+  assert_eq(events[0].data.phase, "analysis")
+  assert_eq(events[0].data.timing, "release.analysis")
+  assert_eq(events[1].data.status, "ok")
+}
+
+pipeline test_release_timed_phase_logs_error_before_rethrow(harness: Harness, task: any) {
+  const run_id = "test-phase-error-" + harness.random.uuid_v7()
+  try {
+    release_timed_phase(
+      pick(harness, ["clock", "fs"]),
+      run_id,
+      "analysis",
+      "release.analysis",
+      {mode: "audit", mock: true},
+      { ->
+        throw "boom"
+      },
+    )
+    throw "expected release_timed_phase to rethrow"
+  } catch (e) {
+    assert_eq(to_string(e), "boom")
+  }
+  const events = read_run_events(harness.fs, run_id)
+  assert_eq(events.map({ event -> event.event_type }), ["phase_started", "phase_finished"])
+  assert_eq(events[1].data.status, "error")
+  assert_eq(events[1].data.error, "boom")
+}
+
+// The confined release must be able to read the key it will sign the tag with.
+// These cases are behavioral on purpose: the defect they cover was a *silent*
+// skip of an unreachable key, which every text-containment assertion in this
+// file would have happily passed.
+@test
+pipeline test_signing_key_root_grants_a_reachable_key(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_signing_key_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const key = path_join(dir, "release-signing-key")
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(key, "key-material-stand-in\n")
+      harness.fs.write_text(cfg, "[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${key}\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      assert_eq(result.exit_code, 0)
+      assert_eq(trim(result.stdout ?? ""), key)
+    },
+  )
+}
+
+@test
+pipeline test_signing_key_root_refuses_an_unreachable_key(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_signing_key_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const missing = path_join(dir, "never-written")
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(cfg, "[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${missing}\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      // The whole point: configured-but-unreachable must stop the run here,
+      // not degrade to an empty grant that fails once the tag is created.
+      assert_eq(result.exit_code, 2)
+      assert_eq(trim(result.stdout ?? ""), "")
+      assert(contains(result.stderr ?? "", "no such file exists"))
+    },
+  )
+}
+
+@test
+pipeline test_signing_key_root_is_silent_when_signing_is_not_configured(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_signing_key_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(cfg, "[user]\n\tname = nobody\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      assert_eq(result.exit_code, 0)
+      assert_eq(trim(result.stdout ?? ""), "")
+    },
+  )
+}
+
+// The confined tag push must be able to read the credential store its helper
+// is configured with. Same silent-skip class as the signing key, one step
+// later: every confined git call works until the transport consults the
+// helper, so an ungranted store surfaces only on the push that publishes.
+@test
+pipeline test_credential_store_root_grants_a_reachable_store(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_credential_store_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const store = path_join(dir, "git-credentials")
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(store, "credential-stand-in\n")
+      harness.fs.write_text(cfg, "[credential]\n\thelper = store --file=${store}\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      assert_eq(result.exit_code, 0)
+      assert_eq(trim(result.stdout ?? ""), store)
+    },
+  )
+}
+
+@test
+pipeline test_credential_store_root_refuses_an_unreachable_store(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_credential_store_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const missing = path_join(dir, "never-written")
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(cfg, "[credential]\n\thelper = store --file=${missing}\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      // Configured-but-unreachable must stop the run at confinement time, not
+      // degrade to a push that fails after the release commit has merged.
+      assert_eq(result.exit_code, 2)
+      assert_eq(trim(result.stdout ?? ""), "")
+      assert(contains(result.stderr ?? "", "no such file exists"))
+    },
+  )
+}
+
+@test
+pipeline test_credential_store_root_is_silent_without_a_file_backed_helper(
+  harness: Harness,
+  task: any,
+) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_credential_store_root.sh")
+  with_temp_dir(
+    harness.fs,
+    { dir ->
+      const cfg = path_join(dir, "gitconfig")
+      harness.fs.write_text(cfg, "[credential]\n\thelper = osxkeychain\n")
+      const result = harness.process.run(
+        {
+          program: "bash",
+          args: ["-c", "GIT_CONFIG_GLOBAL=${shell_quote(cfg)} ${shell_quote(script)}"],
+        },
+      )
+      assert_eq(result.exit_code, 0)
+      assert_eq(trim(result.stdout ?? ""), "")
+    },
+  )
+}
+
+// Collapsing identity material to the runner's secret scratch is what makes the
+// grant survive a writer that replaces the file instead of truncating it. These
+// run the resolver directly, because the property under test is which roots
+// come out, not which lines the script contains.
+@test
+pipeline test_identity_roots_collapse_runner_temp_and_dedupe(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_identity_roots.sh")
+  const temp = "/runner/work/_temp"
+  const result = harness.process.run(
+    {
+      program: "bash",
+      args: [
+        "-c",
+        "RUNNER_TEMP=${shell_quote(temp)} ${shell_quote(script)}"
+          + " ${shell_quote(path_join(temp, "release-signing-key"))}"
+          + " ${shell_quote(path_join(temp, "git-credentials"))}",
+      ],
+    },
+  )
+  assert_eq(result.exit_code, 0)
+  // Two files, one directory: a rename-based writer cannot invalidate this.
+  assert_eq(split(trim(result.stdout ?? ""), "\n"), [temp])
+}
+
+@test
+pipeline test_identity_roots_keep_operator_material_file_scoped(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_identity_roots.sh")
+  const key = "/home/operator/.ssh/id_ed25519"
+  const store = "/home/operator/.config/git-credentials"
+  const result = harness.process.run(
+    {
+      program: "bash",
+      args: ["-c", "RUNNER_TEMP= ${shell_quote(script)} ${shell_quote(key)} ${shell_quote(store)}"],
+    },
+  )
+  assert_eq(result.exit_code, 0)
+  // A home directory is not a secret scratch, so it must never be collapsed.
+  assert_eq(split(trim(result.stdout ?? ""), "\n"), [key, store])
+}
+
+@test
+pipeline test_identity_roots_collapse_only_the_runner_temp_entry(harness: Harness, task: any) {
+  const root = release_harness_root(harness.fs)
+  const script = path_join(root, "scripts/release_identity_roots.sh")
+  const temp = "/runner/work/_temp"
+  const operator_key = "/home/operator/.ssh/id_ed25519"
+  const result = harness.process.run(
+    {
+      program: "bash",
+      args: [
+        "-c",
+        "RUNNER_TEMP=${shell_quote(temp)} ${shell_quote(script)}"
+          + " ${shell_quote(path_join(temp, "release-signing-key"))}"
+          + " ${shell_quote(operator_key)}",
+      ],
+    },
+  )
+  assert_eq(result.exit_code, 0)
+  assert_eq(split(trim(result.stdout ?? ""), "\n"), [temp, operator_key])
+}
