@@ -81,6 +81,8 @@ Start with the job you need to do.
 
 ### Look something up
 
+- [Shipping writer contract](docs/reference/shipping-writers.md). Startup
+  capture, effect checks and refusal behavior for shipping adapters.
 - [Local setup](docs/reference/local-setup.md). Configuration files, credential
   precedence, planner tuning, the macOS launcher, and the tools a run expects
   to find.
