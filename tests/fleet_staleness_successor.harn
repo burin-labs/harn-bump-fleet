@@ -1,6 +1,8 @@
 import {
   AlarmReconciliation,
   StalledBumpWorkflow,
+  bump_successor,
+  repository_check_failed,
   start_stalled_bump,
 } from "../check_fleet_pin_staleness.harn"
 import { PinStalenessRow, pin_staleness_verdict } from "../lib/fleet_staleness"
@@ -36,6 +38,9 @@ fn stale_row() -> PinStalenessRow {
   return pin_staleness_verdict("0.10.114", "v0.10.115", 1, 0) + {slug: SLUG, pin: "0.10.114"}
 }
 
+/** When the target release published: 2026-10-18T02:49:36Z. */
+const PUBLISHED_S = 1792291776
+
 fn update() -> StalledBumpWorkflow {
   return {
     workflow_name: "bump-harn.yml",
@@ -44,13 +49,20 @@ fn update() -> StalledBumpWorkflow {
   }
 }
 
-fn run(id: int, status: string, conclusion: string?) -> dict {
+fn run(
+  id: int,
+  status: string,
+  conclusion: string?,
+  event: string = "push",
+  created_at: string = "2026-10-18T03:35:00Z",
+) -> dict {
   return {
     id: id,
     name: "Bump Harn Runtime",
     display_title: "Bump Harn Runtime",
     path: ".github/workflows/bump-harn.yml",
-    event: "push",
+    event: event,
+    created_at: created_at,
     status: status,
     conclusion: conclusion,
     head_branch: "main",
@@ -76,7 +88,15 @@ fn dispatches(testing: HarnessTesting) -> list {
 }
 
 fn start(harness: Harness, dry_run: bool = false) -> AlarmReconciliation {
-  return start_stalled_bump(harness, stale_row(), update(), "v0.10.115", plan(dry_run), options())
+  return start_stalled_bump(
+    harness,
+    stale_row(),
+    update(),
+    "v0.10.115",
+    PUBLISHED_S,
+    plan(dry_run),
+    options(),
+  )
 }
 
 /**
@@ -166,4 +186,125 @@ pipeline test_an_unreadable_run_list_fails_instead_of_dispatching(harness: Harne
   assert(!result.ok, "an unread run list is not an idle one")
   assert_eq(result.action, "probe_failed")
   assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+/** Queued and waiting runs are in flight too; only a completed run frees the slot. */
+pipeline test_queued_and_waiting_bumps_are_left_alone(harness: Harness) {
+  for status in ["queued", "waiting", "pending"] {
+    harness.testing.http_mock_clear()
+    mock_runs(harness.testing, [run(7, status, nil)])
+    const result = start(harness)
+    assert(result.ok, result.detail)
+    assert_eq(result.action, "bump_running", status)
+    assert_eq(len(dispatches(harness.testing)), 0, status)
+  }
+}
+
+/**
+ * The retry bound. A dispatched bump for this release that already finished
+ * without success would fail the same way again, so it is not re-dispatched.
+ */
+pipeline test_a_failed_dispatch_for_this_release_is_not_retried(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(
+    harness.testing,
+    [run(8, "completed", "failure", "workflow_dispatch", "2026-10-18T05:00:00Z")],
+  )
+  mock_pulls(harness.testing, [])
+  const result = start(harness)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "already_retried")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+/** A dispatch from before this release was for an older target and does not count. */
+pipeline test_a_failed_dispatch_for_an_older_release_does_not_block(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(
+    harness.testing,
+    [run(8, "completed", "failure", "workflow_dispatch", "2026-10-16T05:00:00Z")],
+  )
+  mock_pulls(harness.testing, [])
+  const result = start(harness, true)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "would_dispatch")
+}
+
+/** An unreadable pull-request list must fail, not read as "no bump pull request". */
+pipeline test_an_unreadable_pull_request_list_fails_instead_of_dispatching(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(harness.testing, [])
+  harness.testing.http_mock("GET", PULLS, {status: 500, body: "{}"})
+  const result = start(harness)
+  assert(!result.ok, "an unread pull-request list is not an empty one")
+  assert_eq(result.action, "probe_failed")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+/** Without a publication time the retry bound cannot be read, so nothing is dispatched. */
+pipeline test_an_unreadable_publication_time_fails_instead_of_dispatching(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const result = start_stalled_bump(
+    harness,
+    stale_row(),
+    update(),
+    "v0.10.115",
+    nil,
+    plan(),
+    options(),
+  )
+  assert(!result.ok, result.detail)
+  assert_eq(result.action, "probe_failed")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+/**
+ * An unknown pin keeps its alarm but must not dispatch: a failed or malformed
+ * pin read would otherwise start a bump on every tick.
+ */
+pipeline test_an_unknown_pin_never_dispatches(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const unknown: PinStalenessRow = pin_staleness_verdict(nil, "v0.10.115", 0, 0) + {slug: SLUG}
+  assert_eq(unknown.state, "unknown")
+  assert(unknown.stale, "an unknown pin still alarms")
+  const successor = bump_successor(
+    harness,
+    unknown,
+    true,
+    update(),
+    "v0.10.115",
+    PUBLISHED_S,
+    plan(),
+    options(),
+  )
+  assert_eq(successor, nil)
+  assert_eq(len(harness.testing.http_mock_calls()), 0, "an unknown pin makes no request")
+}
+
+/** A repository the fleet does not bump gets the alarm only. */
+pipeline test_a_repository_the_fleet_does_not_bump_never_dispatches(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const successor = bump_successor(
+    harness,
+    stale_row(),
+    false,
+    update(),
+    "v0.10.115",
+    PUBLISHED_S,
+    plan(),
+    options(),
+  )
+  assert_eq(successor, nil)
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+/** The gate `main` uses: a failed successor fails the run even when the alarm succeeded. */
+pipeline test_a_failed_successor_fails_the_run(harness: Harness) {
+  const alarm: AlarmReconciliation = {ok: true, action: "refreshed", detail: "issue #42"}
+  const failed: AlarmReconciliation = {ok: false, action: "dispatch_failed", detail: "403"}
+  const skipped: AlarmReconciliation = {ok: true, action: "bump_running", detail: "run 7"}
+  assert(repository_check_failed(alarm, failed), "a failed successor fails the run")
+  assert(!repository_check_failed(alarm, skipped))
+  assert(!repository_check_failed(alarm, nil))
+  assert(repository_check_failed({ok: false, action: "open_failed", detail: ""}, nil))
 }
