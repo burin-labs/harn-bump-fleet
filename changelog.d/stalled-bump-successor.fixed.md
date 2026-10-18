@@ -1,0 +1,1 @@
+The pin-staleness check now starts the next bump for a stale consumer that has no bump run in flight and no bump pull request open. A push-triggered bump that ended without a pull request, such as a base conflict asking for a fresh-base retry, previously left the consumer behind until its adapter changed again.

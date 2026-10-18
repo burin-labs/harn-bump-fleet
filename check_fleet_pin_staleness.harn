@@ -8,7 +8,8 @@
 // releases behind with two failed bump runs and nobody paged. This check asks
 // the only question that catches every one of those shapes at once — is each
 // consumer actually on the newest release — and files one issue per repository
-// that is not, closing it again when the pin catches up.
+// that is not, closing it again when the pin catches up. A stale consumer with
+// no bump in flight also gets its next bump started.
 import { ParserSpec } from "std/cli/argparse"
 import { GithubClientOptions } from "harn-github-connector/default"
 import { cli_options, is_exact_harn_release_tag } from "lib/cli_options"
@@ -43,6 +44,8 @@ import {
   github_pr_list,
   github_published_release_tags,
   github_release_at_tag,
+  github_workflow_dispatch,
+  github_workflow_runs,
 } from "lib/github"
 import { development_cutover_verdict, workspace_version_from_manifest } from "lib/release_analysis"
 
@@ -207,6 +210,72 @@ pub fn reconcile_alarm(
   return {ok: true, action: "opened", detail: row.detail}
 }
 
+/** The part of a repository's update spec that names its bump workflow and branch. */
+pub type StalledBumpWorkflow = {workflow_name: string, base_branch: string, branch: string, ...rest}
+
+/**
+ * Start the next bump for a repository this check found stale.
+ *
+ * A consumer bump starts when its adapter lands. A run that ends without a pull
+ * request, such as a base conflict that asks for a fresh-base retry, leaves
+ * nothing to start the next one, so the pin stays behind until some later
+ * adapter change. This is that successor: it dispatches only when no bump run
+ * is in flight and no bump pull request is open, and the schedule bounds how
+ * often it can fire.
+ */
+pub fn start_stalled_bump(
+  harness: Harness,
+  row: PinStalenessRow,
+  update: StalledBumpWorkflow,
+  target: string,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> AlarmReconciliation {
+  const runs = github_workflow_runs(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {branch: update.base_branch},
+    10,
+    client,
+  )
+  if is_err(runs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(runs))}
+  }
+  const active = unwrap(runs).runs.filter({ run -> run.status != "completed" }).to_list()
+  if len(active) > 0 {
+    return {ok: true, action: "bump_running", detail: active[0].url}
+  }
+  const open_prs = github_pr_list(
+    harness,
+    row.slug,
+    {head: update.branch, state: "open", limit: 10},
+    client,
+  )
+  if is_err(open_prs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(open_prs))}
+  }
+  const prs = unwrap(open_prs)
+  if len(prs) > 0 {
+    return {ok: true, action: "bump_pr_open", detail: "#${to_string(prs[0].number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_dispatch", detail: "${update.workflow_name} ${target}"}
+  }
+  const dispatched = github_workflow_dispatch(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {version: target},
+    update.base_branch,
+    client,
+  )
+  if is_err(dispatched) {
+    return {ok: false, action: "dispatch_failed", detail: to_string(unwrap_err(dispatched))}
+  }
+  return {ok: true, action: "dispatched", detail: unwrap(dispatched).url}
+}
+
 pipeline main(harness: Harness) {
   const options = parse_pin_staleness_args(argv)
   const max_behind = resolve_max_releases_behind(options.max_releases_behind)
@@ -303,11 +372,24 @@ pipeline main(harness: Harness) {
       }
     rows = rows + [row]
     const reconciled = reconcile_alarm(harness, row, target, options)
-    if !reconciled.ok {
+    const successor: AlarmReconciliation? = if row.stale && (repo.harn_bump ?? false) {
+      start_stalled_bump(harness, row, update, target, options)
+    } else {
+      nil
+    }
+    if !reconciled.ok || !(successor?.ok ?? true) {
       failed = true
     }
     alarms = alarms
-      + [{repo: repo.slug, action: reconciled.action, ok: reconciled.ok, detail: reconciled.detail}]
+      + [
+        {
+          repo: repo.slug,
+          action: reconciled.action,
+          ok: reconciled.ok,
+          detail: reconciled.detail,
+          successor: successor,
+        },
+      ]
   }
   const undeclared = if options.only == nil {
     undeclared_pin_rows(

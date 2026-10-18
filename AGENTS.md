@@ -49,7 +49,9 @@ The entry points are:
   with `promote_bump_workflow.harn --repositories-json
   '["burin-labs/harn-bump-fleet"]'`. Convergence and each consumer adapter's
   push-triggered bump do the rest, so a release never dispatches consumer
-  bumps through an older orchestration contract.
+  bumps through an older orchestration contract. When that bump ends without
+  a pull request, `check_fleet_pin_staleness.harn` dispatches the next one
+  once the consumer is past its deadline with no bump run or pull request open.
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a

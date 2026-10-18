@@ -1,0 +1,167 @@
+import {
+  AlarmReconciliation,
+  StalledBumpWorkflow,
+  start_stalled_bump,
+} from "../check_fleet_pin_staleness.harn"
+import { PinStalenessRow, pin_staleness_verdict } from "../lib/fleet_staleness"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+// Every request is answered from this fake origin, so no test here can reach
+// GitHub or read an ambient credential.
+const BASE = "https://github.test"
+
+const SLUG = "burin-labs/stuck"
+
+const REPO = BASE + "/repos/burin-labs/stuck"
+
+const RUNS = REPO + "/actions/workflows/bump-harn.yml/runs?branch=main&per_page=10"
+
+const PULLS = REPO + "/pulls?state=open&head="
+  + url_encode("burin-labs:automation/bump-harn-runtime")
+  + "&per_page=10"
+
+const DISPATCH = REPO + "/actions/workflows/bump-harn.yml/dispatches"
+
+fn options() -> GithubClientOptions {
+  return {api_base_url: BASE, installation_token: "staleness-successor-token"}
+}
+
+fn plan(dry_run: bool = false) {
+  return {max_releases_behind: "1", dry_run: dry_run, target: nil, only: nil, run_url: nil}
+}
+
+fn stale_row() -> PinStalenessRow {
+  return pin_staleness_verdict("0.10.114", "v0.10.115", 1, 0) + {slug: SLUG, pin: "0.10.114"}
+}
+
+fn update() -> StalledBumpWorkflow {
+  return {
+    workflow_name: "bump-harn.yml",
+    base_branch: "main",
+    branch: "automation/bump-harn-runtime",
+  }
+}
+
+fn run(id: int, status: string, conclusion: string?) -> dict {
+  return {
+    id: id,
+    name: "Bump Harn Runtime",
+    display_title: "Bump Harn Runtime",
+    path: ".github/workflows/bump-harn.yml",
+    event: "push",
+    status: status,
+    conclusion: conclusion,
+    head_branch: "main",
+    head_sha: "a" * 40,
+    html_url: "https://github.test/burin-labs/stuck/actions/runs/${to_string(id)}",
+  }
+}
+
+fn mock_runs(testing: HarnessTesting, runs: list<dict>) {
+  testing.http_mock(
+    "GET",
+    RUNS,
+    {status: 200, body: json_stringify({total_count: len(runs), workflow_runs: runs})},
+  )
+}
+
+fn mock_pulls(testing: HarnessTesting, pulls: list<dict>) {
+  testing.http_mock("GET", PULLS, {status: 200, body: json_stringify(pulls)})
+}
+
+fn dispatches(testing: HarnessTesting) -> list {
+  return testing.http_mock_calls().filter({ call -> call.method == "POST" }).to_list()
+}
+
+fn start(harness: Harness, dry_run: bool = false) -> AlarmReconciliation {
+  return start_stalled_bump(harness, stale_row(), update(), "v0.10.115", plan(dry_run), options())
+}
+
+/**
+ * The defect this exists for: the adapter's push run ended without a pull
+ * request, so nothing else will ever start the next bump.
+ */
+pipeline test_a_stalled_consumer_gets_its_bump_dispatched(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(harness.testing, [run(39094162789, "completed", "failure")])
+  mock_pulls(harness.testing, [])
+  harness.testing.http_mock(
+    "POST",
+    DISPATCH,
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          workflow_run_id: 4242,
+          run_url: REPO + "/actions/runs/4242",
+          html_url: "https://github.test/burin-labs/stuck/actions/runs/4242",
+        },
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    REPO + "/actions/runs/4242",
+    {status: 200, body: json_stringify(run(4242, "queued", nil) + {event: "workflow_dispatch"})},
+  )
+  const result = start(harness)
+  assert_eq(result.action, "dispatched", result.detail)
+  const posts = dispatches(harness.testing)
+  assert_eq(len(posts), 1, "exactly one bump is dispatched")
+  const sent = json_parse(posts[0].body)
+  assert_eq(sent.ref, "main")
+  assert_eq(sent.inputs.version, "v0.10.115")
+}
+
+/** A bump still running is the successor already; a second would race it. */
+pipeline test_a_running_bump_is_left_alone(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(harness.testing, [run(7, "in_progress", nil)])
+  const result = start(harness)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "bump_running")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+/** An open bump pull request is the repair path; redoing the refresh would discard it. */
+pipeline test_an_open_bump_pull_request_is_left_alone(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(harness.testing, [run(7, "completed", "failure")])
+  mock_pulls(
+    harness.testing,
+    [
+      {
+        number: 11245,
+        title: "Bump Harn runtime",
+        state: "open",
+        base: {ref: "main"},
+        head: {ref: "automation/bump-harn-runtime", sha: "b" * 40},
+      },
+    ],
+  )
+  const result = start(harness)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "bump_pr_open")
+  assert_eq(result.detail, "#11245")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+pipeline test_a_dry_run_reports_the_dispatch_without_sending_it(harness: Harness) {
+  harness.testing.http_mock_clear()
+  mock_runs(harness.testing, [])
+  mock_pulls(harness.testing, [])
+  const result = start(harness, true)
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "would_dispatch")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
+
+/** An unreadable run list must fail the check, not read as "nothing running". */
+pipeline test_an_unreadable_run_list_fails_instead_of_dispatching(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("GET", RUNS, {status: 500, body: "{}"})
+  const result = start(harness)
+  assert(!result.ok, "an unread run list is not an idle one")
+  assert_eq(result.action, "probe_failed")
+  assert_eq(len(dispatches(harness.testing)), 0)
+}
