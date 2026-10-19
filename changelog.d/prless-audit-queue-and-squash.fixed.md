@@ -1,0 +1,1 @@
+The daily branch audit no longer reports GitHub's own `gh-readonly-queue/` merge-queue branches, and it reports a squash-merged branch whose changed files all match the default branch as `content_merged` instead of the only copy of its work.

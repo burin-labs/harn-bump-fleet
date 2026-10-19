@@ -1,0 +1,703 @@
+/**
+ * Abandon unclaimed pre-tag release attempts so a wedged version can be cut
+ * again.
+ *
+ * Two or more refs under `release-attempt/v<version>/` make that version
+ * unreleasable. `release_recovery_candidate_preference` matches `--at-sha`
+ * against each candidate's frozen *source pin*, so a pin that is not one of
+ * them selects zero attempts and throws, while a pin that is one of them
+ * selects exactly one and then compares equal in
+ * `release_recovery_pin_decision` — routing to `resume_pre_tag`. No route
+ * mints a fresh candidate at current `main`, and a resumed tree cannot contain
+ * any fix that landed after it froze. A single attempt still supersedes; the
+ * jam begins at two.
+ *
+ * `sweep_release_refs` will not clear it. That harness deletes only refs whose
+ * content a verified signed tag recovers, so an unclaimed pre-tag candidate is
+ * retained forever by design.
+ *
+ * This module is the missing escape, and it never destroys an attempt: each is
+ * *renamed* into the sweep-owned `release-failed/vX.Y.Z/<oid>-abandoned`
+ * namespace, so the commit stays on origin, stays reachable, and stays
+ * inventoried by the sweep. Abandoning is therefore reversible by pushing the
+ * archived OID back.
+ *
+ * An attempt is abandonable when nothing claims it. A tag claims only the
+ * exact OID it recovers, so the losing candidates of a release that tagged a
+ * different OID are orphans: no tag will ever recover them, the sweep retains
+ * them forever, and this harness is the only thing that can retire them.
+ *
+ * Every claim here is *terminal* — a tag, a published release, a merged-or-open
+ * PR. None of them exists yet while a release is still working toward its tag,
+ * so a candidate that is actively being certified reads as an unclaimed orphan.
+ * That window is not closed by adding another claim to this module; it is
+ * closed by serializing on the release lane itself, which
+ * `abandon_release_attempts.harn` does by holding the `release-owner` host
+ * lease across both modes. The residual blind spot is a release driven from
+ * another machine or from CI, where no local lease exists to observe.
+ */
+import { GitRemoteRef } from "std/git"
+import { parse_release } from "std/semver"
+import { github_claim_ref, github_connector_options } from "./github"
+import { GithubClientOptions, GithubRefClaim } from "harn-github-connector/default"
+
+pub type ReleaseAttemptAbandonMode = "dry_run" | "apply"
+
+const RELEASE_ATTEMPT_ABANDON_SCHEMA: "release_harn.attempt_abandon.v1" =
+  "release_harn.attempt_abandon.v1"
+
+pub type ReleaseAbandonAction = "archive" | "retain"
+
+pub type ReleaseAbandonOutcome = "planned" | "archived" | "retained" | "failed"
+
+/** What, if anything, already owns an attempt. */
+pub type ReleaseAttemptClaim = {
+  /** Commit the version's tag resolves to, or "" when the version has no tag. */
+  tag_target_oid: string,
+  release_exists: bool,
+  open_pr: string,
+}
+
+pub type ReleaseAbandonDecision = {
+  action: ReleaseAbandonAction,
+  reason_code: string,
+  message: string,
+}
+
+pub type ReleaseAttemptAbandonEntry = {
+  version: string,
+  source_ref: string,
+  archive_ref: string,
+  expected_oid: string,
+  observed_oid: string,
+  action: ReleaseAbandonAction,
+  outcome: ReleaseAbandonOutcome,
+  reason_code: string,
+  message: string,
+  /** What the create-only archive claim observed after the attempt was selected. */
+  archive_observed_oid?: string,
+  /** True only when this run created the archive; false means exact-identity adoption. */
+  archive_created?: bool,
+  /** What the exact source-delete lease observed, when the adapter reports it. */
+  source_delete_observed_oid?: string,
+  /** The archive is durable but the source was retained, so retry is lossless. */
+  partial?: bool,
+}
+
+pub type ReleaseAttemptArchiveRequest = {
+  repo: string,
+  source_ref: string,
+  expected_oid: string,
+  archive_ref: string,
+}
+
+/** Measured create-only archive result required before source deletion. */
+pub type ReleaseAttemptArchiveReceipt = {
+  success: bool,
+  created: bool,
+  observed_oid: string,
+  message: string,
+}
+
+/** Validate the connector's claimed/read-back identity before it authorizes deletion. */
+pub fn release_attempt_archive_claim_receipt(
+  request: ReleaseAttemptArchiveRequest,
+  claim: GithubRefClaim,
+) -> ReleaseAttemptArchiveReceipt {
+  const observed_oid = lowercase(trim(claim.oid))
+  const expected_oid = lowercase(trim(request.expected_oid))
+  if claim.claimed && observed_oid == expected_oid {
+    return {
+      success: true,
+      created: true,
+      observed_oid: observed_oid,
+      message: "created the archive ref at exact OID ${observed_oid}",
+    }
+  }
+  if claim.claimed {
+    return {
+      success: false,
+      created: true,
+      observed_oid: observed_oid,
+      message: "archive creation reported ${observed_oid}; expected ${expected_oid}",
+    }
+  }
+  if observed_oid == expected_oid {
+    return {
+      success: true,
+      created: false,
+      observed_oid: observed_oid,
+      message: "adopted the existing archive ref at the same exact OID",
+    }
+  }
+  return {
+    success: false,
+    created: false,
+    observed_oid: observed_oid,
+    message: "archive ref already exists at ${observed_oid}; expected ${expected_oid}",
+  }
+}
+
+/**
+ * Create an archive only while its destination is absent. GitHub owns this
+ * compare-and-create primitive. Contention is read back by the connector: the
+ * same OID is an idempotent prior success, while any different OID is a hard
+ * conflict and is never overwritten.
+ */
+pub fn release_attempt_archive_claim(
+  harness: Harness,
+  slug: string,
+  request: ReleaseAttemptArchiveRequest,
+  options: GithubClientOptions = github_connector_options(),
+) -> ReleaseAttemptArchiveReceipt {
+  const created = github_claim_ref(
+    harness,
+    slug,
+    request.archive_ref,
+    {oid: request.expected_oid},
+    options,
+  )
+  if is_err(created) {
+    return {
+      success: false,
+      created: false,
+      observed_oid: "",
+      message: to_string(unwrap_err(created)?.message ?? unwrap_err(created)),
+    }
+  }
+  return release_attempt_archive_claim_receipt(request, unwrap(created))
+}
+
+pub type ReleaseAttemptAbandonReceipt = {
+  schema_version: "release_harn.attempt_abandon.v1",
+  mode: ReleaseAttemptAbandonMode,
+  slug: string,
+  repo: string,
+  version: string,
+  selected_attempt_oid?: string,
+  state: string,
+  message: string,
+  attempts: list<ReleaseAttemptAbandonEntry>,
+  updated_at: string,
+}
+
+pub type ReleaseAttemptAbandonAdapter = {
+  now: fn() -> string,
+  attempt_refs: fn(string, string) -> list<GitRemoteRef>,
+  claim: fn(string, string, string) -> ReleaseAttemptClaim,
+  archive_ref: fn(ReleaseAttemptArchiveRequest) -> ReleaseAttemptArchiveReceipt,
+  delete_ref: fn(string, string, string) -> dict,
+}
+
+pub type ReleaseAttemptAbandonOptions = {
+  repo: string,
+  version: string,
+  slug?: string,
+  mode?: ReleaseAttemptAbandonMode,
+  /** Restrict recovery to one content-addressed attempt and retain every sibling. */
+  selected_attempt_oid?: string,
+}
+
+fn valid_oid(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", lowercase(trim(value)))) == 1
+}
+
+pub fn valid_release_version(value: string) -> bool {
+  return parse_release(trim(value)) != nil
+}
+
+/**
+ * The archive name the sweep already understands. Keeping abandoned attempts
+ * inside `release-failed/` means a later tag-backed sweep can retire them
+ * through the normal proof path instead of leaving an unowned ref forever.
+ */
+pub fn release_abandoned_attempt_ref(version: string, oid: string) -> string {
+  return "refs/heads/release-failed/v${trim(version)}/${lowercase(trim(oid))}-abandoned"
+}
+
+pub fn release_attempt_ref(version: string, oid: string) -> string {
+  return "refs/heads/release-attempt/v${trim(version)}/${lowercase(trim(oid))}"
+}
+
+/**
+ * Classify one attempt without touching it.
+ *
+ * A tag claims an attempt only when it recovers that attempt's exact OID.
+ * Testing merely whether the version has a tag conflates two opposite cases:
+ * the attempt that actually shipped, and the losing candidates left behind
+ * when the release tagged a different OID. Those losers are orphans — no tag
+ * recovers them, so `sweep_release_refs` retains them forever by design, and
+ * treating the version's tag as a claim would leave this harness refusing the
+ * one case only it can clear.
+ */
+pub fn release_attempt_abandon_decision(
+  attempt_oid: string,
+  claim: ReleaseAttemptClaim,
+) -> ReleaseAbandonDecision {
+  // An open PR outranks everything: recreating or archiving the branch behind
+  // a live PR would clobber it whatever the tag says.
+  if trim(claim.open_pr) != "" {
+    return {
+      action: "retain",
+      reason_code: "claimed_by_open_pr",
+      message: "open PR ${trim(claim.open_pr)} still claims this attempt; merge or close it first",
+    }
+  }
+  const tag_target = lowercase(trim(claim.tag_target_oid))
+  const attempt = lowercase(trim(attempt_oid))
+  if tag_target != "" && tag_target == attempt {
+    return {
+      action: "retain",
+      reason_code: "claimed_by_tag",
+      message:
+        "the published tag recovers this exact attempt; tag-backed cleanup belongs to sweep_release_refs",
+    }
+  }
+  if tag_target != "" {
+    return {
+      action: "archive",
+      reason_code: "orphaned_by_shipped_tag",
+      message:
+        "the published tag recovers ${tag_target}, not this attempt; no tag can ever recover it, so archiving is the only way it is ever retired",
+    }
+  }
+  // No resolvable tag target. A release that exists anyway is unexplained
+  // state, so fail closed rather than archive against it.
+  if claim.release_exists {
+    return {
+      action: "retain",
+      reason_code: "claimed_by_release",
+      message:
+        "a published release claims this version but no tag target resolved; refusing to guess",
+    }
+  }
+  return {
+    action: "archive",
+    reason_code: "unclaimed_pre_tag_candidate",
+    message:
+      "no tag, release, or open PR claims this attempt; archiving frees the version for a fresh cut",
+  }
+}
+
+fn retained_entry(
+  version: string,
+  source_ref: string,
+  expected_oid: string,
+  observed_oid: string,
+  reason_code: string,
+  message: string,
+) -> ReleaseAttemptAbandonEntry {
+  return {
+    version: version,
+    source_ref: source_ref,
+    archive_ref: "",
+    expected_oid: expected_oid,
+    observed_oid: observed_oid,
+    action: "retain",
+    outcome: "retained",
+    reason_code: reason_code,
+    message: message,
+  }
+}
+
+/**
+ * Classify one observed attempt ref. A ref whose target has drifted from the
+ * OID in its own name is never abandoned: content addressing is the only proof
+ * that the ref is the attempt it claims to be.
+ */
+pub fn release_attempt_abandon_entry(
+  version: string,
+  remote: GitRemoteRef,
+  claim: ReleaseAttemptClaim,
+) -> ReleaseAttemptAbandonEntry {
+  const name = trim(remote.ref)
+  const observed_oid = lowercase(trim(remote.oid))
+  const captured = regex_captures("^refs/heads/release-attempt/v([^/]+)/([0-9a-f]{40})$", name)
+  if len(captured) != 1 {
+    return retained_entry(
+      version,
+      name,
+      "",
+      observed_oid,
+      "malformed_attempt_ref",
+      "ref is not a canonical content-addressed release attempt",
+    )
+  }
+  const expected_oid = lowercase(captured[0].groups[1])
+  if captured[0].groups[0] != trim(version) {
+    return retained_entry(
+      version,
+      name,
+      expected_oid,
+      observed_oid,
+      "version_mismatch",
+      "attempt ref belongs to v${captured[0].groups[0]}, not v${trim(version)}",
+    )
+  }
+  if !valid_oid(observed_oid) || observed_oid != expected_oid {
+    return retained_entry(
+      version,
+      name,
+      expected_oid,
+      observed_oid,
+      "moved_ref",
+      "attempt ref target does not match its content-addressed OID",
+    )
+  }
+  const decision = release_attempt_abandon_decision(expected_oid, claim)
+  if decision.action == "retain" {
+    return retained_entry(
+      version,
+      name,
+      expected_oid,
+      observed_oid,
+      decision.reason_code,
+      decision.message,
+    )
+  }
+  return {
+    version: version,
+    source_ref: name,
+    archive_ref: release_abandoned_attempt_ref(version, expected_oid),
+    expected_oid: expected_oid,
+    observed_oid: observed_oid,
+    action: "archive",
+    outcome: "planned",
+    reason_code: decision.reason_code,
+    message: decision.message,
+  }
+}
+
+/**
+ * Retentions that must stop the whole operation.
+ *
+ * Pre-tag, freeing a strict subset is pointless: the remaining attempt keeps
+ * the recovery path wedged, so a live claim blocks everything. `claimed_by_tag`
+ * is the opposite case — that attempt is the commit that shipped, it is
+ * terminal, and `sweep_release_refs` retires it through the normal tag-backed
+ * proof. Letting it block would strand the orphans beside it, which are the
+ * only refs nothing else can ever retire.
+ */
+pub const RELEASE_ABANDON_BLOCKING_REASONS: list<string> = [
+  "claimed_by_open_pr",
+  "claimed_by_release",
+  "moved_ref",
+  "malformed_attempt_ref",
+  "version_mismatch",
+  "selected_attempt_missing",
+  "source_ref_missing",
+]
+
+pub fn release_attempt_abandon_state(
+  mode: ReleaseAttemptAbandonMode,
+  attempts: list<ReleaseAttemptAbandonEntry>,
+) -> string {
+  if len(attempts) == 0 {
+    return "clear"
+  }
+  if attempts.any({ entry -> entry.outcome == "failed" }) {
+    return "failed"
+  }
+  if attempts.any(
+    { entry ->
+      entry.action == "retain"
+        && RELEASE_ABANDON_BLOCKING_REASONS.contains(entry.reason_code)
+    },
+  ) {
+    return "blocked"
+  }
+  if !attempts.any({ entry -> entry.action == "archive" }) {
+    return "clear"
+  }
+  return if mode == "dry_run" {
+    "planned"
+  } else {
+    "abandoned"
+  }
+}
+
+pub fn release_attempt_abandon_message(
+  state: string,
+  version: string,
+  selected_attempt_oid: string = "",
+) -> string {
+  const selected = lowercase(trim(selected_attempt_oid))
+  if selected != "" {
+    if state == "clear" {
+      return "selected attempt ${selected} needs no retirement"
+    }
+    if state == "failed" {
+      return "selected attempt ${selected} was not fully retired; its receipt identifies every durable ref"
+    }
+    if state == "blocked" {
+      return "selected attempt ${selected} is missing, moved, or claimed; no sibling was changed"
+    }
+    if state == "planned" {
+      return "selected attempt ${selected} is ready to archive; every sibling will be retained"
+    }
+    return "selected attempt ${selected} is archived under release-failed/; every sibling was retained"
+  }
+  if state == "clear" {
+    return "nothing to retire for v${version}; every attempt is absent or already recovered by its tag"
+  }
+  if state == "failed" {
+    return "at least one attempt could not be archived; v${version} is still wedged"
+  }
+  if state == "blocked" {
+    return "at least one attempt for v${version} is claimed; resolve the claim before abandoning"
+  }
+  if state == "planned" {
+    return "every attempt for v${version} that nothing can recover is ready to archive; re-run with --apply --yes-live-release"
+  }
+  return "every attempt for v${version} that nothing can recover is archived under release-failed/"
+}
+
+fn archived_entry(
+  planned: ReleaseAttemptAbandonEntry,
+  outcome: ReleaseAbandonOutcome,
+  message: string,
+  archive_observed_oid: string = "",
+  archive_created: bool = false,
+  source_delete_observed_oid: string = "",
+  partial: bool = false,
+) -> ReleaseAttemptAbandonEntry {
+  return {
+    version: planned.version,
+    source_ref: planned.source_ref,
+    archive_ref: planned.archive_ref,
+    expected_oid: planned.expected_oid,
+    observed_oid: planned.observed_oid,
+    action: planned.action,
+    outcome: outcome,
+    reason_code: planned.reason_code,
+    message: message,
+    archive_observed_oid: archive_observed_oid,
+    archive_created: archive_created,
+    source_delete_observed_oid: source_delete_observed_oid,
+    partial: partial,
+  }
+}
+
+/**
+ * Archive first, delete second. The reverse order would leave a window in
+ * which the attempt exists nowhere on origin, so a crash between the two steps
+ * must always leave a recoverable copy rather than a lost one.
+ */
+fn apply_one(
+  adapter: ReleaseAttemptAbandonAdapter,
+  repo: string,
+  planned: ReleaseAttemptAbandonEntry,
+) -> ReleaseAttemptAbandonEntry {
+  const archived = adapter.archive_ref(
+    {
+      repo: repo,
+      source_ref: planned.source_ref,
+      expected_oid: planned.expected_oid,
+      archive_ref: planned.archive_ref,
+    },
+  )
+  if !(archived.success ?? false) {
+    return archived_entry(
+      planned,
+      "failed",
+      "could not archive ${planned.source_ref} to ${planned.archive_ref}: "
+        + trim(archived.message ?? ""),
+      lowercase(trim(archived.observed_oid ?? "")),
+      archived.created ?? false,
+    )
+  }
+  const archive_observed_oid = lowercase(trim(archived.observed_oid ?? ""))
+  if archive_observed_oid != planned.expected_oid {
+    return archived_entry(
+      planned,
+      "failed",
+      "archive operation did not prove ${planned.archive_ref} at exact OID ${planned.expected_oid}; observed ${archive_observed_oid}",
+      archive_observed_oid,
+      archived.created ?? false,
+    )
+  }
+  const deleted = adapter.delete_ref(repo, planned.source_ref, planned.expected_oid)
+  if !(deleted.success ?? false) {
+    return archived_entry(
+      planned,
+      "failed",
+      "archived to ${planned.archive_ref} but could not delete ${planned.source_ref}: "
+        + trim(deleted.message ?? ""),
+      archive_observed_oid,
+      archived.created ?? false,
+      lowercase(trim(deleted.observed_oid ?? "")),
+      true,
+    )
+  }
+  return archived_entry(
+    planned,
+    "archived",
+    "archived to ${planned.archive_ref} and removed the attempt ref",
+    archive_observed_oid,
+    archived.created ?? false,
+    lowercase(trim(deleted.observed_oid ?? planned.expected_oid)),
+  )
+}
+
+fn selected_missing_entry(version: string, oid: string) -> ReleaseAttemptAbandonEntry {
+  return retained_entry(
+    version,
+    release_attempt_ref(version, oid),
+    oid,
+    "",
+    "selected_attempt_missing",
+    "selected attempt ref is absent from the remote inventory",
+  )
+}
+
+/**
+ * Re-read every source selected for mutation, then re-run its terminal claim
+ * gate. This is one all-or-nothing preflight: a disappeared/moved ref or a PR
+ * opened after the first inventory stops mutation before any sibling changes.
+ */
+fn refresh_planned_attempts(
+  adapter: ReleaseAttemptAbandonAdapter,
+  options: ReleaseAttemptAbandonOptions,
+  version: string,
+  attempts: list<ReleaseAttemptAbandonEntry>,
+) -> list<ReleaseAttemptAbandonEntry> {
+  const observed = adapter.attempt_refs(options.repo, version)
+  let refreshed: list<ReleaseAttemptAbandonEntry> = []
+  for entry in attempts {
+    if entry.action != "archive" || entry.outcome != "planned" {
+      refreshed = refreshed + [entry]
+      continue
+    }
+    let current: GitRemoteRef? = nil
+    for remote in observed {
+      if trim(remote.ref) == entry.source_ref {
+        current = remote
+      }
+    }
+    if current == nil {
+      refreshed = refreshed
+        + [
+          retained_entry(
+            version,
+            entry.source_ref,
+            entry.expected_oid,
+            "",
+            "source_ref_missing",
+            "attempt disappeared before the apply preflight; refusing to archive an unobserved source",
+          ),
+        ]
+      continue
+    }
+    refreshed = refreshed
+      + [
+        release_attempt_abandon_entry(
+          version,
+          current,
+          adapter.claim(options.repo, version, entry.expected_oid),
+        ),
+      ]
+  }
+  return refreshed
+}
+
+pub fn run_release_attempt_abandon(
+  adapter: ReleaseAttemptAbandonAdapter,
+  options: ReleaseAttemptAbandonOptions,
+) -> ReleaseAttemptAbandonReceipt {
+  const version = trim(options.version)
+  if !valid_release_version(version) {
+    throw "release attempt version must be a canonical release version, got: " + version
+  }
+  const mode: ReleaseAttemptAbandonMode = options.mode ?? "dry_run"
+  const slug = options.slug ?? "burin-labs/harn"
+  const selected_attempt_oid = lowercase(trim(options.selected_attempt_oid ?? ""))
+  if selected_attempt_oid != "" && !valid_oid(selected_attempt_oid) {
+    throw "selected release attempt must be a full 40-character OID, got: "
+      + selected_attempt_oid
+  }
+  const selected_ref = if selected_attempt_oid == "" {
+    ""
+  } else {
+    release_attempt_ref(version, selected_attempt_oid)
+  }
+  let attempts: list<ReleaseAttemptAbandonEntry> = []
+  let selected_seen = false
+  for remote in adapter.attempt_refs(options.repo, version) {
+    const observed_oid = lowercase(trim(remote.oid))
+    if selected_ref != "" && trim(remote.ref) != selected_ref {
+      attempts = attempts
+        + [
+          retained_entry(
+            version,
+            trim(remote.ref),
+            "",
+            observed_oid,
+            "not_selected",
+            "retained because exact-OID recovery selected ${selected_attempt_oid}",
+          ),
+        ]
+      continue
+    }
+    if selected_ref != "" {
+      selected_seen = true
+    }
+    attempts = attempts
+      + [
+        release_attempt_abandon_entry(
+          version,
+          remote,
+          adapter.claim(options.repo, version, observed_oid),
+        ),
+      ]
+  }
+  if selected_ref != "" && !selected_seen {
+    attempts = attempts + [selected_missing_entry(version, selected_attempt_oid)]
+  }
+  // Whole-version mode remains all-or-nothing when one attempt is claimed.
+  // Exact selection deliberately retains every sibling as `not_selected`,
+  // which is non-blocking because the requested authority names only one OID.
+  // Gate on the owning reason codes rather than treating every retention alike.
+  let blocked = attempts.any(
+    { entry ->
+      entry.action == "retain"
+        && RELEASE_ABANDON_BLOCKING_REASONS.contains(entry.reason_code)
+    },
+  )
+  if mode == "apply" && !blocked {
+    attempts = refresh_planned_attempts(adapter, options, version, attempts)
+    blocked = attempts.any(
+      { entry ->
+        entry.action == "retain"
+          && RELEASE_ABANDON_BLOCKING_REASONS.contains(entry.reason_code)
+      },
+    )
+  }
+  if mode == "apply" && !blocked {
+    let applied: list<ReleaseAttemptAbandonEntry> = []
+    for entry in attempts {
+      applied = applied
+        + [
+          if entry.action == "archive" && entry.outcome == "planned" {
+            apply_one(adapter, options.repo, entry)
+          } else {
+            entry
+          },
+        ]
+    }
+    attempts = applied
+  }
+  const state = release_attempt_abandon_state(mode, attempts)
+  const receipt: ReleaseAttemptAbandonReceipt = {
+    schema_version: RELEASE_ATTEMPT_ABANDON_SCHEMA,
+    mode: mode,
+    slug: slug,
+    repo: options.repo,
+    version: version,
+    selected_attempt_oid: selected_attempt_oid,
+    state: state,
+    message: release_attempt_abandon_message(state, version, selected_attempt_oid),
+    attempts: attempts,
+    updated_at: adapter.now(),
+  }
+  return receipt
+}
