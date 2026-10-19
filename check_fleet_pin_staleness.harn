@@ -8,7 +8,9 @@
 // releases behind with two failed bump runs and nobody paged. This check asks
 // the only question that catches every one of those shapes at once — is each
 // consumer actually on the newest release, retaining a complete private incident.
+// A behind consumer with no bump in flight also gets its next bump started.
 import { ParserSpec } from "std/cli/argparse"
+import { GithubClientOptions } from "harn-github-connector/default"
 import { cli_options, is_exact_harn_release_tag } from "lib/cli_options"
 import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
 import { remote_pin } from "lib/fleet_convergence"
@@ -24,23 +26,28 @@ import {
   reconcile_pin_incident,
 } from "lib/fleet_pin_incident"
 import {
+  BumpSuccessorResult,
   ConvergenceDeadline,
   FleetStalenessSnapshot,
   PinStalenessRow,
   UndeclaredPinRow,
   convergence_survey_due,
+  failed_bump_successors,
   pin_staleness_verdict,
   releases_behind,
   stale_rows,
   undeclared_pin_rows,
 } from "lib/fleet_staleness"
 import {
+  github_connector_options,
   github_file_text_at_ref,
   github_latest_release_tag,
   github_pr_list,
   github_published_release_tags,
   github_release_at_tag,
+  github_workflow_dispatch,
 } from "lib/github"
+import { github_workflow_run_inventory } from "lib/github_workflow_inventory"
 import { development_cutover_verdict, workspace_version_from_manifest } from "lib/release_analysis"
 
 const HARN_REPO = "burin-labs/harn"
@@ -99,14 +106,11 @@ pub fn resolve_count(flag: string, raw: string) -> int {
   return parsed
 }
 
-/**
- * Minutes since `target` was published. An unreadable publication time throws:
- * a deadline measured from nothing would read every consumer as on time.
- */
-fn minutes_since_published(harness: Harness, target: string) -> int {
+/** When `target` was published, in epoch seconds, or the reason it could not be read. */
+fn release_published_seconds(harness: Harness, target: string) -> Result<int, string> {
   const lookup = github_release_at_tag(harness, HARN_REPO, target)
   if is_err(lookup) {
-    throw "could not read the ${target} release: ${to_string(unwrap_err(lookup))}"
+    return Err("could not read the ${target} release: ${to_string(unwrap_err(lookup))}")
   }
   const release = unwrap(lookup)
   const published_at = if release.found {
@@ -120,9 +124,112 @@ fn minutes_since_published(harness: Harness, target: string) -> int {
     to_int(date_parse(published_at))
   }
   if published_s == nil {
-    throw "${target} has no readable publication time"
+    return Err("${target} has no readable publication time")
   }
-  return (harness.clock.now_ms() / 1000 - published_s) / 60
+  return Ok(published_s)
+}
+
+/** The part of a repository's update spec that names its bump workflow and branch. */
+pub type StalledBumpWorkflow = {workflow_name: string, base_branch: string, branch: string, ...rest}
+
+/**
+ * Start the next bump for a repository this check found stale.
+ *
+ * A consumer bump starts when its adapter lands. A run that ends without a pull
+ * request, such as a base conflict that asks for a fresh-base retry, leaves
+ * nothing to start the next one, so the pin stays behind until some later
+ * adapter change. This is that successor: it dispatches only when no bump run
+ * is in flight and no bump pull request is open, and the schedule bounds how
+ * often it can fire.
+ */
+pub fn start_stalled_bump(
+  harness: Harness,
+  row: PinStalenessRow,
+  update: StalledBumpWorkflow,
+  target: string,
+  published_s: int?,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> BumpSuccessorResult {
+  if published_s == nil {
+    return {ok: false, action: "probe_failed", detail: "${target} has no readable publication time"}
+  }
+  const runs = github_workflow_run_inventory(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {branch: update.base_branch},
+    client,
+  )
+  if is_err(runs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(runs))}
+  }
+  const active = unwrap(runs).filter({ run -> run.status != "completed" }).to_list()
+  if len(active) > 0 {
+    return {ok: true, action: "bump_running", detail: active[0].url}
+  }
+  // A successful workflow may still leave no pull request or updated pin.
+  // Every dispatched attempt counts toward the per-release bound.
+  const retried = unwrap(runs).filter(
+    { run ->
+      run.event == "workflow_dispatch"
+        && run.created_seconds >= (published_s ?? 0)
+    },
+  )
+    .to_list()
+  if len(retried) > 0 {
+    return {ok: true, action: "already_retried", detail: retried[0].url}
+  }
+  const open_prs = github_pr_list(
+    harness,
+    row.slug,
+    {head: update.branch, state: "open", limit: 10},
+    client,
+  )
+  if is_err(open_prs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(open_prs))}
+  }
+  const prs = unwrap(open_prs)
+  if len(prs) > 0 {
+    return {ok: true, action: "bump_pr_open", detail: "#${to_string(prs[0].number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_dispatch", detail: "${update.workflow_name} ${target}"}
+  }
+  const dispatched = github_workflow_dispatch(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {version: target},
+    update.base_branch,
+    client,
+  )
+  if is_err(dispatched) {
+    return {ok: false, action: "dispatch_failed", detail: to_string(unwrap_err(dispatched))}
+  }
+  return {ok: true, action: "dispatched", detail: unwrap(dispatched).url}
+}
+
+/**
+ * The successor for one surveyed repository, or nil when none applies.
+ *
+ * Only a pin read as behind dispatches. An unknown pin keeps its alarm, but a
+ * failed or malformed read is not evidence that a bump is needed.
+ */
+pub fn bump_successor(
+  harness: Harness,
+  row: PinStalenessRow,
+  harn_bump: bool,
+  update: StalledBumpWorkflow,
+  target: string,
+  published_s: int?,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> BumpSuccessorResult? {
+  if row.state != "behind" || !harn_bump {
+    return nil
+  }
+  return start_stalled_bump(harness, row, update, target, published_s, options, client)
 }
 
 fn run_pin_staleness(harness: Harness) -> int {
@@ -133,11 +240,21 @@ fn run_pin_staleness(harness: Harness) -> int {
     harness.stdio.eprintln("error: target must be an exact Harn tag, got '${target}'")
     return 2
   }
+  const published = release_published_seconds(harness, target)
+  const published_s: int? = if is_ok(published) {
+    unwrap(published)
+  } else {
+    nil
+  }
   const convergence: ConvergenceDeadline? = if options.max_minutes_behind == nil {
     nil
   } else {
+    // A deadline measured from nothing would read every consumer as on time.
+    if published_s == nil {
+      throw unwrap_err(published)
+    }
     {
-      minutes_since_publish: minutes_since_published(harness, target),
+      minutes_since_publish: (harness.clock.now_ms() / 1000 - (published_s ?? 0)) / 60,
       max_minutes_behind: resolve_count("--max-minutes-behind", options.max_minutes_behind),
     }
   }
@@ -215,7 +332,16 @@ fn run_pin_staleness(harness: Harness) -> int {
         update_workflow: update.workflow_path,
         update_branch: update.branch,
       }
-    rows = rows + [row]
+    const successor = bump_successor(
+      harness,
+      row,
+      repo.harn_bump ?? false,
+      update,
+      target,
+      published_s,
+      options,
+    )
+    rows = rows + [row + {successor: successor}]
   }
   const undeclared: list<UndeclaredPinRow> = if options.only == nil {
     undeclared_pin_rows(
@@ -272,7 +398,9 @@ fn run_pin_staleness(harness: Harness) -> int {
   // A stale consumer is a real finding, so the run goes red on purpose: the
   // filed issue is the durable signal, and this is what makes the schedule's
   // own history readable at a glance.
-  return if !incident.ok || len(stale) > 0 || len(undeclared) > 0 || development_cutover.blocked {
+  return if !incident.ok || len(failed_bump_successors(rows)) > 0 || len(stale) > 0
+    || len(undeclared) > 0
+    || development_cutover.blocked {
     1
   } else {
     0
