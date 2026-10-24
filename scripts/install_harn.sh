@@ -31,8 +31,8 @@ install_root="${HARN_INSTALL_ROOT:-${repo_root}/.harn}"
 bin_dir="${install_root}/bin"
 mkdir -p "${bin_dir}"
 
-# Detect the rust target triple matching `harn-<target>.tar.gz` assets
-# that build-release-binaries.yml uploads to each GitHub release.
+# Detect the rust target triple matching the `harn-<target>.tar.{xz,gz}`
+# assets that build-release-binaries.yml uploads to each GitHub release.
 target=""
 case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
   darwin)
@@ -51,13 +51,28 @@ esac
 
 installed_from_asset=0
 if [ -n "${target}" ] && [ "${HARN_INSTALL_FROM_SOURCE:-0}" != "1" ]; then
-  asset_name="harn-${target}.tar.gz"
+  # Releases from v0.10.179 onward ship .tar.xz; earlier tags ship .tar.gz.
+  # Keep this cutover equal to HARN_TAR_XZ_FIRST_RELEASE in lib/release_readiness.harn.
+  archive_ext="tar.xz"
+  if [[ "${version_no_v}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    if (( BASH_REMATCH[1] == 0 && (BASH_REMATCH[2] < 10 || (BASH_REMATCH[2] == 10 && BASH_REMATCH[3] < 179)) )); then
+      archive_ext="tar.gz"
+    fi
+  fi
+  tar_version="$(tar --version 2>&1 || true)"
+  if [ "${archive_ext}" = "tar.xz" ] && [ "$(uname -s)" = "Linux" ] \
+    && [[ "${tar_version}" != *bsdtar* ]] && ! command -v xz >/dev/null 2>&1; then
+    echo "ERROR: ${tag} ships harn-${target}.tar.xz, but this host has neither bsdtar nor xz to extract it." >&2
+    echo "       Install xz (for example 'apt-get install xz-utils') and re-run." >&2
+    exit 1
+  fi
+  asset_name="harn-${target}.${archive_ext}"
   asset_url="https://github.com/burin-labs/harn/releases/download/${tag}/${asset_name}"
   sums_url="https://github.com/burin-labs/harn/releases/download/${tag}/SHA256SUMS"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' EXIT
   echo "Fetching prebuilt binary: ${asset_url}"
-  if curl -fsSL "${asset_url}" -o "${tmpdir}/harn.tar.gz"; then
+  if curl -fsSL "${asset_url}" -o "${tmpdir}/${asset_name}"; then
     # Verify against the release-published SHA256SUMS sidecar before extract.
     # SHA256SUMS lists every asset in one file (standard `sha256sum` format)
     # produced by the same release pipeline as the tarball, so a swap at the
@@ -82,10 +97,10 @@ if [ -n "${target}" ] && [ "${HARN_INSTALL_FROM_SOURCE:-0}" != "1" ]; then
         exit 1
       fi
       if command -v sha256sum >/dev/null 2>&1; then
-        actual_sum="$(sha256sum "${tmpdir}/harn.tar.gz" | awk '{ print $1 }')"
+        actual_sum="$(sha256sum "${tmpdir}/${asset_name}" | awk '{ print $1 }')"
       else
         # macOS ships `shasum`, not `sha256sum`.
-        actual_sum="$(shasum -a 256 "${tmpdir}/harn.tar.gz" | awk '{ print $1 }')"
+        actual_sum="$(shasum -a 256 "${tmpdir}/${asset_name}" | awk '{ print $1 }')"
       fi
       if [ "${actual_sum}" != "${expected_sum}" ]; then
         echo "ERROR: sha256 mismatch for ${asset_name}." >&2
@@ -96,7 +111,7 @@ if [ -n "${target}" ] && [ "${HARN_INSTALL_FROM_SOURCE:-0}" != "1" ]; then
       fi
       echo "Verified ${asset_name} sha256 ${actual_sum}."
     fi
-    tar -xzf "${tmpdir}/harn.tar.gz" -C "${tmpdir}"
+    tar -xf "${tmpdir}/${asset_name}" -C "${tmpdir}"
     install -m 755 "${tmpdir}/harn" "${bin_dir}/harn"
     if [ -f "${tmpdir}/harn-dap" ]; then
       install -m 755 "${tmpdir}/harn-dap" "${bin_dir}/harn-dap"
