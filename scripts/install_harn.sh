@@ -51,11 +51,11 @@ esac
 
 installed_from_asset=0
 if [ -n "${target}" ] && [ "${HARN_INSTALL_FROM_SOURCE:-0}" != "1" ]; then
-  # Releases from v0.10.178 onward ship .tar.xz; earlier tags ship .tar.gz.
+  # Releases from v0.10.179 onward ship .tar.xz; earlier tags ship .tar.gz.
   # Keep this cutover equal to HARN_TAR_XZ_FIRST_RELEASE in lib/release_readiness.harn.
   archive_ext="tar.xz"
   if [[ "${version_no_v}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-    if (( BASH_REMATCH[1] == 0 && (BASH_REMATCH[2] < 10 || (BASH_REMATCH[2] == 10 && BASH_REMATCH[3] < 178)) )); then
+    if (( BASH_REMATCH[1] == 0 && (BASH_REMATCH[2] < 10 || (BASH_REMATCH[2] == 10 && BASH_REMATCH[3] < 179)) )); then
       archive_ext="tar.gz"
     fi
   fi
