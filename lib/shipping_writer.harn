@@ -1,0 +1,157 @@
+import { FleetManifest, parse_fleet_manifest } from "./fleet_manifest"
+import {
+  ShippingConfiguration,
+  ShippingRecord,
+  capture_shipping_authority,
+  shipping_authority_current,
+} from "./shipping_authority"
+
+/** The controller owns the contents and validation of its opaque writer permit. */
+pub type ControllerAnswer = {
+  schema: "smart-ship.writer-authorization.v1",
+  status: "authorized" | "denied",
+  state_commit: string?,
+  permit: dict?,
+}
+
+pub type FormerWriter = {id: string, repository: string, source: string}
+
+/** Retain once at startup; an authorization check never replaces this capture. */
+pub type WriterCapture = {
+  schema: "fleet.shipping-writer-capture.v1",
+  routing: ShippingRecord,
+  writer: FormerWriter,
+  configuration: string?,
+  permit: dict?,
+}
+
+pub type WriterDecision = {
+  schema: "fleet.shipping-writer-decision.v1",
+  status: "authorized" | "denied",
+  reason: string,
+  state_commit: string?,
+}
+
+/** Hosts provide reads and controller calls without granting this module provider effects. */
+pub type AuthorityReader = {
+  registry: fn() -> FleetManifest,
+  configuration: fn(ShippingConfiguration) -> string,
+  controller: fn(dict) -> ControllerAnswer,
+}
+
+pub type WriterCommand = {action: "capture", writer: FormerWriter} \
+  | {action: "authorize", capture: WriterCapture}
+
+pub type WriterResponse = {
+  schema: "fleet.shipping-writer-response.v1",
+  status: "authorized" | "denied",
+  capture: WriterCapture?,
+  decision: WriterDecision?,
+  error: string?,
+}
+
+pub fn capture_writer(reader: AuthorityReader, writer: FormerWriter) -> WriterCapture {
+  require writer.id.trim() != "" && regex_match("^[0-9a-f]{40}$", writer.source) != nil,
+    "shipping writer needs its identity and actual immutable control source"
+  const routing = capture_shipping_authority(reader.registry(), writer.repository)
+  if routing.descriptor.kind == "legacy" {
+    return {
+      schema: "fleet.shipping-writer-capture.v1",
+      routing: routing,
+      writer: writer,
+      configuration: nil,
+      permit: nil,
+    }
+  }
+  const configuration = reader.configuration(routing.descriptor.configuration)
+  require configuration != "", "managed shipping configuration was not measured"
+  const answer = reader.controller(
+    {action: "capture-writer", configuration: configuration, writer: writer},
+  )
+  require answer.status == "authorized" && answer.state_commit != nil && answer.permit != nil
+    && answer.permit?.installation == routing.descriptor.installation
+    && answer.permit?.writer == writer,
+    "the recorded controller refused this former writer"
+  return {
+    schema: "fleet.shipping-writer-capture.v1",
+    routing: routing,
+    writer: writer,
+    configuration: configuration,
+    permit: answer.permit,
+  }
+}
+
+/** Missing registry data, changed enrollment or refusal cannot restore legacy authority. */
+pub fn authorize_writer(reader: AuthorityReader, captured: WriterCapture) -> WriterDecision {
+  let state_commit: string? = nil
+  const measured = try {
+    require captured.writer.repository == captured.routing.repository,
+      "captured shipping repository changed"
+    require shipping_authority_current(captured.routing, reader.registry()),
+      "shipping enrollment changed or is unreadable"
+    if captured.routing.descriptor.kind == "harn" {
+      require captured.configuration != nil && captured.permit != nil,
+        "managed shipping has no original controller permit"
+      require captured.permit?.writer == captured.writer,
+        "captured controller permit belongs to another writer"
+      const answer = reader.controller(
+        {
+          action: "authorize-writer",
+          configuration: captured.configuration,
+          writer_permit: captured.permit,
+        },
+      )
+      state_commit = answer.state_commit
+      require answer.status == "authorized" && answer.state_commit != nil
+        && answer.permit == captured.permit,
+        "the recorded controller refused the original writer permit"
+    } else {
+      require captured.configuration == nil && captured.permit == nil,
+        "legacy shipping capture contains a managed permit"
+    }
+    true
+  }
+  return {
+    schema: "fleet.shipping-writer-decision.v1",
+    status: is_ok(measured) ? "authorized" : "denied",
+    reason: is_ok(measured) ? "" : to_string(unwrap_err(measured)),
+    state_commit: state_commit,
+  }
+}
+
+/** Decode the public command once and retain the original capture even after denial. */
+pub fn run_writer_command(reader: AuthorityReader, payload: string) -> WriterResponse {
+  const measured = try {
+    require len(payload) <= 1048576, "shipping writer command exceeds its size limit"
+    const command: WriterCommand = schema_expect(json_parse(payload), schema_of(WriterCommand))
+    if command.action == "capture" {
+      const captured = capture_writer(reader, command.writer)
+      {capture: captured, decision: nil}
+    } else {
+      {capture: command.capture, decision: authorize_writer(reader, command.capture)}
+    }
+  }
+  if is_err(measured) {
+    return {
+      schema: "fleet.shipping-writer-response.v1",
+      status: "denied",
+      capture: nil,
+      decision: nil,
+      error: to_string(unwrap_err(measured)),
+    }
+  }
+  const value = unwrap(measured)
+  return {
+    schema: "fleet.shipping-writer-response.v1",
+    status: value.decision?.status ?? "authorized",
+    capture: value.capture,
+    decision: value.decision,
+    error: nil,
+  }
+}
+
+/** Registry decoding uses the owning parser and never supplies a fallback declaration. */
+pub fn parse_registry(text: string) -> FleetManifest {
+  require len(text) <= 1048576, "shipping registry exceeds its size limit"
+  return parse_fleet_manifest(toml_parse(text))
+}
