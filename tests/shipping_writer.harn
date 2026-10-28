@@ -1,0 +1,160 @@
+import { FleetManifest, parse_fleet_manifest } from "../lib/fleet_manifest"
+import { ShippingDescriptor } from "../lib/shipping_authority"
+import { AuthorityReader, ControllerAnswer, run_writer_command } from "../lib/shipping_writer"
+
+const WRITER = {id: "shipping-writer", repository: "sample/project", source: "a".repeat(40)}
+
+fn manifest(shipping: unknown) -> FleetManifest {
+  return parse_fleet_manifest(
+    {
+      schema_version: 1,
+      fleet: {default_root: "projects", default_branch: "main"},
+      policy: {
+        package_workflow: "sample/policy/.github/workflows/package.yml@" + "a".repeat(40),
+        bump_workflow: "sample/policy/.github/workflows/bump.yml@" + "a".repeat(40),
+      },
+      repositories: [{slug: WRITER.repository, directory: "project", shipping: shipping}],
+    },
+  )
+}
+
+fn managed() -> ShippingDescriptor {
+  return {
+    kind: "harn",
+    installation: "sample-installation",
+    configuration: {repository: "sample/control", commit: "b".repeat(40), path: "ship.json"},
+  }
+}
+
+pipeline test_legacy_capture_requires_a_fresh_registry_without_controller_calls() {
+  let fresh = manifest({kind: "legacy"})
+  let controller_calls = 0
+  const reader: AuthorityReader = {
+    registry: { -> fresh },
+    configuration: { _locator ->
+      throw "legacy must not read controller configuration"
+    },
+    controller: { _request ->
+      controller_calls += 1
+      throw "legacy must not read a controller"
+    },
+  }
+  const captured = run_writer_command(reader, json_stringify({action: "capture", writer: WRITER}))
+  assert_eq(captured.schema, "fleet.shipping-writer-response.v1")
+  assert_eq(captured.status, "authorized")
+  assert_eq(
+    run_writer_command(reader, json_stringify({action: "authorize", capture: captured.capture}))
+      .status,
+    "authorized",
+  )
+  fresh = manifest(managed())
+  const delayed = run_writer_command(
+    reader,
+    json_stringify({action: "authorize", capture: captured.capture}),
+  )
+  assert_eq(delayed.status, "denied")
+  assert_eq(controller_calls, 0)
+}
+
+pipeline test_missing_or_malformed_enrollment_cannot_fall_back_to_legacy() {
+  for shipping in [nil, {}, {kind: "legacy", extra: true}] {
+    const reader: AuthorityReader = {
+      registry: { -> manifest(shipping) },
+      configuration: { _locator ->
+        throw "invalid registry reached configuration"
+      },
+      controller: { _request ->
+        throw "invalid registry reached controller"
+      },
+    }
+    const answer = run_writer_command(reader, json_stringify({action: "capture", writer: WRITER}))
+    assert_eq(answer.status, "denied")
+    assert_eq(answer.capture, nil)
+  }
+}
+
+pipeline test_missing_managed_configuration_cannot_fall_back_to_legacy() {
+  const reader: AuthorityReader = {
+    registry: { -> manifest(managed()) },
+    configuration: { _locator ->
+      throw "configuration missing"
+    },
+    controller: { _request ->
+      throw "missing configuration reached controller"
+    },
+  }
+  const answer = run_writer_command(reader, json_stringify({action: "capture", writer: WRITER}))
+  assert_eq(answer.status, "denied")
+  assert_eq(answer.capture, nil)
+}
+
+pipeline test_authorization_preserves_the_original_controller_permit() {
+  const original = {installation: "sample-installation", generation: 1, revision: 2, writer: WRITER}
+  let phase = "capture"
+  let calls = []
+  const reader: AuthorityReader = {
+    registry: { -> manifest(managed()) },
+    configuration: { _locator -> "state/config.json" },
+    controller: { request ->
+      calls = calls + [request]
+      if phase == "capture" {
+        assert_eq(request.action, "capture-writer")
+        assert_eq(request.writer, WRITER)
+        {
+          schema: "smart-ship.writer-authorization.v1",
+          status: "authorized",
+          state_commit: "c".repeat(40),
+          permit: original,
+        }
+      } else {
+        assert_eq(request.action, "authorize-writer")
+        assert_eq(request.writer_permit, original)
+        {
+          schema: "smart-ship.writer-authorization.v1",
+          status: phase == "replacement" ? "authorized" : "denied",
+          state_commit: "d".repeat(40),
+          permit: phase == "replacement" ? original + {generation: 2} : original,
+        }
+      }
+    },
+  }
+  const captured = run_writer_command(reader, json_stringify({action: "capture", writer: WRITER}))
+  assert_eq(captured.status, "authorized")
+  for next in ["denied", "replacement"] {
+    phase = next
+    const refused = run_writer_command(
+      reader,
+      json_stringify({action: "authorize", capture: captured.capture}),
+    )
+    assert_eq(refused.status, "denied")
+    assert_eq(refused.capture, captured.capture)
+    assert_eq(refused.decision?.state_commit, "d".repeat(40))
+  }
+  assert_eq(len(calls), 3)
+}
+
+pipeline test_capture_refuses_mismatched_or_unmeasured_controller_identity() {
+  const permit = {installation: "sample-installation", generation: 1, writer: WRITER}
+  const valid: ControllerAnswer = {
+    schema: "smart-ship.writer-authorization.v1",
+    status: "authorized",
+    state_commit: "c".repeat(40),
+    permit: permit,
+  }
+  for invalid in [
+    valid + {status: "denied"},
+    valid + {state_commit: nil},
+    valid + {permit: nil},
+    valid + {permit: permit + {installation: "another-installation"}},
+    valid + {permit: permit + {writer: WRITER + {source: "b".repeat(40)}}},
+  ] {
+    const reader: AuthorityReader = {
+      registry: { -> manifest(managed()) },
+      configuration: { _locator -> "state/config.json" },
+      controller: { _request -> schema_expect(invalid, schema_of(ControllerAnswer)) },
+    }
+    const answer = run_writer_command(reader, json_stringify({action: "capture", writer: WRITER}))
+    assert_eq(answer.status, "denied")
+    assert_eq(answer.capture, nil)
+  }
+}
