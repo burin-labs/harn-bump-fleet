@@ -1,0 +1,1 @@
+`watch_harn_release.harn` now has an observe-only mode for read-only fleet custody: `--observe-only` polls typed release progress without rearming the release PR or dispatching binary recovery/cache-warm workflows, and the runtime exposes the same boundary as a typed option.

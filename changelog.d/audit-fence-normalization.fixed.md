@@ -1,0 +1,1 @@
+A Markdown code fence in the release-readiness audit no longer fails the release. Fences are normalized on ingest and again where the draft changelog is extracted, so a command written as inline code survives as inline code instead of blocking the lane.
