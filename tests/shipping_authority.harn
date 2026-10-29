@@ -1,0 +1,179 @@
+import {
+  FleetManifest,
+  harn_bump_repositories,
+  harn_package_repositories,
+  parse_fleet_manifest,
+  read_fleet_manifest,
+} from "../lib/fleet_manifest"
+import {
+  capture_shipping_authority,
+  read_shipping_authority,
+  require_shipping_enrollment_retained,
+  shipping_authority_census,
+  shipping_authority_current,
+  shipping_baseline_manifest,
+} from "../lib/shipping_authority"
+
+const TARGET = "sample/project"
+
+const COMMIT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+fn manifest(shipping: unknown = {kind: "legacy"}) -> FleetManifest {
+  return parse_fleet_manifest(
+    {
+      schema_version: 1,
+      fleet: {default_root: "projects", default_branch: "main"},
+      policy: {
+        package_workflow: "sample/policy/.github/workflows/package.yml@${COMMIT}",
+        bump_workflow: "sample/policy/.github/workflows/bump.yml@${COMMIT}",
+      },
+      repositories: [{slug: TARGET, directory: "project", shipping: shipping}],
+    },
+  )
+}
+
+fn managed() {
+  return {
+    kind: "harn",
+    installation: "sample-installation",
+    configuration: {repository: "sample/control", commit: COMMIT, path: "shipping/config.json"},
+  }
+}
+
+fn refused(callback: closure) -> bool {
+  return try {
+    callback()
+    false
+  } catch (error) {
+    true
+  }
+}
+
+pipeline test_real_registry_declares_every_shipping_owner(harness: Harness) {
+  const registry = read_fleet_manifest(harness.fs, "../fleet.toml")
+  const census = shipping_authority_census(registry)
+  assert(census.required_count > 0)
+  assert_eq(census.declared_count, census.required_count)
+  assert_eq(len(census.records), census.required_count)
+  assert_eq(census.missing, [])
+  assert_eq(census.invalid, [])
+  for repository in ["burin-labs/.github", "burin-labs/smart-ship-sandbox"] {
+    assert_eq(capture_shipping_authority(registry, repository).descriptor.kind, "legacy")
+    assert_eq(harn_bump_repositories(registry).any({ row -> row.slug == repository }), false)
+    assert_eq(harn_package_repositories(registry).any({ row -> row.slug == repository }), false)
+  }
+}
+
+pipeline test_explicit_legacy_and_managed_capture_are_stable(harness: Harness) {
+  const legacy = capture_shipping_authority(manifest(), TARGET)
+  assert_eq(legacy.descriptor.kind, "legacy")
+  const enrolled = capture_shipping_authority(manifest(managed()), TARGET)
+  assert_eq(enrolled.descriptor, managed())
+  assert(legacy.identity != enrolled.identity)
+  assert_eq(len(enrolled.identity), 64)
+  assert(shipping_authority_current(enrolled, manifest(managed())))
+  const root = harness.fs.mkdtemp_in_workspace("missing-shipping-configuration-")
+  const configuration = root + "/shipping/config.json"
+  assert_eq(harness.fs.exists(configuration), false)
+  assert(refused({ -> harness.fs.read_text(configuration) }))
+  // The failed configuration read never changes the captured routing record.
+  assert(shipping_authority_current(enrolled, manifest(managed())))
+  assert_eq(enrolled.descriptor.kind, "harn")
+}
+
+pipeline test_partial_invalid_and_unknown_records_never_grant_legacy() {
+  const missing = shipping_authority_census(manifest(nil))
+  assert_eq([missing.required_count, missing.declared_count, len(missing.records)], [1, 0, 0])
+  assert_eq(missing.missing, [TARGET])
+  for raw in [
+    nil,
+    {},
+    {kind: "unknown"},
+    {kind: "legacy", extra: true},
+    {kind: "harn", installation: "sample-installation"},
+    managed() + {installation: " "},
+    managed() + {configuration: managed().configuration + {repository: "https://token@host/repo"}},
+    managed() + {configuration: managed().configuration + {commit: "main"}},
+    managed() + {configuration: managed().configuration + {path: "../config.json"}},
+    managed() + {configuration: managed().configuration + {path: "/config.json"}},
+    managed() + {configuration: managed().configuration + {secret: "forbidden"}},
+  ] {
+    assert(refused({ -> capture_shipping_authority(manifest(raw), TARGET) }))
+  }
+  assert(refused({ -> capture_shipping_authority(manifest(), "sample/unknown") }))
+  const invalid = shipping_authority_census(manifest({kind: "unknown"}))
+  assert_eq([invalid.required_count, invalid.declared_count, len(invalid.records)], [1, 1, 0])
+  assert_eq(invalid.invalid[0]?.repository, TARGET)
+}
+
+pipeline test_delayed_writer_keeps_original_record_across_transfer_and_rollback() {
+  const legacy = capture_shipping_authority(manifest(), TARGET)
+  const enrolled = capture_shipping_authority(manifest(managed()), TARGET)
+  assert_eq(shipping_authority_current(legacy, manifest(managed())), false)
+  assert_eq(shipping_authority_current(enrolled, manifest()), false)
+  assert_eq(shipping_authority_current(enrolled, manifest(nil)), false)
+  const changed = managed()
+    + {
+      configuration: managed().configuration + {commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    }
+  assert_eq(shipping_authority_current(enrolled, manifest(changed)), false)
+  assert_eq(enrolled.descriptor, managed())
+}
+
+pipeline test_other_repository_changes_do_not_invalidate_the_captured_record() {
+  const original = manifest(managed())
+  const captured = capture_shipping_authority(original, TARGET)
+  const fresh = original
+    + {
+      repositories: original.repositories
+        + [{slug: "sample/other", directory: "other", shipping: {kind: "legacy"}}],
+    }
+  assert(shipping_authority_current(captured, fresh))
+  assert(
+    refused(
+      { ->
+        capture_shipping_authority(
+          original + {repositories: original.repositories + original.repositories},
+          TARGET,
+        )
+      },
+    ),
+  )
+}
+
+pipeline test_unreadable_missing_and_malformed_registry_grant_no_record(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("shipping-registry-")
+  assert(refused({ -> read_shipping_authority(harness.fs, TARGET, root + "/absent.toml") }))
+  assert(refused({ -> read_shipping_authority(harness.fs, TARGET, ".") }))
+  const malformed = root + "/malformed.toml"
+  harness.fs.write_text(malformed, "[repositories\n")
+  assert(refused({ -> read_shipping_authority(harness.fs, TARGET, malformed) }))
+  assert(refused({ -> capture_shipping_authority(manifest() + {repositories: []}, TARGET) }))
+}
+
+pipeline test_managed_enrollment_cannot_be_deleted_or_downgraded_during_rollback() {
+  const enrolled = manifest(managed())
+  assert_eq(require_shipping_enrollment_retained(manifest(nil), manifest()), 0)
+  assert_eq(require_shipping_enrollment_retained(manifest(), enrolled), 0)
+  assert_eq(require_shipping_enrollment_retained(enrolled, enrolled), 1)
+  for after in [
+    manifest(),
+    manifest(nil),
+    enrolled + {repositories: []},
+    manifest(managed() + {installation: "replacement-installation"}),
+  ] {
+    assert(refused({ -> require_shipping_enrollment_retained(enrolled, after) }))
+  }
+}
+
+pipeline test_transition_baseline_is_an_immutable_readable_git_object(harness: Harness) {
+  for commit in ["main", "--help", "0000000000000000000000000000000000000000", COMMIT] {
+    assert(refused({ -> shipping_baseline_manifest(harness.process, commit) }))
+  }
+  const observed = harness.process.run(
+    {program: "git", args: ["rev-parse", "HEAD"], timeout_ms: 30000},
+  )
+  assert(observed.success)
+  const baseline = shipping_baseline_manifest(harness.process, trim(observed.stdout))
+  assert(len(baseline.repositories) > 0)
+}
