@@ -59,9 +59,9 @@ The entry points are:
   machine holding all twenty-six checkouts. Pin-only package CI is derived from
   current default-branch bytes and preserves repository-owned jobs. Dry-run
   first; `--apply` writes.
-  `--apply` also arms auto-merge, leased to the commit it published, so each
-  repair lands once that repository's own checks pass. `--no-auto-merge` holds
-  arming; it never merges anything itself.
+  `--apply` checks the published head and adds the Smart Ship `ship` label;
+  required reviews and checks still govern landing. `--no-auto-merge` holds
+  arming; convergence never merges anything itself.
 - `check_projection_source_drift.harn`: the trigger half of the same repair. A
   projection has two inputs, the renderer here and the canonical source file in
   another repository, and only the renderer had an event. This compares each
