@@ -1,0 +1,362 @@
+import {
+  PIN_INCIDENT_MARKER,
+  PinIncidentObservation,
+  pin_incident_body,
+  public_pin_receipt,
+  reconcile_pin_incident,
+} from "../lib/fleet_pin_incident"
+import { PinStalenessRow, pin_staleness_verdict } from "../lib/fleet_staleness"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const BASE = "https://github.test"
+
+const DESTINATION = "test/private-incidents"
+
+const REPOSITORY = "${BASE}/repos/${DESTINATION}"
+
+const ISSUES = "${REPOSITORY}/issues"
+
+type IssueWrite = {body: string, state?: string, ...rest}
+
+fn client() -> GithubClientOptions {
+  return {api_base_url: BASE, installation_token: "fixture-token"}
+}
+
+fn observation(healthy: bool = false) -> PinIncidentObservation {
+  const row: PinStalenessRow = pin_staleness_verdict(
+    if healthy {
+      "0.10.165"
+    } else {
+      nil
+    },
+    "v0.10.165",
+    if healthy {
+      0
+    } else {
+      8
+    },
+    1,
+  )
+    + {
+      slug: "test/consumer",
+      pin: if healthy {
+        "0.10.165"
+      } else {
+        nil
+      },
+    }
+  return {
+    snapshot: {
+      schema_version: "harn_bump_fleet.pin_staleness.v1",
+      target: "v0.10.165",
+      max_releases_behind: 1,
+      convergence_deadline: nil,
+      stale_count: if healthy {
+        0
+      } else {
+        1
+      },
+      repositories: [row],
+    },
+    undeclared_pins: [],
+    expected_count: 1,
+    expected_repositories: ["test/consumer"],
+    observed_at_ms: 1792359000000,
+    source_revision: "abc123",
+    run_url: "https://github.test/run/1",
+    full_fleet: true,
+    development_blocked: false,
+  }
+}
+
+fn mock_repository(testing: HarnessTesting, private_repository: bool = true) {
+  testing.http_mock_clear()
+  testing.http_mock(
+    "GET",
+    REPOSITORY,
+    {
+      status: 200,
+      body: json_stringify(
+        {private: private_repository, unrelated: "real response includes other fields"},
+      ),
+    },
+  )
+  testing.http_mock(
+    "GET",
+    "${REPOSITORY}/labels/harn-pin-staleness",
+    {status: 200, body: "{\"name\":\"harn-pin-staleness\"}"},
+  )
+}
+
+fn mock_readback(testing: HarnessTesting, healthy: bool = false) {
+  testing.http_mock(
+    "GET",
+    "${ISSUES}/42",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          number: 42,
+          body: pin_incident_body(observation(healthy)),
+          state: if healthy {
+            "closed"
+          } else {
+            "open"
+          },
+          labels: [{name: "harn-pin-staleness"}],
+        },
+      ),
+    },
+  )
+}
+
+fn mock_issues(testing: HarnessTesting, existing: bool = false) {
+  testing.http_mock(
+    "GET",
+    "${ISSUES}?labels=harn-pin-staleness&per_page=100&state=open",
+    {
+      status: 200,
+      body: json_stringify(
+        if existing {
+          [{number: 42, title: "incident", body: PIN_INCIDENT_MARKER, state: "open"}]
+        } else {
+          []
+        },
+      ),
+    },
+  )
+}
+
+pipeline test_unknown_pin_opens_one_private_fleet_incident_with_complete_observation(
+  harness: Harness,
+) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing)
+  mock_readback(harness.testing)
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: "{\"number\":42}"})
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "opened")
+  const writes = harness.testing.http_mock_calls().filter({ call -> call.method == "POST" })
+    .to_list()
+  assert_eq(len(writes), 1)
+  assert_eq(writes[0].url, ISSUES)
+  const sent = schema_expect(json_parse(writes[0].body), IssueWrite)
+  assert(contains(sent.body, "Pending measurement: 1"))
+  assert(contains(sent.body, "test/consumer"))
+  assert(contains(sent.body, "abc123"))
+  assert(contains(sent.body, "https://github.test/run/1"))
+  assert(contains(sent.body, PIN_INCIDENT_MARKER))
+}
+
+pipeline test_partial_survey_cannot_refresh_or_close_the_full_incident(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const result = reconcile_pin_incident(
+    harness,
+    observation(true) + {full_fleet: false},
+    DESTINATION,
+    false,
+    client(),
+  )
+  assert_eq(result.action, "scoped_observation")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_empty_or_incomplete_census_is_not_recovery(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const original = observation(true)
+  const result = reconcile_pin_incident(
+    harness,
+    original + {snapshot: original.snapshot + {repositories: []}},
+    DESTINATION,
+    false,
+    client(),
+  )
+  assert(!result.ok)
+  assert_eq(result.action, "incomplete_observation")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_public_destination_refuses_private_fleet_rows(harness: Harness) {
+  mock_repository(harness.testing, false)
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(!result.ok)
+  assert_eq(result.action, "private_destination_required")
+  assert_eq(len(harness.testing.http_mock_calls()), 1)
+}
+
+pipeline test_unknown_pin_refreshes_existing_incident_without_closing(harness: Harness) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing, true)
+  mock_readback(harness.testing)
+  harness.testing.http_mock("PATCH", "${ISSUES}/42", {status: 200, body: "{\"number\":42}"})
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "refreshed")
+  const writes = harness.testing.http_mock_calls().filter({ call -> call.method == "PATCH" })
+    .to_list()
+  assert_eq(len(writes), 1)
+  const sent = schema_expect(json_parse(writes[0].body), IssueWrite)
+  assert_eq(sent.state, nil)
+}
+
+pipeline test_complete_measured_recovery_updates_evidence_and_closes(harness: Harness) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing, true)
+  mock_readback(harness.testing, true)
+  harness.testing.http_mock("PATCH", "${ISSUES}/42", {status: 200, body: "{\"number\":42}"})
+  const result = reconcile_pin_incident(harness, observation(true), DESTINATION, false, client())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "closed")
+  const writes = harness.testing.http_mock_calls().filter({ call -> call.method == "PATCH" })
+    .to_list()
+  assert_eq(len(writes), 1)
+  const sent = schema_expect(json_parse(writes[0].body), IssueWrite)
+  assert_eq(sent.state, "closed")
+  assert(contains(sent.body, "Pending measurement: 0"))
+}
+
+pipeline test_refused_publication_is_reported_as_failure(harness: Harness) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing)
+  harness.testing.http_mock("POST", ISSUES, {status: 403, body: "{\"message\":\"Forbidden\"}"})
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(!result.ok)
+  assert_eq(result.action, "open_failed")
+}
+
+pipeline test_acknowledged_write_without_matching_readback_is_not_durable_publication(
+  harness: Harness,
+) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing)
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: "{\"number\":42}"})
+  harness.testing.http_mock(
+    "GET",
+    "${ISSUES}/42",
+    {
+      status: 200,
+      body: json_stringify(
+        {number: 42, body: "truncated", state: "open", labels: [{name: "harn-pin-staleness"}]},
+      ),
+    },
+  )
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(!result.ok)
+  assert_eq(result.action, "readback_mismatch")
+}
+
+pipeline test_absent_discovery_label_prevents_an_unfindable_issue(harness: Harness) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("GET", REPOSITORY, {status: 200, body: "{\"private\":true}"})
+  harness.testing.http_mock(
+    "GET",
+    "${REPOSITORY}/labels/harn-pin-staleness",
+    {status: 404, body: "{\"message\":\"Not Found\"}"},
+  )
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(!result.ok)
+  assert_eq(result.action, "discovery_label_unmeasured")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method != "GET" }).to_list()),
+    0,
+  )
+}
+
+pipeline test_malformed_issue_census_is_not_an_empty_list(harness: Harness) {
+  mock_repository(harness.testing)
+  harness.testing.http_mock(
+    "GET",
+    "${ISSUES}?labels=harn-pin-staleness&per_page=100&state=open",
+    {status: 200, body: "{}"},
+  )
+  const result = reconcile_pin_incident(harness, observation(), DESTINATION, false, client())
+  assert(!result.ok)
+  assert_eq(result.action, "unmeasured_issue_census")
+  assert_eq(
+    len(harness.testing.http_mock_calls().filter({ call -> call.method != "GET" }).to_list()),
+    0,
+  )
+}
+
+pipeline test_different_repository_with_the_same_count_is_not_complete(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const result = reconcile_pin_incident(
+    harness,
+    observation(true) + {expected_repositories: ["test/other"]},
+    DESTINATION,
+    false,
+    client(),
+  )
+  assert(!result.ok)
+  assert_eq(result.action, "repository_identity_mismatch")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_public_receipt_retains_verdict_without_private_observation_details() {
+  const receipt = json_stringify(
+    public_pin_receipt(
+      observation(),
+      {ok: false, action: "readback_failed", detail: "private/path/test/consumer"},
+    ),
+  )
+  assert(!contains(receipt, "test/consumer"))
+  assert(!contains(receipt, "private/path"))
+  assert(!contains(receipt, "abc123"))
+  assert(contains(receipt, "unknown"))
+  assert(contains(receipt, "pending_count"))
+}
+
+pipeline test_local_dry_run_does_not_require_action_source_identity(harness: Harness) {
+  harness.testing.http_mock_clear()
+  const result = reconcile_pin_incident(
+    harness,
+    observation() + {source_revision: ""},
+    "",
+    true,
+    client(),
+  )
+  assert(result.ok)
+  assert_eq(result.action, "dry_run")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_failed_successor_opens_a_private_incident_within_the_lag_budget(harness: Harness) {
+  mock_repository(harness.testing)
+  mock_issues(harness.testing)
+  const row: PinStalenessRow = pin_staleness_verdict("0.10.164", "v0.10.165", 0, 1)
+    + {
+      slug: "test/consumer",
+      pin: "0.10.164",
+      successor: {ok: false, action: "dispatch_failed", detail: "private dispatch refusal"},
+    }
+  assert_eq(row.state, "behind")
+  assert(!row.stale, "a tolerated pin lag alone would not open the incident")
+  const measured = observation(true)
+  const changed = measured + {snapshot: measured.snapshot + {repositories: [row]}}
+  const body = pin_incident_body(changed)
+  harness.testing.http_mock("POST", ISSUES, {status: 201, body: "{\"number\":42}"})
+  harness.testing.http_mock(
+    "GET",
+    "${ISSUES}/42",
+    {
+      status: 200,
+      body: json_stringify(
+        {number: 42, body: body, state: "open", labels: [{name: "harn-pin-staleness"}]},
+      ),
+    },
+  )
+  const result = reconcile_pin_incident(harness, changed, DESTINATION, false, client())
+  assert(result.ok, result.detail)
+  assert_eq(result.action, "opened", "a failed successor must keep a durable incident")
+  const writes = harness.testing.http_mock_calls().filter({ call -> call.method == "POST" })
+    .to_list()
+  assert_eq(len(writes), 1, "the actual private writer must run exactly once")
+  const sent = schema_expect(json_parse(writes[0].body ?? ""), IssueWrite)
+  assert(contains(sent.body, "private dispatch refusal"), "the private body retains the cause")
+  const public_receipt = public_pin_receipt(changed, result)
+  assert_eq(public_receipt.successor_failed_count, 1)
+  const receipt = json_stringify(public_receipt)
+  assert(!contains(receipt, "private dispatch refusal"))
+  assert(!contains(receipt, "test/consumer"))
+}
