@@ -109,7 +109,7 @@ repository on an `automation/fleet-projections-<digest>` branch named for the
 exact bytes it carries. Each run also retires the proposals it has moved past:
 an open projection pull request on any other such branch is proposing bytes the
 manifest no longer says, so it is closed with the reason rather than left to
-conflict behind an auto-merge that can never fire. It repairs only
+conflict with its replacement. It repairs only
 the three violations that describe bytes drifting from a projection; a typed
 violation names a workflow the fleet does not render, so no correct content
 exists to propose. The local `sync_*` harnesses remain the way to converge a
@@ -119,17 +119,13 @@ repository admission. It is repeatable and fails closed if any requested path
 is not owned by the selected manifest slice, preventing task-scoped repairs
 from absorbing unrelated projection drift.
 
-Nothing in that path writes a default branch or merges anything itself. It does
-arm auto-merge on each proposal, leased to the exact commit it just published,
-so an appended commit fails closed instead of riding along. Every repository
-still keeps its own gate: GitHub merges only once that repository's required
-checks pass, and a red projection sits open exactly as before. What arming
-removes is the person whose remaining job was to agree with a byte comparison
-the loop had already made — and whose absence, for three days in August 2026,
-left the whole fleet unable to bump. `--no-auto-merge` proposes without arming.
+Nothing in that path writes a default branch or merges anything itself. It
+checks the published commit and adds `ship`, so Smart Ship can land the
+proposal after the repository's required reviews and checks pass. A changed
+head or an unmeasured Ship caller refuses arming. `--no-auto-merge` proposes
+without arming.
 
-A repository that refuses arming — auto-merge switched off, or a gate the
-fleet's App cannot satisfy — is reported as `auto_merge.state = "refused"` and
+A refused authorization is reported as `auto_merge.state = "refused"` and
 fails the run. A standing proposal older than three days is `overdue` and
 fails the same way. A sweep that cannot list open proposals does too. Silence
 here is the defect: a fleet that quietly stopped converging reads exactly like
