@@ -1,0 +1,1 @@
+- Version release and fleet audit receipts, validate them once with Harn's typed JSON reader, and reject malformed or unversioned artifacts instead of silently defaulting missing fields.
