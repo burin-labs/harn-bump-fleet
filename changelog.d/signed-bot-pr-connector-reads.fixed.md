@@ -1,0 +1,1 @@
+Read the GitHub connector's typed results through the fleet's own wrappers in `sign_bot_prs.harn`. Three call sites read fields straight off an un-unwrapped `Result`, which yields `nil` silently, so the harness died on its first merge-queue lookup and could never have loaded a pull request.
