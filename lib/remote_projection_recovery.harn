@@ -1,0 +1,255 @@
+import { github_pr_list, github_slug_parts } from "./github"
+import {
+  GithubClientOptions,
+  api_call,
+  github_pr_file_census,
+  pulls_update,
+} from "harn-github-connector/default"
+
+/** A closed identity is recoverable only with measured automation provenance. */
+pub type ProjectionRecovery = {
+  state: "reopened" | "retained" | "absent",
+  pull_request?: int,
+  reason: string,
+}
+
+// The release App owns the canonical supersession comment and close operation.
+const RELEASE_ACTOR_ID: int = 278545796
+
+fn unwrap_or_throw(result: unknown, context: string) -> unknown {
+  if is_err(result) {
+    throw context + ": " + to_string(unwrap_err(result))
+  }
+  return unwrap(result)
+}
+
+pub type ProjectionRecoveryRequest = {
+  slug: string,
+  branch: string,
+  base: string,
+  expected_head: string,
+  selected_paths: list<string>,
+  title: string,
+  expected_comment: string,
+}
+
+/** The final read must still describe the measured, unmerged closed identity. */
+pub fn closed_projection_identity_matches(pull: any, request: ProjectionRecoveryRequest) -> bool {
+  return pull?.state == "closed" && pull?.merged == false
+    && pull?.head?.sha == request.expected_head
+    && pull?.head?.ref == request.branch
+    && pull?.base?.ref == request.base
+    && pull?.title == request.title
+}
+
+fn release_actor(actor: any) -> bool {
+  return actor?.id == RELEASE_ACTOR_ID && actor?.login == "harn-release-bot[bot]"
+    && actor?.type == "Bot"
+}
+
+fn supersession_comment_provenance(
+  comments: list<any>,
+  expected_comment: string,
+  close_time: int,
+) -> bool {
+  let authorized = false
+  for comment in comments {
+    const created = try {
+      to_int(date_parse(to_string(comment?.created_at ?? "")))
+    } catch (_error) {
+      nil
+    }
+    if created == nil || comment?.updated_at != comment?.created_at {
+      return false
+    }
+    if (created ?? 0) > close_time && !release_actor(comment?.user) {
+      return false
+    }
+    if release_actor(comment?.user) && comment?.body == expected_comment
+      && to_int(comment?.id) != nil
+      && (created ?? 0) <= close_time
+      && close_time - (created ?? 0) <= 60 {
+      authorized = true
+    }
+  }
+  return authorized
+}
+
+/** Structural closure evidence, shared by the API path and its falsifiers. */
+pub fn supersession_closure_provenance(
+  pull: any,
+  timeline: list<any>,
+  comments: list<any>,
+  expected_comment: string,
+) -> bool {
+  const closed_at = to_string(pull?.closed_at ?? "")
+  if pull?.state != "closed" || pull?.merged != false || closed_at == ""
+    || len(timeline) == 0
+    || len(timeline) >= 100
+    || len(comments) >= 100 {
+    return false
+  }
+  const closures = timeline.filter({ event -> event?.event == "closed" }).to_list()
+  if len(closures) == 0 {
+    return false
+  }
+  const last = closures[len(closures) - 1]
+  if !release_actor(last?.actor) || last?.created_at != closed_at
+    || last?.commit_id != nil
+    || to_int(last?.id) == nil {
+    return false
+  }
+  const close_time = try {
+    to_int(date_parse(closed_at))
+  } catch (_error) {
+    nil
+  }
+  if close_time == nil {
+    return false
+  }
+  // Any later close/reopen/head mutation invalidates the observed disposition.
+  for event in timeline {
+    // GitHub commit timeline rows use committer.date rather than created_at.
+    const timestamp = if event?.event == "committed" {
+      event?.committer?.date
+    } else if event?.event == "reviewed" {
+      event?.submitted_at
+    } else {
+      event?.created_at
+    }
+    const created = try {
+      to_int(date_parse(to_string(timestamp ?? "")))
+    } catch (_error) {
+      nil
+    }
+    if created == nil {
+      return false
+    }
+    if (created ?? 0) > (close_time ?? 0) && event?.event != "commented" {
+      return false
+    }
+  }
+  return supersession_comment_provenance(comments, expected_comment, close_time ?? 0)
+}
+
+/** Recover an unchanged bot-retired proposal; human and unknown closures stay closed. */
+pub fn recover_projection_proposal(
+  harness: Harness,
+  request: ProjectionRecoveryRequest,
+  options: GithubClientOptions,
+) -> ProjectionRecovery {
+  const {slug, branch, base, expected_head, selected_paths, title, expected_comment} = request
+  const parts = github_slug_parts(slug)
+  if parts == nil || expected_head == "" || len(selected_paths) == 0 {
+    throw "projection recovery requires a measured identity and scope"
+  }
+  const listing = github_pr_list(
+    harness,
+    slug,
+    {state: "closed", head: branch, base: base, per_page: 100},
+    options,
+  )
+  if is_err(listing) {
+    throw "closed projection lookup failed: " + to_string(unwrap_err(listing))
+  }
+  const listed = unwrap(listing)
+  if len(listed) == 0 {
+    return {state: "absent", reason: "no closed proposal owns this identity"}
+  }
+  if len(listed) != 1 {
+    throw "closed projection identity is ambiguous or incomplete"
+  }
+  const pull = listed[0]
+  if pull.head.ref != branch || pull.base.ref != base || pull.head.sha != expected_head
+    || pull.title != title
+    || pull.merged {
+    return {
+      state: "retained",
+      pull_request: pull.number,
+      reason: "closed proposal identity differs",
+    }
+  }
+  const census = unwrap_or_throw(
+    github_pr_file_census(
+      harness,
+      {
+        owner: parts.owner,
+        repo: parts.repo,
+        pull_number: pull.number,
+        expected_head_oid: expected_head,
+        options: options,
+      },
+    ),
+    "closed projection file census failed",
+  )
+  if census.total_files == 0
+    || census.files.any(
+      { file ->
+        !selected_paths.contains(file.filename)
+          || (file.status == "renamed" && !selected_paths.contains(file.previous_filename ?? ""))
+      },
+    ) {
+    return {
+      state: "retained",
+      pull_request: pull.number,
+      reason: "closed proposal exceeds selected scope",
+    }
+  }
+  const prefix = "/repos/${parts.owner}/${parts.repo}"
+  const detail = unwrap_or_throw(
+    api_call(harness, {path: prefix + "/pulls/${pull.number}", options: options}),
+    "closed projection detail failed",
+  )
+  const timeline = unwrap_or_throw(
+    api_call(
+      harness,
+      {path: prefix + "/issues/${pull.number}/timeline?per_page=100", options: options},
+    ),
+    "closed projection timeline failed",
+  )
+  const comments = unwrap_or_throw(
+    api_call(
+      harness,
+      {path: prefix + "/issues/${pull.number}/comments?per_page=100", options: options},
+    ),
+    "closed projection comments failed",
+  )
+  if type_of(timeline) != "list" || type_of(comments) != "list" {
+    throw "closed projection provenance census was not a list"
+  }
+  if !closed_projection_identity_matches(detail, request)
+    || !supersession_closure_provenance(detail, timeline, comments, expected_comment) {
+    return {
+      state: "retained",
+      pull_request: pull.number,
+      reason: "closure lacks exact release-App supersession provenance",
+    }
+  }
+  // GitHub has no conditional reopen API. Refuse changes already visible
+  // after the provenance reads, then bind the returned head before arming.
+  const final_detail = unwrap_or_throw(
+    api_call(harness, {path: prefix + "/pulls/${pull.number}", options: options}),
+    "final closed projection detail failed",
+  )
+  if !closed_projection_identity_matches(final_detail, request)
+    || final_detail?.closed_at != detail?.closed_at {
+    throw "closed projection disposition changed before recovery"
+  }
+  const reopened = unwrap_or_throw(
+    pulls_update(
+      harness,
+      {
+        owner: parts.owner,
+        repo: parts.repo,
+        pull_number: pull.number,
+        edits: {state: "open"},
+        options: options,
+      },
+    ),
+    "bot-retired projection reopen failed",
+  )
+  if reopened.github_state != "open" || reopened.head.sha != expected_head {
+    throw "reopened projection did not retain its measured head"
+  }
+  return {state: "reopened", pull_request: pull.number, reason: "exact bot supersession recovered"}
+}

@@ -1,0 +1,1 @@
+Scoped fleet workflow titles use a compact SHA-256 identity so large repository selections remain discoverable after dispatch. The workflow validates that identity against its exact repository inputs before mutation; full repository lists remain in dispatch and continuation receipts.
