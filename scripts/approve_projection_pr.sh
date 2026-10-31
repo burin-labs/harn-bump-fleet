@@ -91,6 +91,10 @@ jq -e 'all(.[]; .state != "CHANGES_REQUESTED")' <<< "$reviews" > /dev/null \
   || refuse "a review requests changes"
 
 echo "#$pr moves only the orchestration pin to $tag ($added)."
+# The checks above read the files after capturing the head; a push in between
+# would approve a head they never read.
+[[ "$(gh api "repos/$repo/pulls/$pr" --jq .head.sha)" == "$head_sha" ]] \
+  || refuse "the head moved while it was being checked"
 if [[ "${APPROVE_DRY_RUN:-}" == 1 ]]; then
   echo "Dry run: not approving."
   exit 0
