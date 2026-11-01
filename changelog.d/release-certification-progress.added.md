@@ -1,0 +1,1 @@
+The hosted certification wait now reports progress. Each lane names the job it is waiting on and where to watch it, reports status and elapsed time every two minutes, and prints its conclusion and duration when it finishes.
