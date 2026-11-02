@@ -55,13 +55,43 @@ jq -e 'length > 0 and all(.[]; .commit.verification.verified == true)' <<< "$com
 
 files=$(gh api --paginate --slurp "repos/$repo/pulls/$pr/files?per_page=100" | jq 'add // []') \
   || refuse "the changed files could not be read"
-problems=$(jq -r '
+policy="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/projection-approval-paths.json"
+classification=$(jq -r --slurpfile policy "$policy" '
+  $policy[0] as $p
+  | if ($policy | length) != 1
+      or ($p | keys | sort) != ["orchestration_pin", "other_projections"]
+      or ($p.orchestration_pin | type) != "array"
+      or ($p.other_projections | type) != "array"
+      or ($p.orchestration_pin | length) == 0
+      or ($p.other_projections | length) == 0
+      or ([$p.orchestration_pin[], $p.other_projections[]] | all(.[]; type == "string" and length > 0) | not)
+      or ([$p.orchestration_pin[], $p.other_projections[]] | length != (unique | length))
+    then error("invalid projection approval path policy")
+    elif type != "array" or length == 0
+      or (all(.[]; type == "object" and (.filename | type) == "string"
+        and (.status | type) == "string" and (.patch | type) == "string"
+        and (.patch | length) > 0 and (.previous_filename // null) == null) | not)
+    then error("invalid projection file evidence")
+    elif all(.[]; .filename as $f | $p.other_projections | index($f) != null)
+      and all(.[]; .status == "modified" or .status == "added")
+    then "NOT_APPLICABLE"
+    elif any(.[]; .filename as $f | $p.orchestration_pin | index($f) != null)
+    then "ORCHESTRATION_PIN"
+    else "UNRECOGNIZED"
+    end' <<< "$files") || refuse "the projection kind could not be established"
+if [[ "$classification" == NOT_APPLICABLE ]]; then
+  jq -cn --arg head "$head_sha" --argjson files "$files" \
+    '{schema: "harn.projection-approval.v1", status: "NOT_APPLICABLE", approved: false, head: $head, paths: [$files[].filename]}'
+  exit 0
+fi
+[[ "$classification" == ORCHESTRATION_PIN ]] || refuse "the changed files are not a recognized projection"
+problems=$(jq -r --slurpfile policy "$policy" '
   def hunk_lines: split("\n") | map(select(test("^[-+]")));
   def norm: gsub("[0-9a-f]{40}"; "@SHA@");
   if length == 0 then "no files changed" else
   .[]
   | .filename as $f
-  | if ($f != "fleet.toml" and $f != ".github/workflows/bump-harn.yml") then "\($f): not a pin projection file"
+  | if ($policy[0].orchestration_pin | index($f)) == null then "\($f): not a pin projection file"
     elif .status != "modified" or (.previous_filename // null) != null then "\($f): status \(.status) is not an in-place edit"
     elif (.patch // null) == null then "\($f): no textual patch"
     else
