@@ -1,0 +1,161 @@
+#!/usr/bin/env harn
+import { ParserSpec } from "std/cli/argparse"
+import { cli_options } from "lib/cli_options"
+import { consumer_projection_repositories } from "lib/consumer_projection_manifest"
+//
+// Verify every remote default-branch projection against fleet.toml. This is
+// the live complement to typed manifest validation and runs with the fleet App
+// token immediately before scheduled bump dispatch.
+import {
+  manifest_with_consumer_contracts,
+  read_remote_consumer_projection_manifests,
+} from "lib/consumer_projection_manifest"
+import {
+  harn_update_workflow_path,
+  parse_workflow_policy_reference,
+  read_fleet_manifest,
+} from "lib/fleet_manifest"
+import { operation_harn_bump_repositories } from "lib/fleet_manifest"
+import { fleet_operation_scope, fleet_scope_allows } from "lib/fleet_operation_scope"
+import {
+  evaluate_file_projection,
+  evaluate_fleet_policy,
+  evaluate_workflow_policy_anchor,
+  fleet_policy_failure_lines,
+} from "lib/fleet_policy"
+import { github_file_text_at_ref } from "lib/github"
+
+type Options = {only?: string, repositories_json?: string}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-fleet-policy",
+  args: [
+    {kind: "flag", name: "only", long: "--only"},
+    {kind: "flag", name: "repositories_json", long: "--repositories-json"},
+  ],
+}
+
+pipeline main(harness: Harness) {
+  const manifest = read_fleet_manifest(harness.fs)
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const scope = fleet_operation_scope(options.only, options.repositories_json)
+  operation_harn_bump_repositories(manifest, scope)
+  const consumer_resolution = read_remote_consumer_projection_manifests(
+    harness,
+    manifest,
+    manifest.fleet.default_branch,
+    consumer_projection_repositories(manifest).filter(
+      { repo -> fleet_scope_allows(scope, repo.slug) },
+    )
+      .to_list(),
+  )
+  const runtime_manifest = manifest_with_consumer_contracts(manifest, consumer_resolution)
+  let results = []
+  let failed = len(consumer_resolution.errors) > 0
+  let workflow_policies = []
+  for policy in [
+    {name: "package_workflow", reference: manifest.policy.package_workflow},
+    {name: "bump_workflow", reference: manifest.policy.bump_workflow},
+  ] {
+    const parsed = parse_workflow_policy_reference(policy.reference)
+    const pinned = github_file_text_at_ref(harness, parsed.slug, parsed.path, parsed.ref)
+    const current = github_file_text_at_ref(
+      harness,
+      parsed.slug,
+      parsed.path,
+      manifest.fleet.default_branch,
+    )
+    const result = evaluate_workflow_policy_anchor(policy.name, policy.reference, pinned, current)
+    workflow_policies = workflow_policies + [result]
+    failed = failed || !result.ok
+    // A trailing pin does not fail the run, so say so on the way past. Left
+    // only in the receipt it would be invisible, and "invisible" is the half
+    // of this that caused the incident.
+    for note in result.notes {
+      harness.stdio.eprintln("note: ${result.name}: ${note}")
+    }
+  }
+  for repo in runtime_manifest.repositories {
+    if !fleet_scope_allows(scope, repo.slug) {
+      continue
+    }
+    if !(repo.harn_package ?? false) && !(repo.harn_bump ?? false) {
+      continue
+    }
+    const package_workflow = if repo.harn_package ?? false {
+      github_file_text_at_ref(
+        harness,
+        repo.slug,
+        ".github/workflows/ci.yml",
+        manifest.fleet.default_branch,
+      )
+    } else {
+      nil
+    }
+    const bump_workflow = if repo.harn_bump ?? false {
+      github_file_text_at_ref(
+        harness,
+        repo.slug,
+        harn_update_workflow_path(repo),
+        manifest.fleet.default_branch,
+      )
+    } else {
+      nil
+    }
+    const result = evaluate_fleet_policy(runtime_manifest, repo, package_workflow, bump_workflow)
+    results = results + [result]
+    failed = failed || !result.ok
+  }
+  let file_projections = []
+  for projection in consumer_resolution.projections {
+    if !fleet_scope_allows(scope, projection.target_slug) {
+      continue
+    }
+    const source = github_file_text_at_ref(
+      harness,
+      projection.source_slug,
+      projection.source_path,
+      manifest.fleet.default_branch,
+    )
+    const target = github_file_text_at_ref(
+      harness,
+      projection.target_slug,
+      projection.target_path,
+      manifest.fleet.default_branch,
+    )
+    const result = evaluate_file_projection(projection, source, target)
+    file_projections = file_projections + [result]
+    failed = failed || !result.ok
+  }
+  harness.stdio.println(
+    json_stringify_pretty(
+      {
+        schema_version: "harn.fleet-policy.v1",
+        ok: !failed,
+        policy: manifest.policy,
+        workflow_policies: workflow_policies,
+        checked_repository_count: len(results),
+        repositories: results,
+        file_projections: file_projections,
+        consumer_manifest_errors: consumer_resolution.errors,
+        consumer_manifest_refs: consumer_resolution.contract_refs,
+        consumer_manifest_sha256: consumer_resolution.contract_sha256,
+      },
+    ),
+  )
+  for error in consumer_resolution.errors {
+    harness.stdio.eprintln("error ${error}")
+  }
+  // The receipt above is one JSON document that the caller tees to a file, so
+  // the tail of a red job is whichever rows sorted last and every one of them
+  // reads `ok: true`. Name the failures again on stderr, last, so the exit
+  // status arrives with its cause attached.
+  for line in fleet_policy_failure_lines(workflow_policies, results, file_projections) {
+    harness.stdio.eprintln(line)
+  }
+  return if failed {
+    1
+  } else {
+    0
+  }
+}
