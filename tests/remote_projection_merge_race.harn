@@ -1,0 +1,202 @@
+import { FleetProjectionTarget } from "../lib/fleet_projection_targets"
+import { converge_remote_repository, remote_projection_branch } from "../lib/remote_projection"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const BASE = "https://github.test/repos/octo/repo"
+
+const OLD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const FRESH = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+const PROPOSAL = "cccccccccccccccccccccccccccccccccccccccc"
+
+fn targets() -> list<FleetProjectionTarget> {
+  return [
+    {slug: "octo/repo", path: "FIRST.yml", expected: "first\n", origin: "test"},
+    {slug: "octo/repo", path: "SECOND.yml", expected: "second\n", origin: "test"},
+  ]
+}
+
+fn mock_file(testing: HarnessTesting, path: string, ref: string, text: string) {
+  testing.http_mock(
+    "GET",
+    "${BASE}/contents/${path}?ref=${url_encode(ref)}",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          name: path,
+          path: path,
+          sha: OLD,
+          size: len(text),
+          type: "file",
+          encoding: "base64",
+          content: base64_encode(text),
+        },
+      ),
+    },
+  )
+}
+
+fn mock_merge_race(testing: HarnessTesting, mode: string) {
+  testing.http_mock_clear()
+  const branch = remote_projection_branch(targets())
+  testing.http_mock(
+    "GET",
+    "${BASE}/branches/main",
+    {
+      responses: [
+        {status: 200, body: json_stringify({name: "main", commit: {sha: OLD}})},
+        if mode == "head_error" {
+          {status: 403, body: json_stringify({message: "Forbidden"})}
+        } else {
+          {status: 200, body: json_stringify({name: "main", commit: {sha: FRESH}})}
+        },
+      ],
+    },
+  )
+  for target in targets() {
+    mock_file(testing, target.path, "main", "stale\n")
+    mock_file(testing, target.path, branch, target.expected)
+    mock_file(testing, target.path, FRESH, target.expected)
+  }
+  if mode == "first_differs" || mode == "second_differs" {
+    const path = if mode == "first_differs" {
+      "FIRST.yml"
+    } else {
+      "SECOND.yml"
+    }
+    mock_file(testing, path, FRESH, "still stale\n")
+  }
+  if mode == "missing" || mode == "file_error" {
+    testing.http_mock(
+      "GET",
+      "${BASE}/contents/SECOND.yml?ref=${FRESH}",
+      {
+        status: if mode == "missing" {
+          404
+        } else {
+          403
+        },
+        body: json_stringify({message: "Unavailable"}),
+      },
+    )
+  }
+  testing.http_mock(
+    "GET",
+    BASE,
+    {status: 200, body: json_stringify({full_name: "octo/repo", default_branch: "main"})},
+  )
+  testing.http_mock("POST", "${BASE}/git/refs", {status: 422, body: "{}"})
+  testing.http_mock(
+    "GET",
+    "${BASE}/git/ref/heads/${branch}",
+    {
+      status: 200,
+      body: json_stringify({ref: "refs/heads/${branch}", object: {sha: PROPOSAL, type: "commit"}}),
+    },
+  )
+  testing.http_mock(
+    "GET",
+    "${BASE}/git/commits/${PROPOSAL}",
+    {status: 200, body: json_stringify({sha: PROPOSAL, message: "projection"})},
+  )
+  testing.http_mock(
+    "GET",
+    "${BASE}/pulls?state=open&head=${url_encode("octo:${branch}")}&base=main",
+    {status: 200, body: "[]"},
+  )
+  testing.http_mock(
+    "GET",
+    "${BASE}/pulls?state=closed&head=${url_encode("octo:${branch}")}&base=main&per_page=100",
+    {
+      status: 200,
+      body: json_stringify(
+        [
+          {
+            number: 7,
+            title: "Restore fleet-owned projections",
+            state: "closed",
+            merged: true,
+            merged_at: "2026-11-02T15:51:00Z",
+            merge_commit_sha: FRESH,
+            html_url: "https://github.com/octo/repo/pull/7",
+            base: {ref: "main", sha: OLD, repo: {full_name: "octo/repo", owner: {login: "octo"}}},
+            head: {
+              ref: branch,
+              sha: PROPOSAL,
+              repo: {full_name: "octo/repo", owner: {login: "octo"}},
+            },
+          },
+        ],
+      ),
+    },
+  )
+  testing.http_mock(
+    "GET",
+    "${BASE}/pulls?state=open&base=main&per_page=10&page=1",
+    {status: 200, body: "[]"},
+  )
+}
+
+@test(cases: [{name: "merged", args: ["merged", "clean"]}, {name: "first_differs", args: ["first_differs", "pending"]}, {name: "second_differs", args: ["second_differs", "pending"]}, {name: "missing", args: ["missing", "pending"]}, {name: "file_error", args: ["file_error", "error"]}, {name: "head_error", args: ["head_error", "error"]}])
+pipeline test_closed_identity_is_clean_only_after_complete_fresh_main_read(
+  harness: Harness,
+  mode: string,
+  expected_status: string,
+) {
+  mock_merge_race(harness.testing, mode)
+  const options: GithubClientOptions = {
+    api_base_url: "https://github.test",
+    installation_token: "test-token",
+  }
+  const result = converge_remote_repository(
+    harness,
+    "octo/repo",
+    "main",
+    targets(),
+    true,
+    true,
+    options,
+  )
+  assert_eq(result.status, expected_status, result.error ?? "")
+  assert_eq(result.auto_merge, nil)
+  if expected_status == "clean" {
+    assert_eq(result.commit, FRESH)
+    assert_eq(result.drifted, [])
+    assert_eq(result.recovery, nil)
+  } else if expected_status == "pending" {
+    assert_eq(result.recovery?.state, "retained")
+  }
+  let reads = 0
+  let claims = 0
+  let closed_reads = 0
+  for call in harness.testing.http_mock_calls() {
+    const method = to_string(call?.method ?? "")
+    const url = to_string(call?.url ?? "")
+    if method != "GET" {
+      assert_eq(method, "POST")
+      assert_eq(url, "${BASE}/git/refs", "no reopen, replacement commit, PR or arming mutation")
+      claims = claims + 1
+    }
+    if url == "${BASE}/contents/FIRST.yml?ref=${FRESH}"
+      || url == "${BASE}/contents/SECOND.yml?ref=${FRESH}" {
+      reads = reads + 1
+    }
+    if contains(url, "state=closed") {
+      closed_reads = closed_reads + 1
+    }
+  }
+  assert_eq(claims, 1, "the actual existing-ref path was reached")
+  if expected_status == "clean" || expected_status == "pending" {
+    assert_eq(reads, 2, "both selected files were measured at one immutable main commit")
+    assert_eq(
+      closed_reads,
+      if expected_status == "clean" {
+        0
+      } else {
+        1
+      },
+    )
+  }
+}
