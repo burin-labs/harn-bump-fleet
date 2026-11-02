@@ -1,0 +1,255 @@
+import { FleetRepository } from "./fleet_manifest"
+
+pub type PackageTestCompatibilityStatus = "passed" | "failed" | "unmeasured"
+
+pub type PackageTestCompatibilityRow = {
+  repository: string,
+  revision: string,
+  status: PackageTestCompatibilityStatus,
+  exit_code: int?,
+  selected_file_count: int?,
+  discovered_test_count: int?,
+  receipt_sha256: string,
+  receipt: dict?,
+  reason: string,
+}
+
+pub type PackageTestCompatibilityReceipt = {
+  schema_version: "harn_bump_fleet.package_test_compatibility.v1",
+  candidate_binary_sha256: string,
+  selected_count: int,
+  passed_count: int,
+  failed_count: int,
+  unmeasured_count: int,
+  repositories: list<PackageTestCompatibilityRow>,
+}
+
+pub type PackageTestCompatibilityAdapter = {
+  revision: fn(string) -> string,
+  fingerprint: fn(string) -> string,
+  inventory: fn(string, string) -> dict,
+}
+
+pub type PackageTestCompatibilityObservation = {
+  repository: string,
+  revision: string,
+  before: string,
+  after: string,
+  command: dict,
+  receipt_text: string,
+}
+
+fn production_adapter(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  harn_bin: string,
+) -> PackageTestCompatibilityAdapter {
+  return {
+    revision: fn(directory) {
+      const result = harness.process.run(
+        {program: "git", args: ["rev-parse", "HEAD"], cwd: directory},
+      )
+      return if result.success {
+        trim(result.stdout ?? "")
+      } else {
+        ""
+      }
+    },
+    fingerprint: fn(directory) {
+      const result = harness.process.run(
+        {
+          program: "git",
+          args: ["status", "--porcelain=v1", "--untracked-files=all"],
+          cwd: directory,
+        },
+      )
+      return if result.success {
+        sha256(result.stdout ?? "")
+      } else {
+        "unmeasured"
+      }
+    },
+    inventory: fn(directory, receipt_path) { return harness.process.run(
+      {
+        program: harn_bin,
+        args: ["package", "test-inventory", ".", "--json", "--receipt-out", receipt_path],
+        cwd: directory,
+        env: {HARN_SECRET_PROVIDERS: "env"},
+        timeout_ms: 120000,
+      },
+    ) },
+  }
+}
+
+fn receipt_inventory(decoded: dict) -> dict? {
+  if decoded.get("ok") == true {
+    return decoded.get("data")
+  }
+  return decoded.get("error")?.get("details")?.get("inventory")
+}
+
+/** Classify one exact command receipt without allowing absence to read as zero. */
+pub fn classify_package_test_compatibility(
+  observation: PackageTestCompatibilityObservation,
+) -> PackageTestCompatibilityRow {
+  const raw = trim(observation.receipt_text)
+  if observation.before == "unmeasured" || observation.after == "unmeasured" {
+    return {
+      repository: observation.repository,
+      revision: observation.revision,
+      status: "unmeasured",
+      exit_code: observation.command.exit_code,
+      selected_file_count: nil,
+      discovered_test_count: nil,
+      receipt_sha256: if raw == "" {
+        ""
+      } else {
+        sha256(raw)
+      },
+      receipt: nil,
+      reason: "repository mutation fingerprint was not measured",
+    }
+  }
+  if observation.before != observation.after {
+    return {
+      repository: observation.repository,
+      revision: observation.revision,
+      status: "failed",
+      exit_code: observation.command.exit_code,
+      selected_file_count: nil,
+      discovered_test_count: nil,
+      receipt_sha256: if raw == "" {
+        ""
+      } else {
+        sha256(raw)
+      },
+      receipt: nil,
+      reason: "package test inventory mutated the repository",
+    }
+  }
+  if raw == "" {
+    return {
+      repository: observation.repository,
+      revision: observation.revision,
+      status: "unmeasured",
+      exit_code: observation.command.exit_code,
+      selected_file_count: nil,
+      discovered_test_count: nil,
+      receipt_sha256: "",
+      receipt: nil,
+      reason: "package test inventory receipt was absent or malformed",
+    }
+  }
+  const parsed = json_parse(raw)
+  if is_err(parsed) {
+    return {
+      repository: observation.repository,
+      revision: observation.revision,
+      status: "unmeasured",
+      exit_code: observation.command.exit_code,
+      selected_file_count: nil,
+      discovered_test_count: nil,
+      receipt_sha256: if raw == "" {
+        ""
+      } else {
+        sha256(raw)
+      },
+      receipt: nil,
+      reason: "package test inventory receipt was absent or malformed",
+    }
+  }
+  const decoded = unwrap(parsed)
+  const inventory = receipt_inventory(decoded)
+  const selected = inventory?.get("selected_file_count")
+  const discovered = inventory?.get("discovered_test_count")
+  if decoded.get("schemaVersion") != 1 || selected == nil || discovered == nil {
+    return {
+      repository: observation.repository,
+      revision: observation.revision,
+      status: "unmeasured",
+      exit_code: observation.command.exit_code,
+      selected_file_count: nil,
+      discovered_test_count: nil,
+      receipt_sha256: sha256(raw),
+      receipt: decoded,
+      reason: "package test inventory receipt omitted its schema or measured counts",
+    }
+  }
+  const passed = decoded.get("ok") == true && observation.command.success
+  return {
+    repository: observation.repository,
+    revision: observation.revision,
+    status: if passed {
+      "passed"
+    } else {
+      "failed"
+    },
+    exit_code: observation.command.exit_code,
+    selected_file_count: selected,
+    discovered_test_count: discovered,
+    receipt_sha256: sha256(raw),
+    receipt: decoded,
+    reason: if passed {
+      "package test discovery passed"
+    } else {
+      "package test discovery reported a compatibility migration"
+    },
+  }
+}
+
+/** Run the candidate runtime against every materialized managed Harn package. */
+pub fn package_test_compatibility_scan(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  repositories: list<FleetRepository>,
+  fleet_root: string,
+  harn_bin: string,
+  receipt_dir: string,
+  injected_adapter: PackageTestCompatibilityAdapter? = nil,
+) -> PackageTestCompatibilityReceipt {
+  if len(repositories) == 0 {
+    throw "package compatibility preflight selected no repositories"
+  }
+  harness.fs.mkdir(receipt_dir, true)
+  const adapter = injected_adapter ?? production_adapter(harness, harn_bin)
+  let rows: list<PackageTestCompatibilityRow> = []
+  for repo in repositories {
+    const directory = path_join(fleet_root, repo.directory)
+    const receipt_path = path_join(receipt_dir, repo.directory + ".json")
+    const revision = adapter.revision(directory)
+    const before = adapter.fingerprint(directory)
+    const command = adapter.inventory(directory, receipt_path)
+    const receipt_text = if harness.fs.exists(receipt_path) {
+      harness.fs.read_text(receipt_path)
+    } else {
+      command.stdout ?? ""
+    }
+    const after = adapter.fingerprint(directory)
+    rows = rows
+      + [
+        classify_package_test_compatibility(
+          {
+            repository: repo.slug,
+            revision: revision,
+            before: before,
+            after: after,
+            command: command,
+            receipt_text: receipt_text,
+          },
+        ),
+      ]
+  }
+  return {
+    schema_version: "harn_bump_fleet.package_test_compatibility.v1",
+    candidate_binary_sha256: sha256(harness.fs.read_bytes(harn_bin)),
+    selected_count: len(rows),
+    passed_count: len(rows.filter({ row -> row.status == "passed" }).to_list()),
+    failed_count: len(rows.filter({ row -> row.status == "failed" }).to_list()),
+    unmeasured_count: len(rows.filter({ row -> row.status == "unmeasured" }).to_list()),
+    repositories: rows,
+  }
+}
+
+pub fn package_test_compatibility_passed(receipt: PackageTestCompatibilityReceipt) -> bool {
+  return receipt.selected_count > 0 && receipt.passed_count == receipt.selected_count
+    && receipt.failed_count == 0
+    && receipt.unmeasured_count == 0
+}
