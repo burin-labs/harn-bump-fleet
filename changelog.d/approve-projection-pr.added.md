@@ -1,0 +1,1 @@
+Approve the release bot's orchestration-pin projection pull request automatically when its diff moves only the pin to a published Harn release commit, so a release no longer waits for a person before Smart Ship lands it.

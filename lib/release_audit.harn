@@ -1,0 +1,592 @@
+import { workflow_result_text } from "std/agent/result_text"
+import { strip_code_fences } from "std/llm/safe"
+
+// Sentinel prefix emitted by `agent_result_text` when an agent_loop result
+// carries no visible final text. Validators key on this exact prefix, so it
+// lives in one place to keep producer and consumers in lockstep.
+const NO_VISIBLE_TEXT_PREFIX = "Agent review returned no visible text. Raw result:"
+
+// Findings that mean "the model produced nothing to validate", as opposed to
+// "the model answered and the answer was rejected". The operator-facing failure
+// explanation keys on these exact strings to pick between a provider-credential
+// remediation and an audit-contract one, so they live beside the checks that
+// emit them.
+pub const NO_VISIBLE_AUDIT_FINDING =
+  "agent returned no visible final audit text; use a repair turn to produce the audit from gathered evidence"
+
+pub const EMPTY_AUDIT_FINDING = "agent audit returned empty text"
+
+// The loop-status finding. It reports that the agent loop ended on something
+// other than `done`; it says nothing about whether the audit is evidenced.
+pub const LOOP_STATUS_FINDING_PREFIX = "agent_loop ended with status"
+
+/**
+ * Report whether the loop-status finding is the only thing left.
+ *
+ * This is NOT sufficient to relax the gate on its own. A repair attempt that
+ * makes no tool calls produces exactly this shape while resting on no
+ * evidence, so callers must also require a closed evidence contract.
+ */
+pub fn audit_findings_are_loop_status_only(findings: list<string>) -> bool {
+  if len(findings) == 0 {
+    return false
+  }
+  for finding in findings {
+    if !starts_with(finding, LOOP_STATUS_FINDING_PREFIX) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Split validation findings into availability and content classes.
+ *
+ * These two classes need opposite handling. A review that never arrived is a
+ * provider availability failure — auth, rate limit, or an empty response — and
+ * says nothing about the release. A review that arrived and proposes a
+ * malformed draft changelog would corrupt CHANGELOG.md if applied.
+ *
+ * Treating both as release blockers made provider availability the single
+ * largest cause of failed release attempts: 10 of 35 hosted failures in one
+ * 60-run window stopped here without any finding about the release itself.
+ */
+pub fn audit_findings_are_availability_only(findings: list<string>) -> bool {
+  if len(findings) == 0 {
+    return false
+  }
+  for finding in findings {
+    if finding != NO_VISIBLE_AUDIT_FINDING && finding != EMPTY_AUDIT_FINDING {
+      return false
+    }
+  }
+  return true
+}
+
+pub type ReleaseAuditContext = {
+  first_post_tag_commit?: string,
+  post_tag_pr_numbers?: list<int>,
+  latest_tag?: string,
+  pin_sha?: string,
+}
+
+/**
+ * Remove Markdown code fences from audit text. `strip_code_fences` drops fence
+ * *lines*, which leaves a triple backtick used inline (`` ```make check``` ``)
+ * intact; collapsing every remaining run of three or more backticks to one
+ * keeps the command readable as inline code. Like `rewrap_long_prose_lines`
+ * below, normalizing mechanically beats failing a whole release run over a
+ * solved formatting problem. Marker lines are plain text, so
+ * BEGIN_DRAFT_CHANGELOG/END_DRAFT_CHANGELOG pass through untouched.
+ */
+pub fn normalize_agent_audit_text(text: string) -> string {
+  let out = strip_code_fences(text)
+  while contains(out, "```") {
+    out = replace(out, "```", "`")
+  }
+  return out
+}
+
+/** Return the best visible final text from an agent_loop result. */
+pub fn agent_result_text(result: dict) -> string {
+  const text = trim(workflow_result_text(result))
+  if text != "" {
+    return normalize_agent_audit_text(text)
+  }
+  return NO_VISIBLE_TEXT_PREFIX + "\n```json\n" + json_stringify(result)
+    + "\n```"
+}
+
+/** Return the raw text between BEGIN_DRAFT_CHANGELOG and END_DRAFT_CHANGELOG. */
+pub fn raw_agent_changelog_section(text: string) -> string {
+  const start_marker = "BEGIN_DRAFT_CHANGELOG"
+  const end_marker = "END_DRAFT_CHANGELOG"
+  let in_block = false
+  let lines = []
+  for line in text.split("\n") {
+    if trim(line) == start_marker {
+      in_block = true
+      continue
+    }
+    if trim(line) == end_marker {
+      break
+    }
+    if in_block {
+      lines = lines + [line]
+    }
+  }
+  return trim(lines.join("\n"))
+}
+
+/** Return any text after END_DRAFT_CHANGELOG. */
+fn agent_changelog_trailing_text(text: string) -> string {
+  const end_marker = "END_DRAFT_CHANGELOG"
+  const parts = text.split(end_marker)
+  if len(parts) < 2 {
+    return ""
+  }
+  return trim(parts[1:len(parts)].join(end_marker))
+}
+
+/** True when a response contains an actual line-delimited draft envelope marker. */
+fn has_draft_changelog_marker_line(text: string) -> bool {
+  for line in text.split("\n") {
+    const marker = trim(line)
+    if marker == "BEGIN_DRAFT_CHANGELOG" || marker == "END_DRAFT_CHANGELOG" {
+      return true
+    }
+  }
+  return false
+}
+
+/** Return the normalized changelog section for next_version from an agent audit. */
+pub fn agent_changelog_section(text: string, next_version: string) -> string {
+  // Normalize here as well as on ingest: this is the seam whose output is
+  // applied to CHANGELOG.md, so no caller can route a fenced draft into the
+  // file by reaching the extractor with un-normalized text.
+  const raw = normalize_agent_audit_text(raw_agent_changelog_section(text))
+  if raw == "" {
+    return ""
+  }
+  const expected_heading = "## v${next_version}"
+  let seen_expected = false
+  let skip_section = false
+  let lines = []
+  for line in raw.split("\n") {
+    const t = trim(line)
+    if !seen_expected {
+      if t == expected_heading {
+        seen_expected = true
+        lines = lines + [line]
+      }
+      continue
+    }
+    if starts_with(t, "## v") {
+      break
+    }
+    if starts_with(t, "### ") {
+      skip_section = !(t == "### Added" || t == "### Changed" || t == "### Fixed"
+        || t == "### Internal")
+    }
+    if skip_section {
+      continue
+    }
+    if t == "..." {
+      continue
+    }
+    lines = lines + [line]
+  }
+  if !seen_expected {
+    return raw
+  }
+  return rewrap_long_prose_lines(trim(lines.join("\n")), 120)
+}
+
+/**
+ * Wrap one draft line at word boundaries so it fits `width` columns, using the
+ * CHANGELOG continuation style (bullet continuations indent two spaces past
+ * the dash; plain prose keeps its own indent). Returns the original line
+ * untouched when it already fits, is structural (heading/fence/table/quote),
+ * or cannot be wrapped under the limit (a single overlong token) — the style
+ * validator still flags those.
+ */
+fn wrap_prose_line(line: string, width: int) -> list<string> {
+  if len(line) <= width {
+    return [line]
+  }
+  const trimmed = trim(line)
+  if starts_with(trimmed, "#") || starts_with(trimmed, "```") || starts_with(trimmed, "|")
+    || starts_with(trimmed, ">") {
+    return [line]
+  }
+  let lead = ""
+  for m in regex_captures("^( *)", line) {
+    lead = m.groups[0]
+  }
+  const cont_indent = if starts_with(trimmed, "- ") {
+    lead + "  "
+  } else {
+    lead
+  }
+  let wrapped = []
+  let current = ""
+  for word in split(trimmed, " ").filter({ w -> w != "" }) {
+    if current == "" {
+      current = if len(wrapped) == 0 {
+        lead + word
+      } else {
+        cont_indent + word
+      }
+      continue
+    }
+    const candidate = current + " " + word
+    if len(candidate) > width {
+      wrapped = wrapped + [current]
+      current = cont_indent + word
+    } else {
+      current = candidate
+    }
+  }
+  if current != "" {
+    wrapped = wrapped + [current]
+  }
+  for produced in wrapped {
+    if len(produced) > width {
+      return [line]
+    }
+  }
+  return wrapped
+}
+
+/**
+ * Deterministically re-wrap prose lines longer than `width` columns. Models
+ * reliably emit a few 121-130 column bullets no matter how firmly the prompt
+ * asks for 120; like the code-fence strip above, normalizing the draft
+ * mechanically beats failing the whole release run over a solved formatting
+ * problem. Unwrappable lines pass through unchanged so the style validator
+ * still reports them.
+ */
+fn rewrap_long_prose_lines(section: string, width: int) -> string {
+  let out = []
+  for line in split(section, "\n") {
+    out = out + wrap_prose_line(line, width)
+  }
+  return out.join("\n")
+}
+
+/** Validate only machine-verifiable audit shape, not semantic release-note judgment. */
+pub fn validate_release_agent_audit(
+  next_version: string,
+  status: string,
+  text: string,
+) -> list<string> {
+  return validate_release_agent_audit_with_context(next_version, status, text, {})
+}
+
+fn changelog_draft_markdown_style_findings(draft: string) -> list<string> {
+  let findings = []
+  let lines = split(draft, "\n")
+  for {index, value} in lines.enumerate() {
+    const line_no = index + 1
+    if len(value) > 120 {
+      findings = findings
+        + [
+          "agent draft changelog line ${line_no} is ${len(value)} characters; wrap prose to 120 characters or fewer with two-space continuation indentation",
+        ]
+    }
+    const trimmed = trim(value)
+    if starts_with(trimmed, "## ") || starts_with(trimmed, "### ") {
+      if index + 1 < len(lines) && trim(lines[index + 1]) != "" {
+        findings = findings
+          + [
+            "agent draft changelog heading on line ${line_no} must be followed by a blank line to match CHANGELOG.md style",
+          ]
+      }
+    }
+  }
+  return findings
+}
+
+fn normalized_draft_line(line: string) -> string {
+  return trim(regex_replace("[^A-Za-z0-9]+", " ", lowercase(trim(line))))
+}
+
+/** Reject structural repetition before model-authored notes can affect CHANGELOG.md. */
+fn changelog_draft_repetition_findings(draft: string) -> list<string> {
+  let findings = []
+  let headings = []
+  let bullets = []
+  for line in split(draft, "\n") {
+    const value = trim(line)
+    if starts_with(value, "### ") {
+      const normalized = normalized_draft_line(value)
+      if headings.contains(normalized) {
+        findings = findings
+          + ["agent draft changelog repeats normalized heading `${value}`"]
+      } else {
+        headings = headings + [normalized]
+      }
+    }
+    if starts_with(value, "- ") {
+      const normalized = normalized_draft_line(value)
+      if bullets.contains(normalized) {
+        findings = findings
+          + ["agent draft changelog repeats normalized bullet `${value}`"]
+      } else {
+        bullets = bullets + [normalized]
+      }
+    }
+  }
+  // A draft with four or more bullets should contain at least half as many
+  // distinct normalized bullets. This catches recursive/degenerate expansion
+  // without rejecting an ordinary pair of similarly worded release notes.
+  let total = 0
+  for line in split(draft, "\n") {
+    if starts_with(trim(line), "- ") {
+      total = total + 1
+    }
+  }
+  if total >= 4 {
+    if len(bullets) * 2 < total {
+      findings = findings
+        + [
+          "agent draft changelog has an extreme repetition ratio (${len(bullets)} distinct normalized bullets across ${total} bullets)",
+        ]
+    }
+  }
+  return findings
+}
+
+fn changelog_draft_version_findings(draft: string, next_version: string) -> list<string> {
+  let findings = []
+  const expected = "## v${next_version}"
+  for line in split(draft, "\n") {
+    const value = trim(line)
+    if starts_with(value, "## v") && value != expected {
+      findings = findings
+        + [
+          "agent draft changelog contradicts the release version with heading `${value}`; only `${expected}` is allowed",
+        ]
+    }
+  }
+  return findings
+}
+
+fn changelog_draft_range_findings(draft: string, context: ReleaseAuditContext) -> list<string> {
+  const latest = trim(context.latest_tag ?? "")
+  const pin = trim(context.pin_sha ?? "")
+  if latest == "" || pin == "" {
+    return []
+  }
+  const expected = "${latest}..${pin}"
+  let findings = []
+  for capture in regex_captures("v[0-9]+[.][0-9]+[.][0-9]+\\.\\.[0-9a-fA-F]{7,40}", draft) ?? [] {
+    const observed = capture?.match ?? ""
+    if observed != expected && observed != "${latest}..HEAD" {
+      findings = findings
+        + [
+          "agent audit contradicts the pinned release range with `${observed}`; expected `${expected}`",
+        ]
+    }
+  }
+  return findings
+}
+
+/**
+ * Validate fixup-mode audit shape. Looser than the standard audit because
+ * the deterministic merge is authoritative; the agent only confirms the
+ * fold and flags misclassified entries. Specifically: no draft changelog
+ * is required (or expected) because re-authoring the release section is
+ * forbidden in fixup mode.
+ */
+pub fn validate_release_fixup_audit(status: string, text: string) -> list<string> {
+  let findings = []
+  if starts_with(text, NO_VISIBLE_TEXT_PREFIX) {
+    findings = findings
+      + [
+        "agent returned no visible final audit text; use a repair turn to produce the audit from gathered evidence",
+      ]
+    return findings
+  }
+  if status != "done" {
+    findings = findings
+      + [
+        "agent_loop ended with status `${status}` instead of `done`; the audit text may be incomplete",
+      ]
+  }
+  if trim(text) == "" {
+    findings = findings + ["agent audit returned empty text"]
+    return findings
+  }
+  if !starts_with(trim(text), "Audit:") {
+    findings = findings
+      + ["agent audit must start with `Audit:` so the final answer is not process prose"]
+  }
+  if has_draft_changelog_marker_line(text) {
+    findings = findings
+      + [
+        "fixup-mode audit contains BEGIN_DRAFT_CHANGELOG markers; the shipped release notes are authoritative — do not author a new draft",
+      ]
+  }
+  if contains(text, "<tool_call>") || contains(text, "<function=")
+    || contains(text, "</function>") {
+    findings = findings
+      + ["agent audit contains unresolved tool-call protocol text instead of a final audit"]
+  }
+  if contains(text, "<assistant prose truncated by turn policy") {
+    findings = findings
+      + [
+        "agent audit was truncated by turn policy; tighten the response or raise max_prose_chars before relying on it",
+      ]
+  }
+  return findings
+}
+
+/**
+ * True iff the draft has an `## Unreleased` ATX heading on its own line.
+ * Substring matches inside CHANGELOG bullet prose (e.g. an entry describing
+ * release_ship.sh's auto-rename behavior) are deliberately ignored.
+ */
+fn draft_has_unreleased_heading(raw_draft: string) -> bool {
+  for line in raw_draft.split("\n") {
+    const stripped = trim(line)
+    if stripped == "## Unreleased" || starts_with(stripped, "## Unreleased ") {
+      return true
+    }
+  }
+  return false
+}
+
+fn audit_mentions_release_evidence(text: string, context: ReleaseAuditContext) -> bool {
+  const lower = lowercase(text)
+  const pr_numbers = context.post_tag_pr_numbers ?? []
+  for number in pr_numbers {
+    const s = "${number}"
+    if contains(text, "#${s}") || contains(lower, "pr ${s}") || contains(lower, "pr #${s}") {
+      return true
+    }
+  }
+  const pr_count = len(pr_numbers)
+  if pr_count > 0
+    && (contains(lower, "${pr_count} pr") || contains(lower, "${pr_count} post-tag")
+      || contains(lower, "${pr_count} pull request")) {
+    return true
+  }
+  return pr_count == 0
+}
+
+fn changelog_coverage_text(text: string) -> string {
+  let lines = []
+  for line in split(text, "\n") {
+    if contains(lowercase(line), "changelog coverage") {
+      lines = lines + [line]
+    }
+  }
+  if len(lines) == 0 {
+    return text
+  }
+  return lines.join("\n")
+}
+
+fn changelog_coverage_mentions_concrete_evidence(
+  text: string,
+  context: ReleaseAuditContext,
+) -> list<string> {
+  if audit_mentions_release_evidence(changelog_coverage_text(text), context) {
+    return []
+  }
+  const pr_numbers = context.post_tag_pr_numbers ?? []
+  const pr_count = len(pr_numbers)
+  if pr_count == 0 {
+    return []
+  }
+  return [
+    "agent audit CHANGELOG coverage is too generic; mention one concrete post-tag PR (for example `#${pr_numbers[0]}`) or the `${pr_count}` PR count before accepting the draft",
+  ]
+}
+
+/** Validate machine-verifiable audit shape using deterministic release facts. */
+pub fn validate_release_agent_audit_with_context(
+  next_version: string,
+  status: string,
+  text: string,
+  context: ReleaseAuditContext,
+) -> list<string> {
+  let findings = []
+  if starts_with(text, NO_VISIBLE_TEXT_PREFIX) {
+    findings = findings + [NO_VISIBLE_AUDIT_FINDING]
+  }
+  if status != "done" {
+    findings = findings
+      + [
+        "agent_loop ended with status `${status}` instead of `done`; the audit text may be incomplete",
+      ]
+  }
+  if trim(text) == "" {
+    findings = findings + [EMPTY_AUDIT_FINDING]
+  }
+  if starts_with(text, NO_VISIBLE_TEXT_PREFIX) {
+    return findings
+  }
+  if !starts_with(trim(text), "Audit:") {
+    findings = findings
+      + ["agent audit must start with `Audit:` so the final answer is not process prose"]
+  }
+  // A Markdown code fence used to fail the release here. It is a formatting
+  // artifact, not an unusable audit: `normalize_agent_audit_text` removes fences
+  // on ingest and again in `agent_changelog_section`, so the fence can no longer
+  // reach CHANGELOG.md and there is nothing left for a finding to protect.
+  if contains(text, "scripts/release_prepare.sh") {
+    findings = findings
+      + [
+        "agent audit mentions nonexistent `scripts/release_prepare.sh`; release preparation is driven by release_harn.harn and scripts/release_ship.sh",
+      ]
+  }
+  if contains(text, "--finalize") {
+    findings = findings
+      + [
+        "agent audit mentions `--finalize`; ship-pr mode must shepherd the release PR rather than claim finalization",
+      ]
+  }
+  if contains(text, "<tool_call>") || contains(text, "<function=")
+    || contains(text, "</function>") {
+    findings = findings
+      + ["agent audit contains unresolved tool-call protocol text instead of a final audit"]
+  }
+  const raw_draft = raw_agent_changelog_section(text)
+  if raw_draft == "" {
+    findings = findings
+      + [
+        "agent audit does not include a strict BEGIN_DRAFT_CHANGELOG / END_DRAFT_CHANGELOG block with markers on their own lines",
+      ]
+  } else if !starts_with(raw_draft, "## v${next_version}") {
+    findings = findings
+      + ["agent draft changelog does not start with expected heading `## v${next_version}`"]
+  }
+  if draft_has_unreleased_heading(raw_draft) {
+    findings = findings
+      + [
+        "agent draft changelog contains an `## Unreleased` heading; promote authored entries under `## v${next_version}`",
+      ]
+  }
+  findings = findings + changelog_coverage_mentions_concrete_evidence(text, context)
+  // Style-check the NORMALIZED draft (the text that would actually be
+  // applied): agent_changelog_section re-wraps wrappable overlong prose, so
+  // only genuinely unwrappable lines surface as findings here.
+  findings = findings
+    + changelog_draft_markdown_style_findings(agent_changelog_section(text, next_version))
+  findings = findings + changelog_draft_repetition_findings(raw_draft)
+  findings = findings + changelog_draft_version_findings(raw_draft, next_version)
+  findings = findings + changelog_draft_range_findings(text, context)
+  const first_commit = trim(context.first_post_tag_commit ?? "")
+  if first_commit != "" && first_commit != "(none)" && !contains(text, first_commit) {
+    findings = findings
+      + [
+        "agent audit does not mention the first post-tag commit `${first_commit}` from the deterministic release fact sheet",
+      ]
+  }
+  if agent_changelog_trailing_text(text) != "" {
+    findings = findings
+      + [
+        "agent audit includes trailing commentary after END_DRAFT_CHANGELOG; put operational handoff in Audit bullets before the draft block and stop at the end marker",
+      ]
+  }
+  if contains(text, "<assistant prose truncated by turn policy") {
+    findings = findings
+      + [
+        "agent audit was truncated by turn policy; increase max_prose_chars or make the draft more concise before applying it",
+      ]
+  }
+  const draft = agent_changelog_section(text, next_version)
+  if contains(draft, "<assistant prose truncated by turn policy") {
+    findings = findings
+      + ["agent draft changelog was truncated by turn policy and is unsafe to apply"]
+  }
+  if contains(draft, "(``)") || contains(draft, "(``,") || contains(draft, "``)") {
+    findings = findings
+      + [
+        "agent draft changelog contains empty inline-code spans, likely from stripped tool-protocol tags; rephrase without literal protocol tags",
+      ]
+  }
+  return findings
+}
