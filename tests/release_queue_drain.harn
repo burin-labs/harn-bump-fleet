@@ -1,0 +1,392 @@
+import { claim_release_merge_lease, release_merge_lease_headline } from "../lib/release_merge_lease"
+import {
+  ReleaseQueueDrainEntry,
+  release_queue_drain,
+  release_queue_drain_github,
+} from "../lib/release_queue_drain"
+
+const BASE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+const OTHER = "cccccccccccccccccccccccccccccccccccccccc"
+
+fn entry(number: int, head: string) -> ReleaseQueueDrainEntry {
+  return {
+    id: "entry-${number}",
+    pull_id: "PR_${number}",
+    pull_number: number,
+    head_sha: head,
+    base_branch: "main",
+  }
+}
+
+fn target() {
+  return {
+    repo: "burin-labs/harn",
+    base_branch: "main",
+    base_oid: BASE,
+    candidate_pr: 1,
+    candidate_head: HEAD,
+  }
+}
+
+pipeline test_claim_drains_preexisting_queue_and_preserves_the_candidate(task: any) {
+  let queue = [entry(2, OTHER), entry(1, HEAD)]
+  let removed: list<int> = []
+  const adapter = {
+    lease_is_current: fn() { return true },
+    base_head: fn() { return BASE },
+    queue_snapshot: fn() { return queue },
+    dequeue: fn(item) {
+      removed = removed + [item.pull_number]
+      queue = queue.filter({ e -> e.id != item.id }).to_list()
+    },
+  }
+  assert_eq(adapter.queue_snapshot()[0].base_branch, target().base_branch)
+  assert_eq(release_queue_drain(target(), adapter), 1)
+  assert_eq(removed, [2])
+  assert_eq(queue.map({ e -> e.pull_number }).to_list(), [1])
+  assert_eq(release_queue_drain(target(), adapter), 0)
+  assert_eq(removed, [2], "retry must not dequeue the release candidate")
+}
+
+pipeline test_drain_refuses_a_moving_base_or_a_queue_that_refills(task: any) {
+  let reads = 0
+  let removals = 0
+  const moved = {
+    lease_is_current: fn() { return true },
+    base_head: fn() {
+      reads = reads + 1
+      return reads == 1 ? BASE : OTHER
+    },
+    queue_snapshot: fn() { return removals == 0 ? [entry(2, OTHER)] : [] },
+    dequeue: fn(_item) { removals = removals + 1 },
+  }
+  assert(
+    is_err(
+      try {
+        release_queue_drain(target(), moved)
+      },
+    ),
+  )
+  assert_eq(removals, 1, "the drain must reach the queued entry before rejecting the race")
+  assert_eq(reads, 2, "the base must be checked again after draining")
+  const refilled = {
+    lease_is_current: fn() { return true },
+    base_head: fn() { return BASE },
+    queue_snapshot: fn() { return [entry(2, OTHER)] },
+    dequeue: fn(_item) {
+    },
+  }
+  assert(
+    is_err(
+      try {
+        release_queue_drain(target(), refilled)
+      },
+    ),
+  )
+  let lease_reads = 0
+  let removed_after_lease = false
+  const lost = {
+    lease_is_current: fn() {
+      lease_reads = lease_reads + 1
+      return lease_reads == 1
+    },
+    base_head: fn() { return BASE },
+    queue_snapshot: fn() { return [entry(2, OTHER)] },
+    dequeue: fn(_item) { removed_after_lease = true },
+  }
+  assert(
+    is_err(
+      try {
+        release_queue_drain(target(), lost)
+      },
+    ),
+  )
+  assert(!removed_after_lease, "a lost lease must stop the dequeue")
+}
+
+pipeline test_lease_claim_reaches_github_dequeue_before_reporting_success(harness: Harness) {
+  const api = "https://api.github.test"
+  const prefix = api + "/repos/burin-labs/harn"
+  const lease_oid = "dddddddddddddddddddddddddddddddddddddddd"
+  const tree = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  const ref = "refs/release-merge-lease/main"
+  const lease = target() + {generation: "generation-1", tag: "v1.0.0", merge_method: "squash"}
+  const queue_entry = {
+    id: "MQE_2",
+    pullRequest: {id: "PR_2", number: 2, headRefOid: OTHER, baseRefName: "main"},
+  }
+  const queue = fn(nodes) { return {
+    data: {
+      repository: {
+        mergeQueue: {
+          entries: {totalCount: len(nodes), pageInfo: {hasNextPage: false}, nodes: nodes},
+        },
+      },
+    },
+  } }
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/ref/heads/main",
+    {
+      status: 200,
+      body: json_stringify({ref: "refs/heads/main", object: {sha: BASE, type: "commit"}}),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/commits/" + BASE,
+    {status: 200, body: json_stringify({sha: BASE, tree: {sha: tree}})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    prefix + "/git/commits",
+    {status: 201, body: json_stringify({sha: lease_oid, tree: {sha: tree}})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    prefix + "/git/refs",
+    {status: 201, body: json_stringify({ref: ref, object: {sha: lease_oid, type: "commit"}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/branches/main",
+    {status: 200, body: json_stringify({commit: {sha: BASE}})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {
+      responses: [
+        {status: 200, body: json_stringify(queue([queue_entry]))},
+        {
+          status: 200,
+          body: json_stringify(
+            {data: {dequeuePullRequest: {clientMutationId: "release-drain-2-cccccccccccc"}}},
+          ),
+        },
+        {status: 200, body: json_stringify(queue([]))},
+      ],
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/ref/release-merge-lease/main",
+    {status: 200, body: json_stringify({ref: ref, object: {sha: lease_oid}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/commits/" + lease_oid,
+    {
+      status: 200,
+      body: json_stringify({sha: lease_oid, message: release_merge_lease_headline(lease)}),
+    },
+  )
+  const result = claim_release_merge_lease(
+    harness,
+    lease,
+    {api_base_url: api, installation_token: "fixture-token"},
+  )
+  assert(is_ok(result), to_string(result))
+  assert(unwrap(result).acquired)
+  const graphql = harness.testing.http_mock_calls().filter({ c -> c.url == api + "/graphql" })
+    .to_list()
+  assert_eq(len(graphql), 3, "read the queue, dequeue, then verify the queue is empty")
+  assert(contains(to_string(graphql[1].body), "dequeuePullRequest"))
+  assert(contains(to_string(graphql[1].body), "PR_2"))
+}
+
+pipeline test_incomplete_queue_reads_refuse_before_mutation(harness: Harness) {
+  const api = "https://api.github.test"
+  const prefix = api + "/repos/burin-labs/harn"
+  const lease_oid = "dddddddddddddddddddddddddddddddddddddddd"
+  const headline = "release-lease-fixture"
+  for response in [
+    {
+      data: {
+        repository: {
+          mergeQueue: {entries: {totalCount: 1, pageInfo: {hasNextPage: true}, nodes: []}},
+        },
+      },
+    },
+    {data: {repository: {}}},
+    {data: {repository: {mergeQueue: nil}}, errors: [{message: "forbidden"}]},
+  ] {
+    harness.testing.http_mock_clear()
+    harness.testing.http_mock(
+      "GET",
+      prefix + "/git/ref/release-merge-lease/main",
+      {status: 200, body: json_stringify({object: {sha: lease_oid}})},
+    )
+    harness.testing.http_mock(
+      "GET",
+      prefix + "/git/commits/" + lease_oid,
+      {status: 200, body: json_stringify({sha: lease_oid, message: headline})},
+    )
+    harness.testing.http_mock(
+      "GET",
+      prefix + "/branches/main",
+      {status: 200, body: json_stringify({commit: {sha: BASE}})},
+    )
+    harness.testing.http_mock(
+      "POST",
+      api + "/graphql",
+      {status: 200, body: json_stringify(response)},
+    )
+    const result = try {
+      release_queue_drain_github(
+        harness,
+        target(),
+        lease_oid,
+        headline,
+        {api_base_url: api, installation_token: "fixture-token"},
+      )
+    }
+    assert(is_err(result), "a partial, missing or errored queue must not be treated as empty")
+    const graphql = harness.testing.http_mock_calls().filter({ c -> c.url == api + "/graphql" })
+      .to_list()
+    assert_eq(len(graphql), 1, "the invalid census must not reach a dequeue mutation")
+  }
+}
+
+pipeline test_queue_census_reads_every_page_before_dequeue(harness: Harness) {
+  const api = "https://api.github.test"
+  const prefix = api + "/repos/burin-labs/harn"
+  const lease_oid = "dddddddddddddddddddddddddddddddddddddddd"
+  const headline = "release-lease-fixture"
+  const other = {
+    id: "MQE_2",
+    pullRequest: {id: "PR_2", number: 2, headRefOid: OTHER, baseRefName: "main"},
+  }
+  const candidate = {
+    id: "MQE_1",
+    pullRequest: {id: "PR_1", number: 1, headRefOid: HEAD, baseRefName: "main"},
+  }
+  const page = fn(nodes, count, more, cursor) { return {
+    data: {
+      repository: {
+        mergeQueue: {
+          entries: {
+            totalCount: count,
+            pageInfo: {hasNextPage: more, endCursor: cursor},
+            nodes: nodes,
+          },
+        },
+      },
+    },
+  } }
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/ref/release-merge-lease/main",
+    {status: 200, body: json_stringify({object: {sha: lease_oid}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/commits/" + lease_oid,
+    {status: 200, body: json_stringify({sha: lease_oid, message: headline})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/branches/main",
+    {status: 200, body: json_stringify({commit: {sha: BASE}})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {
+      responses: [
+        {status: 200, body: json_stringify(page([other], 2, true, "cursor-1"))},
+        {status: 200, body: json_stringify(page([candidate], 2, false, "cursor-2"))},
+        {
+          status: 200,
+          body: json_stringify(
+            {data: {dequeuePullRequest: {clientMutationId: "release-drain-2-cccccccccccc"}}},
+          ),
+        },
+        {status: 200, body: json_stringify(page([candidate], 1, false, "cursor-2"))},
+      ],
+    },
+  )
+  assert_eq(
+    release_queue_drain_github(
+      harness,
+      target(),
+      lease_oid,
+      headline,
+      {api_base_url: api, installation_token: "fixture-token"},
+    ),
+    1,
+  )
+  const calls = harness.testing.http_mock_calls().filter({ c -> c.url == api + "/graphql" })
+    .to_list()
+  assert_eq(len(calls), 4)
+  assert(contains(to_string(calls[1].body), "cursor-1"), "second page must use the cursor")
+  assert(contains(to_string(calls[2].body), "PR_2"), "dequeue must follow the full census")
+}
+
+pipeline test_queue_count_change_between_pages_refuses_dequeue(harness: Harness) {
+  const api = "https://api.github.test"
+  const prefix = api + "/repos/burin-labs/harn"
+  const lease_oid = "dddddddddddddddddddddddddddddddddddddddd"
+  const headline = "release-lease-fixture"
+  const item = {
+    id: "MQE_2",
+    pullRequest: {id: "PR_2", number: 2, headRefOid: OTHER, baseRefName: "main"},
+  }
+  const page = fn(count, more, cursor) { return {
+    data: {
+      repository: {
+        mergeQueue: {
+          entries: {
+            totalCount: count,
+            pageInfo: {hasNextPage: more, endCursor: cursor},
+            nodes: [item],
+          },
+        },
+      },
+    },
+  } }
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/ref/release-merge-lease/main",
+    {status: 200, body: json_stringify({object: {sha: lease_oid}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/git/commits/" + lease_oid,
+    {status: 200, body: json_stringify({sha: lease_oid, message: headline})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    prefix + "/branches/main",
+    {status: 200, body: json_stringify({commit: {sha: BASE}})},
+  )
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {
+      responses: [
+        {status: 200, body: json_stringify(page(2, true, "cursor-1"))},
+        {status: 200, body: json_stringify(page(1, false, "cursor-2"))},
+      ],
+    },
+  )
+  const result = try {
+    release_queue_drain_github(
+      harness,
+      target(),
+      lease_oid,
+      headline,
+      {api_base_url: api, installation_token: "fixture-token"},
+    )
+  }
+  assert(is_err(result), "a queue that changes between pages is not a complete census")
+  const calls = harness.testing.http_mock_calls().filter({ c -> c.url == api + "/graphql" })
+    .to_list()
+  assert_eq(len(calls), 2, "an unstable census must not reach a dequeue")
+}

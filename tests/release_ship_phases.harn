@@ -1,0 +1,384 @@
+import { retry_commands_after_agent_repair } from "../lib/release_agent"
+import { ReleaseAnalysis } from "../lib/release_analysis"
+import { release_candidate_certification_join } from "../lib/release_candidate_certification"
+import { release_publication } from "../lib/release_publication"
+import { ReleaseNotesScope } from "../lib/release_runtime"
+import { release_ship_pipeline } from "../lib/release_ship"
+import {
+  release_ship_candidate_archive_binding_gate,
+  release_ship_candidate_certification_gate,
+} from "../lib/release_ship_certify"
+import {
+  adopt_signed_release_commit_argv,
+  release_commit_parent_matches,
+  release_commit_plan,
+  release_fixup_commit_parents_match,
+  release_fixup_uses_ancestry_merge,
+  release_ship_prepare_route,
+} from "../lib/release_ship_prepare"
+
+fn fixture_publication() {
+  return release_publication("1.2.3", "0123456789abcdef0123456789abcdef01234567")
+}
+
+fn fixture_analysis() -> ReleaseAnalysis {
+  const notes_scope: ReleaseNotesScope = "candidate_tree"
+  return {
+    repo: "/tmp/harn",
+    mode: "ship-pr",
+    bump: "patch",
+    model: "mock",
+    provider: "mock",
+    mock: true,
+    operator_focus: "",
+    branch: "release/v1.2.3",
+    expected_branch: "release/v1.2.3",
+    base_branch: "main",
+    pin_sha: "0123456789abcdef0123456789abcdef01234567",
+    pin_sha_input: "",
+    source_snapshot: {
+      kind: "mock",
+      requested_sha: "",
+      resolved_sha: "0123456789abcdef0123456789abcdef01234567",
+      analysis_head: "0123456789abcdef0123456789abcdef01234567",
+      analysis_root: "/tmp/harn",
+      source_repo: "/tmp/harn",
+    },
+    fixup_mode: false,
+    release_notes_scope: notes_scope,
+    fixup_tag: "",
+    fixup_pr_url: "",
+    fixup_publication: nil,
+    current_version: "1.2.2",
+    next_version: "1.2.3",
+    prepared_release: false,
+    latest_tag: "v1.2.2",
+    changelog_top: "1.2.3",
+    dirty_files: 0,
+    status: "",
+    diff_stat: "",
+    diff_names: "CHANGELOG.md",
+    commits_since_latest_tag: "abc1234 release: important change",
+    commit_file_changes_since_latest_tag: "M CHANGELOG.md",
+    commit_stats_since_latest_tag: "1 file changed",
+    post_tag_pr_numbers: [42],
+    post_tag_pr_details: "PR #42",
+    recent_merged_prs: "[]",
+    changelog_section: "## v1.2.3\n\n### Changed\n\n- Something.",
+    changelog_unreleased_section: "",
+    release_scripts: {release_ship: true, release_gate: true},
+    workflows: {publish_release: true, build_release_binaries: true},
+    release_scope_findings: [],
+    deterministic_findings: [],
+  }
+}
+
+fn fixture_ready(steps: any) {
+  return {
+    proceed: true,
+    steps: steps,
+    analysis: fixture_analysis(),
+    version: "1.2.3",
+    publication: fixture_publication(),
+  }
+}
+
+fn step_names(commands: any) {
+  return commands.map(fn(command) { return command.name })
+}
+
+pipeline test_release_commit_plan_preserves_normal_command_contract(task: any) {
+  const plan = release_commit_plan(
+    {base: "main"},
+    {status: " M CHANGELOG.md", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  )
+  assert_eq([plan.already_complete, plan.needs_commit], [false, true])
+  assert_eq(step_names(plan.stage), ["stage-tracked-release-content"])
+  assert_eq(plan.stage[0]?.argv, ["git", "add", "-u"])
+  assert_eq(plan.commit.argv, ["git", "commit", "-m", "Release v1.2.3"])
+  assert_eq(step_names(plan.commands), ["fetch-base"])
+  assert_eq(plan.commands[0]?.argv, ["git", "fetch", "origin", "--tags", "main"])
+}
+
+pipeline test_adopt_signed_release_commit_avoids_reset_hard(task: any) {
+  // Hosted ship-pr 31069565698: `git reset --hard` is catastrophic-floor
+  // hard-denied, so the adopt step must force-checkout -B instead.
+  const oid = "2d593f6f844cb46ea3eb6d57c8b855817ae35d51"
+  const argv = adopt_signed_release_commit_argv("0.10.59", oid)
+  assert_eq(argv, ["git", "checkout", "--force", "-B", "release/v0.10.59", oid])
+  assert_eq(contains(argv.join(" "), "reset"), false)
+}
+
+pipeline test_no_release_command_sets_a_reserved_harn_variable(task: any) {
+  // `HARN_*` is Harn's namespace: an unregistered name there is not ignored,
+  // it aborts the run at startup. A release command that carries one fails the
+  // moment a hook or nested step invokes `harn`, which is the opposite of what
+  // an environment override is usually reached for.
+  const plan = release_commit_plan(
+    {base: "main"},
+    {status: " M CHANGELOG.md", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  )
+  for command in plan.stage + [plan.commit] + plan.commands {
+    const env = if type_of(command.argv) == "dict" {
+      command.argv?.env ?? {}
+    } else {
+      {}
+    }
+    for entry in env {
+      assert_eq(starts_with(entry.key, "HARN_") && !starts_with(entry.key, "HARN_EXT_"), false)
+    }
+  }
+}
+
+pipeline test_pre_tag_checkpoint_skips_release_preparation(task: any) {
+  assert_eq(release_ship_prepare_route({pre_tag_resume: true}), "resume_pre_tag")
+  assert_eq(release_ship_prepare_route({pre_tag_resume: false}), "prepare")
+  assert_eq(release_ship_prepare_route({fixup_mode: true}), "prepare")
+}
+
+pipeline test_pre_tag_resume_reenters_candidate_certification(task: any) {
+  // Regression for hosted .130 recovery: adopting an immutable attempt must
+  // re-enter the canonical certification owner. Same-named commit checks are
+  // not enough to bypass it because they do not prove workflow/run identity or
+  // the archive, local-source, and binary-size gates.
+  let called = false
+  const gate = release_ship_candidate_certification_gate(
+    {pre_tag_resume: true},
+    fixture_publication(),
+    [{name: "cutoff-proved"}],
+    fn(publication, steps) {
+      called = true
+      assert_eq(publication.head_oid, fixture_publication().head_oid)
+      return {
+        steps: steps + [{name: "candidate-child-evidence-missing"}],
+        success: false,
+        timing: {started_at_ms: 1, completed_at_ms: 2, duration_ms: 1, critical_path: "platform"},
+      }
+    },
+  )
+  assert_eq(called, true)
+  assert_eq(gate.success, false)
+  assert_eq(step_names(gate.steps), ["cutoff-proved", "candidate-child-evidence-missing"])
+}
+
+pipeline test_candidate_certification_stops_before_pr_when_archive_binding_fails(task: any) {
+  const gate = release_ship_candidate_archive_binding_gate(
+    {},
+    [{name: "candidate-certification-join"}],
+    fn() { return {
+      success: false,
+      action: "failed",
+      remote_ref: "refs/tags/harn-candidate-archive-certification/" + "a" * 40,
+      tag_object_oid: "",
+      receipt: nil,
+      reason: "signed candidate archive certification is absent",
+    } },
+  )
+  assert_eq(gate.success, false)
+  assert_eq(
+    step_names(gate.steps),
+    ["candidate-certification-join", "bind-certified-candidate-archive"],
+  )
+  assert_eq(gate.steps[1]?.success, false)
+}
+
+pipeline test_post_publish_fixup_does_not_create_a_candidate_archive_binding(task: any) {
+  let called = false
+  const gate = release_ship_candidate_archive_binding_gate(
+    {
+      fixup_mode: true,
+      skip_tag: true,
+      fixup_tag: "v1.2.3",
+      fixup_publication: fixture_publication(),
+    },
+    [{name: "post-publish-fixup-ready"}],
+    fn() {
+      called = true
+      throw "post-publish fixup must not bind a new candidate archive"
+    },
+  )
+  assert_eq(called, false)
+  assert_eq(gate.success, true)
+  assert_eq(step_names(gate.steps), ["post-publish-fixup-ready"])
+}
+
+pipeline test_candidate_certification_join_uses_parallel_critical_path(task: any) {
+  const joined = release_candidate_certification_join(
+    [
+      {name: "platform", started_at_ms: 1000, completed_at_ms: 27000},
+      {name: "archive", started_at_ms: 2000, completed_at_ms: 26000},
+    ],
+  )
+  assert_eq(joined.started_at_ms, 1000)
+  assert_eq(joined.completed_at_ms, 27000)
+  assert_eq(joined.duration_ms, 26000)
+  assert_eq(joined.critical_path, "platform")
+  assert_eq(joined.duration_ms < 50000, true)
+}
+
+pipeline test_release_commit_parent_must_be_the_frozen_source_only(task: any) {
+  const source = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  assert_eq(release_commit_parent_matches("${head} ${source}", source), true)
+  assert_eq(
+    release_commit_parent_matches(
+      "${head} ${source} cccccccccccccccccccccccccccccccccccccccc",
+      source,
+    ),
+    false,
+  )
+  assert_eq(
+    release_commit_parent_matches("${head} dddddddddddddddddddddddddddddddddddddddd", source),
+    false,
+  )
+}
+
+pipeline test_commit_repair_retry_replays_the_exact_commit_argv(task: any) {
+  const commit = release_commit_plan(
+    {base: "main"},
+    {status: " M CHANGELOG.md", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  ).commit
+  const retry_steps = retry_commands_after_agent_repair(commit)
+  assert_eq(
+    step_names(retry_steps),
+    ["stage-after-agent-repair-commit", "commit-after-agent-repair"],
+  )
+  assert_eq(retry_steps[1]?.command, commit.argv)
+}
+
+pipeline test_release_commit_plan_reuses_complete_release_commit(task: any) {
+  const plan = release_commit_plan(
+    {base: "main"},
+    {status: "", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  )
+  assert_eq([plan.already_complete, plan.needs_commit], [true, false])
+  assert_eq(step_names(plan.stage), [])
+  assert_eq(step_names(plan.commands), ["fetch-base"])
+}
+
+pipeline test_release_commit_plan_appends_shipped_tag_ancestry_fixup(task: any) {
+  const plan = release_commit_plan(
+    {base: "main", fixup_mode: true, skip_tag: true, fixup_tag: "v1.2.3"},
+    {status: "", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  )
+  assert_eq(step_names(plan.commands), ["fetch-base", "merge-shipped-tag-ours"])
+  assert_eq(
+    plan.commands[1]?.argv,
+    [
+      "git",
+      "merge",
+      "-S",
+      "--no-ff",
+      "-s",
+      "ours",
+      "v1.2.3",
+      "-m",
+      "Tie release/v1.2.3 to shipped tag v1.2.3 (ours)",
+    ],
+  )
+}
+
+pipeline test_hosted_fixup_keeps_github_signed_release_commit_as_publication_head(task: any) {
+  const cfg = {
+    base: "main",
+    fixup_mode: true,
+    skip_tag: true,
+    fixup_tag: "v1.2.3",
+    github_signed_commit: true,
+  }
+  const plan = release_commit_plan(
+    cfg,
+    {status: "", diff_names: "CHANGELOG.md", branch: "release/v1.2.3"},
+    "1.2.3",
+  )
+  assert_eq(release_fixup_uses_ancestry_merge(cfg), false)
+  assert_eq(step_names(plan.commands), ["fetch-base"])
+}
+
+pipeline test_release_fixup_parent_proof_requires_both_owned_edges(task: any) {
+  const pin = "1111111111111111111111111111111111111111"
+  const release = "2222222222222222222222222222222222222222"
+  const tag = "3333333333333333333333333333333333333333"
+  const merge = "4444444444444444444444444444444444444444"
+  assert_eq(
+    release_fixup_commit_parents_match("${merge} ${release} ${tag}", "${release} ${pin}", pin, tag),
+    true,
+  )
+  assert_eq(
+    release_fixup_commit_parents_match("${merge} ${tag} ${release}", "${release} ${pin}", pin, tag),
+    false,
+  )
+  assert_eq(
+    release_fixup_commit_parents_match(
+      "${merge} ${release} ${tag}",
+      "${release} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pin,
+      tag,
+    ),
+    false,
+  )
+}
+
+pipeline test_release_ship_pipeline_stops_at_prepare_failure(task: any) {
+  let later_phase_called = false
+  const result = release_ship_pipeline(
+    [{name: "initial"}],
+    {
+      prepare: fn(steps) { return {proceed: false, steps: steps + [{name: "prepare-stop"}]} },
+      certify: fn(_prepared) {
+        later_phase_called = true
+        return {proceed: false, steps: []}
+      },
+      pr: fn(_tagged) {
+        later_phase_called = true
+        return {steps: [], handed_off: true, pr_url: "unexpected"}
+      },
+    },
+  )
+  assert_eq(
+    [step_names(result.steps), result.handed_off, later_phase_called],
+    [["initial", "prepare-stop"], false, false],
+  )
+}
+
+pipeline test_release_ship_pipeline_stops_at_certification_failure(task: any) {
+  let pr_called = false
+  const result = release_ship_pipeline(
+    [],
+    {
+      prepare: fn(steps) { return fixture_ready(steps + [{name: "prepare-ready"}]) },
+      certify: fn(prepared) { return {
+        proceed: false,
+        steps: prepared.steps + [{name: "certify-stop"}],
+      } },
+      pr: fn(_tagged) {
+        pr_called = true
+        return {steps: [], handed_off: true, pr_url: "unexpected"}
+      },
+    },
+  )
+  assert_eq(step_names(result.steps), ["prepare-ready", "certify-stop"])
+  assert_eq([result.handed_off, pr_called], [false, false])
+}
+
+pipeline test_release_ship_pipeline_hands_certified_attempt_to_pr_phase(task: any) {
+  const result = release_ship_pipeline(
+    [],
+    {
+      prepare: fn(steps) { return fixture_ready(steps + [{name: "prepare-ready"}]) },
+      certify: fn(prepared) { return fixture_ready(prepared.steps + [{name: "certify-ready"}]) },
+      pr: fn(certified) { return {
+        steps: certified.steps + [{name: "pr-handoff"}],
+        handed_off: true,
+        pr_url: "https://example.test/pull/7",
+      } },
+    },
+  )
+  assert_eq(step_names(result.steps), ["prepare-ready", "certify-ready", "pr-handoff"])
+  assert_eq([result.handed_off, result.pr_url], [true, "https://example.test/pull/7"])
+}
