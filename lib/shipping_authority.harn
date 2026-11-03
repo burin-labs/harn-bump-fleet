@@ -1,0 +1,173 @@
+import {
+  FleetManifest,
+  parse_fleet_manifest,
+  read_fleet_manifest,
+  validate_fleet_manifest,
+} from "./fleet_manifest"
+
+/** A credential-free configuration object fetched from one immutable Git tree. */
+pub type ShippingConfiguration = {repository: string, commit: string, path: string}
+
+type RawDescriptor = dict<string, unknown>
+
+/** Routing metadata does not replace Harn's generation-bound writer permit. */
+pub type ShippingDescriptor = {kind: "legacy"} \
+  | {kind: "harn", installation: string, configuration: ShippingConfiguration}
+
+/** Retained once at startup; a later lookup may refuse but never replace it. */
+pub type ShippingRecord = {repository: string, descriptor: ShippingDescriptor, identity: string}
+
+/** Missing declarations remain distinct from measured invalid declarations. */
+pub type ShippingCensus = {
+  required_count: int,
+  declared_count: int,
+  records: list<ShippingRecord>,
+  missing: list<string>,
+  invalid: list<{repository: string, reason: string}>,
+}
+
+fn exact_keys(value: unknown, expected: list<string>) -> bool {
+  return type_of(value) == "dict" && value.keys().sorted() == expected.sorted()
+}
+
+fn decode_descriptor(raw: unknown) -> ShippingDescriptor {
+  const descriptor: ShippingDescriptor = schema_expect(raw, ShippingDescriptor)
+  if descriptor.kind == "legacy" {
+    require exact_keys(raw, ["kind"]), "legacy shipping descriptor has unknown fields"
+    return descriptor
+  }
+  require exact_keys(raw, ["kind", "installation", "configuration"]),
+    "managed shipping descriptor has unknown fields"
+  const object: RawDescriptor = schema_expect(raw, RawDescriptor)
+  require exact_keys(object.get("configuration"), ["repository", "commit", "path"]),
+    "shipping configuration locator has unknown fields"
+  require trim(descriptor.installation) == descriptor.installation
+    && descriptor.installation != "",
+    "shipping installation identity is empty or unnormalized"
+  const configuration = descriptor.configuration
+  require len(regex_captures("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", configuration.repository)) == 1,
+    "shipping configuration repository must be a credential-free repository slug"
+  require len(regex_captures("^[0-9a-f]{40}$", configuration.commit)) == 1,
+    "shipping configuration must name an immutable full commit"
+  require len(regex_captures("^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$", configuration.path)) == 1
+    && configuration.path.split("/").all({ part -> part != "." && part != ".." }),
+    "shipping configuration must name a relative repository file"
+  return descriptor
+}
+
+fn record(repository: string, descriptor: ShippingDescriptor) -> ShippingRecord {
+  // A fixed ordered tuple excludes unrelated rows and map iteration order.
+  const identity = if descriptor.kind == "legacy" {
+    sha256(json_stringify(["fleet.shipping.v1", repository, "legacy"]))
+  } else {
+    sha256(
+      json_stringify(
+        [
+          "fleet.shipping.v1",
+          repository,
+          "harn",
+          descriptor.installation,
+          descriptor.configuration.repository,
+          descriptor.configuration.commit,
+          descriptor.configuration.path,
+        ],
+      ),
+    )
+  }
+  return {repository: repository, descriptor: descriptor, identity: identity}
+}
+
+/** Measure the complete registry before permitting any writer to capture routing. */
+pub fn shipping_authority_census(manifest: FleetManifest) -> ShippingCensus {
+  const validated = validate_fleet_manifest(manifest)
+  let records: list<ShippingRecord> = []
+  let missing: list<string> = []
+  let invalid: list<{repository: string, reason: string}> = []
+  let declared = 0
+  for repository in validated.repositories {
+    if repository.shipping == nil {
+      missing = missing + [repository.slug]
+      continue
+    }
+    declared = declared + 1
+    try {
+      records = records + [record(repository.slug, decode_descriptor(repository.shipping))]
+    } catch (error) {
+      invalid = invalid + [{repository: repository.slug, reason: "invalid descriptor or locator"}]
+    }
+  }
+  return {
+    required_count: len(validated.repositories),
+    declared_count: declared,
+    records: records,
+    missing: missing,
+    invalid: invalid,
+  }
+}
+
+/** Missing, partial, invalid, duplicate, or unknown registry data grants no routing. */
+pub fn capture_shipping_authority(manifest: FleetManifest, repository: string) -> ShippingRecord {
+  const census = shipping_authority_census(manifest)
+  require census.required_count > 0 && len(census.records) == census.required_count
+    && len(census.missing) == 0
+    && len(census.invalid) == 0,
+    "shipping registry is incomplete: " + json_stringify(census)
+  const captured = census.records.find({ candidate -> candidate.repository == repository })
+  require captured != nil, "shipping repository is not registered: " + repository
+  return unwrap(captured)
+}
+
+/** Read failures propagate; there is no default policy on missing registry data. */
+pub fn read_shipping_authority(
+  fs: HarnessFs,
+  repository: string,
+  path: string = "fleet.toml",
+) -> ShippingRecord {
+  return capture_shipping_authority(read_fleet_manifest(fs, path), repository)
+}
+
+/** Compare the original record, never upgrade a delayed writer to a fresh grant. */
+pub fn shipping_authority_current(captured: ShippingRecord, fresh: FleetManifest) -> bool {
+  return try {
+    capture_shipping_authority(fresh, captured.repository) == captured
+  } catch (error) {
+    false
+  }
+}
+
+/** Enrollment survives rollback and membership edits; Harn owns shadow generations. */
+pub fn require_shipping_enrollment_retained(before: FleetManifest, after: FleetManifest) -> int {
+  const previous = validate_fleet_manifest(before)
+  let retained = 0
+  for repository in previous.repositories {
+    // A historical registry may predate declarations. This grants no writer
+    // authority; capture still refuses any current missing declaration.
+    if repository.shipping == nil {
+      continue
+    }
+    const descriptor = decode_descriptor(repository.shipping)
+    if descriptor.kind == "harn" {
+      const current = capture_shipping_authority(after, repository.slug)
+      require current.descriptor.kind == "harn",
+        "managed shipping enrollment cannot revert to legacy: "
+        + repository.slug
+      require current.descriptor.installation == descriptor.installation,
+        "managed shipping installation cannot be replaced: "
+        + repository.slug
+      retained = retained + 1
+    }
+  }
+  return retained
+}
+
+/** Read the comparison from a bounded immutable Git object, never a mutable ref. */
+pub fn shipping_baseline_manifest(process: HarnessProcess, commit: string) -> FleetManifest {
+  require len(regex_captures("^[0-9a-f]{40}$", commit)) == 1
+    && commit != "0000000000000000000000000000000000000000",
+    "shipping registry baseline requires a nonzero immutable commit"
+  const result = process.run(
+    {program: "git", args: ["show", commit + ":fleet.toml"], timeout_ms: 30000},
+  )
+  require result.success && result.exit_code == 0, "shipping registry baseline is unreadable"
+  return parse_fleet_manifest(toml_parse(result.stdout))
+}
