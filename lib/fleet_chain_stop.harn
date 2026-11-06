@@ -1,0 +1,239 @@
+// Decide whether a fleet update chain has anything left to gain from another
+// round.
+//
+// A chain schedules a successor round whenever the round it just finished did
+// not prove. That is right when the round failed at something a later round can
+// change: code a repair agent edits, a pull request that still needs a check,
+// an index that had not caught up. It is wrong when every failure is identical
+// to the one the next round will read, and the cost of being wrong is not
+// abstract.
+//
+// Measured, on one target, in one day: two chains ran their full four rounds
+// between 09:45 and 11:12 UTC, and every round ended with the same six
+// consumers refusing the same read. Each round reads and writes across every
+// fleet repository with the release app's token, so eight rounds in ninety
+// minutes spent the installation's hourly budget; the hourly consumer
+// rehearsals then failed closed on their first API call and a pending release
+// could not obtain its proof. Nothing about the sixth round was more informed
+// than the first.
+//
+// So the class of a refusal, not merely the fact of one, decides the chain.
+import {
+  FleetObservationClass,
+  fleet_observation_transient_refusal,
+} from "./fleet_observation_class"
+
+/**
+ * The failure reason a repair agent is allowed to act on.
+ *
+ * Exported so the repair plan and the chain's stop decision agree on which
+ * failures are code failures by construction rather than by two lists that
+ * drift apart.
+ */
+pub const CHAIN_CODE_REPAIRABLE_REASON: string = "checks_failing"
+
+/**
+ * The failure reason for an automated reviewer's unanswered findings.
+ *
+ * Code the repair agent edits, like a failing check, so it is repairable. Once
+ * the fleet has answered every finding at the current head it becomes
+ * `review_findings_escalated`, which no further round can change.
+ */
+pub const CHAIN_REVIEW_REPAIRABLE_REASON: string = "review_findings_unanswered"
+
+/** The failure reason a branch recovery, not a model, resolves. */
+pub const CHAIN_RECOVERABLE_REASON: string = "target_branch_missing_pull_request"
+
+/**
+ * What a further round could do about one failed repository.
+ *
+ * `repairable` covers both kinds of work a round performs on its own: an agent
+ * edit and a branch recovery. `transient` is a refusal that settles without
+ * anyone acting. `final` is everything else, which is the default, because a
+ * failure nobody has classified is one no round has been shown to clear.
+ */
+pub type FleetChainRefusalKind = "repairable" | "transient" | "final"
+
+/** One failed repository, classified for the chain's decision. */
+pub type FleetChainRefusal = {
+  repo: string,
+  kind: FleetChainRefusalKind,
+  code: string,
+  category: string,
+  reason: string,
+}
+
+/**
+ * Whether the chain schedules a successor, and the sentence that says why.
+ *
+ * `summary` is written for the run summary and the skip reason of the step
+ * that would have dispatched. A chain that stops without naming what stopped it
+ * is indistinguishable from a chain that broke.
+ */
+pub type FleetChainStopDecision = {
+  stop: bool,
+  reason: string,
+  summary: string,
+  repairable: list<string>,
+  transient: list<string>,
+  final: list<string>,
+  transient_retries_used: int,
+  transient_retry_budget: int,
+  /** The retry count the successor round is dispatched with. */
+  next_transient_retries: int,
+}
+
+/** One further round for a refusal that settles on its own, and no more. */
+pub const CHAIN_TRANSIENT_RETRY_BUDGET: int = 1
+
+fn refusal_class(row: any) -> FleetObservationClass? {
+  const raw = row?.default_branch_check_proof?.refusal
+  if raw == nil {
+    return nil
+  }
+  const disposition = to_string(raw?.disposition ?? "")
+  if disposition != "retry" && disposition != "refuse" {
+    return nil
+  }
+  return {
+    disposition: disposition,
+    code: to_string(raw?.code ?? ""),
+    category: to_string(raw?.category ?? ""),
+    action: to_string(raw?.action ?? ""),
+  }
+}
+
+/**
+ * Classify one convergence row, or nothing when the row did not fail.
+ *
+ * A waiting row is not a refusal. It is the ordinary state of a round that has
+ * work still running, and the existing round limit already bounds it.
+ */
+pub fn fleet_chain_refusal(row: any) -> FleetChainRefusal? {
+  if to_string(row?.state ?? "") != "failed" {
+    return nil
+  }
+  const repo = to_string(row?.repo ?? "")
+  const reason = to_string(row?.reason ?? "")
+  if reason == CHAIN_CODE_REPAIRABLE_REASON || reason == CHAIN_REVIEW_REPAIRABLE_REASON
+    || reason == CHAIN_RECOVERABLE_REASON {
+    return {repo: repo, kind: "repairable", code: "", category: "", reason: reason}
+  }
+  const classified = refusal_class(row)
+  if classified != nil && fleet_observation_transient_refusal(unwrap(classified)) {
+    const known: FleetObservationClass = unwrap(classified)
+    return {
+      repo: repo,
+      kind: "transient",
+      code: known.code,
+      category: known.category,
+      reason: reason,
+    }
+  }
+  return {
+    repo: repo,
+    kind: "final",
+    code: classified?.code ?? "",
+    category: classified?.category ?? "",
+    reason: reason,
+  }
+}
+
+fn names(refusals: list<FleetChainRefusal>, kind: FleetChainRefusalKind) -> list<string> {
+  return refusals.filter({ row -> row.kind == kind }).map({ row -> row.repo }).to_list()
+}
+
+fn transient_detail(refusals: list<FleetChainRefusal>) -> string {
+  return refusals.filter({ row -> row.kind == "transient" }).map(
+    { row -> row.repo + " (" + row.code + ")" },
+  )
+    .to_list()
+    .join(", ")
+}
+
+/**
+ * Decide the chain from this round's rows and the transient retries already
+ * spent.
+ *
+ * Rows come from the round's own proof receipt. An unreadable receipt yields no
+ * rows, and no rows must not read as "nothing left to do": a round that could
+ * not report is a round that proved nothing, so the decision defers to the
+ * existing round limit instead of stopping the chain on silence.
+ */
+pub fn fleet_chain_stop_decision(
+  rows: list,
+  transient_retries_used: int = 0,
+  transient_retry_budget: int = CHAIN_TRANSIENT_RETRY_BUDGET,
+) -> FleetChainStopDecision {
+  let refusals: list<FleetChainRefusal> = []
+  for row in rows {
+    const classified = fleet_chain_refusal(row)
+    if classified != nil {
+      refusals = refusals + [unwrap(classified)]
+    }
+  }
+  const repairable = names(refusals, "repairable")
+  const transient = names(refusals, "transient")
+  const finalized = names(refusals, "final")
+  const base = {
+    repairable: repairable,
+    transient: transient,
+    final: finalized,
+    transient_retries_used: transient_retries_used,
+    transient_retry_budget: transient_retry_budget,
+  }
+  if len(refusals) == 0 {
+    return base
+      + {
+        stop: false,
+        reason: "no_refusals_to_classify",
+        summary: "this round reported no failed repository, so the round limit governs the chain",
+        next_transient_retries: transient_retries_used,
+      }
+  }
+  if len(finalized) > 0 && len(repairable) == 0 && len(transient) == 0 {
+    return base
+      + {
+        stop: true,
+        reason: "refusals_not_code_repairable",
+        summary: "stopping the chain: every failure this round is a refusal no round can clear, on "
+          + finalized.join(", ")
+          + "; read the action on each and re-dispatch once it is addressed",
+        next_transient_retries: transient_retries_used,
+      }
+  }
+  if len(repairable) > 0 {
+    return base
+      + {
+        stop: false,
+        reason: "repairable_failures_remain",
+        summary: "continuing the chain: a further round can still act on "
+          + repairable.join(", "),
+        next_transient_retries: transient_retries_used,
+      }
+  }
+  if transient_retries_used < transient_retry_budget {
+    return base
+      + {
+        stop: false,
+        reason: "transient_refusal_retry",
+        summary: "continuing the chain for retry "
+          + to_string(transient_retries_used + 1)
+          + " of "
+          + to_string(transient_retry_budget)
+          + ": every failure this round is a refusal that settles on its own, on "
+          + transient_detail(refusals),
+        next_transient_retries: transient_retries_used + 1,
+      }
+  }
+  return base
+    + {
+      stop: true,
+      reason: "transient_retry_budget_exhausted",
+      summary: "stopping the chain: the same self-settling refusal survived its "
+        + to_string(transient_retry_budget)
+        + " retry, so it is not the race it was classified as, on "
+        + transient_detail(refusals),
+      next_transient_retries: transient_retries_used,
+    }
+}

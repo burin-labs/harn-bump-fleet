@@ -1,0 +1,1 @@
+`watch_harn_release` can now import the typed receipt from one exact hosted release run before monitoring starts. Reruns keep newer local watch state instead of replacing it with the older hosted handoff.
