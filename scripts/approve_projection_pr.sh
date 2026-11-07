@@ -30,7 +30,8 @@
 #                      adapter from `orchestration_pin`), and the body's
 #                      `Fleet-owned-projection-restore:` trailers name exactly
 #                      the changed files.
-# Both also need green checks (the `CI status` aggregate) and no unresolved
+# Every commit must be authored by the bot, so a person's verified web-UI
+# commit added to the branch declines it. Both also need green checks (the `CI status` aggregate) and no unresolved
 # review thread. The path lists are the security boundary: one file outside them
 # declines the pull request. A consumer pull request that is not yet eligible is
 # declined with a receipt and exit 0 so a pending check does not turn a workflow
@@ -92,6 +93,12 @@ commits=$(gh api --paginate --slurp "repos/$repo/pulls/$pr/commits?per_page=100"
   || fault "the commits could not be read"
 jq -e 'length > 0 and all(.[]; .commit.verification.verified == true)' <<< "$commits" > /dev/null \
   || refuse "a commit is missing or not GitHub-verified"
+# GitHub also verifies a commit a person makes in the web UI, so verification
+# alone does not say who wrote it. The bot writes through the API: it is the
+# author and GitHub's web-flow identity is the committer.
+jq -e --arg bot "$bot" 'all(.[]; .author.login == $bot and (.committer.login == $bot or .committer.login == "web-flow"))' \
+  <<< "$commits" > /dev/null \
+  || refuse "a commit was not authored by $bot"
 
 files=$(gh api --paginate --slurp "repos/$repo/pulls/$pr/files?per_page=100" | jq 'add // []') \
   || fault "the changed files could not be read"
