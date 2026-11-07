@@ -53,6 +53,15 @@ The entry points are:
   a pull request, `check_fleet_pin_staleness.harn` dispatches the next one
   when its pin is behind and no bump run or pull request is open,
   at most once per release.
+- `.github/workflows/approve-fleet-pr.yml` and `scripts/approve_projection_pr.sh`: approve
+  the release bot's pull requests with no person in the loop. `APPROVAL_SCOPE=pin` (this
+  repository's orchestration-pin projection) and `consumer` (a consumer's runtime bump or
+  projection restore) share one trust anchor: bot author, GitHub-verified commits, head
+  bound. `scripts/projection-approval-paths.json` is the only path allowlist, and
+  `tests/projection_approval_eligibility.harn` pins it to the projection registry. One file
+  outside it declines the pull request; a decline is a receipt, never a red run. Consumers
+  reach the workflow through the Smart Ship caller once `policy.approval_workflow` pins a
+  commit of this repository.
 - `converge_fleet_projections.harn`: the remote counterpart to the `sync_*`
   harnesses. It reads every fleet-owned projection from its target's default
   branch and proposes the repair as a pull request, so drift converges without a
