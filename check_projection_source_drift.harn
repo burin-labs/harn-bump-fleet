@@ -1,0 +1,195 @@
+#!/usr/bin/env harn
+//
+// Dispatch projection convergence when a canonical source moves.
+//
+// `fleet-projection-convergence.yml` already repairs a projection whose
+// RENDERER changed, on the merge that changes it. A projection's other input is
+// the canonical source file, which lives in a repository that knows nothing
+// about the consumers projecting it. A source change therefore matched no
+// trigger, and every consumer reading it stayed stale until the daily cron.
+//
+// This closes that half. It runs on its own schedule, asks what each declared
+// source's head is now, compares it with the head that source last converged
+// from, and dispatches convergence for exactly the consumers of the sources
+// that moved.
+//
+// It decides and dispatches, and it records NOTHING. The convergence run
+// writes the records, for the consumers it observed already matching. That
+// ownership is the point: a dispatch being accepted says only that a run
+// started. A run that fails, is cancelled, or opens a repair nobody merges
+// leaves the consumer exactly as stale as it was, and a record written here
+// would report it converged from that moment on. So this comparison keeps
+// asking until the convergence run says the bytes are in place.
+//
+// It renders nothing, writes no consumer repository, and merges nothing: the
+// convergence workflow still owns all of that, and each consumer still owns
+// its own gate.
+import { ParserSpec } from "std/cli/argparse"
+import { cli_options } from "lib/cli_options"
+import {
+  consumer_projection_repositories,
+  read_remote_consumer_projection_manifests,
+} from "lib/consumer_projection_manifest"
+import { read_fleet_manifest } from "lib/fleet_manifest"
+import { github_connector_options, github_workflow_dispatch } from "lib/github"
+import { github_path_head } from "lib/github_source_head"
+import {
+  PROJECTION_SOURCE_PREFIX,
+  ProjectionSourceObservation,
+  converged_source_commits,
+  declared_projection_sources,
+  plan_projection_source_drift,
+  projection_source_ref_rows,
+} from "lib/projection_source_drift"
+
+const FLEET_REPO = "burin-labs/harn-bump-fleet"
+
+const CONVERGENCE_WORKFLOW = "fleet-projection-convergence.yml"
+
+type Options = {dry_run: bool, remote: string}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-projection-source-drift",
+  args: [
+    {kind: "switch", name: "dry_run", long: "--dry-run"},
+    {kind: "flag", name: "remote", long: "--remote", default: "origin"},
+  ],
+}
+
+/**
+ * Every record currently written, read in one unauthenticated request.
+ *
+ * `git ls-remote` against this public repository answers for every source at
+ * once and spends no API budget. A listing that could not be read is refused
+ * rather than treated as an empty namespace: empty means nothing has ever
+ * converged, which would converge the entire fleet on a transient network
+ * failure.
+ */
+fn read_records(process: HarnessProcess, remote: string) -> list<{ref: string, oid: string}> {
+  const result = process.run(
+    {
+      program: "git",
+      args: ["ls-remote", remote, "${PROJECTION_SOURCE_PREFIX}/*"],
+      timeout_ms: 60000,
+    },
+  )
+  if is_err(result) {
+    throw "the projection source records could not be listed, so no source can be shown converged"
+  }
+  const done = unwrap(result)
+  if (done.exit_code ?? 1) != 0 {
+    throw "the projection source records could not be listed: " + to_string(done.stderr ?? "")
+  }
+  return projection_source_ref_rows(to_string(done.stdout ?? ""))
+}
+
+pipeline main(harness: Harness) -> int {
+  const options = cli_options<Options>(ARG_SPEC, argv, schema_of(Options))
+  const manifest = read_fleet_manifest(harness.fs)
+  const default_branch = manifest.fleet.default_branch
+  const resolution = read_remote_consumer_projection_manifests(
+    harness,
+    manifest,
+    default_branch,
+    consumer_projection_repositories(manifest),
+  )
+  // A consumer whose contract could not be read declares sources this run
+  // cannot see. Continuing would report a fleet converged on the strength of
+  // the consumers that did answer.
+  if len(resolution.errors) > 0 {
+    harness.stdio.println(
+      json_stringify_pretty(
+        {
+          schema_version: "harn.projection-source-drift.v1",
+          ok: false,
+          dispatched: false,
+          unreadable_consumers: resolution.errors,
+        },
+      ),
+    )
+    for error in resolution.errors {
+      harness.stdio.eprintln("error ${error}")
+    }
+    return 1
+  }
+  let observations: list<ProjectionSourceObservation> = []
+  for source in declared_projection_sources(resolution.projections) {
+    const head = github_path_head(
+      harness,
+      source.slug,
+      source.path,
+      default_branch,
+      github_connector_options(),
+    )
+    observations = observations
+      + [
+        if is_err(head) {
+          {
+            slug: source.slug,
+            path: source.path,
+            head: "",
+            resolved: false,
+            detail: to_string(unwrap_err(head)?.message ?? unwrap_err(head)),
+          }
+        } else {
+          {slug: source.slug, path: source.path, head: unwrap(head), resolved: true, detail: ""}
+        },
+      ]
+  }
+  const records = read_records(harness.process, options.remote)
+  const plan = plan_projection_source_drift(
+    resolution.projections,
+    observations,
+    converged_source_commits(records.map({ row -> row.ref }).to_list()),
+  )
+  let dispatched = false
+  let dispatch_detail = ""
+  let failures = []
+  if plan.dispatch && !options.dry_run {
+    const receipt = github_workflow_dispatch(
+      harness,
+      FLEET_REPO,
+      CONVERGENCE_WORKFLOW,
+      {apply: "true", only: join(plan.consumers, ",")},
+    )
+    if is_err(receipt) {
+      failures = failures + ["convergence dispatch failed: " + to_string(unwrap_err(receipt))]
+    } else {
+      dispatched = true
+      dispatch_detail = to_string(unwrap(receipt)?.url ?? "")
+    }
+  }
+  harness.stdio.println(
+    json_stringify_pretty(
+      {
+        schema_version: "harn.projection-source-drift.v1",
+        ok: len(failures) == 0,
+        dry_run: options.dry_run,
+        default_branch: default_branch,
+        source_count: len(plan.decisions),
+        moved_count: plan.moved_count,
+        unknown_count: plan.unknown_count,
+        converged_count: plan.converged_count,
+        consumers: plan.consumers,
+        dispatched: dispatched,
+        dispatch_url: dispatch_detail,
+        failures: failures,
+        decisions: plan.decisions,
+      },
+    ),
+  )
+  for decision in plan.decisions {
+    if decision.state == "converged" {
+      continue
+    }
+    harness.stdio.eprintln("${decision.state} ${decision.key}: ${decision.detail}")
+  }
+  for failure in failures {
+    harness.stdio.eprintln("error ${failure}")
+  }
+  return if len(failures) == 0 {
+    0
+  } else {
+    1
+  }
+}
