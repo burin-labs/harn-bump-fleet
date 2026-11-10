@@ -40,7 +40,8 @@
 # Usage: approve_projection_pr.sh <pull-request-number>
 # Environment: GH_TOKEN (pull-requests: write, checks: read), GITHUB_REPOSITORY,
 # APPROVAL_SCOPE (pin by default, or consumer), RELEASE_BOT_LOGIN (default
-# harn-release-bot[bot]), APPROVE_DRY_RUN=1 to decide without approving.
+# harn-release-bot[bot]), APPROVE_DRY_RUN=1 to decide without approving,
+# FLEET_MANIFEST_PATH (default ../fleet.toml) for the runtime bump arming policy.
 set -euo pipefail
 
 pr=${1:?usage: approve_projection_pr.sh <pull-request-number>}
@@ -48,6 +49,7 @@ pr=${1:?usage: approve_projection_pr.sh <pull-request-number>}
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}
 bot=${RELEASE_BOT_LOGIN:-harn-release-bot[bot]}
 scope=${APPROVAL_SCOPE:-pin}
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ "$scope" == pin || "$scope" == consumer ]] || { echo "APPROVAL_SCOPE must be pin or consumer: $scope" >&2; exit 2; }
 
 # A fault is a read or policy failure and always fails the run. A refusal is a
@@ -88,13 +90,56 @@ approve() {
   if jq -e --arg receipt "$receipt" 'any(.[]; .state == "APPROVED"
       and ((.body // "") | rtrimstr("\n") | split("\n") | last) == $receipt)' <<< "$reviews" > /dev/null; then
     echo "#$pr already carries an approval bound to $head_sha."
+    arm
     exit 0
   fi
   jq -n --arg sha "$head_sha" --arg body "$summary" --arg receipt "$receipt" \
     '{commit_id: $sha, event: "APPROVE", body: "\($body)\n\($receipt)"}' |
     gh api -X POST "repos/$repo/pulls/$pr/reviews" --input - > /dev/null
   echo "Approved #$pr at $head_sha."
+  arm
   exit 0
+}
+
+# Nothing else labels a runtime bump `ship`: the bump workflow publishes it
+# unarmed, and once its head is approved the bump driver preserves that head
+# rather than refresh it. So the head this run just verified and approved is
+# armed here, which also recovers a head approved earlier and never armed. It
+# runs only after every check above passed for the current head, so an approval
+# of an older head arms nothing. The fleet manifest's `bump_ship_enabled` can
+# withhold it, and a `ship` label anyone removed is never put back: removing it
+# is how a person stops delivery.
+arm() {
+  [[ "$scope" == consumer && "${kind:-}" == runtime-bump ]] || return 0
+  local manifest=${FLEET_MANIFEST_PATH:-$here/../fleet.toml} enabled events
+  enabled=$(python3 -I -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    rows = [r for r in tomllib.load(handle).get("repositories", []) if r.get("slug") == sys.argv[2]]
+if len(rows) != 1:
+    print("unlisted")
+else:
+    value = rows[0].get("bump_ship_enabled", True)
+    print(("true" if value else "false") if isinstance(value, bool) else "invalid")
+' "$manifest" "$repo") || fault "the fleet manifest could not be read"
+  case "$enabled" in
+    true) ;;
+    false) echo "Not arming #$pr: the fleet manifest withholds ship for $repo."; return 0 ;;
+    unlisted) echo "Not arming #$pr: $repo is not one fleet manifest repository."; return 0 ;;
+    *) fault "the fleet manifest's bump_ship_enabled for $repo is not a boolean" ;;
+  esac
+  if jq -e 'any(.labels[]?; .name == "ship")' <<< "$meta" > /dev/null; then
+    echo "#$pr is already armed."
+    return 0
+  fi
+  events=$(gh api --paginate --slurp "repos/$repo/issues/$pr/events?per_page=100" | jq 'add // []') \
+    || fault "the label history could not be read"
+  if jq -e 'any(.[]; .event == "unlabeled" and .label.name == "ship")' <<< "$events" > /dev/null; then
+    echo "Not arming #$pr: its ship label was removed, so delivery stays stopped."
+    return 0
+  fi
+  gh api -X POST "repos/$repo/issues/$pr/labels" -f 'labels[]=ship' > /dev/null
+  echo "Armed #$pr at $head_sha."
 }
 
 meta=$(gh api "repos/$repo/pulls/$pr") || fault "the pull request could not be read"
@@ -128,7 +173,7 @@ jq -e --arg bot "$bot" 'all(.[]; .author.login == $bot and (.committer.login == 
 
 files=$(gh api --paginate --slurp "repos/$repo/pulls/$pr/files?per_page=100" | jq 'add // []') \
   || fault "the changed files could not be read"
-policy="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/projection-approval-paths.json"
+policy="$here/projection-approval-paths.json"
 jq -e '
   . as $p
   | ($p | keys | sort) == ["orchestration_pin", "other_projections", "runtime_bump"]

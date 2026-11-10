@@ -5,6 +5,11 @@ repo=${PROJECTION_APPROVAL_REPO:-burin-labs/harn-bump-fleet}
 [[ "${1:-}" == api ]] || exit 91
 shift
 if [[ "${1:-}" == -X ]]; then
+  if [[ "$*" == "-X POST repos/$repo/issues/42/labels -f labels[]=ship" ]]; then
+    printf 'ship\n' >> "$PROJECTION_APPROVAL_FIXTURE/label-posts"
+    printf '[]\n'
+    exit 0
+  fi
   [[ "${2:-}" == POST && "${3:-}" == "repos/$repo/pulls/42/reviews" ]] || exit 92
   cat > "$PROJECTION_APPROVAL_FIXTURE/review.json"
   printf 'POST\n' >> "$PROJECTION_APPROVAL_FIXTURE/posts"
@@ -28,6 +33,13 @@ case "$*" in
   "--paginate --slurp repos/$repo/pulls/42/reviews?per_page=100")
     if [[ -e "$PROJECTION_APPROVAL_FIXTURE/reviews.json" ]]; then
       cat "$PROJECTION_APPROVAL_FIXTURE/reviews.json"
+    else
+      printf '[[]]\n'
+    fi
+    ;;
+  "--paginate --slurp repos/$repo/issues/42/events?per_page=100")
+    if [[ -e "$PROJECTION_APPROVAL_FIXTURE/events.json" ]]; then
+      cat "$PROJECTION_APPROVAL_FIXTURE/events.json"
     else
       printf '[[]]\n'
     fi
