@@ -90,6 +90,8 @@ Start with the job you need to do.
   repository's own CI runs, and what each job proves.
 - [Consumer refresh finalization](docs/reference/consumer-refresh-finalization.md).
   The optional contract for regenerating artifacts after runtime migrations.
+- [Consumer bump runner](docs/reference/consumer-bump-runner.md). Select one
+  runner label for the consumer's refresh and validation work.
 - [Dependabot fleet template](docs/dependabot-fleet-template.md). The projected
   dependency configuration every fleet repository receives.
 
