@@ -26,7 +26,11 @@ case "$*" in
     cat "$PROJECTION_APPROVAL_FIXTURE/files.json"
     ;;
   "--paginate --slurp repos/$repo/pulls/42/reviews?per_page=100")
-    printf '[[]]\n'
+    if [[ -e "$PROJECTION_APPROVAL_FIXTURE/reviews.json" ]]; then
+      cat "$PROJECTION_APPROVAL_FIXTURE/reviews.json"
+    else
+      printf '[[]]\n'
+    fi
     ;;
   'repos/burin-labs/harn/releases?per_page=20 --jq '*)
     printf 'v0.10.185\n'
