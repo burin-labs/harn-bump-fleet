@@ -71,6 +71,32 @@ refuse() {
   exit 1
 }
 
+# Smart Ship admits a bot approval only through a reviewer-authored receipt on the
+# review body's last line, bound to the repository, pull request and head this
+# script checked (harn-github-connector's review.author_evidence.v1). GitHub's
+# review commit field is not evidence there, so the binding lives in the body.
+# An approval already carrying this head's receipt is not posted again.
+approve() {
+  local summary=$1 digest receipt
+  digest=$( { command -v sha256sum > /dev/null && printf '%s' "$repo" | sha256sum; } \
+    || printf '%s' "$repo" | shasum -a 256) || fault "the repository digest could not be computed"
+  digest=${digest%% *}
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fault "the repository digest is malformed"
+  receipt=$(jq -cn --arg digest "$digest" --argjson pr "$pr" --arg head "$head_sha" \
+    '{schema: "review.author_evidence.v1", repository_digest: $digest, pr: $pr, head_sha: $head, replies: []}')
+  receipt="<!-- fleet-approval-review-author-evidence: $receipt -->"
+  if jq -e --arg receipt "$receipt" 'any(.[]; .state == "APPROVED"
+      and ((.body // "") | rtrimstr("\n") | split("\n") | last) == $receipt)' <<< "$reviews" > /dev/null; then
+    echo "#$pr already carries an approval bound to $head_sha."
+    exit 0
+  fi
+  jq -n --arg sha "$head_sha" --arg body "$summary" --arg receipt "$receipt" \
+    '{commit_id: $sha, event: "APPROVE", body: "\($body)\n\($receipt)"}' |
+    gh api -X POST "repos/$repo/pulls/$pr/reviews" --input - > /dev/null
+  echo "Approved #$pr at $head_sha."
+  exit 0
+}
+
 meta=$(gh api "repos/$repo/pulls/$pr") || fault "the pull request could not be read"
 read -r state draft base author author_type head_repo head_ref head_sha < <(
   jq -r '[.state, .draft, .base.ref, .user.login, .user.type,
@@ -179,11 +205,7 @@ if [[ "$scope" == consumer ]]; then
     echo "Dry run: not approving."
     exit 0
   fi
-  jq -n --arg sha "$head_sha" --arg what "$what" \
-    '{commit_id: $sha, event: "APPROVE", body: "Moves only \($what); author, signature, checks and review threads verified at this head."}' |
-    gh api -X POST "repos/$repo/pulls/$pr/reviews" --input - > /dev/null
-  echo "Approved #$pr at $head_sha."
-  exit 0
+  approve "Moves only $what; author, signature, checks and review threads verified at this head."
 fi
 
 classification=$(jq -r --slurpfile policy "$policy" '
@@ -252,7 +274,4 @@ if [[ "${APPROVE_DRY_RUN:-}" == 1 ]]; then
   echo "Dry run: not approving."
   exit 0
 fi
-jq -n --arg sha "$head_sha" --arg tag "$tag" \
-  '{commit_id: $sha, event: "APPROVE", body: "Moves only the orchestration pin to the published \($tag) release commit."}' |
-  gh api -X POST "repos/$repo/pulls/$pr/reviews" --input - > /dev/null
-echo "Approved #$pr at $head_sha."
+approve "Moves only the orchestration pin to the published $tag release commit."
