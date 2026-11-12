@@ -1,0 +1,1 @@
+Release baseline refresh accepts a successful exact-source Linux build after publication recovery, even when a later job failed in the original run. Missing or failed build evidence and invalid size reports still refuse the update.

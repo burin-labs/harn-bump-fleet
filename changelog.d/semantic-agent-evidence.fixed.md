@@ -1,0 +1,1 @@
+- Make release-agent evidence gates semantic and reject degenerate changelog drafts.
