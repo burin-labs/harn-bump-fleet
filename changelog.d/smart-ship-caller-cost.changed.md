@@ -1,0 +1,1 @@
+The fleet-rendered Smart Ship caller sweeps every three hours instead of every half hour, runs its approval before the look on the same event so an approved fleet pull request lands without waiting for a sweep, skips the approval job for other authors' pull requests, and runs on the self-hosted light pool for repositories whose manifest row sets `smart_ship_runner = "owned"`.

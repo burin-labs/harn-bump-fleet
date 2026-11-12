@@ -1,0 +1,338 @@
+import { FleetStalenessSnapshot, UndeclaredPinRow, failed_bump_successors } from "./fleet_staleness"
+import {
+  github_connector_options,
+  github_issue_create,
+  github_issue_update,
+  github_slug_parts,
+} from "./github"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+pub const PIN_INCIDENT_MARKER = "<!-- harn-bump-fleet:pin-staleness-incident:v1 -->"
+
+pub const PIN_INCIDENT_LABEL = "harn-pin-staleness"
+
+pub type PinIncidentObservation = {
+  snapshot: FleetStalenessSnapshot,
+  undeclared_pins: list<UndeclaredPinRow>,
+  expected_count: int,
+  expected_repositories: list<string>,
+  observed_at_ms: int,
+  source_revision: string,
+  run_url: string?,
+  full_fleet: bool,
+  development_blocked: bool,
+}
+
+pub type PinIncidentPublication = {ok: bool, action: string, detail: string}
+
+type RepositoryPrivacy = {private: bool}
+
+type IncidentIssue = {number: int, body: string?, pull_request?: unknown}
+
+type IncidentIssues = list<IncidentIssue>
+
+type IncidentReadback = {number: int, body: string, state: string, labels: list<{name: string}>}
+
+type IncidentWriteReceipt = {number: int}
+
+type IncidentLabel = {name: string}
+
+fn verify_pin_incident(
+  harness: Harness,
+  destination: string,
+  issue_number: int,
+  body: string,
+  state: string,
+  client: GithubClientOptions,
+) -> PinIncidentPublication {
+  const read = api_call(
+    harness,
+    {path: "/repos/${destination}/issues/${issue_number}", options: client},
+  )
+  if is_err(read) {
+    return {ok: false, action: "readback_failed", detail: to_string(unwrap_err(read))}
+  }
+  const value = unwrap(read)
+  if !schema_is(value, IncidentReadback) || value.number != issue_number || value.body != body
+    || value.state != state
+    || !value.labels.map({ label -> label.name }).to_list().contains(PIN_INCIDENT_LABEL) {
+    return {
+      ok: false,
+      action: "readback_mismatch",
+      detail: "published incident did not retain its complete evidence, state and discovery label",
+    }
+  }
+  return {ok: true, action: "verified", detail: "issue #${issue_number}"}
+}
+
+pub fn pin_incident_body(observation: PinIncidentObservation) -> string {
+  const rows = observation.snapshot.repositories
+  const pending = len(rows.filter({ row -> row.state == "unknown" }).to_list())
+  const failed = len(rows.filter({ row -> row.stale && row.state != "unknown" }).to_list())
+    + len(failed_bump_successors(rows))
+    + len(observation.undeclared_pins)
+    + if observation.development_blocked {
+      1
+    } else {
+      0
+    }
+  return "${PIN_INCIDENT_MARKER}\n\n# Fleet runtime pin incident\n\n"
+    + "Observed ${len(rows)} of ${observation.expected_count} watched repositories; measured pins: ${len(rows) - pending}. "
+    + "Failing: ${failed}. Pending measurement: ${pending}. "
+    + "Target: ${observation.snapshot.target}.\n\n"
+    + "This issue retains the complete observation, including healthy rows, unknown pins, "
+    + "per-repository lag budgets and update paths. Only a complete fleet survey may refresh "
+    + "or resolve it. A retained observation is dated evidence, not a claim that pins have recovered.\n\n"
+    + "```json\n${json_stringify_pretty(observation)}\n```\n"
+}
+
+pub fn public_pin_receipt(
+  observation: PinIncidentObservation,
+  publication: PinIncidentPublication,
+) -> dict {
+  const rows = observation.snapshot.repositories
+  return {
+    schema_version: observation.snapshot.schema_version,
+    target: observation.snapshot.target,
+    stale_count: len(rows.filter({ row -> row.stale }).to_list()),
+    observed_count: len(rows),
+    pending_count: len(rows.filter({ row -> row.state == "unknown" }).to_list()),
+    undeclared_count: len(observation.undeclared_pins),
+    successor_failed_count: len(failed_bump_successors(rows)),
+    development_blocked: observation.development_blocked,
+    incident: pick(publication, ["ok", "action"]),
+    repositories: rows.map({ row -> pick(row, ["state", "stale"]) }).to_list(),
+  }
+}
+
+fn validate_pin_observation(
+  observation: PinIncidentObservation,
+  dry_run: bool,
+) -> PinIncidentPublication {
+  if !observation.full_fleet {
+    return {
+      ok: true,
+      action: "scoped_observation",
+      detail: "scoped surveys cannot mutate the fleet incident",
+    }
+  }
+  const rows = observation.snapshot.repositories
+  if observation.expected_count <= 0 || len(rows) != observation.expected_count {
+    return {
+      ok: false,
+      action: "incomplete_observation",
+      detail: "fleet repository census is empty or incomplete",
+    }
+  }
+  if (!dry_run && observation.source_revision == "") || observation.observed_at_ms <= 0 {
+    return {
+      ok: false,
+      action: "missing_identity",
+      detail: "observation requires source and time identity",
+    }
+  }
+  if len(rows.map({ row -> row.slug }).to_list().unique()) != len(rows) {
+    return {
+      ok: false,
+      action: "duplicate_repository",
+      detail: "fleet observation repeats a repository",
+    }
+  }
+  if rows.map({ row -> row.slug }).to_list().sorted()
+    != observation.expected_repositories.sorted() {
+    return {
+      ok: false,
+      action: "repository_identity_mismatch",
+      detail: "observed repositories differ from the declared fleet inventory",
+    }
+  }
+  return {ok: true, action: "validated", detail: "complete fleet inventory"}
+}
+
+fn validate_pin_destination(
+  harness: Harness,
+  destination: string,
+  client: GithubClientOptions,
+) -> PinIncidentPublication {
+  const parts = github_slug_parts(destination)
+  if parts == nil {
+    return {
+      ok: false,
+      action: "invalid_destination",
+      detail: "configure a private incident repository",
+    }
+  }
+  const privacy = api_call(harness, {path: "/repos/${parts.owner}/${parts.repo}", options: client})
+  if is_err(privacy) {
+    return {
+      ok: false,
+      action: "privacy_unmeasured",
+      detail: "could not measure destination privacy",
+    }
+  }
+  const repository = unwrap(privacy)
+  if !schema_is(repository, RepositoryPrivacy) || !repository.private {
+    return {
+      ok: false,
+      action: "private_destination_required",
+      detail: "fleet rows require a measured private repository",
+    }
+  }
+  const label = api_call(
+    harness,
+    {path: "/repos/${destination}/labels/${PIN_INCIDENT_LABEL}", options: client},
+  )
+  if is_err(label) {
+    return {
+      ok: false,
+      action: "discovery_label_unmeasured",
+      detail: "incident discovery label must exist before publication",
+    }
+  }
+  const label_value = unwrap(label)
+  if !schema_is(label_value, IncidentLabel) || label_value.name != PIN_INCIDENT_LABEL {
+    return {
+      ok: false,
+      action: "discovery_label_unmeasured",
+      detail: "incident discovery label must exist before publication",
+    }
+  }
+  return {ok: true, action: "validated", detail: "private destination and discovery label measured"}
+}
+
+pub fn reconcile_pin_incident(
+  harness: Harness,
+  observation: PinIncidentObservation,
+  destination: string,
+  dry_run: bool,
+  client: GithubClientOptions = github_connector_options(),
+) -> PinIncidentPublication {
+  const validation = validate_pin_observation(observation, dry_run)
+  if validation.action != "validated" {
+    return validation
+  }
+  const rows = observation.snapshot.repositories
+  const blocked = len(rows.filter({ row -> row.stale || row.state == "unknown" }).to_list()) > 0
+    || len(failed_bump_successors(rows)) > 0
+    || len(observation.undeclared_pins) > 0
+    || observation.development_blocked
+  if dry_run {
+    return {
+      ok: true,
+      action: "dry_run",
+      detail: if blocked {
+        "fleet incident remains open"
+      } else {
+        "fleet measured healthy"
+      },
+    }
+  }
+  const destination_validation = validate_pin_destination(harness, destination, client)
+  if !destination_validation.ok {
+    return destination_validation
+  }
+  const listed = api_call(
+    harness,
+    {
+      path: "/repos/${destination}/issues?labels=${PIN_INCIDENT_LABEL}&per_page=100&state=open",
+      options: client,
+    },
+  )
+  if is_err(listed) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(listed))}
+  }
+  const decoded = schema_parse(unwrap(listed), schema_of(IncidentIssues))
+  if is_err(decoded) {
+    return {
+      ok: false,
+      action: "unmeasured_issue_census",
+      detail: "issue response did not satisfy the typed incident census",
+    }
+  }
+  const all = schema_expect(unwrap(listed), IncidentIssues)
+  if len(all) >= 100 {
+    return {
+      ok: false,
+      action: "incomplete_issue_census",
+      detail: "labelled issue listing may be truncated",
+    }
+  }
+  const existing = all.filter(
+    { issue -> issue.pull_request == nil && contains(issue.body ?? "", PIN_INCIDENT_MARKER) },
+  )
+    .to_list()
+  if len(existing) > 1 {
+    return {
+      ok: false,
+      action: "duplicate_incident",
+      detail: "multiple fleet incidents require reconciliation",
+    }
+  }
+  if len(existing) == 0 {
+    if !blocked {
+      return {ok: true, action: "none", detail: "no incident open; fleet measured healthy"}
+    }
+    const created = github_issue_create(
+      harness,
+      destination,
+      "Fleet runtime pins need attention",
+      pin_incident_body(observation),
+      [PIN_INCIDENT_LABEL],
+      client,
+    )
+    if is_err(created) {
+      return {ok: false, action: "open_failed", detail: to_string(unwrap_err(created))}
+    }
+    const receipt = unwrap(created)
+    if !schema_is(receipt, IncidentWriteReceipt) || receipt.number <= 0 {
+      return {ok: false, action: "unmeasured_write", detail: "issue creation omitted its number"}
+    }
+    const verified = verify_pin_incident(
+      harness,
+      destination,
+      receipt.number,
+      pin_incident_body(observation),
+      "open",
+      client,
+    )
+    return if verified.ok {
+      verified + {action: "opened"}
+    } else {
+      verified
+    }
+  }
+  const issue = existing[0]
+  const fields = if blocked {
+    {body: pin_incident_body(observation)}
+  } else {
+    {body: pin_incident_body(observation), state: "closed", state_reason: "completed"}
+  }
+  const updated = github_issue_update(harness, destination, issue.number, fields, client)
+  if is_err(updated) {
+    return {ok: false, action: "update_failed", detail: to_string(unwrap_err(updated))}
+  }
+  const verified = verify_pin_incident(
+    harness,
+    destination,
+    issue.number,
+    pin_incident_body(observation),
+    if blocked {
+      "open"
+    } else {
+      "closed"
+    },
+    client,
+  )
+  return if verified.ok {
+    verified
+      + {
+        action: if blocked {
+          "refreshed"
+        } else {
+          "closed"
+        },
+      }
+  } else {
+    verified
+  }
+}

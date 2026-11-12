@@ -1,0 +1,429 @@
+#!/usr/bin/env harn
+//
+// The alarm for a bump pipeline that stops landing.
+//
+// Every other signal in this repository reports on a run that happened: a red
+// workflow, a receipt, a closed pull request. None of them fire when the
+// pipeline simply stops producing anything, which is how a consumer sat four
+// releases behind with two failed bump runs and nobody paged. This check asks
+// the only question that catches every one of those shapes at once — is each
+// consumer actually on the newest release, retaining a complete private incident.
+// A behind consumer with no bump in flight also gets its next bump started.
+import { ParserSpec } from "std/cli/argparse"
+import { GithubClientOptions } from "harn-github-connector/default"
+import { cli_options, is_exact_harn_release_tag } from "lib/cli_options"
+import { hydrate_remote_consumer_repositories } from "lib/consumer_projection_manifest"
+import { remote_pin } from "lib/fleet_convergence"
+import {
+  read_fleet_manifest,
+  resolve_harn_update_spec,
+  scoped_harn_pin_watch_repositories,
+  unwatched_repositories,
+} from "lib/fleet_manifest"
+import {
+  PinIncidentObservation,
+  public_pin_receipt,
+  reconcile_pin_incident,
+} from "lib/fleet_pin_incident"
+import {
+  BumpSuccessorResult,
+  ConvergenceDeadline,
+  FleetStalenessSnapshot,
+  PinStalenessRow,
+  UndeclaredPinRow,
+  convergence_survey_due,
+  failed_bump_successors,
+  pin_staleness_verdict,
+  releases_behind,
+  stale_rows,
+  undeclared_pin_rows,
+} from "lib/fleet_staleness"
+import {
+  github_connector_options,
+  github_file_text_at_ref,
+  github_latest_release_tag,
+  github_pr_list,
+  github_published_release_tags,
+  github_release_at_tag,
+  github_workflow_dispatch,
+} from "lib/github"
+import { github_workflow_run_inventory } from "lib/github_workflow_inventory"
+import { development_cutover_verdict, workspace_version_from_manifest } from "lib/release_analysis"
+
+const HARN_REPO = "burin-labs/harn"
+
+pub type PinStalenessOptions = {
+  target?: string,
+  only?: string,
+  max_releases_behind: string,
+  max_minutes_behind?: string,
+  survey_window_minutes?: string,
+  dry_run: bool,
+  run_url?: string,
+  manifest?: string,
+  incident_repository?: string,
+  source_revision?: string,
+}
+
+const ARG_SPEC: ParserSpec = {
+  name: "check-fleet-pin-staleness",
+  args: [
+    {kind: "positional", name: "target", required: false},
+    {kind: "flag", name: "only", long: "--only"},
+    {kind: "flag", name: "max_releases_behind", long: "--max-releases-behind", default: "1"},
+    {kind: "flag", name: "max_minutes_behind", long: "--max-minutes-behind"},
+    {kind: "flag", name: "survey_window_minutes", long: "--survey-window-minutes"},
+    {kind: "switch", name: "dry_run", long: "--dry-run"},
+    {kind: "flag", name: "run_url", long: "--run-url"},
+    // The heartbeat's negative control points this at a fixture whose pin cannot be read.
+    {kind: "flag", name: "manifest", long: "--manifest"},
+    {kind: "flag", name: "incident_repository", long: "--incident-repository"},
+    {kind: "flag", name: "source_revision", long: "--source-revision"},
+  ],
+}
+
+pub fn parse_pin_staleness_args(args: list<string>) -> PinStalenessOptions {
+  return cli_options<PinStalenessOptions>(ARG_SPEC, args, schema_of(PinStalenessOptions))
+}
+
+/**
+ * The threshold as a number, refusing anything that is not one.
+ *
+ * A flag arrives as text, and `to_int` answers `nil` for garbage. Letting that
+ * `nil` reach the comparison would make every consumer read as not-stale — an
+ * alarm silently disarmed by a typo is worse than no alarm at all.
+ */
+pub fn resolve_max_releases_behind(raw: string) -> int {
+  return resolve_count("--max-releases-behind", raw)
+}
+
+/** A count flag as a number, refusing anything that is not one, for the same reason. */
+pub fn resolve_count(flag: string, raw: string) -> int {
+  const parsed = to_int(trim(raw))
+  if parsed == nil || parsed < 0 {
+    throw "${flag} must be a non-negative integer, got '${raw}'"
+  }
+  return parsed
+}
+
+/** When `target` was published, in epoch seconds, or the reason it could not be read. */
+fn release_published_seconds(harness: Harness, target: string) -> Result<int, string> {
+  const lookup = github_release_at_tag(harness, HARN_REPO, target)
+  if is_err(lookup) {
+    return Err("could not read the ${target} release: ${to_string(unwrap_err(lookup))}")
+  }
+  const release = unwrap(lookup)
+  const published_at = if release.found {
+    release.release?.published_at
+  } else {
+    nil
+  }
+  const published_s = if published_at == nil {
+    nil
+  } else {
+    to_int(date_parse(published_at))
+  }
+  if published_s == nil {
+    return Err("${target} has no readable publication time")
+  }
+  return Ok(published_s)
+}
+
+/** The part of a repository's update spec that names its bump workflow and branch. */
+pub type StalledBumpWorkflow = {workflow_name: string, base_branch: string, branch: string, ...rest}
+
+/**
+ * Start the next bump for a repository this check found stale.
+ *
+ * A consumer bump starts when its adapter lands. A run that ends without a pull
+ * request, such as a base conflict that asks for a fresh-base retry, leaves
+ * nothing to start the next one, so the pin stays behind until some later
+ * adapter change. This is that successor: it dispatches only when no bump run
+ * is in flight and no bump pull request is open, and the schedule bounds how
+ * often it can fire.
+ */
+pub fn start_stalled_bump(
+  harness: Harness,
+  row: PinStalenessRow,
+  update: StalledBumpWorkflow,
+  target: string,
+  published_s: int?,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> BumpSuccessorResult {
+  if published_s == nil {
+    return {ok: false, action: "probe_failed", detail: "${target} has no readable publication time"}
+  }
+  const runs = github_workflow_run_inventory(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {branch: update.base_branch},
+    client,
+  )
+  if is_err(runs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(runs))}
+  }
+  const active = unwrap(runs).filter({ run -> run.status != "completed" }).to_list()
+  if len(active) > 0 {
+    return {ok: true, action: "bump_running", detail: active[0].url}
+  }
+  // A successful workflow may still leave no pull request or updated pin.
+  // Every dispatched attempt counts toward the per-release bound.
+  const retried = unwrap(runs).filter(
+    { run ->
+      run.event == "workflow_dispatch"
+        && run.created_seconds >= (published_s ?? 0)
+    },
+  )
+    .to_list()
+  if len(retried) > 0 {
+    return {ok: true, action: "already_retried", detail: retried[0].url}
+  }
+  const open_prs = github_pr_list(
+    harness,
+    row.slug,
+    {head: update.branch, state: "open", limit: 10},
+    client,
+  )
+  if is_err(open_prs) {
+    return {ok: false, action: "probe_failed", detail: to_string(unwrap_err(open_prs))}
+  }
+  const prs = unwrap(open_prs)
+  if len(prs) > 0 {
+    return {ok: true, action: "bump_pr_open", detail: "#${to_string(prs[0].number)}"}
+  }
+  if options.dry_run {
+    return {ok: true, action: "would_dispatch", detail: "${update.workflow_name} ${target}"}
+  }
+  const dispatched = github_workflow_dispatch(
+    harness,
+    row.slug,
+    update.workflow_name,
+    {version: target},
+    update.base_branch,
+    client,
+  )
+  if is_err(dispatched) {
+    return {ok: false, action: "dispatch_failed", detail: to_string(unwrap_err(dispatched))}
+  }
+  return {ok: true, action: "dispatched", detail: unwrap(dispatched).url}
+}
+
+/**
+ * The successor for one surveyed repository, or nil when none applies.
+ *
+ * Only a pin read as behind dispatches. An unknown pin keeps its alarm, but a
+ * failed or malformed read is not evidence that a bump is needed.
+ */
+pub fn bump_successor(
+  harness: Harness,
+  row: PinStalenessRow,
+  harn_bump: bool,
+  update: StalledBumpWorkflow,
+  target: string,
+  published_s: int?,
+  options: PinStalenessOptions,
+  client: GithubClientOptions = github_connector_options(),
+) -> BumpSuccessorResult? {
+  if row.state != "behind" || !harn_bump {
+    return nil
+  }
+  return start_stalled_bump(harness, row, update, target, published_s, options, client)
+}
+
+fn run_pin_staleness(harness: Harness) -> int {
+  const options = parse_pin_staleness_args(argv)
+  const max_behind = resolve_max_releases_behind(options.max_releases_behind)
+  const target = options.target ?? github_latest_release_tag(harness, HARN_REPO)
+  if !is_exact_harn_release_tag(target) {
+    harness.stdio.eprintln("error: target must be an exact Harn tag, got '${target}'")
+    return 2
+  }
+  const published = release_published_seconds(harness, target)
+  const published_s: int? = if is_ok(published) {
+    unwrap(published)
+  } else {
+    nil
+  }
+  const convergence: ConvergenceDeadline? = if options.max_minutes_behind == nil {
+    nil
+  } else {
+    // A deadline measured from nothing would read every consumer as on time.
+    if published_s == nil {
+      throw unwrap_err(published)
+    }
+    {
+      minutes_since_publish: (harness.clock.now_ms() / 1000 - (published_s ?? 0)) / 60,
+      max_minutes_behind: resolve_count("--max-minutes-behind", options.max_minutes_behind),
+    }
+  }
+  if options.survey_window_minutes != nil {
+    if convergence == nil {
+      harness.stdio.eprintln("error: --survey-window-minutes needs --max-minutes-behind")
+      return 2
+    }
+    const window = resolve_count("--survey-window-minutes", options.survey_window_minutes)
+    if !convergence_survey_due(convergence, window) {
+      harness.stdio.println(
+        json_stringify_pretty(
+          {
+            schema_version: "harn_bump_fleet.pin_staleness.v1",
+            target: target,
+            convergence_deadline: convergence,
+            surveyed: false,
+            detail: "outside the survey window after the deadline; the daily run covers the rest",
+          },
+        ),
+      )
+      return 0
+    }
+  }
+  const tags = github_published_release_tags(harness, HARN_REPO)
+  if is_err(tags) {
+    harness.stdio.eprintln("error: could not measure published releases")
+    return 1
+  }
+  const release_tags = unwrap(tags)
+  const cargo_manifest = github_file_text_at_ref(harness, HARN_REPO, "Cargo.toml", "main") ?? ""
+  const open_harn_prs = github_pr_list(
+    harness,
+    HARN_REPO,
+    {base: "main", state: "open", limit: 100},
+  )
+  if is_err(open_harn_prs) {
+    harness.stdio.eprintln("error: could not inspect post-release development pull requests")
+    return 1
+  }
+  const development_cutover = development_cutover_verdict(
+    workspace_version_from_manifest(cargo_manifest),
+    unwrap(open_harn_prs).map({ pr -> pr.head.ref }).to_list(),
+  )
+  const manifest = read_fleet_manifest(harness.fs, options.manifest ?? "fleet.toml")
+  const repositories = hydrate_remote_consumer_repositories(
+    harness,
+    manifest,
+    scoped_harn_pin_watch_repositories(manifest, options.only),
+    manifest.fleet.default_branch,
+  )
+  if len(repositories) == 0 {
+    harness.stdio.eprintln("error: selected scope has no watched Harn pin repository")
+    return 1
+  }
+  let rows = []
+  for repo in repositories {
+    const update = resolve_harn_update_spec(manifest, repo, target)
+    const pin = remote_pin(harness, update)
+    const behind = releases_behind(pin, release_tags)
+    const budget = repo.bump_max_releases_behind ?? max_behind
+    // A repository with its own lag budget trails on purpose; the deadline
+    // holds every other consumer to the newest release.
+    const repo_deadline = if repo.bump_max_releases_behind == nil {
+      convergence
+    } else {
+      nil
+    }
+    const verdict = pin_staleness_verdict(pin, target, behind, budget, repo_deadline)
+    const row: PinStalenessRow = verdict
+      + {
+        slug: repo.slug,
+        pin: pin,
+        max_releases_behind: budget,
+        update_workflow: update.workflow_path,
+        update_branch: update.branch,
+      }
+    const successor = bump_successor(
+      harness,
+      row,
+      repo.harn_bump ?? false,
+      update,
+      target,
+      published_s,
+      options,
+    )
+    rows = rows + [row + {successor: successor}]
+  }
+  const undeclared: list<UndeclaredPinRow> = if options.only == nil {
+    undeclared_pin_rows(
+      unwatched_repositories(manifest).map(
+        { repo ->
+          {
+            slug: repo.slug,
+            pin_text: github_file_text_at_ref(
+              harness,
+              repo.slug,
+              ".harn-version",
+              manifest.fleet.default_branch,
+            ),
+          }
+        },
+      )
+        .to_list(),
+    )
+  } else {
+    []
+  }
+  const stale = stale_rows(rows)
+  const snapshot: FleetStalenessSnapshot = {
+    schema_version: "harn_bump_fleet.pin_staleness.v1",
+    target: target,
+    max_releases_behind: max_behind,
+    convergence_deadline: convergence,
+    stale_count: len(stale),
+    development_cutover: development_cutover,
+    repositories: rows,
+  }
+  const expected_repositories: list<string> = repositories.map({ repo -> repo.slug }).to_list()
+  const observation: PinIncidentObservation = {
+    snapshot: snapshot,
+    undeclared_pins: undeclared,
+    expected_count: len(repositories),
+    expected_repositories: expected_repositories,
+    observed_at_ms: harness.clock.now_ms(),
+    source_revision: options.source_revision ?? harness.env.get("GITHUB_SHA") ?? "",
+    run_url: options.run_url,
+    full_fleet: options.only == nil && options.manifest == nil,
+    development_blocked: development_cutover.blocked,
+  }
+  const incident = reconcile_pin_incident(
+    harness,
+    observation,
+    options.incident_repository ?? harness.env.get("FLEET_INCIDENT_REPOSITORY") ?? "",
+    options.dry_run,
+  )
+  harness.stdio.println(json_stringify_pretty(public_pin_receipt(observation, incident)))
+  if development_cutover.blocked {
+    harness.stdio.eprintln("STALE development cutover: inspect the private fleet incident")
+  }
+  // A stale consumer is a real finding, so the run goes red on purpose: the
+  // filed issue is the durable signal, and this is what makes the schedule's
+  // own history readable at a glance.
+  return if !incident.ok || len(failed_bump_successors(rows)) > 0 || len(stale) > 0
+    || len(undeclared) > 0
+    || development_cutover.blocked {
+    1
+  } else {
+    0
+  }
+}
+
+pipeline main(harness: Harness) {
+  return try {
+    run_pin_staleness(harness)
+  } catch (_error) {
+    harness.stdio.println(
+      json_stringify_pretty(
+        {
+          schema_version: "harn_bump_fleet.pin_staleness.v1",
+          surveyed: false,
+          pending_count: nil,
+          action: "survey_unmeasured",
+        },
+      ),
+    )
+    harness.stdio.eprintln(
+      "Fleet pin survey failed before a complete observation; private details withheld",
+    )
+    1
+  }
+}
