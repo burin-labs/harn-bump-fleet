@@ -1,0 +1,1 @@
+Fleet approvals now end with the reviewer receipt Smart Ship requires of a bot approval, bound to the repository, pull request and head that were checked, so an approved fleet pull request lands instead of waiting for a person. A head that already carries that approval is not approved again.

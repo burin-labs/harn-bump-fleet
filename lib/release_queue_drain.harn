@@ -1,0 +1,204 @@
+import { github_branch_head, github_ref_snapshot } from "./github"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+pub type ReleaseQueueDrainTarget = {
+  repo: string,
+  base_branch: string,
+  base_oid: string,
+  candidate_pr: int,
+  candidate_head: string,
+}
+
+pub type ReleaseQueueDrainAdapter = {
+  base_head: fn() -> string,
+  lease_is_current: fn() -> bool,
+  queue_snapshot: fn() -> list<ReleaseQueueDrainEntry>,
+  dequeue: fn(ReleaseQueueDrainEntry) -> nil,
+}
+
+pub type ReleaseQueueDrainEntry = {
+  id: string,
+  pull_id: string,
+  pull_number: int,
+  head_sha: string,
+  base_branch: string,
+}
+
+type QueueResponse = {
+  data: {
+    repository: {
+      mergeQueue: {
+        entries: {
+          totalCount: int,
+          pageInfo: {hasNextPage: bool, endCursor?: string?},
+          nodes: list<{
+            id: string,
+            pullRequest: {id: string, number: int, headRefOid: string, baseRefName: string},
+          }>,
+        },
+      }?,
+    },
+  },
+  errors?: list<any>?,
+}
+
+type DequeueResponse = {data: {dequeuePullRequest: {clientMutationId: string}}, errors?: list<any>?}
+
+/** Drain every other entry after claiming the lease, and fail closed on a moving base or queue. */
+pub fn release_queue_drain(
+  target: ReleaseQueueDrainTarget,
+  adapter: ReleaseQueueDrainAdapter,
+) -> int {
+  require adapter.lease_is_current(), "release lease is not held"
+  require adapter.base_head() == target.base_oid, "release base moved before queue drain"
+  const before = adapter.queue_snapshot()
+  let removed = 0
+  for entry in before {
+    require entry.base_branch == target.base_branch, "queue entry has a different base"
+    if entry.pull_number == target.candidate_pr {
+      require entry.head_sha == target.candidate_head, "queued release candidate head moved"
+    } else {
+      require adapter.lease_is_current(), "release lease changed during queue drain"
+      adapter.dequeue(entry)
+      removed = removed + 1
+    }
+  }
+  const after = adapter.queue_snapshot()
+  for entry in after {
+    require entry.base_branch == target.base_branch && entry.pull_number == target.candidate_pr
+      && entry.head_sha == target.candidate_head,
+      "merge queue still contains a non-candidate entry"
+  }
+  require adapter.base_head() == target.base_oid, "release base moved during queue drain"
+  require adapter.lease_is_current(), "release lease changed during queue drain"
+  return removed
+}
+
+/** Read a complete queue census and dequeue only the observed pull request identity. */
+pub fn release_queue_drain_github(
+  harness: Harness,
+  target: ReleaseQueueDrainTarget,
+  lease_oid: string,
+  lease_headline: string,
+  options: GithubClientOptions,
+) -> int {
+  const parts = split(target.repo, "/")
+  require len(parts) == 2, "queue drain requires owner/repository"
+  const adapter: ReleaseQueueDrainAdapter = {
+    lease_is_current: fn() {
+      const result = github_ref_snapshot(
+        harness,
+        target.repo,
+        "refs/release-merge-lease/${target.base_branch}",
+        options,
+      )
+      if is_err(result) {
+        return false
+      }
+      const snapshot = unwrap(result)
+      return snapshot.state == "present" && snapshot.oid == lease_oid
+        && snapshot.holder_headline == lease_headline
+    },
+    base_head: fn() {
+      const result = github_branch_head(harness, target.repo, target.base_branch, options)
+      require is_ok(result), "could not read release base"
+      return unwrap(result).oid
+    },
+    queue_snapshot: fn() {
+      let rows: list<ReleaseQueueDrainEntry> = []
+      let cursor: string? = nil
+      let expected = -1
+      let pages = 0
+      while true {
+        require pages < 100, "merge queue census exceeded its page limit"
+        const result = api_call(
+          harness,
+          {
+            path: "/graphql",
+            method: "POST",
+            body: {
+              query:
+                "query($owner: String!, $repo: String!, $base: String!, $cursor: String) { repository(owner: $owner, name: $repo) { mergeQueue(branch: $base) { entries(first: 100, after: $cursor) { totalCount pageInfo { hasNextPage endCursor } nodes { id pullRequest { id number headRefOid baseRefName } } } } } }",
+              variables: {
+                owner: parts[0],
+                repo: parts[1],
+                base: target.base_branch,
+                cursor: cursor,
+              },
+            },
+            options: options,
+          },
+        )
+        require is_ok(result), "could not read the complete merge queue"
+        const response = schema_expect(unwrap(result), schema_of(QueueResponse))
+        require len(response.errors ?? []) == 0, "merge queue query returned errors"
+        const queue = response.data.repository.mergeQueue
+        if queue == nil {
+          require pages == 0, "merge queue disappeared during census"
+          return []
+        }
+        const entries = queue.entries
+        if pages == 0 {
+          expected = entries.totalCount
+        }
+        require entries.totalCount == expected, "merge queue changed during census"
+        rows = rows
+          + entries.nodes.map(
+            { item ->
+              {
+                id: item.id,
+                pull_id: item.pullRequest.id,
+                pull_number: item.pullRequest.number,
+                head_sha: item.pullRequest.headRefOid,
+                base_branch: item.pullRequest.baseRefName,
+              }
+            },
+          )
+            .to_list()
+        pages = pages + 1
+        if !entries.pageInfo.hasNextPage {
+          require expected == len(rows), "merge queue census is incomplete"
+          break
+        }
+        const next = entries.pageInfo.endCursor
+        require len(entries.nodes) > 0 && next != nil && trim(next) != "" && next != cursor,
+          "merge queue pagination did not advance"
+        cursor = next
+      }
+      for row in rows {
+        require trim(row.id) != "" && trim(row.pull_id) != "" && row.pull_number > 0
+          && regex_match("^[0-9a-fA-F]{40}$", row.head_sha) != nil,
+          "merge queue entry identity is incomplete"
+      }
+      require len(rows.map({ item -> item.id }).unique()) == len(rows)
+        && len(rows.map({ item -> item.pull_number }).unique()) == len(rows),
+        "merge queue census contains duplicate entries"
+      return rows
+    },
+    dequeue: fn(entry) {
+      require trim(entry.pull_id) != ""
+        && regex_match("^[0-9a-fA-F]{40}$", entry.head_sha) != nil,
+        "queued pull request #${entry.pull_number} is unreadable"
+      const request = "release-drain-${entry.pull_number}-${substring(entry.head_sha, 0, 12)}"
+      const result = api_call(
+        harness,
+        {
+          path: "/graphql",
+          method: "POST",
+          body: {
+            query:
+              "mutation($id: ID!, $request: String!) { dequeuePullRequest(input: {id: $id, clientMutationId: $request}) { clientMutationId } }",
+            variables: {id: entry.pull_id, request: request},
+          },
+          options: options,
+        },
+      )
+      require is_ok(result), "could not dequeue pull request #${entry.pull_number}"
+      const response = schema_expect(unwrap(result), schema_of(DequeueResponse))
+      require len(response.errors ?? []) == 0
+        && response.data.dequeuePullRequest.clientMutationId == request,
+        "dequeue of pull request #${entry.pull_number} was not confirmed"
+    },
+  }
+  return release_queue_drain(target, adapter)
+}

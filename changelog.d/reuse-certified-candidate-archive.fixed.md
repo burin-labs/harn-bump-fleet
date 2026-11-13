@@ -1,0 +1,1 @@
+Adopt an already-certified candidate archive instead of rebuilding five platforms, keyed on the source-qualified archive manifest artifact and on archive-policy content rather than on the policy commit.
