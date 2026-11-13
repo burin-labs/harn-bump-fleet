@@ -1,0 +1,1 @@
+The Harn source-install fallback now builds with Rust 1.99.1. Harn's workspace `rust-version` moves to 1.99 in burin-labs/harn#10949, so the 1.95.0 pin could no longer compile it. The update-repair benchmark fixture keeps its own 1.95.0 pin, because its embedded CI failure is the 1.95 Clippy output.
