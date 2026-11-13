@@ -1,0 +1,1 @@
+The release binary-size baseline refresh narrows its timestamp to the UTC second resolution the consuming policy validator accepts, and refuses a stamp that is not an instant, so the refresh pull request is no longer born red at every cut.
