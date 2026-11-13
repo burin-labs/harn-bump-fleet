@@ -1,0 +1,1 @@
+The Harn release harness now resumes an exact next-version fold from its immutable release attempt without fetching an oversized all-PR history, while unrelated release modes and version gaps still fail closed.

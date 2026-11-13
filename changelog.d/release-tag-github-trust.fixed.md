@@ -1,0 +1,1 @@
+Local Harn releases now prove that GitHub recognizes the exact SSH key that signed the release tag before pushing it, preventing a locally valid signature from failing the downstream publication gate.
