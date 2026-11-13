@@ -1,0 +1,145 @@
+import { github_connector_options } from "./github"
+import {
+  OVERRIDE_IMPLEMENTATION_ROOTS,
+  OVERRIDE_SOURCE_SLUG,
+  OverrideImplementationComparison,
+} from "./merge_override_projection"
+import { GithubConnectorResult, api_call } from "harn-github-connector/default"
+
+type GitTreePointer = {sha: string}
+
+type GitCommit = {sha: string, tree: GitTreePointer}
+
+type GitTreeEntry = {path: string, mode: string, type: string, sha: string}
+
+type GitTree = {sha: string, truncated: bool, tree: list<GitTreeEntry>}
+
+fn immutable_revision(value: string) -> bool {
+  return len(regex_captures("^[0-9a-f]{40}$", value)) == 1
+}
+
+/** Bind the implementation tree to the exact immutable revision requested. */
+pub fn override_commit_tree(revision: string, value: unknown) -> string {
+  require immutable_revision(revision), "override implementation requires an immutable revision"
+  const commit = schema_expect(value, schema_of(GitCommit))
+  require commit.sha == revision && immutable_revision(commit.tree.sha),
+    "override implementation commit or tree identity was not measured"
+  return commit.tree.sha
+}
+
+/** A complete regular-file census of every registered implementation root. */
+pub fn override_implementation_files(tree_sha: string, value: unknown) -> dict<string, string> {
+  const tree = schema_expect(value, schema_of(GitTree))
+  require immutable_revision(tree_sha) && tree.sha == tree_sha && !tree.truncated,
+    "override implementation tree was foreign or incomplete"
+  require len(tree.tree) > 0 && len(OVERRIDE_IMPLEMENTATION_ROOTS) > 0,
+    "override implementation inventory was empty"
+  let seen: dict<string, bool> = {}
+  let measured: dict<string, bool> = {}
+  let populated: dict<string, bool> = {}
+  let files: dict<string, string> = {}
+  for entry in tree.tree {
+    require immutable_revision(entry.sha) && !seen.has(entry.path)
+      && split(entry.path, "/").all({ part -> part != "" && part != "." && part != ".." }),
+      "override implementation tree entry was malformed or repeated"
+    seen[entry.path] = true
+    for root in OVERRIDE_IMPLEMENTATION_ROOTS {
+      if entry.path == root.path {
+        require (root.directory && entry.type == "tree" && entry.mode == "040000")
+          || (!root.directory && entry.type == "blob" && ["100644", "100755"].contains(entry.mode)),
+          "override implementation root had an unexpected kind"
+        measured[root.path] = true
+      }
+      if entry.path == root.path || starts_with(entry.path, "${root.path}/") {
+        require root.directory || entry.path == root.path,
+          "override implementation file root contained descendants"
+        if entry.type == "tree" {
+          require entry.mode == "040000", "override implementation directory had an unknown mode"
+          continue
+        }
+        require entry.type == "blob" && ["100644", "100755"].contains(entry.mode),
+          "override implementation must contain regular files"
+        populated[root.path] = true
+        files[entry.path] = "${entry.mode}:${entry.sha}"
+      }
+    }
+  }
+  require OVERRIDE_IMPLEMENTATION_ROOTS.all(
+    { root -> measured.has(root.path) && populated.has(root.path) },
+  ),
+    "override implementation omitted a registered root"
+  return files
+}
+
+fn read_implementation(
+  harness: Harness,
+  revision: string,
+) -> GithubConnectorResult<dict<string, string>> {
+  if !immutable_revision(revision) {
+    return Err(
+      {code: "invalid_response", category: "schema_drift", message: "invalid override revision"},
+    )
+  }
+  const prefix = "/repos/${OVERRIDE_SOURCE_SLUG}/git"
+  const commit = api_call(
+    harness,
+    {path: "${prefix}/commits/${revision}", options: github_connector_options()},
+  )
+  if is_err(commit) {
+    return Err(unwrap_err(commit))
+  }
+  try {
+    const tree_sha = override_commit_tree(revision, unwrap(commit))
+    const tree = api_call(
+      harness,
+      {path: "${prefix}/trees/${tree_sha}?recursive=1", options: github_connector_options()},
+    )
+    if is_err(tree) {
+      return Err(unwrap_err(tree))
+    }
+    return Ok(override_implementation_files(tree_sha, unwrap(tree)))
+  } catch (error) {
+    return Err({code: "invalid_response", category: "schema_drift", message: to_string(error)})
+  }
+}
+
+/** Reachability is established by the caller before any candidate enters this comparison. */
+pub fn equivalent_override_implementations(
+  harness: Harness,
+  canonical: string,
+  candidates: list<string>,
+) -> GithubConnectorResult<OverrideImplementationComparison> {
+  if !immutable_revision(canonical) || candidates.any({ pin -> !immutable_revision(pin) }) {
+    return Err(
+      {
+        code: "invalid_response",
+        category: "schema_drift",
+        message: "invalid override comparison revision",
+      },
+    )
+  }
+  let requested: list<string> = []
+  for revision in candidates {
+    if revision != canonical && !requested.contains(revision) {
+      requested = requested + [revision]
+    }
+  }
+  if len(requested) == 0 {
+    return Ok({canonical: canonical, checked: [], equivalent: []})
+  }
+  const source = read_implementation(harness, canonical)
+  if is_err(source) {
+    return Err(unwrap_err(source))
+  }
+  let equivalent: list<string> = []
+  for revision in requested {
+    const current = read_implementation(harness, revision)
+    if is_err(current) {
+      return Err(unwrap_err(current))
+    }
+    if unwrap(current) == unwrap(source) {
+      equivalent = equivalent + [revision]
+    }
+  }
+  return Ok({canonical: canonical, checked: requested, equivalent: equivalent})
+}

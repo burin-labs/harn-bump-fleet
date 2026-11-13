@@ -1,0 +1,1 @@
+Fleet convergence now projects the shared agent contract into remote AGENTS.md files while preserving repository rules. Missing guidance and malformed managed markers produce named failures instead of unchanged success.
