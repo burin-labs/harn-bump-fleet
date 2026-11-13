@@ -1,0 +1,1 @@
+Published release recovery loads selected consumers' runtime contracts before reading their pins or proving convergence. Missing selected contracts still refuse recovery, and excluded consumers are not queried.

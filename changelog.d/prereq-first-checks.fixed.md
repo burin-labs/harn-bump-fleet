@@ -1,0 +1,1 @@
+A bump-workflow promotion no longer gives up on the pull request it just opened because GitHub has not linked its checks yet. A proposal with no checks is waited on for up to five minutes; a named failing check still ends the wait at once.
