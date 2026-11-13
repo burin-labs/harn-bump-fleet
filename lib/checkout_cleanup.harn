@@ -1,0 +1,219 @@
+import { command_result_fail, command_result_ok } from "std/command"
+import { git_current_branch, git_pull_ff_only, git_run, git_switch } from "std/git"
+import { recorded_step } from "./release_execution"
+
+pub type CheckoutCommandResult = {
+  success: bool,
+  stdout?: string,
+  stderr?: string,
+  exit_code?: int,
+  ...rest,
+}
+
+pub type CheckoutCommandRunner = fn(string) -> CheckoutCommandResult
+
+pub type CheckoutCommandSpec = {name: string, command: string}
+
+pub type CheckoutCleanupResult = {
+  success: bool,
+  skipped: bool,
+  branch: string,
+  detail: string,
+  warning: string,
+  fatal: bool,
+  steps: list<dict>,
+}
+
+/**
+ * Fetch exactly the remote-tracking base ref a release needs. Release
+ * recovery checkouts may retain a deleted branch in remote.origin.fetch, so
+ * broad fetch/prune must never decide whether the release can start.
+ */
+pub fn base_ref_fetch_args(base: string) -> list<string> {
+  return [
+    "fetch",
+    "origin",
+    "--no-tags",
+    "--quiet",
+    "+refs/heads/${base}:refs/remotes/origin/${base}",
+  ]
+}
+
+pub fn base_ref_fetch_command(base: string) -> string {
+  return "git " + join(base_ref_fetch_args(base), " ")
+}
+
+/**
+ * Display labels for the cleanup steps, in execution order.
+ *
+ * The labels are only used for `recorded_step` audit text and to key the
+ * scripted runner in tests — production execution dispatches to std/git
+ * directly via `cleanup_command_result` (no shell parsing involved), so
+ * `base` flows in as a plain value without needing shell quoting.
+ */
+pub fn checkout_cleanup_commands(base: string) -> list<CheckoutCommandSpec> {
+  return [
+    {name: "cleanup-fetch-origin", command: base_ref_fetch_command(base)},
+    {name: "cleanup-switch-base", command: "git switch " + base},
+    {name: "cleanup-sync-base", command: "git pull --ff-only origin " + base + " --quiet"},
+  ]
+}
+
+fn cleanup_command_result(
+  process: HarnessProcess,
+  run_command: any,
+  repo: any,
+  name: any,
+  command: any,
+  base: any,
+) {
+  if run_command != nil {
+    return run_command(command)
+  }
+  if name == "cleanup-status" {
+    return git_run(process, ["status", "--porcelain", "--untracked-files=normal"], {repo: repo})
+  }
+  if name == "cleanup-fetch-origin" {
+    return git_run(process, base_ref_fetch_args(base), {repo: repo})
+  }
+  if name == "cleanup-switch-base" {
+    return git_switch(process, base, repo)
+  }
+  if name == "cleanup-sync-base" {
+    return git_pull_ff_only(process, repo, "origin", base, {quiet: true})
+  }
+  if name == "cleanup-current-branch" {
+    return git_current_branch(process, repo)
+  }
+  throw "unknown cleanup command step: " + name
+}
+
+/** Restore a clean checkout to `base`, or skip safely when local changes are present. */
+pub fn checkout_cleanup(
+  process: HarnessProcess,
+  run_command: CheckoutCommandRunner? = nil,
+  base: string = "main",
+  repo: string = ".",
+) -> CheckoutCleanupResult {
+  let steps = []
+  const status_command = "git status --porcelain --untracked-files=normal"
+  const status = cleanup_command_result(
+    process,
+    run_command,
+    repo,
+    "cleanup-status",
+    status_command,
+    base,
+  )
+  steps = steps + [recorded_step("cleanup-status", status_command, status)]
+  if !status.success {
+    return {
+      success: false,
+      skipped: false,
+      branch: "",
+      detail: "could not inspect working tree before cleanup",
+      warning: cleanup_warning("could not inspect working tree before cleanup"),
+      fatal: false,
+      steps: steps,
+    }
+  }
+  if trim(status.stdout) != "" {
+    steps = steps
+      + [
+        recorded_step(
+          "cleanup-skipped-dirty",
+          "skip cleanup checkout",
+          command_result_ok(
+            "working tree has tracked or untracked changes; leaving checkout unchanged\n",
+          ),
+        ),
+      ]
+    return {
+      success: true,
+      skipped: true,
+      branch: "",
+      detail: "working tree dirty; left checkout unchanged",
+      warning: "",
+      fatal: false,
+      steps: steps,
+    }
+  }
+  for spec in checkout_cleanup_commands(base) {
+    const result = cleanup_command_result(process, run_command, repo, spec.name, spec.command, base)
+    steps = steps + [recorded_step(spec.name, spec.command, result)]
+    if !result.success {
+      const detail = "failed during " + spec.name
+      return {
+        success: false,
+        skipped: false,
+        branch: "",
+        detail: detail,
+        warning: cleanup_warning(detail),
+        fatal: false,
+        steps: steps,
+      }
+    }
+  }
+  const branch_command = "git branch --show-current"
+  const branch = cleanup_command_result(
+    process,
+    run_command,
+    repo,
+    "cleanup-current-branch",
+    branch_command,
+    base,
+  )
+  steps = steps + [recorded_step("cleanup-current-branch", branch_command, branch)]
+  if !branch.success {
+    return {
+      success: false,
+      skipped: false,
+      branch: "",
+      detail: "could not verify cleanup branch",
+      warning: cleanup_warning("could not verify cleanup branch"),
+      fatal: false,
+      steps: steps,
+    }
+  }
+  const current = trim(branch.stdout)
+  if current != base {
+    steps = steps
+      + [
+        recorded_step(
+          "cleanup-verify-base",
+          "verify checkout is " + base,
+          command_result_fail(1, "checkout is " + current + "; expected " + base),
+        ),
+      ]
+    return {
+      success: false,
+      skipped: false,
+      branch: current,
+      detail: "checkout is " + current + "; expected " + base,
+      warning: cleanup_warning("checkout is " + current + "; expected " + base),
+      fatal: false,
+      steps: steps,
+    }
+  }
+  steps = steps
+    + [
+      recorded_step(
+        "cleanup-verify-base",
+        "verify checkout is " + base,
+        command_result_ok("checkout is " + base + "\n"),
+      ),
+    ]
+  return {
+    success: true,
+    skipped: false,
+    branch: current,
+    detail: "checkout restored to " + base,
+    warning: "",
+    fatal: false,
+    steps: steps,
+  }
+}
+
+fn cleanup_warning(detail: any) {
+  return "non-fatal checkout cleanup warning: " + detail
+}

@@ -1,0 +1,1 @@
+Hosted Harn releases can now materialize the manifest-owned downstream fleet, run the canonical bump controller, and wait on the exact child workflow until every configured consumer has merged the target pin, with typed receipts at each boundary.
