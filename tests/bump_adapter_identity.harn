@@ -1,0 +1,188 @@
+import { LiveBumpRemote, live_bump_adapter } from "std/bump/live"
+import { shell_quote } from "std/runtime"
+import { render_bump_workflow } from "../lib/bump_workflow_projection"
+import { parse_consumer_contract_manifest } from "../lib/consumer_projection_manifest"
+import { FleetManifest, FleetRepository, bump_adapter_contract } from "../lib/fleet_manifest"
+import { evaluate_bump_workflow_semantics } from "../lib/fleet_policy"
+import { decode_github_workflow } from "../lib/github_workflow"
+
+fn manifest(repo: FleetRepository) -> FleetManifest {
+  return {
+    schema_version: 1,
+    fleet: {default_root: "~/projects", default_branch: "main"},
+    policy: {
+      package_workflow:
+        "owner/policy/.github/workflows/harn-package.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      bump_workflow:
+        "owner/harn/.github/workflows/bump-harn.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    repositories: [repo],
+  }
+}
+
+fn unreachable_remote() -> LiveBumpRemote {
+  const unreachable = fn() {
+    throw "validator must not call the remote"
+  }
+  return {
+    latest_release_tag: unreachable,
+    release_view: fn(_tag) { return unreachable() },
+    base_head: unreachable,
+    fetch_base: fn(_oid) { return unreachable() },
+    is_generated_commit: fn(_oid) { return unreachable() },
+    find_bump_pr: unreachable,
+    disable_auto_merge: fn(_pr, _base) { return unreachable() },
+    publish_commit: fn(_request) { return unreachable() },
+    branch_matches_base: unreachable,
+    upsert_pr: fn(_existing, _head) { return unreachable() },
+    close_pr: fn(_number, _comment) { return unreachable() },
+    enable_auto_merge: fn(_number, _head) { return unreachable() },
+  }
+}
+
+pipeline test_projected_non_package_validator_reaches_the_released_execution_owner(
+  harness: Harness,
+) {
+  const root = harness.fs.mkdtemp_in_workspace("bump-validator-")
+  const script = path_join(root, "validate.harn")
+  const marker = path_join(root, "reached")
+  const binary = path_normalize(path_join(harness.fs.source_dir(), "../.harn/bin/harn"))
+  const command = "exec " + shell_quote(binary) + " run --no-sandbox " + shell_quote(script)
+  const repo: FleetRepository = {
+    slug: "owner/index",
+    directory: "index",
+    harn_package: false,
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: command,
+  }
+  const declared = manifest(repo)
+  const projected = decode_github_workflow(render_bump_workflow(declared, repo)).jobs.get("bump")
+    ?.with
+  assert_eq(projected?.get("test-inventory-mode"), "repository-validation")
+  assert_eq(projected?.get("validate-command"), command)
+  const adapter = live_bump_adapter(
+    harness.clock,
+    harness.tools,
+    unreachable_remote(),
+    {repo_dir: root, validation_command: projected?.get("validate-command")},
+    harness.fs,
+  )
+  for status in [0, 7] {
+    harness.fs.write_text(
+      script,
+      "fn main(harness: Harness) -> int { harness.fs.write_text(${json_stringify(marker)}, ${json_stringify(to_string(status))}); return ${status} }\n",
+    )
+    const verdict = adapter.run_validation()
+    assert_eq(
+      harness.fs.read_text(marker),
+      to_string(status),
+      "the declared validator must actually run",
+    )
+    assert_eq(len(verdict.steps), 1)
+    assert_eq(verdict.ok, status == 0)
+    assert_eq(verdict.steps[0].ok, status == 0)
+  }
+  harness.fs.delete(root)
+}
+
+pipeline test_generated_bump_projects_complete_consumer_title_and_strict_inventory() {
+  for area in ["Harn", "core", ""] {
+    const repo: FleetRepository = {
+      slug: "owner/package",
+      directory: "package",
+      harn_package: true,
+      harn_bump: true,
+      bump_workflow_ownership: "fleet",
+      pr_title_area: area,
+    }
+    const declared = manifest(repo)
+    const source = render_bump_workflow(declared, repo)
+    const inputs = decode_github_workflow(source).jobs.get("bump")?.with
+    const expected = "[${area == "" ? "CI" : area}] Bump Harn runtime"
+    assert_eq(inputs?.get("pr-title"), expected)
+    assert_eq(inputs?.get("test-inventory-mode"), "package")
+    const contract = bump_adapter_contract(declared, repo)
+    assert_eq(evaluate_bump_workflow_semantics(contract, source), [])
+    for input in ["pr-title", "test-inventory-mode"] {
+      const value = input == "pr-title" ? json_stringify(expected) : "package"
+      const line = "      ${input}: ${value}\n"
+      assert(contains(source, line))
+      for replacement in ["", "      ${input}: wrong-value\n", "      ${input}: false\n"] {
+        assert_eq(
+          evaluate_bump_workflow_semantics(contract, replace(source, line, replacement)),
+          ["bump adapter ${input} projection disagrees with its consumer contract"],
+        )
+      }
+    }
+  }
+}
+
+/** Consumer-owned validators are read before a non-package inventory waiver is resolved. */
+pipeline test_consumer_contract_keeps_its_validator_and_inventory(harness: Harness) {
+  const repo: FleetRepository = {
+    slug: "owner/application",
+    directory: "application",
+    harn_package: false,
+    consumer_owned_contract: true,
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+  }
+  const fleet = manifest(repo)
+  const source = harness.fs.read_text("fixtures/non-package-fleet-projections.toml")
+  const hydrated = parse_consumer_contract_manifest(fleet, repo, source).repository
+  assert_eq(hydrated.harn_package, false)
+  const contract = bump_adapter_contract(fleet, hydrated)
+  assert_eq(contract.test_inventory_mode, "repository-validation")
+  assert_eq(contract.validation_command, hydrated.bump_validate_command)
+  assert_eq(contract.validation_command, "harn run validate.harn")
+  const workflow = render_bump_workflow(fleet, hydrated)
+  assert_eq(evaluate_bump_workflow_semantics(contract, workflow), [])
+  assert_eq(
+    decode_github_workflow(workflow).jobs.get("bump")?.with?.get("validate-command"),
+    contract.validation_command,
+  )
+  for classification in [nil, true] {
+    const refused = try {
+      parse_consumer_contract_manifest(fleet, repo + {harn_package: classification}, source)
+      false
+    } catch (_error) {
+      true
+    }
+    assert(refused)
+  }
+}
+
+pipeline test_only_declared_non_package_with_validator_waives_package_inventory() {
+  const base: FleetRepository = {
+    slug: "owner/index",
+    directory: "index",
+    harn_bump: true,
+    bump_workflow_ownership: "fleet",
+    bump_validate_command: "harn run validate.harn",
+  }
+  assert_eq(bump_adapter_contract(manifest(base), base).test_inventory_mode, "package")
+  const index = base + {harn_package: false}
+  assert_eq(
+    bump_adapter_contract(manifest(index), index).test_inventory_mode,
+    "repository-validation",
+  )
+  const without_validator = index + {bump_validate_command: " "}
+  assert_eq(
+    bump_adapter_contract(manifest(without_validator), without_validator).test_inventory_mode,
+    "package",
+  )
+  for repo in [
+    without_validator + {bump_test_inventory_mode: "repository-validation"},
+    base + {bump_test_inventory_mode: "repository-validation"},
+    base + {harn_package: true, bump_test_inventory_mode: "repository-validation"},
+  ] {
+    const rejected = try {
+      bump_adapter_contract(manifest(repo), repo)
+      false
+    } catch (_error) {
+      true
+    }
+    assert(rejected)
+  }
+}
