@@ -1,0 +1,1 @@
+Resolve one certified commit at dispatch instead of binding the cut to the default branch: an unpinned hosted release now selects the newest commit whose required contexts are all green, records that exact OID in the dispatch receipt, and refuses by name rather than falling back to the branch head.
