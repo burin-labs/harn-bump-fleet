@@ -64,11 +64,13 @@ the [Harn release runbook](https://github.com/burin-labs/harn/blob/main/docs/src
 for workflow-owned recovery. Do not manually tag the old prepared candidate or
 restore the retired candidate-only dispatch inputs.
 
-For an offline rehearsal of the historical control flow, use:
+For an offline rehearsal of release analysis and audit reporting, use:
 
 ```sh
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode audit --no-chat
 ```
 
-The mock flow proves its fixture behavior. It supplies no current release,
-signing, certification, publication, or downstream evidence.
+The mock audit uses deterministic fixtures and makes no provider calls. It
+supplies no current signing, certification, publication, or downstream evidence.
+Local preparation and mock shipping are retired; their historical controller
+does not run beside Harn's workflow.

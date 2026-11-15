@@ -16,7 +16,8 @@ The entry points are:
   polls them, and enables auto-merge on the resulting PRs.
 - `release_harn.harn`: delegates live `ship-pr --yes-live-release` to Harn's
   no-input workflow opener on main and records its typed handoff. Local live
-  preparation refuses; historical preparation remains an offline mock rehearsal.
+  preparation refuses. Offline rehearsals exercise the read-only audit and
+  the canonical handoff's injected adapter; there is no local release controller.
 - `watch_harn_release.harn`: reads the recorded handoff, an explicitly selected
   release PR, and its exact merge-group producer attempt. It verifies the public
   tag target and seven public files against the certificate. Missing evidence
@@ -95,28 +96,16 @@ Release implementation changes belong in the stage that owns the behavior:
   mock commands, run events, and timing
 - `release_analysis`: release facts, commit/PR evidence, and deterministic
   analysis prompts
-- `release_agent_tools` / `release_agent`: agent tool boundaries, review,
-  validation, artifacts, and recovery
-- `release_prepare` / `release_checkout`: prepare-audit reuse, cutoff/tag
-  reconciliation, branch setup, and checkout state
-- `release_note_fold` / `release_notes`: candidate-tree folding, release notes,
-  and fixup/drift state
-- `release_reporting`: PR rendering and execution summaries
+- `release_agent_tools` / `release_agent`: audit tools, review and artifacts
+- `release_notes`: immutable published-note provenance and run/session view checks
+- `release_report`: typed audit JSON and Markdown
 - `release_crystallization`: deterministic, agent, and tool fixture streams
   plus their manifest and artifact writer
-- `release_modes`: prepare execution, thin ship-phase composition, and cleanup
-- `release_ship_prepare`: prepared commit and immutable attempt publication
-- `release_ship_certify`: cutoff and exact-candidate certification gates
-- `release_ship_pr`: canonical workflow opener and typed handoff; mock PR publication
+- `release_workflow_open`: canonical workflow dispatch and typed pending handoff
 - `release_watch_handoff`: immutable PR, merged-source, and producer-attempt identities
 - `release_archive_observation`: certificate identity and measured public-file digests
-- `release_watch_runtime`: read-only canonical publication observation and mock control flow
-- `release_candidate_tag`: certified-candidate tagging and write-once receipt binding
-- `release_main_tag`: historical merged-main recovery and bump reversal
-- `release_main_drift`: the drift reading those recoveries decide on, and
-  the union of ruleset-required and repository-declared release contexts
-- `release_preflight`: interactive flags, planner/fleet/sccache checks, and
-  build-lock lifecycle
+- `release_watch_runtime`: read-only canonical publication observation
+- `release_preflight`: interactive audit choices, report chat and release-fold facts
 
 Do not put stage policy back in the entrypoint or add a second implementation
 behind a compatibility helper. `check_source_length.harn` enforces a 1,500-line
@@ -162,7 +151,7 @@ Common harness runs:
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --dry-run
 scripts/with_env.sh harn run --no-sandbox bump_fleet.harn -- --only burin-labs/harn-cloud
 scripts/with_env.sh harn run --no-sandbox release_harn.harn
-scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode ship-pr
+scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mock --agent --mode audit --no-chat
 scripts/with_env.sh harn run --no-sandbox release_harn.harn -- --mode ship-pr --yes-live-release
 scripts/watch_harn_release.sh --receipt PATH --release-pr NUMBER --producer-run RUN_ID
 scripts/with_env.sh harn run --no-sandbox sync_agent_guidance.harn -- --check
